@@ -88,10 +88,17 @@ class HyperliquidAdapter:
         await self.limiter.acquire(WEIGHT_STANDARD_INFO, Priority.METADATA, timeout=15)
         return await self._call(self.info.extra_agents, account)
 
-    async def verify_agent(self, account_address: str, private_key: str) -> AgentVerification:
+    async def verify_agent(
+        self,
+        account_address: str,
+        private_key: str,
+        expected_agent_address: str | None = None,
+    ) -> AgentVerification:
         main = account_address.lower()
         local = Account.from_key(private_key)
         agent = local.address.lower()
+        if expected_agent_address and agent != expected_agent_address.lower():
+            raise ValueError('API Wallet address does not match the supplied private key')
         if agent == main:
             raise ValueError('Main wallet private keys are not accepted. Create a named Hyperliquid API wallet.')
         agents = await self.extra_agents(main)
