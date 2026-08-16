@@ -61,7 +61,7 @@ async def _sync_missing_fills(db: AsyncSession, hl: HyperliquidAdapter, user: Us
         for fill in by_oid.get(str(execution.exchange_oid), []):
             ts_ms = int(fill.get('time') or int(execution.created_at.timestamp() * 1000))
             stmt = insert(Fill).values(
-                exchange_fill_id=fill_event_id(fill), execution_id=execution.id,
+                exchange_fill_id=f'{hl.network}:{fill_event_id(fill)}', execution_id=execution.id,
                 user_id=user.id, asset=str(fill.get('coin') or execution.asset),
                 size=Decimal(str(fill.get('sz', '0'))), price=Decimal(str(fill.get('px', '0'))),
                 side=str(fill.get('side') or fill.get('dir') or '')[:8],
@@ -92,13 +92,6 @@ async def reconcile_user(
     master_mids: dict[str, str] | None = None,
     create_jobs: bool = True,
 ) -> dict:
-    """Reconcile one follower against its own exchange network.
-
-    ``hl`` and ``mids`` are follower-side. ``master_positions``,
-    ``master_equity`` and optional ``master_mids`` are source-side. Keeping
-    those domains explicit is what makes mainnet-master -> testnet-follower
-    safe and mathematically correct.
-    """
     follower_mids = mids
     source_mids = master_mids or mids
     run = ReconciliationRun(user_id=user.id, before={}, after={})
@@ -186,12 +179,7 @@ async def reconcile_user(
                     db.add(CopyJob(
                         user_id=user.id, asset=asset, origin='RECONCILE', state=JobState.QUEUED,
                         correlation_id=uuid.uuid4().hex,
-                        context={
-                            'master_position': str(master_positions[asset]),
-                            'master_equity': str(master_equity),
-                            'master_mark_price': master_mark,
-                            'mark_price': master_mark,
-                        },
+                        context={'master_position': str(master_positions[asset]), 'master_equity': str(master_equity), 'master_mark_price': master_mark, 'mark_price': master_mark},
                     ))
             elif create_jobs and real != 0 and asset not in master_positions:
                 should_close = bool(ledger.managed) or user.manual_trade_policy.value == 'STRICT'
@@ -206,12 +194,7 @@ async def reconcile_user(
                         db.add(CopyJob(
                             user_id=user.id, asset=asset, origin='RECONCILE', state=JobState.QUEUED,
                             correlation_id=uuid.uuid4().hex,
-                            context={
-                                'master_position': '0',
-                                'master_equity': str(master_equity),
-                                'master_mark_price': close_mark,
-                                'mark_price': close_mark,
-                            },
+                            context={'master_position': '0', 'master_equity': str(master_equity), 'master_mark_price': close_mark, 'mark_price': close_mark},
                         ))
 
         unmanaged_margin = Decimal(0)
@@ -224,10 +207,7 @@ async def reconcile_user(
                     unmanaged_margin += abs(Decimal(str(pos.get('marginUsed', '0') or '0')))
                 except Exception:
                     pass
-        db.add(EquitySnapshot(
-            user_id=user.id, account_value=equity, free_margin=free_margin,
-            unmanaged_margin=unmanaged_margin, taken_at=datetime.now(UTC),
-        ))
+        db.add(EquitySnapshot(user_id=user.id, account_value=equity, free_margin=free_margin, unmanaged_margin=unmanaged_margin, taken_at=datetime.now(UTC)))
 
         run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills}; run.finished_at = datetime.now(UTC)
         await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'discrepancies': discrepancies})
@@ -244,7 +224,6 @@ async def reconcile_active_users(
     *,
     master_hl: HyperliquidAdapter | None = None,
 ) -> int:
-    """Reconcile followers with an optional distinct read-only master adapter."""
     source_hl = master_hl or hl
     mp, me, source_mids = await master_snapshot(source_hl)
     follower_mids = source_mids if source_hl is hl else await hl.mids()
@@ -256,11 +235,5 @@ async def reconcile_active_users(
         query = query.limit(limit)
     users = (await db.execute(query)).scalars().all()
     for user in users:
-        await reconcile_user(
-            db, hl, user,
-            master_positions=mp,
-            master_equity=me,
-            mids=follower_mids,
-            master_mids=source_mids,
-        )
+        await reconcile_user(db, hl, user, master_positions=mp, master_equity=me, mids=follower_mids, master_mids=source_mids)
     return len(users)
