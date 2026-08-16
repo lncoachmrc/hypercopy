@@ -17,7 +17,7 @@ def test_parse_filled_order_response():
 
 
 def test_parse_rejection():
-    r=parse_order_response({'response':{'data':{'statuses':[{'error':'Insufficient margin'}]}})
+    r=parse_order_response({'response':{'data':{'statuses':[{'error':'Insufficient margin'}]}}})
     assert r.state=='REJECTED'
 
 
