@@ -27,25 +27,34 @@ stop=asyncio.Event()
 def _stop(*_): stop.set()
 
 
+def _checkpoint_slug() -> str:
+    # Network + address is the real identity of a Hyperliquid principal. This
+    # prevents a previous testnet checkpoint from suppressing mainnet fills (or
+    # vice versa) when the same EVM address is used in both environments.
+    return f'master_checkpoint:{settings.master_network}:{settings.HYPERLIQUID_MASTER_ADDRESS.lower()}'
+
+
 async def _checkpoint(db) -> int:
-    row=await db.get(SystemFlag,'master_checkpoint')
+    row=await db.get(SystemFlag,_checkpoint_slug())
     return int((row.value or {}).get('time_ms',0)) if row else 0
 
 
 async def _set_checkpoint(db,time_ms:int,event_id:str):
-    # WS and replay can overlap. Never move the persistent checkpoint backwards.
-    row=await db.get(SystemFlag,'master_checkpoint',with_for_update=True)
+    slug=_checkpoint_slug()
+    row=await db.get(SystemFlag,slug,with_for_update=True)
     if not row:
-        row=SystemFlag(slug='master_checkpoint',enabled=True,value={}); db.add(row)
+        row=SystemFlag(slug=slug,enabled=True,value={}); db.add(row)
     current=int((row.value or {}).get('time_ms',0))
     if time_ms >= current:
-        row.value={'time_ms':time_ms,'exchange_event_id':event_id}
+        row.value={'time_ms':time_ms,'exchange_event_id':event_id,'network':settings.master_network}
     await db.commit()
 
 
 class Watcher:
     def __init__(self):
-        self.redis=redis_client(); self.limiter=WeightedRateLimiter(self.redis,Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN)); self.hl=HyperliquidAdapter(self.limiter)
+        self.redis=redis_client()
+        self.limiter=WeightedRateLimiter(self.redis,Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN))
+        self.hl=HyperliquidAdapter(self.limiter,network=settings.master_network)
         self.lease=WatcherLease(SessionLocal,ttl_seconds=settings.WATCHER_LEASE_TTL_SECONDS,renew_seconds=settings.WATCHER_LEASE_RENEW_SECONDS)
         self._equity=Decimal(0); self._equity_at=0.0
 
@@ -58,11 +67,6 @@ class Watcher:
             self._equity=Decimal(str(state.get('marginSummary',{}).get('accountValue','0'))); self._equity_at=now
             return self._equity
         except Exception:
-            # Redis powers the shared rate limiter and may be unavailable. The
-            # master event must still be durable in PostgreSQL whenever we have
-            # a recent trustworthy equity observation. Fall back to the last
-            # persisted master event; if none exists, fail closed rather than
-            # inventing an equity value.
             async with SessionLocal() as db:
                 last=(await db.execute(select(MasterEvent).order_by(MasterEvent.event_ts.desc()).limit(1))).scalar_one_or_none()
                 if last and last.master_equity and last.master_equity>0:
@@ -81,7 +85,7 @@ class Watcher:
                 except Exception: log.warning('Redis publish failed; durable job remains in PostgreSQL',extra={'job_id':str(job.id)},exc_info=True)
             await db.commit()
             await _set_checkpoint(db,int(event.event_ts.timestamp()*1000),event.exchange_event_id)
-        try: await self.redis.publish(f'{settings.REALTIME_CHANNEL_PREFIX}:system',__import__('json').dumps({'type':'master_fill','asset':event.asset,'price':str(event.price),'size':str(event.size),'at':event.event_ts.isoformat()}))
+        try: await self.redis.publish(f'{settings.REALTIME_CHANNEL_PREFIX}:system',__import__('json').dumps({'type':'master_fill','asset':event.asset,'price':str(event.price),'size':str(event.size),'at':event.event_ts.isoformat(),'network':settings.master_network}))
         except Exception: pass
 
     async def replay(self):
@@ -98,9 +102,8 @@ class Watcher:
             if len(fills)<2000: return
             cursor=max(int(f.get('time',cursor)) for f in fills)+1
             if seen>=settings.HL_REPLAY_MAX_FILLS: break
-        # We cannot prove continuity beyond Hyperliquid's retained fill window.
         async with SessionLocal() as db:
-            db.add(SystemIncident(severity='CRITICAL',code='MASTER_REPLAY_GAP_UNPROVEN',message='Historical replay hit configured safety ceiling; manual reconciliation required',context={'start_ms':start,'seen':seen})); flag=await db.get(SystemFlag,'global_pause')
+            db.add(SystemIncident(severity='CRITICAL',code='MASTER_REPLAY_GAP_UNPROVEN',message='Historical replay hit configured safety ceiling; manual reconciliation required',context={'start_ms':start,'seen':seen,'network':settings.master_network})); flag=await db.get(SystemFlag,'global_pause')
             if not flag: flag=SystemFlag(slug='global_pause',enabled=True); db.add(flag)
             flag.enabled=True; flag.reason='Master replay continuity could not be proven'; await db.commit()
         raise RuntimeError('Master replay continuity could not be proven')
@@ -108,10 +111,6 @@ class Watcher:
     async def run_leader(self):
         await self.lease.start_renewal()
         try:
-            # Keep the authoritative PG lease across normal exchange-side
-            # websocket rotations. Before each new realtime session, replay from
-            # the durable checkpoint so any fills that landed during the tiny
-            # reconnect gap are recovered exactly once.
             while not stop.is_set() and not self.lease.lost.is_set():
                 await self.replay()
                 async for fill in self.hl.master_fills(settings.HYPERLIQUID_MASTER_ADDRESS,stop):
@@ -119,7 +118,7 @@ class Watcher:
                         break
                     await self.process_fill(fill)
                 if not stop.is_set() and not self.lease.lost.is_set():
-                    log.info('Master websocket session rotated; replaying before reconnect')
+                    log.info('Master websocket session rotated; replaying before reconnect',extra={'network':settings.master_network})
                     await asyncio.sleep(0.5)
         finally:
             await self.lease.stop_renewal(); await self.lease.release()
@@ -127,6 +126,7 @@ class Watcher:
     async def run(self):
         async with SessionLocal() as db: await assert_schema(db)
         if not settings.HYPERLIQUID_MASTER_ADDRESS: raise RuntimeError('HYPERLIQUID_MASTER_ADDRESS is required')
+        log.info('Master watcher source',extra={'network':settings.master_network,'address':settings.HYPERLIQUID_MASTER_ADDRESS[:8]+'…'})
         while not stop.is_set():
             try:
                 if await self.lease.try_acquire(): await self.run_leader()
