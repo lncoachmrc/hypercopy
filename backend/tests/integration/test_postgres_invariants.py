@@ -7,11 +7,19 @@ import os
 import uuid
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import text
 
-from app.db.session import SessionLocal
+from app.db.session import SessionLocal, engine
 
 pytestmark=pytest.mark.skipif(os.getenv('RUN_INTEGRATION')!='1',reason='requires CI PostgreSQL')
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _dispose_pool_after_test():
+    """Do not carry asyncpg connections across pytest's per-test event loops."""
+    yield
+    await engine.dispose()
 
 
 @pytest.mark.asyncio
