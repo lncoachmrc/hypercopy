@@ -26,6 +26,16 @@ configure_logging(); log=get_logger(__name__); stop=asyncio.Event()
 def _stop(*_): stop.set()
 
 
+def _job_matches_current_networks(job: CopyJob) -> bool:
+    if job.origin not in {'EVENT', 'RECONCILE'}:
+        return True
+    ctx = job.context or {}
+    return (
+        ctx.get('master_network') == settings.master_network
+        and ctx.get('follower_network') == settings.follower_network
+    )
+
+
 class Worker:
     def __init__(self):
         self.id = replica_identity()
@@ -47,6 +57,18 @@ class Worker:
         async with SessionLocal() as db:
             raw=await db.get(CopyJob,uid)
             if not raw or raw.state in {JobState.DONE,JobState.SKIPPED,JobState.DEAD}: return True
+
+            # Historical jobs created before a network split (or under a
+            # different source/destination pair) must never update targets or
+            # submit orders in the current topology.
+            if not _job_matches_current_networks(raw):
+                raw.state=JobState.SKIPPED
+                raw.last_error='Stale job from a different or unversioned Hyperliquid network topology'
+                raw.owner=None
+                raw.locked_until=None
+                await db.commit()
+                return True
+
             if raw.origin=='ADMIN_RECONCILE':
                 user=await db.get(User,raw.user_id)
                 if user:
@@ -56,9 +78,6 @@ class Worker:
                         db,self.follower_hl,user,
                         master_positions=mp,master_equity=me,mids=follower_mids,master_mids=master_mids,
                     )
-                    # reconcile_user creates durable jobs in PostgreSQL. Publish
-                    # them immediately instead of waiting for the next 60s
-                    # maintenance pass.
                     await repair_stream(self.redis,db)
                 raw.state=JobState.DONE; await db.commit(); return True
             job=await claim_job(db,self.id,uid)
@@ -91,17 +110,13 @@ class Worker:
     async def maintenance(self):
         while not stop.is_set():
             try:
-                # First recover any previously durable-but-unpublished jobs.
                 async with SessionLocal() as db:
                     await release_stale_jobs(db)
                     await repair_stream(self.redis,db)
                     await monitor_credential_expiry(db, self.redis)
 
-                # Reconciliation may create fresh target jobs.
                 await self.run_reconcile_if_leader()
 
-                # Publish those fresh jobs in this same cycle so SHADOW targets
-                # and live testnet deltas do not lag by another interval.
                 async with SessionLocal() as db:
                     await repair_stream(self.redis,db)
                 await self.heartbeat()
