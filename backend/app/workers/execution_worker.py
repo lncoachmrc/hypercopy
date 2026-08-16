@@ -31,8 +31,6 @@ class Worker:
         self.id = replica_identity()
         self.redis = redis_client()
         self.limiter = WeightedRateLimiter(self.redis, Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN))
-        # Master is read-only and may live on mainnet while follower execution
-        # remains isolated on testnet.
         self.master_hl = HyperliquidAdapter(self.limiter, network=settings.master_network)
         self.follower_hl = HyperliquidAdapter(self.limiter, network=settings.follower_network)
         self.current_job = None
@@ -58,6 +56,10 @@ class Worker:
                         db,self.follower_hl,user,
                         master_positions=mp,master_equity=me,mids=follower_mids,master_mids=master_mids,
                     )
+                    # reconcile_user creates durable jobs in PostgreSQL. Publish
+                    # them immediately instead of waiting for the next 60s
+                    # maintenance pass.
+                    await repair_stream(self.redis,db)
                 raw.state=JobState.DONE; await db.commit(); return True
             job=await claim_job(db,self.id,uid)
             if not job: return True
@@ -89,9 +91,20 @@ class Worker:
     async def maintenance(self):
         while not stop.is_set():
             try:
+                # First recover any previously durable-but-unpublished jobs.
                 async with SessionLocal() as db:
-                    await release_stale_jobs(db); await repair_stream(self.redis,db); await monitor_credential_expiry(db, self.redis)
-                await self.run_reconcile_if_leader(); await self.heartbeat()
+                    await release_stale_jobs(db)
+                    await repair_stream(self.redis,db)
+                    await monitor_credential_expiry(db, self.redis)
+
+                # Reconciliation may create fresh target jobs.
+                await self.run_reconcile_if_leader()
+
+                # Publish those fresh jobs in this same cycle so SHADOW targets
+                # and live testnet deltas do not lag by another interval.
+                async with SessionLocal() as db:
+                    await repair_stream(self.redis,db)
+                await self.heartbeat()
             except Exception: log.warning('Worker maintenance failed',exc_info=True)
             await asyncio.sleep(settings.RECONCILE_INTERVAL_SECONDS)
 
