@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.hyperliquid import fill_event_id, signed_fill_delta
+from app.core.config import settings
 from app.core.logging import get_logger
 from app.models.entities import CopyJob, MasterEvent, TradingAccount, User, UserState
 
@@ -70,7 +71,8 @@ async def persist_master_fill_and_jobs(
                 'master_mark_price': str(price),
                 'mark_price': str(price),
                 'master_event_id': str(event.id),
-                'master_network': source_network,
+                'master_network': source_network or settings.master_network,
+                'follower_network': settings.follower_network,
             },
         ).on_conflict_do_nothing(constraint='uq_job_master_user').returning(CopyJob.id)
         inserted = (await db.execute(statement)).scalar_one_or_none()
