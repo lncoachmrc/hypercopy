@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
@@ -15,6 +16,7 @@ from app.core.crypto import crypto
 from app.core.security import hash_ip, normalize_address
 from app.db.redis import redis_client
 from app.db.session import get_db
+from app.engine.sizing import EXCHANGE_MIN_NOTIONAL
 from app.models.entities import CopyJob, CopyState, CredentialStatus, Execution, PositionLedger, RiskHalt, RiskProfile, RiskState, SigningCredential, TradingAccount, User
 from app.schemas.trading import ClosePositionsIn
 from app.schemas.user import RiskProfileIn, TradingAccountIn
@@ -76,7 +78,38 @@ async def dashboard(user: User = Depends(current_user), db: AsyncSession = Depen
 @router.get('/positions')
 async def positions(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     rows = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user.id).order_by(PositionLedger.asset))).scalars().all()
-    return [{'asset': r.asset, 'current_size': r.size, 'target_size': r.target_size, 'delta': r.target_size-r.size, 'managed': r.managed, 'exchange_verified_at': r.exchange_verified_at} for r in rows]
+    risk = (await db.execute(select(RiskProfile).where(RiskProfile.user_id == user.id))).scalar_one_or_none()
+    min_notional = max(risk.min_notional if risk else EXCHANGE_MIN_NOTIONAL, EXCHANGE_MIN_NOTIONAL)
+    out = []
+    for r in rows:
+        mark = r.mark_price or Decimal(0)
+        delta = r.target_size - r.size
+        delta_notional = abs(delta) * mark if mark > 0 else Decimal(0)
+        if r.managed and mark <= 0:
+            status = 'UNAVAILABLE'
+            reason = f'Mercato non disponibile su {settings.follower_network.upper()}'
+        elif delta == 0:
+            status = 'ON_TARGET'
+            reason = None
+        elif delta_notional < min_notional:
+            status = 'BELOW_MIN'
+            reason = f'Delta ${delta_notional:.2f} sotto minimo ${min_notional:.0f}'
+        else:
+            status = 'READY'
+            reason = None
+        out.append({
+            'asset': r.asset,
+            'current_size': r.size,
+            'target_size': r.target_size,
+            'delta': delta,
+            'mark_price': mark,
+            'delta_notional': delta_notional,
+            'status': status,
+            'reason': reason,
+            'managed': r.managed,
+            'exchange_verified_at': r.exchange_verified_at,
+        })
+    return out
 
 
 @router.get('/executions')
@@ -90,9 +123,6 @@ async def executions(user: User = Depends(current_user), db: AsyncSession = Depe
 
 @router.post('/trading-account', dependencies=[Depends(require_csrf)])
 async def link_trading_account(body: TradingAccountIn, request: Request, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    # Product invariant: the authenticated Web3 wallet is the follower account.
-    # The same EVM address may be the master only when source and destination
-    # are different Hyperliquid networks. Identity is (network, address).
     account_address = normalize_address(user.auth_wallet)
     master_address = normalize_address(settings.HYPERLIQUID_MASTER_ADDRESS) if settings.HYPERLIQUID_MASTER_ADDRESS else ''
     same_principal = (
@@ -136,9 +166,6 @@ async def link_trading_account(body: TradingAccountIn, request: Request, user: U
     blob = crypto.encrypt(body.agent_private_key, user_id=str(user.id), account_id=str(account.id))
     expires = datetime.fromtimestamp(verification.valid_until/1000, UTC) if verification.valid_until else None
     db.add(SigningCredential(trading_account_id=account.id, ciphertext_b64=blob.ciphertext_b64, nonce_b64=blob.nonce_b64, wrapped_dek_b64=blob.wrapped_dek_b64, wrap_nonce_b64=blob.wrap_nonce_b64, key_provider=blob.key_provider, key_reference=blob.key_reference, key_version=blob.key_version, agent_fingerprint=hashlib.sha256(verification.agent_address.encode()).hexdigest(), expires_at=expires, status=CredentialStatus.ACTIVE))
-    # Relinking after a credential removal must never jump straight to ACTIVE.
-    # In staging/default-safe deployments it may return a PAUSED user only to
-    # SHADOW, where targets are calculated but no exchange order is submitted.
     if settings.DEFAULT_SHADOW_MODE and user.copy_state == CopyState.PAUSED:
         user.copy_state = CopyState.SHADOW
         user.shadow_started_at = datetime.now(UTC)
