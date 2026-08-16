@@ -3,7 +3,7 @@ from decimal import Decimal
 import pytest
 from eth_account import Account
 
-from app.adapters.hyperliquid import HyperliquidAdapter, deterministic_cloid, parse_order_response
+from app.adapters.hyperliquid import HyperliquidAdapter, deterministic_cloid, parse_order_response, position_configs
 
 
 def test_cloid_is_exactly_128_bits_and_deterministic():
@@ -19,7 +19,7 @@ def test_parse_filled_order_response():
 
 
 def test_parse_rejection():
-    r=parse_order_response({'response':{'data':{'statuses':[{'error':'Insufficient margin'}]}})
+    r=parse_order_response({'response':{'data':{'statuses':[{'error':'Insufficient margin'}]}}})
     assert r.state=='REJECTED'
 
 
@@ -30,6 +30,19 @@ def test_adapter_selects_network_specific_endpoints():
     assert main.ws_url == 'wss://api.hyperliquid.xyz/ws'
     assert test.api_url == 'https://api.hyperliquid-testnet.xyz'
     assert test.ws_url == 'wss://api.hyperliquid-testnet.xyz/ws'
+
+
+def test_position_configs_extracts_master_leverage_and_margin_mode():
+    configs = position_configs({
+        'assetPositions': [
+            {'position': {'coin': 'BTC', 'szi': '0.00128', 'leverage': {'type': 'cross', 'value': 2}}},
+            {'position': {'coin': 'ETH', 'szi': '-0.01', 'leverage': {'type': 'isolated', 'value': '5'}}},
+        ]
+    })
+    assert configs['BTC'].leverage == 2
+    assert configs['BTC'].is_cross is True
+    assert configs['ETH'].leverage == 5
+    assert configs['ETH'].is_cross is False
 
 
 @pytest.mark.asyncio
