@@ -1,4 +1,7 @@
-from app.adapters.hyperliquid import deterministic_cloid, fill_event_id, parse_order_response
+import pytest
+from eth_account import Account
+
+from app.adapters.hyperliquid import HyperliquidAdapter, deterministic_cloid, fill_event_id, parse_order_response
 
 
 def test_cloid_is_exactly_128_bits_and_deterministic():
@@ -16,3 +19,13 @@ def test_parse_filled_order_response():
 def test_parse_rejection():
     r=parse_order_response({'response':{'data':{'statuses':[{'error':'Insufficient margin'}]}}})
     assert r.state=='REJECTED'
+
+
+@pytest.mark.asyncio
+async def test_verify_agent_rejects_declared_address_key_mismatch():
+    main = Account.create()
+    agent = Account.create()
+    wrong_agent = Account.create()
+    adapter = HyperliquidAdapter(None)  # mismatch is rejected before any network/rate-limit call
+    with pytest.raises(ValueError, match='does not match'):
+        await adapter.verify_agent(main.address, agent.key.hex(), wrong_agent.address)
