@@ -7,6 +7,9 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+Network = Literal['testnet', 'mainnet']
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', case_sensitive=True, extra='ignore')
 
@@ -19,7 +22,12 @@ class Settings(BaseSettings):
     DATABASE_URL: str = 'postgresql+asyncpg://hypercopy:hypercopy@postgres:5432/hypercopy'
     REDIS_URL: str = 'redis://redis:6379/0'
 
-    HYPERLIQUID_NETWORK: Literal['testnet', 'mainnet'] = 'testnet'
+    # Legacy single-network setting kept as a safe fallback during migration.
+    # New deployments should set MASTER and FOLLOWER explicitly. An account is
+    # identified by (network, address), not address alone.
+    HYPERLIQUID_NETWORK: Network = 'testnet'
+    HYPERLIQUID_MASTER_NETWORK: Network | None = None
+    HYPERLIQUID_FOLLOWER_NETWORK: Network | None = None
     HYPERLIQUID_MASTER_ADDRESS: str = ''
     HL_RATE_BUDGET_PER_MIN: int = 1200
     HL_ORDER_EXPIRES_AFTER_MS: int = 15_000
@@ -86,10 +94,12 @@ class Settings(BaseSettings):
         if self.APP_ENV == 'production':
             if self.SESSION_SECRET == 'development-only-change-me' or len(self.SESSION_SECRET) < 32:
                 raise ValueError('SESSION_SECRET must be a strong production secret')
-            if self.KEK_PROVIDER == 'env' and self.HYPERLIQUID_NETWORK == 'mainnet':
-                raise ValueError('Mainnet production requires an external KMS provider')
-        if self.ENABLE_LIVE_TRADING and self.HYPERLIQUID_NETWORK != 'mainnet':
-            raise ValueError('ENABLE_LIVE_TRADING is only meaningful on mainnet')
+            # KMS is required only when HyperCopy signs on mainnet. Merely
+            # observing a mainnet master is read-only and needs no master key.
+            if self.KEK_PROVIDER == 'env' and self.follower_network == 'mainnet':
+                raise ValueError('Mainnet follower execution requires an external KMS provider')
+        if self.ENABLE_LIVE_TRADING and self.follower_network != 'mainnet':
+            raise ValueError('ENABLE_LIVE_TRADING is only meaningful for mainnet follower execution')
         if self.WATCHER_LEASE_RENEW_SECONDS >= self.WATCHER_LEASE_TTL_SECONDS:
             raise ValueError('watcher lease renew interval must be lower than TTL')
         return self
@@ -103,12 +113,42 @@ class Settings(BaseSettings):
         return {x.strip().lower() for x in self.SUPERADMIN_ADDRESSES.split(',') if x.strip()}
 
     @property
+    def master_network(self) -> Network:
+        return self.HYPERLIQUID_MASTER_NETWORK or self.HYPERLIQUID_NETWORK
+
+    @property
+    def follower_network(self) -> Network:
+        return self.HYPERLIQUID_FOLLOWER_NETWORK or self.HYPERLIQUID_NETWORK
+
+    @staticmethod
+    def hyperliquid_url_for(network: Network) -> str:
+        return 'https://api.hyperliquid-testnet.xyz' if network == 'testnet' else 'https://api.hyperliquid.xyz'
+
+    @property
+    def hyperliquid_master_api_url(self) -> str:
+        return self.hyperliquid_url_for(self.master_network)
+
+    @property
+    def hyperliquid_follower_api_url(self) -> str:
+        return self.hyperliquid_url_for(self.follower_network)
+
+    @property
+    def hyperliquid_master_ws_url(self) -> str:
+        return self.hyperliquid_master_api_url.replace('https://', 'wss://') + '/ws'
+
+    @property
+    def hyperliquid_follower_ws_url(self) -> str:
+        return self.hyperliquid_follower_api_url.replace('https://', 'wss://') + '/ws'
+
+    # Backward-compatible aliases: generic adapters are follower-side by
+    # default because only followers ever sign orders.
+    @property
     def hyperliquid_api_url(self) -> str:
-        return 'https://api.hyperliquid-testnet.xyz' if self.HYPERLIQUID_NETWORK == 'testnet' else 'https://api.hyperliquid.xyz'
+        return self.hyperliquid_follower_api_url
 
     @property
     def hyperliquid_ws_url(self) -> str:
-        return self.hyperliquid_api_url.replace('https://', 'wss://') + '/ws'
+        return self.hyperliquid_follower_ws_url
 
 
 @lru_cache(maxsize=1)
