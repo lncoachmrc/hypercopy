@@ -2,7 +2,18 @@ export type SessionUser = { id:string; auth_wallet:string; role:'USER'|'ADMIN'|'
 export type Session = { user: SessionUser; entitlements: Record<string,unknown>; csrf_token:string };
 
 const cfg = () => window.__HYPERCOPY_CONFIG__ ?? {};
-const base = () => (cfg().API_BASE_URL || '/api/v1').replace(/\/$/, '');
+
+// Security/session invariant: deployed HyperCopy browser traffic must stay on
+// the frontend origin and reach the API through Nginx /api/v1.  This prevents
+// a stale Railway API_BASE_URL from silently reintroducing cross-site cookies
+// (which privacy browsers such as Brave may block).  An absolute API URL is
+// honoured only during explicit local development.
+const isLocalDev = () => ['localhost','127.0.0.1','::1'].includes(location.hostname);
+const base = () => {
+  const configured=(cfg().API_BASE_URL || '').replace(/\/$/, '');
+  if (isLocalDev() && configured) return configured;
+  return '/api/v1';
+};
 let csrf = '';
 export const setCsrf = (value:string) => { csrf=value; };
 
@@ -31,7 +42,7 @@ export const put=<T>(p:string,b:unknown)=>api<T>(p,{method:'PUT',body:JSON.strin
 export const del=<T>(p:string)=>api<T>(p,{method:'DELETE'});
 
 export function wsUrl(){
-  if(cfg().WS_URL) return cfg().WS_URL!;
+  if(isLocalDev() && cfg().WS_URL) return cfg().WS_URL!;
   const apiBase=base();
   if(apiBase.startsWith('http')) return apiBase.replace(/^http/,'ws').replace(/\/api\/v1$/,'')+'/api/v1/ws/events';
   return `${location.protocol==='https:'?'wss':'ws'}://${location.host}/api/v1/ws/events`;
