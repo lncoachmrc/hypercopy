@@ -48,6 +48,12 @@ class AccountSnapshot:
     free_margin: Decimal
 
 
+@dataclass(frozen=True, slots=True)
+class PositionConfig:
+    leverage: int
+    is_cross: bool
+
+
 def deterministic_cloid(copy_job_id: str, attempt_kind: str) -> str:
     return '0x' + hashlib.blake2b(f'{copy_job_id}:{attempt_kind}'.encode(), digest_size=16).hexdigest()
 
@@ -62,6 +68,26 @@ def signed_fill_delta(fill: dict[str, Any]) -> Decimal:
     if side in {'b', 'buy', 'open long', 'close short'} or 'long' in side and 'close long' not in side:
         return size
     return -size
+
+
+def position_configs(state: dict) -> dict[str, PositionConfig]:
+    """Extract per-market leverage/margin mode from clearinghouseState."""
+    out: dict[str, PositionConfig] = {}
+    for row in state.get('assetPositions', []):
+        position = row.get('position', row)
+        asset = str(position.get('coin') or '')
+        if not asset:
+            continue
+        leverage = position.get('leverage') or {}
+        try:
+            value = max(int(Decimal(str(leverage.get('value', 1)))), 1)
+        except Exception:
+            value = 1
+        out[asset] = PositionConfig(
+            leverage=value,
+            is_cross=str(leverage.get('type') or 'cross').lower() != 'isolated',
+        )
+    return out
 
 
 def _decimal(value: Any) -> Decimal:
@@ -83,7 +109,6 @@ def _perp_free_margin(state: dict) -> Decimal:
 
 
 def _spot_usdc(state: dict | None) -> tuple[Decimal, Decimal]:
-    """Return (total, hold) for canonical USDC token 0 from spot state."""
     if not state:
         return Decimal(0), Decimal(0)
     for row in state.get('balances', []):
@@ -151,15 +176,6 @@ class HyperliquidAdapter:
         return abstraction
 
     async def account_snapshot(self, address: str, *, priority: Priority = Priority.RECONCILE) -> AccountSnapshot:
-        """Read account equity correctly across Hyperliquid abstraction modes.
-
-        Standard/classic accounts expose their usable equity in perpetuals
-        ``clearinghouseState.marginSummary``. Hyperliquid unified accounts expose
-        balances/holds through ``spotClearinghouseState`` instead, while perp
-        positions remain in the perp state. Portfolio margin requires valuation
-        of multiple collateral assets and is intentionally rejected until that
-        calculation is implemented rather than silently overstating buying power.
-        """
         perp = await self.user_state(address, priority=priority)
         abstraction = await self.user_abstraction(address, priority=priority)
 
@@ -236,6 +252,29 @@ class HyperliquidAdapter:
         if asset not in self._specs:
             raise ValueError(f'Unknown Hyperliquid perpetual asset: {asset}')
         return self._specs[asset][1]
+
+    async def update_leverage(
+        self,
+        *,
+        account_address: str,
+        private_key: str,
+        asset: str,
+        leverage: int,
+        is_cross: bool,
+    ) -> dict:
+        """Set the follower market's leverage/margin mode using its API wallet."""
+        await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
+        spec = await self.asset_spec(asset)
+        leverage = max(1, min(int(leverage), spec.max_leverage))
+        if spec.only_isolated:
+            is_cross = False
+        local = Account.from_key(private_key)
+        exchange = Exchange(local, self.api_url, account_address=account_address)
+        exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
+        response = await self._call(exchange.update_leverage, leverage, asset, is_cross)
+        if not isinstance(response, dict) or response.get('status') not in (None, 'ok'):
+            raise RuntimeError(f'Hyperliquid leverage update failed: {response}')
+        return response
 
     async def query_order_by_cloid(self, account: str, cloid: str) -> dict:
         await self._acquire(WEIGHT_CHEAP_INFO, Priority.ORDER, timeout=10)
