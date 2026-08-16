@@ -59,9 +59,10 @@ WEIGHT_USER_FILLS_MAX = 120
 
 
 class Priority(IntEnum):
-    """Who gets the budget when it is scarce. Higher wins."""
+    """Independent consumer lanes sharing the same global REST ceiling."""
 
     RECONCILE = 10      # verifying follower state: can always wait a cycle
+    DIAGNOSTIC = 15     # explicit operator reads; must not compete with watcher
     METADATA = 20       # asset specs: cached for minutes anyway
     MASTER_STATE = 30   # reading the master: drives everything downstream
     ORDER = 40          # placing a follower's trade: never deferred first
@@ -71,14 +72,15 @@ class Priority(IntEnum):
 class Budget:
     """Per-consumer share of the per-minute IP budget.
 
-    Master state receives enough headroom for the watcher, worker reconciliation
-    and occasional operator diagnostics to coexist in the same sliding minute.
-    The aggregate still remains exactly within Hyperliquid's 1200/min ceiling.
+    Operator diagnostics have a small dedicated lane. This prevents Control
+    Room reads from starving the master watcher while keeping the same global
+    Hyperliquid 1200 weight/minute ceiling.
     """
 
     total_per_minute: int = 1200
-    orders: int = 680
-    reconcile: int = 260
+    orders: int = 660
+    reconcile: int = 220
+    diagnostic: int = 60
     master_state: int = 120
     metadata: int = 100
     reserve: int = 40
@@ -87,13 +89,14 @@ class Budget:
         return {
             Priority.ORDER: self.orders,
             Priority.RECONCILE: self.reconcile,
+            Priority.DIAGNOSTIC: self.diagnostic,
             Priority.MASTER_STATE: self.master_state,
             Priority.METADATA: self.metadata,
         }[priority]
 
     def validate(self) -> None:
         allocated = (
-            self.orders + self.reconcile + self.master_state
+            self.orders + self.reconcile + self.diagnostic + self.master_state
             + self.metadata + self.reserve
         )
         if allocated > self.total_per_minute:
