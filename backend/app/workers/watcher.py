@@ -28,9 +28,6 @@ def _stop(*_): stop.set()
 
 
 def _checkpoint_slug() -> str:
-    # Network + address is the real identity of a Hyperliquid principal. This
-    # prevents a previous testnet checkpoint from suppressing mainnet fills (or
-    # vice versa) when the same EVM address is used in both environments.
     return f'master_checkpoint:{settings.master_network}:{settings.HYPERLIQUID_MASTER_ADDRESS.lower()}'
 
 
@@ -78,7 +75,10 @@ class Watcher:
     async def process_fill(self,fill:dict):
         equity=await self.master_equity(); cid=uuid.uuid4().hex
         async with SessionLocal() as db:
-            event,jobs=await persist_master_fill_and_jobs(db,fill=fill,master_equity=equity,fencing_token=self.lease.token,correlation_id=cid)
+            event,jobs=await persist_master_fill_and_jobs(
+                db,fill=fill,master_equity=equity,fencing_token=self.lease.token,
+                correlation_id=cid,source_network=settings.master_network,
+            )
             if not event: return
             for job in jobs:
                 try: await publish_job(self.redis,db,job)
