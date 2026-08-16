@@ -69,12 +69,17 @@ class Priority(IntEnum):
 
 @dataclass(frozen=True, slots=True)
 class Budget:
-    """Per-consumer share of the per-minute IP budget."""
+    """Per-consumer share of the per-minute IP budget.
+
+    Master state receives enough headroom for the watcher, worker reconciliation
+    and occasional operator diagnostics to coexist in the same sliding minute.
+    The aggregate still remains exactly within Hyperliquid's 1200/min ceiling.
+    """
 
     total_per_minute: int = 1200
-    orders: int = 700
-    reconcile: int = 300
-    master_state: int = 60
+    orders: int = 680
+    reconcile: int = 260
+    master_state: int = 120
     metadata: int = 100
     reserve: int = 40
 
