@@ -67,7 +67,6 @@ def test_reverse_long_to_short_splits_close_then_open():
 
 
 def test_partial_fill_residual_converges():
-    # Target is 0.12 BTC; prior partial fill left the follower at 0.15.
     r = make('12', current='0.15')
     assert r.order_size == D('0.03000')
     assert r.reduce_only
@@ -86,3 +85,15 @@ def test_unmanaged_margin_reduces_eligible_equity():
     follower = FollowerState('u', D('10000'), D('5000'), D('0'), D('1'))
     r = plan(master, follower, SPEC)
     assert r.target_size == D('0.10000')
+
+
+def test_cross_network_uses_master_mark_for_ratio_and_follower_mark_for_units():
+    # Master: 1 BTC * $60k / $120k equity = 50% exposure.
+    # Follower: $10k * 50% = $5k target notional, converted at the follower
+    # testnet mark of $50k -> 0.1 BTC. Using the master mark here would be wrong.
+    master = MasterExposure('BTC', D('1'), D('60000'), D('120000'))
+    follower = FollowerState('u', D('10000'), D('0'), D('0'), D('1'))
+    r = plan(master, follower, SPEC, follower_mark_price=D('50000'))
+    assert r.target_size == D('0.1')
+    assert r.order_size == D('0.10000')
+    assert r.notional == D('5000.00000')
