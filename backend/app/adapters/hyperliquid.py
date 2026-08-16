@@ -14,7 +14,7 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils.types import Cloid
 
-from app.core.config import settings
+from app.core.config import Network, settings
 from app.core.logging import get_logger
 from app.engine.sizing import AssetSpec, round_price
 from app.adapters.ratelimit import Priority, WEIGHT_CHEAP_INFO, WEIGHT_EXCHANGE_ACTION, WEIGHT_STANDARD_INFO, WEIGHT_USER_FILLS_MAX, WeightedRateLimiter
@@ -56,14 +56,18 @@ def signed_fill_delta(fill: dict[str, Any]) -> Decimal:
 
 
 class HyperliquidAdapter:
-    def __init__(self, limiter: WeightedRateLimiter):
+    def __init__(self, limiter: WeightedRateLimiter | None, network: Network | None = None):
         self.limiter = limiter
-        self.info = Info(settings.hyperliquid_api_url, skip_ws=True)
+        self.network: Network = network or settings.follower_network
+        self.api_url = settings.hyperliquid_url_for(self.network)
+        self.ws_url = self.api_url.replace('https://', 'wss://') + '/ws'
+        self.info = Info(self.api_url, skip_ws=True)
         self._specs: dict[str, tuple[float, AssetSpec]] = {}
 
     async def _metric_incr(self, name: str) -> None:
         try:
-            await self.limiter._redis.incr(f'hypercopy:metrics:{name}')  # shared Redis metric only
+            if self.limiter is not None:
+                await self.limiter._redis.incr(f'hypercopy:metrics:{name}')  # shared Redis metric only
         except Exception:
             pass
 
@@ -76,16 +80,21 @@ class HyperliquidAdapter:
                 await self._metric_incr('hl_429_count')
             raise
 
+    async def _acquire(self, weight: int, priority: Priority, timeout: int) -> None:
+        if self.limiter is None:
+            return
+        await self.limiter.acquire(weight, priority, timeout=timeout)
+
     async def user_state(self, address: str, *, priority: Priority = Priority.RECONCILE) -> dict:
-        await self.limiter.acquire(WEIGHT_CHEAP_INFO, priority, timeout=10)
+        await self._acquire(WEIGHT_CHEAP_INFO, priority, timeout=10)
         return await self._call(self.info.user_state, address)
 
     async def mids(self) -> dict[str, str]:
-        await self.limiter.acquire(WEIGHT_CHEAP_INFO, Priority.MASTER_STATE, timeout=10)
+        await self._acquire(WEIGHT_CHEAP_INFO, Priority.MASTER_STATE, timeout=10)
         return await self._call(self.info.all_mids)
 
     async def extra_agents(self, account: str) -> list[dict]:
-        await self.limiter.acquire(WEIGHT_STANDARD_INFO, Priority.METADATA, timeout=15)
+        await self._acquire(WEIGHT_STANDARD_INFO, Priority.METADATA, timeout=15)
         return await self._call(self.info.extra_agents, account)
 
     async def verify_agent(
@@ -119,7 +128,7 @@ class HyperliquidAdapter:
         cached = self._specs.get(asset)
         if cached and cached[0] > time.monotonic():
             return cached[1]
-        await self.limiter.acquire(WEIGHT_STANDARD_INFO, Priority.METADATA, timeout=15)
+        await self._acquire(WEIGHT_STANDARD_INFO, Priority.METADATA, timeout=15)
         meta = await self._call(self.info.meta)
         expiry = time.monotonic() + settings.HL_MARKET_CACHE_TTL_SECONDS
         for row in meta.get('universe', []):
@@ -135,24 +144,24 @@ class HyperliquidAdapter:
         return self._specs[asset][1]
 
     async def query_order_by_cloid(self, account: str, cloid: str) -> dict:
-        await self.limiter.acquire(WEIGHT_CHEAP_INFO, Priority.ORDER, timeout=10)
+        await self._acquire(WEIGHT_CHEAP_INFO, Priority.ORDER, timeout=10)
         return await self._call(self.info.query_order_by_cloid, account, Cloid.from_str(cloid))
 
     async def user_fills_by_time(self, account: str, start_ms: int, end_ms: int | None = None) -> list[dict]:
-        await self.limiter.acquire(WEIGHT_USER_FILLS_MAX, Priority.RECONCILE, timeout=30)
+        await self._acquire(WEIGHT_USER_FILLS_MAX, Priority.RECONCILE, timeout=30)
         return await self._call(self.info.user_fills_by_time, account, start_ms, end_ms)
 
     async def place_ioc(
         self, *, account_address: str, private_key: str, asset: str, is_buy: bool,
         size: Decimal, mark_price: Decimal, slippage_bps: int, reduce_only: bool, cloid: str,
     ) -> OrderOutcome:
-        await self.limiter.acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
+        await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
         spec = await self.asset_spec(asset)
         slip = Decimal(slippage_bps) / Decimal(10_000)
         aggressive = mark_price * (Decimal(1) + slip if is_buy else Decimal(1) - slip)
         px = round_price(aggressive, spec.sz_decimals)
         local = Account.from_key(private_key)
-        exchange = Exchange(local, settings.hyperliquid_api_url, account_address=account_address)
+        exchange = Exchange(local, self.api_url, account_address=account_address)
         exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
 
         def _submit():
@@ -176,7 +185,7 @@ class HyperliquidAdapter:
         """
         try:
             async with websockets.connect(
-                settings.hyperliquid_ws_url,
+                self.ws_url,
                 ping_interval=20,
                 ping_timeout=20,
                 close_timeout=5,
@@ -209,16 +218,15 @@ class HyperliquidAdapter:
         except asyncio.CancelledError:
             raise
         except websockets.exceptions.ConnectionClosedOK as exc:
-            # Hyperliquid testnet may rotate a healthy session with close code
-            # 1000 and reason "Expired". This is a normal lifecycle event, not
-            # a watcher failure. The caller will replay from the durable
-            # PostgreSQL checkpoint before opening the next realtime session.
+            # Hyperliquid may rotate a healthy session with close code 1000 and
+            # reason "Expired". This is a normal lifecycle event, not a watcher
+            # failure. The caller replays from the network-scoped checkpoint.
             await self._metric_incr('ws_session_rotation_count')
-            log.info('Master websocket session closed normally; replay required', extra={'state': str(exc)})
+            log.info('Master websocket session closed normally; replay required', extra={'state': str(exc), 'network': self.network})
             return
         except Exception:
             await self._metric_incr('ws_reconnect_count')
-            log.warning('Master websocket disconnected; watcher will replay before reconnect', exc_info=True)
+            log.warning('Master websocket disconnected; watcher will replay before reconnect', extra={'network': self.network}, exc_info=True)
             raise
 
 
