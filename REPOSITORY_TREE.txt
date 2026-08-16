@@ -1,0 +1,149 @@
+hypercopy-final/
+├── .github/
+│   ├── workflows/
+│   │   ├── ci.yml
+│   │   └── codeql.yml
+│   └── dependabot.yml
+├── backend/
+│   ├── alembic/
+│   │   ├── versions/
+│   │   │   ├── 0001_initial.py
+│   │   │   ├── 0002_seed.py
+│   │   │   ├── 0003_operational_risk.py
+│   │   │   └── 0004_ledger_marks.py
+│   │   ├── env.py
+│   │   └── script.py.mako
+│   ├── app/
+│   │   ├── adapters/
+│   │   │   ├── __init__.py
+│   │   │   ├── hyperliquid.py
+│   │   │   ├── ratelimit.py
+│   │   │   └── stripe_client.py
+│   │   ├── api/
+│   │   │   ├── __init__.py
+│   │   │   ├── admin.py
+│   │   │   ├── auth.py
+│   │   │   ├── billing.py
+│   │   │   ├── deps.py
+│   │   │   ├── health.py
+│   │   │   ├── router.py
+│   │   │   ├── user.py
+│   │   │   └── ws.py
+│   │   ├── core/
+│   │   │   ├── __init__.py
+│   │   │   ├── config.py
+│   │   │   ├── crypto.py
+│   │   │   ├── errors.py
+│   │   │   ├── logging.py
+│   │   │   └── security.py
+│   │   ├── db/
+│   │   │   ├── __init__.py
+│   │   │   ├── base.py
+│   │   │   ├── lease.py
+│   │   │   ├── redis.py
+│   │   │   ├── schema.py
+│   │   │   └── session.py
+│   │   ├── engine/
+│   │   │   ├── __init__.py
+│   │   │   ├── reconcile.py
+│   │   │   ├── risk.py
+│   │   │   ├── sizing.py
+│   │   │   └── states.py
+│   │   ├── models/
+│   │   │   ├── __init__.py
+│   │   │   └── entities.py
+│   │   ├── schemas/
+│   │   │   ├── __init__.py
+│   │   │   ├── admin.py
+│   │   │   ├── auth.py
+│   │   │   ├── trading.py
+│   │   │   └── user.py
+│   │   ├── services/
+│   │   │   ├── __init__.py
+│   │   │   ├── audit.py
+│   │   │   ├── copy.py
+│   │   │   ├── credentials.py
+│   │   │   ├── entitlement.py
+│   │   │   ├── execution.py
+│   │   │   ├── metrics.py
+│   │   │   ├── queue.py
+│   │   │   └── reconcile.py
+│   │   ├── workers/
+│   │   │   ├── __init__.py
+│   │   │   ├── execution_worker.py
+│   │   │   └── watcher.py
+│   │   ├── __init__.py
+│   │   └── main.py
+│   ├── tests/
+│   │   ├── integration/
+│   │   │   └── test_postgres_invariants.py
+│   │   ├── trading/
+│   │   └── unit/
+│   │       ├── test_crypto.py
+│   │       ├── test_hyperliquid_helpers.py
+│   │       ├── test_reconcile.py
+│   │       ├── test_risk.py
+│   │       ├── test_security.py
+│   │       ├── test_sizing.py
+│   │       └── test_states.py
+│   ├── .dockerignore
+│   ├── alembic.ini
+│   ├── Dockerfile
+│   ├── railway.toml
+│   ├── railway.watcher.toml
+│   ├── railway.worker.toml
+│   ├── requirements-dev.txt
+│   └── requirements.txt
+├── docs/
+│   ├── API.md
+│   ├── ARCHITECTURE.md
+│   ├── DEFINITION_OF_DONE.md
+│   ├── DEPLOYMENT.md
+│   ├── IMPLEMENTATION_NOTES.md
+│   ├── ROADMAP.md
+│   ├── RUNBOOK.md
+│   ├── SECURITY.md
+│   ├── SPEC.md
+│   └── TEST_REPORT.md
+├── frontend/
+│   ├── public/
+│   ├── src/
+│   │   ├── Admin.tsx
+│   │   ├── api.ts
+│   │   ├── App.tsx
+│   │   ├── auth.tsx
+│   │   ├── Billing.tsx
+│   │   ├── Dashboard.tsx
+│   │   ├── main.tsx
+│   │   ├── Settings.tsx
+│   │   ├── styles.css
+│   │   └── vite-env.d.ts
+│   ├── .dockerignore
+│   ├── config.template.js
+│   ├── Dockerfile
+│   ├── index.html
+│   ├── nginx.conf
+│   ├── package-lock.json
+│   ├── package.json
+│   ├── railway.toml
+│   ├── tsconfig.json
+│   └── vite.config.ts
+├── scripts/
+│   ├── generate_keys.py
+│   ├── rebuild_redis_queue.py
+│   ├── release_preflight.py
+│   ├── rotate_kek.py
+│   ├── seed_plans.py
+│   └── shadow_report.py
+├── .env.example
+├── .gitignore
+├── DEFINITION_OF_DONE.md
+├── DEPLOYMENT.md
+├── docker-compose.yml
+├── Makefile
+├── README.md
+├── ROADMAP.md
+├── RUNBOOK.md
+├── SECURITY.md
+├── SPEC.md
+└── TEST_REPORT.md

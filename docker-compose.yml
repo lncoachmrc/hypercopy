@@ -1,0 +1,68 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: hypercopy
+      POSTGRES_PASSWORD: hypercopy
+      POSTGRES_DB: hypercopy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hypercopy -d hypercopy"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    ports: ["5432:5432"]
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    ports: ["6379:6379"]
+
+  migrate:
+    build: ./backend
+    command: ["alembic", "upgrade", "head"]
+    env_file: .env
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  api:
+    build: ./backend
+    env_file: .env
+    environment: {PORT: "8000"}
+    ports: ["8000:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+
+  master-watcher:
+    build: ./backend
+    command: ["python", "-m", "app.workers.watcher"]
+    env_file: .env
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+
+  execution-worker:
+    build: ./backend
+    command: ["python", "-m", "app.workers.execution_worker"]
+    env_file: .env
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+
+  frontend:
+    build: ./frontend
+    environment:
+      PORT: "8080"
+      API_BASE_URL: http://localhost:8000/api/v1
+      WS_URL: ws://localhost:8000/api/v1/ws/events
+    ports: ["5173:8080"]
+    depends_on: [api]
+
+volumes:
+  postgres_data:

@@ -1,0 +1,18 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+watchPatterns = [
+  "/backend/app/workers/execution_worker.py", "/backend/app/engine/**",
+  "/backend/app/adapters/**", "/backend/app/core/**", "/backend/app/db/**",
+  "/backend/app/models/**", "/backend/app/services/execution.py", "/backend/app/services/reconcile.py",
+  "/backend/app/services/queue.py", "/backend/app/services/audit.py", "/backend/app/services/entitlement.py",
+  "/backend/alembic/**", "/backend/requirements.txt", "/backend/Dockerfile",
+  "/backend/railway.worker.toml"
+]
+
+[deploy]
+startCommand = "python -m app.workers.execution_worker"
+restartPolicyType = "ALWAYS"
+numReplicas = 1
+overlapSeconds = 20
+drainingSeconds = 60

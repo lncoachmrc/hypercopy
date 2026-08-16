@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+import math
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import case, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.entities import (
+    CopyJob, CredentialStatus, EquitySnapshot, Execution, ExecutionState,
+    JobState, MasterEvent, PositionLedger, ReconciliationRun,
+    SigningCredential, WatcherLeaseModel, WorkerHeartbeat,
+)
+
+
+async def dashboard_for_user(db: AsyncSession, user_id) -> dict:
+    latest = (await db.execute(select(EquitySnapshot).where(EquitySnapshot.user_id == user_id).order_by(EquitySnapshot.taken_at.desc()).limit(1))).scalar_one_or_none()
+    points = (await db.execute(select(EquitySnapshot).where(EquitySnapshot.user_id == user_id, EquitySnapshot.taken_at >= datetime.now(UTC)-timedelta(days=90)).order_by(EquitySnapshot.taken_at))).scalars().all()
+    values = [float(p.account_value) for p in points]
+    pnl = values[-1] - values[0] if len(values) >= 2 else 0.0
+    peak = values[0] if values else 0.0
+    max_dd = 0.0
+    for v in values:
+        peak = max(peak, v)
+        if peak > 0:
+            max_dd = max(max_dd, (peak-v)/peak*100)
+    daily = {}
+    for p in points:
+        daily[p.taken_at.date()] = float(p.account_value)
+    closes = list(daily.values())
+    returns = [(closes[i]/closes[i-1]-1) for i in range(1, len(closes)) if closes[i-1] > 0]
+    sharpe = None
+    if len(returns) >= 20:
+        mean = sum(returns)/len(returns)
+        var = sum((r-mean)**2 for r in returns)/(len(returns)-1)
+        if var > 0:
+            sharpe = mean/math.sqrt(var)*math.sqrt(365.25)
+    positions = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user_id))).scalars().all()
+    return {
+        'equity': float(latest.account_value) if latest else None,
+        'pnl_absolute': pnl,
+        'max_drawdown_pct': max_dd,
+        'sharpe': sharpe,
+        'sharpe_observations': len(returns),
+        'equity_history': [{'at': p.taken_at.isoformat(), 'value': float(p.account_value)} for p in points],
+        'positions': len([p for p in positions if p.size != 0]),
+    }
+
+
+async def system_snapshot(db: AsyncSession, rate_snapshot: dict | None = None) -> dict:
+    now = datetime.now(UTC)
+    queued = (await db.execute(select(func.count()).select_from(CopyJob).where(CopyJob.state.in_([JobState.QUEUED, JobState.RETRYING])))).scalar_one()
+    oldest = (await db.execute(select(func.min(CopyJob.created_at)).where(CopyJob.state.in_([JobState.QUEUED, JobState.RETRYING])))).scalar_one_or_none()
+    unknown = (await db.execute(select(func.count()).select_from(Execution).where(Execution.state == ExecutionState.UNKNOWN))).scalar_one()
+    workers = (await db.execute(select(WorkerHeartbeat).order_by(WorkerHeartbeat.seen_at.desc()).limit(50))).scalars().all()
+    recon_fail = (await db.execute(select(func.count()).select_from(ReconciliationRun).where(ReconciliationRun.status == 'FAILED', ReconciliationRun.started_at > now-timedelta(hours=1)))).scalar_one()
+    last_master = (await db.execute(select(func.max(MasterEvent.event_ts)))).scalar_one_or_none()
+    lease = await db.get(WatcherLeaseModel, 'master-watcher')
+    recent_exec = (await db.execute(select(Execution).where(Execution.created_at > now-timedelta(minutes=15)))).scalars().all()
+    resolved_latencies = [(x.resolved_at-x.created_at).total_seconds()*1000 for x in recent_exec if x.resolved_at]
+    rejected = len([x for x in recent_exec if x.state in {ExecutionState.REJECTED, ExecutionState.CANCELED}])
+    expiring_7d = (await db.execute(select(func.count()).select_from(SigningCredential).where(SigningCredential.expires_at.is_not(None), SigningCredential.expires_at <= now+timedelta(days=7), SigningCredential.expires_at > now))).scalar_one()
+    return {
+        'queue_depth': int(queued),
+        'oldest_job_age_seconds': (now-oldest).total_seconds() if oldest else 0,
+        'unknown_executions': int(unknown),
+        'reconciliation_failures_1h': int(recon_fail),
+        'watcher_last_event_age_seconds': (now-last_master).total_seconds() if last_master else None,
+        'watcher_lease_holder': lease.holder if lease and lease.expires_at > now else None,
+        'watcher_lease_expires_at': lease.expires_at.isoformat() if lease else None,
+        'execution_latency_ms_avg_15m': (sum(resolved_latencies)/len(resolved_latencies)) if resolved_latencies else 0,
+        'execution_reject_rate_15m': (rejected/len(recent_exec)) if recent_exec else 0,
+        'credential_expiring_7d': int(expiring_7d),
+        'workers': [{'id': w.worker_id, 'service': w.service, 'seen_at': w.seen_at.isoformat(), 'current_job_id': str(w.current_job_id) if w.current_job_id else None} for w in workers],
+        'rate_limit': rate_snapshot or {},
+    }

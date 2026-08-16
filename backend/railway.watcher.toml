@@ -1,0 +1,17 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+watchPatterns = [
+  "/backend/app/workers/watcher.py", "/backend/app/adapters/hyperliquid.py",
+  "/backend/app/adapters/ratelimit.py", "/backend/app/core/**", "/backend/app/db/**",
+  "/backend/app/models/**", "/backend/app/services/copy.py", "/backend/app/services/queue.py",
+  "/backend/alembic/**", "/backend/requirements.txt", "/backend/Dockerfile",
+  "/backend/railway.watcher.toml"
+]
+
+[deploy]
+startCommand = "python -m app.workers.watcher"
+restartPolicyType = "ALWAYS"
+numReplicas = 1
+overlapSeconds = 20
+drainingSeconds = 30
