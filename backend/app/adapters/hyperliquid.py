@@ -39,6 +39,15 @@ class OrderOutcome:
     raw: dict | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class AccountSnapshot:
+    perp_state: dict
+    spot_state: dict | None
+    abstraction: str
+    account_value: Decimal
+    free_margin: Decimal
+
+
 def deterministic_cloid(copy_job_id: str, attempt_kind: str) -> str:
     return '0x' + hashlib.blake2b(f'{copy_job_id}:{attempt_kind}'.encode(), digest_size=16).hexdigest()
 
@@ -55,6 +64,42 @@ def signed_fill_delta(fill: dict[str, Any]) -> Decimal:
     return -size
 
 
+def _decimal(value: Any) -> Decimal:
+    if value in (None, ''):
+        return Decimal(0)
+    return Decimal(str(value))
+
+
+def _perp_account_value(state: dict) -> Decimal:
+    return _decimal(state.get('marginSummary', {}).get('accountValue'))
+
+
+def _perp_free_margin(state: dict) -> Decimal:
+    raw = state.get('withdrawable')
+    if raw not in (None, ''):
+        return max(_decimal(raw), Decimal(0))
+    summary = state.get('marginSummary', {})
+    return max(_decimal(summary.get('accountValue')) - _decimal(summary.get('totalMarginUsed')), Decimal(0))
+
+
+def _spot_usdc(state: dict | None) -> tuple[Decimal, Decimal]:
+    """Return (total, hold) for canonical USDC token 0 from spot state."""
+    if not state:
+        return Decimal(0), Decimal(0)
+    for row in state.get('balances', []):
+        if str(row.get('coin', '')).upper() == 'USDC' or row.get('token') == 0:
+            return _decimal(row.get('total')), _decimal(row.get('hold'))
+    return Decimal(0), Decimal(0)
+
+
+def _unrealized_pnl(state: dict) -> Decimal:
+    total = Decimal(0)
+    for row in state.get('assetPositions', []):
+        position = row.get('position', row)
+        total += _decimal(position.get('unrealizedPnl'))
+    return total
+
+
 class HyperliquidAdapter:
     def __init__(self, limiter: WeightedRateLimiter | None, network: Network | None = None):
         self.limiter = limiter
@@ -63,11 +108,12 @@ class HyperliquidAdapter:
         self.ws_url = self.api_url.replace('https://', 'wss://') + '/ws'
         self.info = Info(self.api_url, skip_ws=True)
         self._specs: dict[str, tuple[float, AssetSpec]] = {}
+        self._abstraction_cache: dict[str, tuple[float, str]] = {}
 
     async def _metric_incr(self, name: str) -> None:
         try:
             if self.limiter is not None:
-                await self.limiter._redis.incr(f'hypercopy:metrics:{name}')  # shared Redis metric only
+                await self.limiter._redis.incr(f'hypercopy:metrics:{name}')
         except Exception:
             pass
 
@@ -88,6 +134,54 @@ class HyperliquidAdapter:
     async def user_state(self, address: str, *, priority: Priority = Priority.RECONCILE) -> dict:
         await self._acquire(WEIGHT_CHEAP_INFO, priority, timeout=10)
         return await self._call(self.info.user_state, address)
+
+    async def spot_user_state(self, address: str, *, priority: Priority = Priority.RECONCILE) -> dict:
+        await self._acquire(WEIGHT_CHEAP_INFO, priority, timeout=10)
+        return await self._call(self.info.spot_user_state, address)
+
+    async def user_abstraction(self, address: str, *, priority: Priority = Priority.RECONCILE) -> str:
+        key = address.lower()
+        cached = self._abstraction_cache.get(key)
+        if cached and cached[0] > time.monotonic():
+            return cached[1]
+        await self._acquire(WEIGHT_STANDARD_INFO, priority, timeout=15)
+        value = await self._call(self.info.post, '/info', {'type': 'userAbstraction', 'user': address})
+        abstraction = str(value or 'default')
+        self._abstraction_cache[key] = (time.monotonic() + 300, abstraction)
+        return abstraction
+
+    async def account_snapshot(self, address: str, *, priority: Priority = Priority.RECONCILE) -> AccountSnapshot:
+        """Read account equity correctly across Hyperliquid abstraction modes.
+
+        Standard/classic accounts expose their usable equity in perpetuals
+        ``clearinghouseState.marginSummary``. Hyperliquid unified accounts expose
+        balances/holds through ``spotClearinghouseState`` instead, while perp
+        positions remain in the perp state. Portfolio margin requires valuation
+        of multiple collateral assets and is intentionally rejected until that
+        calculation is implemented rather than silently overstating buying power.
+        """
+        perp = await self.user_state(address, priority=priority)
+        abstraction = await self.user_abstraction(address, priority=priority)
+
+        if abstraction == 'portfolioMargin':
+            raise ValueError('Portfolio Margin accounts are not yet supported by HyperCopy')
+
+        if abstraction == 'unifiedAccount':
+            spot = await self.spot_user_state(address, priority=priority)
+            usdc_total, usdc_hold = _spot_usdc(spot)
+            pnl = _unrealized_pnl(perp)
+            account_value = max(usdc_total + pnl, Decimal(0))
+            margin_used = _decimal(perp.get('marginSummary', {}).get('totalMarginUsed'))
+            free_margin = max(account_value - usdc_hold - margin_used, Decimal(0))
+            return AccountSnapshot(perp, spot, abstraction, account_value, free_margin)
+
+        return AccountSnapshot(
+            perp_state=perp,
+            spot_state=None,
+            abstraction=abstraction,
+            account_value=_perp_account_value(perp),
+            free_margin=_perp_free_margin(perp),
+        )
 
     async def mids(self) -> dict[str, str]:
         await self._acquire(WEIGHT_CHEAP_INFO, Priority.MASTER_STATE, timeout=10)
@@ -174,15 +268,6 @@ class HyperliquidAdapter:
         return parse_order_response(response)
 
     async def master_fills(self, address: str, stop_event: asyncio.Event) -> AsyncIterator[dict]:
-        """Consume one WebSocket session with Hyperliquid application heartbeats.
-
-        Hyperliquid closes a websocket when it has not sent a message for 60s.
-        Quiet user-specific feeds therefore require the documented JSON
-        ``{"method":"ping"}`` heartbeat. Protocol-level websocket pings alone do
-        not satisfy that application-level requirement. On a real disconnect we
-        return control to the watcher so it replays durable fills before the next
-        realtime session.
-        """
         try:
             async with websockets.connect(
                 self.ws_url,
@@ -196,9 +281,6 @@ class HyperliquidAdapter:
                 }))
                 while not stop_event.is_set():
                     try:
-                        # Heartbeat before Hyperliquid's documented 60s idle
-                        # threshold. recv() cancellation is safe in websockets;
-                        # no application message is lost by this timeout.
                         raw = await asyncio.wait_for(ws.recv(), timeout=30)
                     except TimeoutError:
                         await ws.send(json.dumps({'method': 'ping'}))
@@ -218,9 +300,6 @@ class HyperliquidAdapter:
         except asyncio.CancelledError:
             raise
         except websockets.exceptions.ConnectionClosedOK as exc:
-            # Hyperliquid may rotate a healthy session with close code 1000 and
-            # reason "Expired". This is a normal lifecycle event, not a watcher
-            # failure. The caller replays from the network-scoped checkpoint.
             await self._metric_incr('ws_session_rotation_count')
             log.info('Master websocket session closed normally; replay required', extra={'state': str(exc), 'network': self.network})
             return
@@ -241,7 +320,6 @@ def parse_order_response(response: dict) -> OrderOutcome:
         return OrderOutcome('FILLED', str(f.get('oid')) if f.get('oid') is not None else None,
                             Decimal(str(f.get('totalSz', '0'))), Decimal(str(f.get('avgPx'))) if f.get('avgPx') else None, raw=response)
     if 'resting' in first:
-        # IOC should not rest; if it does, treat it as unknown and reconcile.
         return OrderOutcome('UNKNOWN', str(first['resting'].get('oid')), reason='IOC returned resting status', raw=response)
     if 'error' in first:
         return OrderOutcome('REJECTED', reason=str(first['error']), raw=response)
