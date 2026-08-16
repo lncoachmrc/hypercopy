@@ -136,7 +136,13 @@ async def link_trading_account(body: TradingAccountIn, request: Request, user: U
     blob = crypto.encrypt(body.agent_private_key, user_id=str(user.id), account_id=str(account.id))
     expires = datetime.fromtimestamp(verification.valid_until/1000, UTC) if verification.valid_until else None
     db.add(SigningCredential(trading_account_id=account.id, ciphertext_b64=blob.ciphertext_b64, nonce_b64=blob.nonce_b64, wrapped_dek_b64=blob.wrapped_dek_b64, wrap_nonce_b64=blob.wrap_nonce_b64, key_provider=blob.key_provider, key_reference=blob.key_reference, key_version=blob.key_version, agent_fingerprint=hashlib.sha256(verification.agent_address.encode()).hexdigest(), expires_at=expires, status=CredentialStatus.ACTIVE))
-    await audit(db, action='TRADING_ACCOUNT_LINKED', actor_id=user.id, subject_id=user.id, ip_hash=hash_ip(request.client.host if request.client else None), after={'account': account_address[:8]+'…', 'agent': verification.agent_address[:8]+'…', 'network': settings.follower_network, 'expires_at': expires.isoformat() if expires else None})
+    # Relinking after a credential removal must never jump straight to ACTIVE.
+    # In staging/default-safe deployments it may return a PAUSED user only to
+    # SHADOW, where targets are calculated but no exchange order is submitted.
+    if settings.DEFAULT_SHADOW_MODE and user.copy_state == CopyState.PAUSED:
+        user.copy_state = CopyState.SHADOW
+        user.shadow_started_at = datetime.now(UTC)
+    await audit(db, action='TRADING_ACCOUNT_LINKED', actor_id=user.id, subject_id=user.id, ip_hash=hash_ip(request.client.host if request.client else None), after={'account': account_address[:8]+'…', 'agent': verification.agent_address[:8]+'…', 'network': settings.follower_network, 'copy_state': user.copy_state.value, 'expires_at': expires.isoformat() if expires else None})
     await db.commit(); return await _serialize_user(db, user)
 
 
@@ -179,6 +185,18 @@ async def put_risk(body: RiskProfileIn, user: User = Depends(current_user), db: 
 @router.post('/copy/pause', dependencies=[Depends(require_csrf)])
 async def pause(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     user.copy_state = CopyState.PAUSED; await audit(db, action='COPY_PAUSED', actor_id=user.id, subject_id=user.id); await db.commit(); return await _serialize_user(db, user)
+
+
+@router.post('/copy/shadow', dependencies=[Depends(require_csrf)])
+async def shadow(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
+    if not account:
+        raise HTTPException(409, 'Connect a Hyperliquid trading account first')
+    user.copy_state = CopyState.SHADOW
+    user.shadow_started_at = datetime.now(UTC)
+    await audit(db, action='COPY_SHADOW_ENABLED', actor_id=user.id, subject_id=user.id, after={'master_network': settings.master_network, 'follower_network': settings.follower_network})
+    await db.commit()
+    return await _serialize_user(db, user)
 
 
 @router.post('/copy/resume', dependencies=[Depends(require_csrf)])
