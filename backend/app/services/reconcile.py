@@ -24,20 +24,6 @@ def _positions(state: dict) -> dict[str, Decimal]:
     return out
 
 
-def _account_value(state: dict) -> Decimal:
-    return Decimal(str(state.get('marginSummary', {}).get('accountValue', '0')))
-
-
-def _free_margin(state: dict) -> Decimal:
-    raw = state.get('withdrawable')
-    if raw not in (None, ''):
-        return max(Decimal(str(raw)), Decimal(0))
-    summary = state.get('marginSummary', {})
-    value = Decimal(str(summary.get('accountValue', '0')))
-    used = Decimal(str(summary.get('totalMarginUsed', '0')))
-    return max(value - used, Decimal(0))
-
-
 async def _sync_missing_fills(db: AsyncSession, hl: HyperliquidAdapter, user: User, account_address: str) -> int:
     missing = (await db.execute(
         select(Execution).where(
@@ -76,9 +62,9 @@ async def _sync_missing_fills(db: AsyncSession, hl: HyperliquidAdapter, user: Us
 
 async def master_snapshot(hl: HyperliquidAdapter) -> tuple[dict[str, Decimal], Decimal, dict[str, str]]:
     settings = __import__('app.core.config', fromlist=['settings']).settings
-    state = await hl.user_state(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
+    snapshot = await hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
     mids = await hl.mids()
-    return _positions(state), _account_value(state), mids
+    return _positions(snapshot.perp_state), snapshot.account_value, mids
 
 
 async def reconcile_user(
@@ -100,15 +86,19 @@ async def reconcile_user(
         account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
         if not account:
             run.status = 'SKIPPED'; run.finished_at = datetime.now(UTC); await db.commit(); return {'status': 'SKIPPED'}
-        real_state = await hl.user_state(account.account_address)
+
+        snapshot = await hl.account_snapshot(account.account_address)
+        real_state = snapshot.perp_state
+        equity = snapshot.account_value
+        free_margin = snapshot.free_margin
+        account_mode = snapshot.abstraction
+
         try:
             synced_fills = await _sync_missing_fills(db, hl, user, account.account_address)
         except Exception:
             synced_fills = 0
             log.warning('Deferred fill-history synchronization', extra={'user_id': str(user.id)}, exc_info=True)
         real_positions = _positions(real_state)
-        equity = _account_value(real_state)
-        free_margin = _free_margin(real_state)
         risk_state = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
         if not risk_state:
             risk_state = RiskState(user_id=user.id, peak_equity=equity, day_start_equity=equity, day_key=datetime.now(UTC).date().isoformat())
@@ -209,10 +199,10 @@ async def reconcile_user(
                     pass
         db.add(EquitySnapshot(user_id=user.id, account_value=equity, free_margin=free_margin, unmanaged_margin=unmanaged_margin, taken_at=datetime.now(UTC)))
 
-        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills}; run.finished_at = datetime.now(UTC)
-        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'discrepancies': discrepancies})
+        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode}; run.finished_at = datetime.now(UTC)
+        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity)})
         await db.commit()
-        return {'status': 'OK', 'discrepancies': discrepancies, 'equity': str(equity)}
+        return {'status': 'OK', 'discrepancies': discrepancies, 'equity': str(equity), 'account_mode': account_mode}
     except Exception as exc:
         run.status = 'FAILED'; run.error = f'{type(exc).__name__}: {exc}'; run.finished_at = datetime.now(UTC); await db.commit(); raise
 
