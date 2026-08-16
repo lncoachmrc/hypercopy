@@ -10,12 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.hyperliquid import HyperliquidAdapter, fill_event_id
 from app.adapters.ratelimit import Priority
-from app.core.logging import get_logger
-from app.engine.reconcile import classify
 from app.models.entities import CopyJob, CopyState, EquitySnapshot, Execution, ExecutionState, Fill, JobState, PositionLedger, ReconciliationRun, RiskHalt, RiskProfile, RiskState, TradingAccount, User, UserState
 from app.services.audit import audit
 
-log = get_logger(__name__)
+log = __import__('app.core.logging', fromlist=['get_logger']).get_logger(__name__)
 
 
 def _positions(state: dict) -> dict[str, Decimal]:
@@ -31,9 +29,6 @@ def _account_value(state: dict) -> Decimal:
 
 
 def _free_margin(state: dict) -> Decimal:
-    # Hyperliquid clearinghouseState exposes withdrawable as the immediately
-    # available collateral. Fall back conservatively to account value minus
-    # total margin used if the field is unavailable.
     raw = state.get('withdrawable')
     if raw not in (None, ''):
         return max(Decimal(str(raw)), Decimal(0))
@@ -44,13 +39,6 @@ def _free_margin(state: dict) -> Decimal:
 
 
 async def _sync_missing_fills(db: AsyncSession, hl: HyperliquidAdapter, user: User, account_address: str) -> int:
-    """Eventually materialize real exchange fills without inventing fill ids.
-
-    Order acknowledgements can tell us total size/average price but do not always
-    carry each fill's `tid`. During reconciliation we fetch the real fill stream
-    only when a FILLED execution lacks fill rows, match by exchange OID, and use
-    Hyperliquid's own hash/oid/tid tuple as the persistent unique id.
-    """
     missing = (await db.execute(
         select(Execution).where(
             Execution.user_id == user.id,
@@ -87,12 +75,32 @@ async def _sync_missing_fills(db: AsyncSession, hl: HyperliquidAdapter, user: Us
 
 
 async def master_snapshot(hl: HyperliquidAdapter) -> tuple[dict[str, Decimal], Decimal, dict[str, str]]:
-    state = await hl.user_state(__import__('app.core.config', fromlist=['settings']).settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
+    settings = __import__('app.core.config', fromlist=['settings']).settings
+    state = await hl.user_state(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
     mids = await hl.mids()
     return _positions(state), _account_value(state), mids
 
 
-async def reconcile_user(db: AsyncSession, hl: HyperliquidAdapter, user: User, *, master_positions: dict[str, Decimal], master_equity: Decimal, mids: dict[str, str], create_jobs: bool = True) -> dict:
+async def reconcile_user(
+    db: AsyncSession,
+    hl: HyperliquidAdapter,
+    user: User,
+    *,
+    master_positions: dict[str, Decimal],
+    master_equity: Decimal,
+    mids: dict[str, str],
+    master_mids: dict[str, str] | None = None,
+    create_jobs: bool = True,
+) -> dict:
+    """Reconcile one follower against its own exchange network.
+
+    ``hl`` and ``mids`` are follower-side. ``master_positions``,
+    ``master_equity`` and optional ``master_mids`` are source-side. Keeping
+    those domains explicit is what makes mainnet-master -> testnet-follower
+    safe and mathematically correct.
+    """
+    follower_mids = mids
+    source_mids = master_mids or mids
     run = ReconciliationRun(user_id=user.id, before={}, after={})
     db.add(run); await db.flush()
     try:
@@ -100,9 +108,6 @@ async def reconcile_user(db: AsyncSession, hl: HyperliquidAdapter, user: User, *
         if not account:
             run.status = 'SKIPPED'; run.finished_at = datetime.now(UTC); await db.commit(); return {'status': 'SKIPPED'}
         real_state = await hl.user_state(account.account_address)
-        # Fill materialization is useful for audit/history but must not starve the
-        # correctness-critical position reconciliation when its high-weight
-        # history request has no budget. Retry on the next cycle.
         try:
             synced_fills = await _sync_missing_fills(db, hl, user, account.account_address)
         except Exception:
@@ -116,15 +121,13 @@ async def reconcile_user(db: AsyncSession, hl: HyperliquidAdapter, user: User, *
             risk_state = RiskState(user_id=user.id, peak_equity=equity, day_start_equity=equity, day_key=datetime.now(UTC).date().isoformat())
             db.add(risk_state)
         risk = (await db.execute(select(RiskProfile).where(RiskProfile.user_id == user.id))).scalar_one_or_none()
-        # Compute the minimum liquidation distance from the real exchange
-        # positions. Open/increase operations are halted below 15%, while
-        # reductions remain permitted by the Risk Engine.
+
         distances = []
         for row in real_state.get('assetPositions', []):
             pos = row.get('position', row)
             asset_name = str(pos.get('coin') or '')
             liq_raw = pos.get('liquidationPx')
-            mark_raw = mids.get(asset_name)
+            mark_raw = follower_mids.get(asset_name)
             try:
                 if liq_raw not in (None, '', '0') and mark_raw not in (None, '', '0'):
                     liq = Decimal(str(liq_raw)); mark_px = Decimal(str(mark_raw))
@@ -163,33 +166,34 @@ async def reconcile_user(db: AsyncSession, hl: HyperliquidAdapter, user: User, *
         for asset in assets:
             real = real_positions.get(asset, Decimal(0))
             ledger = ledger_by_asset.get(asset)
+            follower_mark = Decimal(str(follower_mids.get(asset, '0')))
             if not ledger:
-                ledger = PositionLedger(user_id=user.id, asset=asset, size=real, mark_price=Decimal(str(mids.get(asset, '0'))), managed=asset in master_positions, exchange_verified_at=datetime.now(UTC))
+                ledger = PositionLedger(user_id=user.id, asset=asset, size=real, mark_price=follower_mark, managed=asset in master_positions, exchange_verified_at=datetime.now(UTC))
                 db.add(ledger); ledger_by_asset[asset] = ledger
             before = ledger.size
             ledger.size = real
-            ledger.mark_price = Decimal(str(mids.get(asset, '0')))
+            ledger.mark_price = follower_mark
             ledger.exchange_verified_at = datetime.now(UTC)
             if before != real:
                 discrepancies.append({'asset': asset, 'ledger': str(before), 'real': str(real)})
 
-            # Position target is calculated by execution service; reconciliation
-            # creates a durable job from the current master snapshot so the same
-            # pure sizing engine is used on hot and cold paths.
             if create_jobs and asset in unresolved_assets:
-                # Exactly-once safety beats liveness: a new target job must not
-                # race an external effect whose Cloid is still ambiguous. The
-                # execution reconciler/admin must resolve that intent first.
                 continue
             if create_jobs and asset in master_positions and master_positions[asset] != 0:
                 already = (await db.execute(select(CopyJob.id).where(CopyJob.user_id == user.id, CopyJob.asset == asset, CopyJob.origin == 'RECONCILE', CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING])).limit(1))).scalar_one_or_none()
                 if not already:
-                    db.add(CopyJob(user_id=user.id, asset=asset, origin='RECONCILE', state=JobState.QUEUED, correlation_id=uuid.uuid4().hex, context={'master_position': str(master_positions[asset]), 'master_equity': str(master_equity), 'mark_price': str(mids.get(asset, '0'))}))
+                    master_mark = str(source_mids.get(asset, '0'))
+                    db.add(CopyJob(
+                        user_id=user.id, asset=asset, origin='RECONCILE', state=JobState.QUEUED,
+                        correlation_id=uuid.uuid4().hex,
+                        context={
+                            'master_position': str(master_positions[asset]),
+                            'master_equity': str(master_equity),
+                            'master_mark_price': master_mark,
+                            'mark_price': master_mark,
+                        },
+                    ))
             elif create_jobs and real != 0 and asset not in master_positions:
-                # A position previously managed by HyperCopy must converge to
-                # zero when the master exits, regardless of the user's manual
-                # trade policy. Truly unmanaged/orphan positions are left alone
-                # under COEXIST/MANUAL_WINS and closed only under STRICT.
                 should_close = bool(ledger.managed) or user.manual_trade_policy.value == 'STRICT'
                 if should_close:
                     already = (await db.execute(select(CopyJob.id).where(
@@ -198,11 +202,18 @@ async def reconcile_user(db: AsyncSession, hl: HyperliquidAdapter, user: User, *
                         CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),
                     ).limit(1))).scalar_one_or_none()
                     if not already:
-                        db.add(CopyJob(user_id=user.id, asset=asset, origin='RECONCILE', state=JobState.QUEUED, correlation_id=uuid.uuid4().hex, context={'master_position': '0', 'master_equity': str(master_equity), 'mark_price': str(mids.get(asset, '0'))}))
+                        close_mark = str(source_mids.get(asset, follower_mids.get(asset, '0')))
+                        db.add(CopyJob(
+                            user_id=user.id, asset=asset, origin='RECONCILE', state=JobState.QUEUED,
+                            correlation_id=uuid.uuid4().hex,
+                            context={
+                                'master_position': '0',
+                                'master_equity': str(master_equity),
+                                'master_mark_price': close_mark,
+                                'mark_price': close_mark,
+                            },
+                        ))
 
-        # Eligible equity excludes margin tied to unmanaged positions. This is
-        # persisted once per reconciliation so the hot execution path requires
-        # no per-follower state read from Hyperliquid.
         unmanaged_margin = Decimal(0)
         for row in real_state.get('assetPositions', []):
             pos = row.get('position', row)
@@ -226,8 +237,17 @@ async def reconcile_user(db: AsyncSession, hl: HyperliquidAdapter, user: User, *
         run.status = 'FAILED'; run.error = f'{type(exc).__name__}: {exc}'; run.finished_at = datetime.now(UTC); await db.commit(); raise
 
 
-async def reconcile_active_users(db: AsyncSession, hl: HyperliquidAdapter, limit: int | None = None) -> int:
-    mp, me, mids = await master_snapshot(hl)
+async def reconcile_active_users(
+    db: AsyncSession,
+    hl: HyperliquidAdapter,
+    limit: int | None = None,
+    *,
+    master_hl: HyperliquidAdapter | None = None,
+) -> int:
+    """Reconcile followers with an optional distinct read-only master adapter."""
+    source_hl = master_hl or hl
+    mp, me, source_mids = await master_snapshot(source_hl)
+    follower_mids = source_mids if source_hl is hl else await hl.mids()
     query = select(User).join(TradingAccount, TradingAccount.user_id == User.id).where(
         User.state == UserState.ACTIVE,
         User.copy_state.in_([CopyState.ACTIVE, CopyState.SHADOW, CopyState.PAUSED]),
@@ -236,5 +256,11 @@ async def reconcile_active_users(db: AsyncSession, hl: HyperliquidAdapter, limit
         query = query.limit(limit)
     users = (await db.execute(query)).scalars().all()
     for user in users:
-        await reconcile_user(db, hl, user, master_positions=mp, master_equity=me, mids=mids)
+        await reconcile_user(
+            db, hl, user,
+            master_positions=mp,
+            master_equity=me,
+            mids=follower_mids,
+            master_mids=source_mids,
+        )
     return len(users)
