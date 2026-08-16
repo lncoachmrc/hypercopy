@@ -7,17 +7,27 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.entities import (
-    CopyJob, CredentialStatus, EquitySnapshot, Execution, ExecutionState,
+    CopyJob, CredentialStatus, EquitySnapshot, Execution, ExecutionState, Fill,
     JobState, MasterEvent, PositionLedger, ReconciliationRun,
     SigningCredential, WatcherLeaseModel, WorkerHeartbeat,
 )
 
 
 async def dashboard_for_user(db: AsyncSession, user_id) -> dict:
+    since = datetime.now(UTC)-timedelta(days=90)
     latest = (await db.execute(select(EquitySnapshot).where(EquitySnapshot.user_id == user_id).order_by(EquitySnapshot.taken_at.desc()).limit(1))).scalar_one_or_none()
-    points = (await db.execute(select(EquitySnapshot).where(EquitySnapshot.user_id == user_id, EquitySnapshot.taken_at >= datetime.now(UTC)-timedelta(days=90)).order_by(EquitySnapshot.taken_at))).scalars().all()
+    points = (await db.execute(select(EquitySnapshot).where(EquitySnapshot.user_id == user_id, EquitySnapshot.taken_at >= since).order_by(EquitySnapshot.taken_at))).scalars().all()
     values = [float(p.account_value) for p in points]
-    pnl = values[-1] - values[0] if len(values) >= 2 else 0.0
+
+    # Equity deltas include deposits, withdrawals and account-mode migrations,
+    # so they are not trading PnL. Until funding/unrealized PnL attribution is
+    # modelled explicitly, show net realized PnL from HyperCopy fills only.
+    realized = (await db.execute(
+        select(func.coalesce(func.sum(func.coalesce(Fill.closed_pnl, 0) - func.coalesce(Fill.fee, 0)), 0))
+        .where(Fill.user_id == user_id, Fill.ts >= since)
+    )).scalar_one()
+    pnl = float(realized or 0)
+
     peak = values[0] if values else 0.0
     max_dd = 0.0
     for v in values:
