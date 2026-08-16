@@ -28,7 +28,14 @@ def _stop(*_): stop.set()
 
 class Worker:
     def __init__(self):
-        self.id=replica_identity(); self.redis=redis_client(); self.limiter=WeightedRateLimiter(self.redis,Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN)); self.hl=HyperliquidAdapter(self.limiter); self.current_job=None
+        self.id = replica_identity()
+        self.redis = redis_client()
+        self.limiter = WeightedRateLimiter(self.redis, Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN))
+        # Master is read-only and may live on mainnet while follower execution
+        # remains isolated on testnet.
+        self.master_hl = HyperliquidAdapter(self.limiter, network=settings.master_network)
+        self.follower_hl = HyperliquidAdapter(self.limiter, network=settings.follower_network)
+        self.current_job = None
 
     async def heartbeat(self):
         async with SessionLocal() as db:
@@ -45,12 +52,17 @@ class Worker:
             if raw.origin=='ADMIN_RECONCILE':
                 user=await db.get(User,raw.user_id)
                 if user:
-                    mp,me,mids=await master_snapshot(self.hl); await reconcile_user(db,self.hl,user,master_positions=mp,master_equity=me,mids=mids)
+                    mp,me,master_mids=await master_snapshot(self.master_hl)
+                    follower_mids=master_mids if settings.master_network == settings.follower_network else await self.follower_hl.mids()
+                    await reconcile_user(
+                        db,self.follower_hl,user,
+                        master_positions=mp,master_equity=me,mids=follower_mids,master_mids=master_mids,
+                    )
                 raw.state=JobState.DONE; await db.commit(); return True
             job=await claim_job(db,self.id,uid)
             if not job: return True
             self.current_job=job.id; await self.heartbeat()
-            result=await process_job(db,self.hl,job)
+            result=await process_job(db,self.follower_hl,job)
             self.current_job=None
             try:
                 await self.redis.publish(
@@ -88,17 +100,16 @@ class Worker:
             acquired=bool((await conn.execute(text("SELECT pg_try_advisory_lock(hashtext('hypercopy:reconciler'))"))).scalar_one())
             if not acquired: return
             try:
-                async with SessionLocal() as db: await reconcile_active_users(db,self.hl)
+                async with SessionLocal() as db:
+                    await reconcile_active_users(db,self.follower_hl,master_hl=self.master_hl)
             finally:
                 await conn.execute(text("SELECT pg_advisory_unlock(hashtext('hypercopy:reconciler'))")); await conn.commit()
 
     async def run(self):
         async with SessionLocal() as db: await assert_schema(db)
+        log.info('Execution worker networks', extra={'master_network': settings.master_network, 'follower_network': settings.follower_network})
         consume=asyncio.create_task(self.consume()); maintenance=asyncio.create_task(self.maintenance())
         await stop.wait()
-        # Stop maintenance immediately, but do not cancel a possibly in-flight
-        # exchange submission. The consume loop sees `stop` after the current job
-        # and exits naturally; Railway drainingSeconds gives it time to finish.
         maintenance.cancel()
         await asyncio.gather(maintenance, return_exceptions=True)
         try:
