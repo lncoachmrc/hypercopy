@@ -25,11 +25,7 @@ async def persist_master_fill_and_jobs(
     db: AsyncSession, *, fill: dict[str, Any], master_equity: Decimal,
     fencing_token: int, correlation_id: str,
 ) -> tuple[MasterEvent | None, list[CopyJob]]:
-    """Atomically persist the exchange fact then durable per-follower jobs.
-
-    The fencing token is checked while holding the lease row lock. A revived old
-    watcher cannot insert after a newer process has acquired a larger token.
-    """
+    """Atomically persist the exchange fact then durable per-follower jobs."""
     lease = (await db.execute(text("SELECT fencing_token, expires_at FROM watcher_lease WHERE name='master-watcher' FOR SHARE"))).first()
     if lease is None or int(lease[0]) != fencing_token or lease[1] <= datetime.now(UTC):
         raise RuntimeError('Watcher fenced out or lease expired before master-event write')
@@ -53,11 +49,8 @@ async def persist_master_fill_and_jobs(
     db.add(event)
     await db.flush()
 
-    # Deliberately fan out to every active user with a trading account. Business
-    # halts (pause, subscription expiry, drawdown, global pause) are evaluated
-    # later by the Risk Engine *after* target/delta classification, so reductions
-    # can still pass while new exposure is denied. Filtering those users here
-    # would strand leveraged positions when the master reduces or closes.
+    # Fan out durably to every active user with a linked trading account. Risk
+    # and entitlement gates are evaluated later, after target classification.
     eligible = (await db.execute(
         select(User.id).join(TradingAccount, TradingAccount.user_id == User.id)
         .where(User.state == UserState.ACTIVE)
@@ -70,8 +63,13 @@ async def persist_master_fill_and_jobs(
             id=job_id, master_event_id=event.id, user_id=user_id, asset=asset,
             origin='EVENT', state='QUEUED', correlation_id=correlation_id,
             context={
-                'master_position': str(position_after), 'master_equity': str(master_equity),
-                'mark_price': str(price), 'master_event_id': str(event.id),
+                'master_position': str(position_after),
+                'master_equity': str(master_equity),
+                'master_mark_price': str(price),
+                # Legacy key retained so old workers can drain in-flight jobs
+                # safely during rolling deployment.
+                'mark_price': str(price),
+                'master_event_id': str(event.id),
             },
         ).on_conflict_do_nothing(constraint='uq_job_master_user').returning(CopyJob.id)
         inserted = (await db.execute(statement)).scalar_one_or_none()
