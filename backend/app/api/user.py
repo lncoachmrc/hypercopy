@@ -121,40 +121,52 @@ async def get_risk(user: User = Depends(current_user), db: AsyncSession = Depend
 
 
 @router.put('/risk-profile', dependencies=[Depends(require_csrf)])
-async def put_risk(body: RiskProfileIn, request: Request, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+async def put_risk(body: RiskProfileIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     row = (await db.execute(select(RiskProfile).where(RiskProfile.user_id == user.id))).scalar_one()
-    before={c.name:str(getattr(row,c.name)) for c in row.__table__.columns if c.name not in {'id','user_id','created_at','updated_at'}}
-    for field,value in body.model_dump().items(): setattr(row,field,value)
-    await audit(db, action='RISK_PROFILE_UPDATED', actor_id=user.id, subject_id=user.id, ip_hash=hash_ip(request.client.host if request.client else None), before=before, after=body.model_dump(mode='json'))
-    await db.commit(); return await get_risk(user,db)
+    values = body.model_dump()
+    ent = await entitlement(db, user)
+    limits = ent.get('limits') or {}
+    if 'max_multiplier' in limits:
+        values['multiplier'] = min(values['multiplier'], __import__('decimal').Decimal(str(limits['max_multiplier'])))
+    if 'max_notional_per_trade' in limits:
+        values['max_notional_per_trade'] = min(values['max_notional_per_trade'], __import__('decimal').Decimal(str(limits['max_notional_per_trade'])))
+    if 'max_positions' in limits:
+        values['max_positions'] = min(values['max_positions'], int(limits['max_positions']))
+    for k, v in values.items(): setattr(row, k, v)
+    await audit(db, action='RISK_PROFILE_UPDATED', actor_id=user.id, subject_id=user.id, after={k: str(v) if hasattr(v, 'as_tuple') else v for k, v in values.items()})
+    await db.commit(); return await get_risk(user, db)
 
 
 @router.post('/copy/pause', dependencies=[Depends(require_csrf)])
-async def pause_copy(request: Request, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    user.copy_state = CopyState.PAUSED
-    await audit(db, action='COPY_PAUSED', actor_id=user.id, subject_id=user.id, ip_hash=hash_ip(request.client.host if request.client else None))
-    await db.commit(); return {'copy_state': user.copy_state.value}
+async def pause(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    user.copy_state = CopyState.PAUSED; await audit(db, action='COPY_PAUSED', actor_id=user.id, subject_id=user.id); await db.commit(); return await _serialize_user(db, user)
 
 
 @router.post('/copy/resume', dependencies=[Depends(require_csrf)])
-async def resume_copy(request: Request, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    if not user.trading_account:
-        user.trading_account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
-    if not user.trading_account:
-        raise HTTPException(409, 'Trading account not linked')
-    await reconcile_user(db, _hl(), user)
+async def resume(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    rs = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
+    if rs and rs.state != RiskHalt.NORMAL: raise HTTPException(409, f'Cannot resume while {rs.state.value} is active')
+    account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
+    if not account: raise HTTPException(409, 'Connect a Hyperliquid trading account first')
+    # Reconcile against the exchange before enabling new exposure. While the
+    # user is still PAUSED/SHADOW, any reduction jobs are safe and openings are
+    # not allowed until this transaction flips the state to ACTIVE.
+    try:
+        hl = _hl()
+        mp, meq, mids = await master_snapshot(hl)
+        await reconcile_user(db, hl, user, master_positions=mp, master_equity=meq, mids=mids)
+    except Exception as exc:
+        raise HTTPException(503, 'Reconciliation must succeed before copytrading can resume') from exc
     user.copy_state = CopyState.ACTIVE
-    await audit(db, action='COPY_RESUMED', actor_id=user.id, subject_id=user.id, ip_hash=hash_ip(request.client.host if request.client else None))
-    await db.commit(); return {'copy_state': user.copy_state.value}
+    await audit(db, action='COPY_RESUMED', actor_id=user.id, subject_id=user.id)
+    await db.commit()
+    return await _serialize_user(db, user)
 
 
 @router.post('/copy/close-positions', dependencies=[Depends(require_csrf)])
-async def close_positions(body: ClosePositionsIn, request: Request, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    if body.confirmation != 'CLOSE':
-        raise HTTPException(400, 'confirmation must be CLOSE')
-    rows=(await db.execute(select(PositionLedger).where(PositionLedger.user_id==user.id,PositionLedger.managed.is_(True),PositionLedger.size!=0))).scalars().all()
-    if not rows: return {'queued':0}
-    queued=0
+async def close_positions(body: ClosePositionsIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    rows = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user.id, PositionLedger.managed.is_(True), PositionLedger.size != 0))).scalars().all()
+    count = 0
     for row in rows:
-        job=CopyJob(user_id=user.id,asset=row.asset,origin='USER_CLOSE',context={'target_size':'0','mark_price':str(row.mark_price)},correlation_id=__import__('uuid').uuid4().hex); db.add(job); queued+=1
-    await audit(db,action='USER_CLOSE_ALL',actor_id=user.id,subject_id=user.id,reason=body.reason,ip_hash=hash_ip(request.client.host if request.client else None),after={'queued':queued}); await db.commit(); return {'queued':queued}
+        db.add(CopyJob(user_id=user.id, asset=row.asset, origin='CLOSE_ALL', state='QUEUED', correlation_id=__import__('uuid').uuid4().hex, context={'master_position': '0', 'master_equity': '1', 'mark_price': '0'})); count += 1
+    await audit(db, action='CLOSE_POSITIONS_REQUESTED', actor_id=user.id, subject_id=user.id, reason=body.reason, after={'jobs': count}); await db.commit(); return {'queued': count}
