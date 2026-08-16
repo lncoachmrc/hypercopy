@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.hyperliquid import HyperliquidAdapter, fill_event_id
 from app.adapters.ratelimit import Priority
+from app.core.config import settings
+from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, FollowerState, MasterExposure, compute_target
 from app.models.entities import CopyJob, CopyState, EquitySnapshot, Execution, ExecutionState, Fill, JobState, PositionLedger, ReconciliationRun, RiskHalt, RiskProfile, RiskState, TradingAccount, User, UserState
 from app.services.audit import audit
 
@@ -61,7 +63,6 @@ async def _sync_missing_fills(db: AsyncSession, hl: HyperliquidAdapter, user: Us
 
 
 async def master_snapshot(hl: HyperliquidAdapter) -> tuple[dict[str, Decimal], Decimal, dict[str, str]]:
-    settings = __import__('app.core.config', fromlist=['settings']).settings
     snapshot = await hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
     mids = await hl.mids()
     return _positions(snapshot.perp_state), snapshot.account_value, mids
@@ -98,6 +99,7 @@ async def reconcile_user(
         except Exception:
             synced_fills = 0
             log.warning('Deferred fill-history synchronization', extra={'user_id': str(user.id)}, exc_info=True)
+
         real_positions = _positions(real_state)
         risk_state = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
         if not risk_state:
@@ -138,55 +140,9 @@ async def reconcile_user(
 
         ledger_rows = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user.id))).scalars().all()
         ledger_by_asset = {x.asset: x for x in ledger_rows}
-        unresolved_assets = set((await db.execute(
-            select(Execution.asset).where(
-                Execution.user_id == user.id,
-                Execution.state.in_([ExecutionState.SUBMITTING, ExecutionState.UNKNOWN]),
-            )
-        )).scalars().all())
-        assets = set(master_positions) | set(real_positions) | set(ledger_by_asset)
-        discrepancies = []
-        for asset in assets:
-            real = real_positions.get(asset, Decimal(0))
-            ledger = ledger_by_asset.get(asset)
-            follower_mark = Decimal(str(follower_mids.get(asset, '0')))
-            if not ledger:
-                ledger = PositionLedger(user_id=user.id, asset=asset, size=real, mark_price=follower_mark, managed=asset in master_positions, exchange_verified_at=datetime.now(UTC))
-                db.add(ledger); ledger_by_asset[asset] = ledger
-            before = ledger.size
-            ledger.size = real
-            ledger.mark_price = follower_mark
-            ledger.exchange_verified_at = datetime.now(UTC)
-            if before != real:
-                discrepancies.append({'asset': asset, 'ledger': str(before), 'real': str(real)})
 
-            if create_jobs and asset in unresolved_assets:
-                continue
-            if create_jobs and asset in master_positions and master_positions[asset] != 0:
-                already = (await db.execute(select(CopyJob.id).where(CopyJob.user_id == user.id, CopyJob.asset == asset, CopyJob.origin == 'RECONCILE', CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING])).limit(1))).scalar_one_or_none()
-                if not already:
-                    master_mark = str(source_mids.get(asset, '0'))
-                    db.add(CopyJob(
-                        user_id=user.id, asset=asset, origin='RECONCILE', state=JobState.QUEUED,
-                        correlation_id=uuid.uuid4().hex,
-                        context={'master_position': str(master_positions[asset]), 'master_equity': str(master_equity), 'master_mark_price': master_mark, 'mark_price': master_mark},
-                    ))
-            elif create_jobs and real != 0 and asset not in master_positions:
-                should_close = bool(ledger.managed) or user.manual_trade_policy.value == 'STRICT'
-                if should_close:
-                    already = (await db.execute(select(CopyJob.id).where(
-                        CopyJob.user_id == user.id, CopyJob.asset == asset,
-                        CopyJob.origin == 'RECONCILE',
-                        CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),
-                    ).limit(1))).scalar_one_or_none()
-                    if not already:
-                        close_mark = str(source_mids.get(asset, follower_mids.get(asset, '0')))
-                        db.add(CopyJob(
-                            user_id=user.id, asset=asset, origin='RECONCILE', state=JobState.QUEUED,
-                            correlation_id=uuid.uuid4().hex,
-                            context={'master_position': '0', 'master_equity': str(master_equity), 'master_mark_price': close_mark, 'mark_price': close_mark},
-                        ))
-
+        # Calculate unmanaged margin before target sizing so follower eligible
+        # equity is the same in reconciliation and execution.
         unmanaged_margin = Decimal(0)
         for row in real_state.get('assetPositions', []):
             pos = row.get('position', row)
@@ -197,6 +153,86 @@ async def reconcile_user(
                     unmanaged_margin += abs(Decimal(str(pos.get('marginUsed', '0') or '0')))
                 except Exception:
                     pass
+
+        unresolved_assets = set((await db.execute(
+            select(Execution.asset).where(
+                Execution.user_id == user.id,
+                Execution.state.in_([ExecutionState.SUBMITTING, ExecutionState.UNKNOWN]),
+            )
+        )).scalars().all())
+        assets = set(master_positions) | set(real_positions) | set(ledger_by_asset)
+        discrepancies = []
+        multiplier = risk.multiplier if risk else Decimal(1)
+        min_notional = max(risk.min_notional if risk else EXCHANGE_MIN_NOTIONAL, EXCHANGE_MIN_NOTIONAL)
+
+        for asset in assets:
+            real = real_positions.get(asset, Decimal(0))
+            ledger = ledger_by_asset.get(asset)
+            follower_mark = Decimal(str(follower_mids.get(asset, '0') or '0'))
+            if not ledger:
+                ledger = PositionLedger(user_id=user.id, asset=asset, size=real, mark_price=follower_mark, managed=asset in master_positions, exchange_verified_at=datetime.now(UTC))
+                db.add(ledger); ledger_by_asset[asset] = ledger
+            if asset in master_positions and master_positions.get(asset, Decimal(0)) != 0:
+                ledger.managed = True
+
+            before = ledger.size
+            ledger.size = real
+            ledger.mark_price = follower_mark
+            ledger.exchange_verified_at = datetime.now(UTC)
+            if before != real:
+                discrepancies.append({'asset': asset, 'ledger': str(before), 'real': str(real)})
+
+            if not create_jobs or user.copy_state == CopyState.PAUSED or asset in unresolved_assets:
+                continue
+
+            master_pos = master_positions.get(asset, Decimal(0))
+            master_mark = Decimal(str(source_mids.get(asset, '0') or '0'))
+            desired_target = Decimal(0)
+            if master_pos != 0 and master_equity > 0 and master_mark > 0 and follower_mark > 0:
+                desired_target = compute_target(
+                    MasterExposure(asset, master_pos, master_mark, master_equity),
+                    FollowerState(str(user.id), equity, unmanaged_margin, real, multiplier),
+                    follower_mark,
+                )
+
+            # In SHADOW, current exchange size intentionally remains zero, so
+            # comparing desired target with real size would recreate the same
+            # job every minute. Compare against the last calculated target.
+            # In ACTIVE, compare desired target against the real exchange size.
+            basis = ledger.target_size if user.copy_state == CopyState.SHADOW else real
+            drift_notional = abs(desired_target - basis) * follower_mark if follower_mark > 0 else Decimal(0)
+            if drift_notional < min_notional:
+                continue
+
+            # Respect unmanaged/manual positions when the master has no exposure.
+            if master_pos == 0 and real != 0 and not ledger.managed and user.manual_trade_policy.value != 'STRICT':
+                continue
+
+            pending = (await db.execute(select(CopyJob.id).where(
+                CopyJob.user_id == user.id,
+                CopyJob.asset == asset,
+                CopyJob.origin == 'RECONCILE',
+                CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),
+            ).limit(1))).scalar_one_or_none()
+            if pending:
+                continue
+
+            db.add(CopyJob(
+                user_id=user.id,
+                asset=asset,
+                origin='RECONCILE',
+                state=JobState.QUEUED,
+                correlation_id=uuid.uuid4().hex,
+                context={
+                    'master_position': str(master_pos),
+                    'master_equity': str(master_equity),
+                    'master_mark_price': str(master_mark),
+                    'mark_price': str(master_mark),
+                    'master_network': settings.master_network,
+                    'follower_network': settings.follower_network,
+                },
+            ))
+
         db.add(EquitySnapshot(user_id=user.id, account_value=equity, free_margin=free_margin, unmanaged_margin=unmanaged_margin, taken_at=datetime.now(UTC)))
 
         run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode}; run.finished_at = datetime.now(UTC)
