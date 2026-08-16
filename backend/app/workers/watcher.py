@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
-from app.adapters.hyperliquid import HyperliquidAdapter
+from app.adapters.hyperliquid import HyperliquidAdapter, position_configs
 from app.adapters.ratelimit import Budget, Priority, WeightedRateLimiter
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
@@ -73,11 +73,23 @@ class Watcher:
             raise
 
     async def process_fill(self,fill:dict):
-        equity=await self.master_equity(); cid=uuid.uuid4().hex
+        asset=str(fill.get('coin') or '')
+        config=None
+        try:
+            snapshot=await self.hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS,priority=Priority.MASTER_STATE)
+            equity=snapshot.account_value
+            self._equity=equity; self._equity_at=asyncio.get_running_loop().time()
+            config=position_configs(snapshot.perp_state).get(asset)
+        except Exception:
+            equity=await self.master_equity()
+            log.warning('Master leverage unavailable for realtime fill; increasing exposure will wait for reconciliation',extra={'asset':asset})
+        cid=uuid.uuid4().hex
         async with SessionLocal() as db:
             event,jobs=await persist_master_fill_and_jobs(
                 db,fill=fill,master_equity=equity,fencing_token=self.lease.token,
                 correlation_id=cid,source_network=settings.master_network,
+                master_leverage=config.leverage if config else None,
+                master_is_cross=config.is_cross if config else None,
             )
             if not event: return
             for job in jobs:
