@@ -67,9 +67,10 @@ async def verify(body: VerifyIn, request: Request, response: Response, db: Async
 
     token, csrf = create_session_token(str(user.id), user.auth_wallet, user.role.value)
     secure = settings.APP_ENV != 'development'
-    cookie_samesite = 'lax' if settings.APP_ENV == 'development' else 'none'
-    response.set_cookie(settings.SESSION_COOKIE_NAME, token, max_age=settings.SESSION_TTL_SECONDS, httponly=True, secure=secure, samesite=cookie_samesite, path='/')
-    response.set_cookie(settings.CSRF_COOKIE_NAME, csrf, max_age=settings.SESSION_TTL_SECONDS, httponly=False, secure=secure, samesite=cookie_samesite, path='/')
+    # Browser traffic is same-origin through the frontend Nginx gateway, so Lax
+    # is sufficient and avoids dependence on third-party cookie policies.
+    response.set_cookie(settings.SESSION_COOKIE_NAME, token, max_age=settings.SESSION_TTL_SECONDS, httponly=True, secure=secure, samesite='lax', path='/')
+    response.set_cookie(settings.CSRF_COOKIE_NAME, csrf, max_age=settings.SESSION_TTL_SECONDS, httponly=False, secure=secure, samesite='lax', path='/')
     ent = await entitlement(db, user)
     return SessionOut(user=SessionUser(id=str(user.id), auth_wallet=user.auth_wallet, role=user.role.value, state=user.state.value, copy_state=user.copy_state.value), entitlements=ent, csrf_token=csrf)
 
@@ -79,9 +80,8 @@ async def logout(response: Response, claims: dict = Depends(session_claims)):
     ttl = max(int(claims.get('exp', 0) - datetime.now(UTC).timestamp()), 1)
     await redis_client().setex(f"session:deny:{claims.get('jti','')}", ttl, '1')
     secure = settings.APP_ENV != 'development'
-    cookie_samesite = 'lax' if settings.APP_ENV == 'development' else 'none'
-    response.delete_cookie(settings.SESSION_COOKIE_NAME, path='/', secure=secure, httponly=True, samesite=cookie_samesite)
-    response.delete_cookie(settings.CSRF_COOKIE_NAME, path='/', secure=secure, httponly=False, samesite=cookie_samesite)
+    response.delete_cookie(settings.SESSION_COOKIE_NAME, path='/', secure=secure, httponly=True, samesite='lax')
+    response.delete_cookie(settings.CSRF_COOKIE_NAME, path='/', secure=secure, httponly=False, samesite='lax')
 
 
 @router.get('/session', response_model=SessionOut)
