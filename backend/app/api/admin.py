@@ -30,7 +30,11 @@ async def system(user: User = Depends(admin), db: AsyncSession = Depends(get_db)
     try: rate = await limiter.snapshot()
     except Exception: rate = {'status':'redis_unavailable'}
     flags = (await db.execute(select(SystemFlag))).scalars().all()
-    data = await system_snapshot(db, rate); data['flags'] = {f.slug: f.enabled for f in flags}; return data
+    data = await system_snapshot(db, rate)
+    data['flags'] = {f.slug: f.enabled for f in flags}
+    data['master_network'] = settings.master_network
+    data['follower_network'] = settings.follower_network
+    return data
 
 
 @router.get('/users')
@@ -64,16 +68,20 @@ async def resume_user(user_id: uuid.UUID, body: AdminAction, actor: User = Depen
         raise HTTPException(409,f'Cannot resume while {rs.state.value} is active')
     account=(await db.execute(select(TradingAccount).where(TradingAccount.user_id==target.id))).scalar_one_or_none()
     if not account: raise HTTPException(409,'Follower has no Hyperliquid trading account')
-    # Same invariant as self-service resume: exchange reconciliation must succeed
-    # while the user is still paused, before new exposure becomes eligible.
-    hl=HyperliquidAdapter(WeightedRateLimiter(redis_client(),Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN)))
+    limiter=WeightedRateLimiter(redis_client(),Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN))
+    master_hl=HyperliquidAdapter(limiter,network=settings.master_network)
+    follower_hl=HyperliquidAdapter(limiter,network=settings.follower_network)
     try:
-        mp,meq,mids=await master_snapshot(hl)
-        await reconcile_user(db,hl,target,master_positions=mp,master_equity=meq,mids=mids)
+        mp,meq,master_mids=await master_snapshot(master_hl)
+        follower_mids=master_mids if settings.master_network == settings.follower_network else await follower_hl.mids()
+        await reconcile_user(
+            db,follower_hl,target,
+            master_positions=mp,master_equity=meq,mids=follower_mids,master_mids=master_mids,
+        )
     except Exception as exc:
         raise HTTPException(503,'Reconciliation must succeed before admin resume') from exc
     target.copy_state=CopyState.ACTIVE
-    await audit(db,action='ADMIN_USER_RESUME',actor_id=actor.id,subject_id=target.id,reason=body.reason)
+    await audit(db,action='ADMIN_USER_RESUME',actor_id=actor.id,subject_id=target.id,reason=body.reason,after={'master_network':settings.master_network,'follower_network':settings.follower_network})
     await db.commit(); return {'ok':True}
 
 
@@ -81,7 +89,6 @@ async def resume_user(user_id: uuid.UUID, body: AdminAction, actor: User = Depen
 async def queue_reconcile(user_id: uuid.UUID, body: AdminReconcile, actor: User = Depends(admin), db: AsyncSession = Depends(get_db)):
     target=await db.get(User,user_id)
     if not target: raise HTTPException(404,'User not found')
-    # Reconciler detects this flag and performs a full state read.
     db.add(CopyJob(user_id=target.id,asset='__RECONCILE__',origin='ADMIN_RECONCILE',state='QUEUED',correlation_id=uuid.uuid4().hex,context={'reason':body.reason}))
     await audit(db,action='ADMIN_RECONCILE_REQUESTED',actor_id=actor.id,subject_id=target.id,reason=body.reason); await db.commit(); return {'queued':True}
 
@@ -107,7 +114,9 @@ async def emergency(body: AdminAction, actor: User = Depends(superadmin), db: As
 @router.post('/system/live-trading', dependencies=[Depends(require_csrf)])
 async def live_trading(body: AdminAction, actor: User = Depends(superadmin), db: AsyncSession = Depends(get_db)):
     if body.confirmation != 'ENABLE MAINNET': raise HTTPException(422,'Confirmation must be ENABLE MAINNET')
-    if settings.HYPERLIQUID_NETWORK != 'mainnet' or not settings.ENABLE_LIVE_TRADING: raise HTTPException(409,'Environment gates 1/2 are not enabled')
+    # The dangerous network is the one on which HyperCopy signs follower orders,
+    # not a read-only mainnet master source.
+    if settings.follower_network != 'mainnet' or not settings.ENABLE_LIVE_TRADING: raise HTTPException(409,'Environment gates 1/2 are not enabled')
     await _flag(db,'live_trading',True,actor,body.reason); return {'ok':True}
 
 
