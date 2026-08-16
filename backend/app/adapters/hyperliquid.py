@@ -158,21 +158,43 @@ class HyperliquidAdapter:
         return parse_order_response(response)
 
     async def master_fills(self, address: str, stop_event: asyncio.Event) -> AsyncIterator[dict]:
-        """Consume one WebSocket session.
+        """Consume one WebSocket session with Hyperliquid application heartbeats.
 
-        On disconnect we deliberately return control to the watcher instead of
-        reconnecting inside the adapter. The watcher then replays durable fills
-        by time before opening the next realtime session, closing the gap that a
-        transparent reconnect could otherwise hide.
+        Hyperliquid closes a websocket when it has not sent a message for 60s.
+        Quiet user-specific feeds therefore require the documented JSON
+        ``{"method":"ping"}`` heartbeat. Protocol-level websocket pings alone do
+        not satisfy that application-level requirement. On a real disconnect we
+        return control to the watcher so it replays durable fills before the next
+        realtime session.
         """
         try:
-            async with websockets.connect(settings.hyperliquid_ws_url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
-                await ws.send(json.dumps({'method': 'subscribe', 'subscription': {'type': 'userFills', 'user': address}}))
+            async with websockets.connect(
+                settings.hyperliquid_ws_url,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=5,
+            ) as ws:
+                await ws.send(json.dumps({
+                    'method': 'subscribe',
+                    'subscription': {'type': 'userFills', 'user': address},
+                }))
                 while not stop_event.is_set():
-                    raw = await asyncio.wait_for(ws.recv(), timeout=45)
-                    message = json.loads(raw)
-                    if message.get('channel') != 'userFills':
+                    try:
+                        # Heartbeat before Hyperliquid's documented 60s idle
+                        # threshold. recv() cancellation is safe in websockets;
+                        # no application message is lost by this timeout.
+                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                    except TimeoutError:
+                        await ws.send(json.dumps({'method': 'ping'}))
                         continue
+
+                    message = json.loads(raw)
+                    channel = message.get('channel')
+                    if channel in {'pong', 'subscriptionResponse'}:
+                        continue
+                    if channel != 'userFills':
+                        continue
+
                     data = message.get('data', {})
                     fills = data.get('fills', []) if isinstance(data, dict) else []
                     for fill in fills:
