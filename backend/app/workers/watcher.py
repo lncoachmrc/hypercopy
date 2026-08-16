@@ -108,13 +108,19 @@ class Watcher:
     async def run_leader(self):
         await self.lease.start_renewal()
         try:
-            # Replay *before every WebSocket session*. Any disconnect bubbles
-            # out of the adapter, releases the leader cycle, and forces another
-            # replay before realtime consumption resumes.
-            await self.replay()
-            async for fill in self.hl.master_fills(settings.HYPERLIQUID_MASTER_ADDRESS,stop):
-                if self.lease.lost.is_set(): break
-                await self.process_fill(fill)
+            # Keep the authoritative PG lease across normal exchange-side
+            # websocket rotations. Before each new realtime session, replay from
+            # the durable checkpoint so any fills that landed during the tiny
+            # reconnect gap are recovered exactly once.
+            while not stop.is_set() and not self.lease.lost.is_set():
+                await self.replay()
+                async for fill in self.hl.master_fills(settings.HYPERLIQUID_MASTER_ADDRESS,stop):
+                    if self.lease.lost.is_set() or stop.is_set():
+                        break
+                    await self.process_fill(fill)
+                if not stop.is_set() and not self.lease.lost.is_set():
+                    log.info('Master websocket session rotated; replaying before reconnect')
+                    await asyncio.sleep(0.5)
         finally:
             await self.lease.stop_renewal(); await self.lease.release()
 
