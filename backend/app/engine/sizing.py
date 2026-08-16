@@ -39,11 +39,11 @@ PERP_MAX_PRICE_DECIMALS = 6
 class OrderIntent(str, Enum):
     """What a delta means in terms of exposure, not direction."""
 
-    OPEN = "open"          # increases exposure in the master's direction
-    REDUCE = "reduce"      # decreases exposure, reduce-only
-    CLOSE = "close"        # takes the position to exactly zero
-    REVERSE = "reverse"    # crosses zero: must be split into two orders
-    NONE = "none"          # already on target
+    OPEN = "open"
+    REDUCE = "reduce"
+    CLOSE = "close"
+    REVERSE = "reverse"
+    NONE = "none"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +61,7 @@ class MasterExposure:
     """The master's committed exposure on one asset, at a point in time."""
 
     asset: str
-    position_size: Decimal        # signed: positive long, negative short
+    position_size: Decimal
     mark_price: Decimal
     eligible_equity: Decimal
 
@@ -71,11 +71,7 @@ class MasterExposure:
 
     @property
     def exposure_ratio(self) -> Decimal:
-        """Fraction of the master's account committed to this asset.
-
-        This is the quantity that travels to followers. Nobody's exposure
-        depends on how large the master's account happens to be.
-        """
+        """Signed fraction of master equity committed to this asset."""
         if self.eligible_equity <= 0:
             return Decimal(0)
         signed = Decimal(1) if self.position_size >= 0 else Decimal(-1)
@@ -89,17 +85,11 @@ class FollowerState:
     user_id: str
     account_value: Decimal
     margin_used_unmanaged: Decimal = Decimal(0)
-    current_size: Decimal = Decimal(0)     # signed, this asset
+    current_size: Decimal = Decimal(0)
     multiplier: Decimal = Decimal(1)
 
     @property
     def eligible_equity(self) -> Decimal:
-        """Account value minus margin locked in positions we do not manage.
-
-        A follower holding half their account in a hand-opened trade does not
-        want that half in the denominator. Using raw accountValue would size
-        every copied trade against capital that is not actually available.
-        """
         return max(self.account_value - self.margin_used_unmanaged, Decimal(0))
 
 
@@ -110,12 +100,11 @@ class SizingResult:
     target_size: Decimal
     current_size: Decimal
     delta: Decimal
-    order_size: Decimal            # rounded, absolute
+    order_size: Decimal
     is_buy: bool
     reduce_only: bool
     notional: Decimal
     reason: str | None = None
-    # A reversal needs two orders; the second is described here.
     secondary: "SizingResult | None" = None
     notes: list[str] = field(default_factory=list)
 
@@ -125,18 +114,13 @@ class SizingResult:
 
 
 def round_size(size: Decimal, sz_decimals: int) -> Decimal:
-    """Truncate toward zero to the asset's precision.
-
-    Rounding *down* rather than to nearest is a safety property: rounding up on
-    a close could push past the position and leave the follower holding
-    unintended opposite exposure.
-    """
+    """Truncate toward zero so a close never overshoots into opposite exposure."""
     quantum = Decimal(1).scaleb(-sz_decimals)
     return abs(size).quantize(quantum, rounding=ROUND_DOWN)
 
 
 def round_price(price: Decimal, sz_decimals: int) -> Decimal:
-    """Apply Hyperliquid's tick rules so the order is not rejected on format."""
+    """Apply Hyperliquid's perp price-format rules."""
     if price <= 0:
         return price
     max_places = max(PERP_MAX_PRICE_DECIMALS - sz_decimals, 0)
@@ -149,29 +133,29 @@ def round_price(price: Decimal, sz_decimals: int) -> Decimal:
 def compute_target(
     master: MasterExposure,
     follower: FollowerState,
+    follower_mark_price: Decimal | None = None,
 ) -> Decimal:
-    """Signed position size the follower should hold on this asset.
+    """Signed follower size that reproduces the master's exposure ratio.
 
-        target_notional = exposure_ratio x eligible_equity x multiplier
-        target_size     = target_notional / mark_price
+    The master mark measures the master's notional/equity ratio. The follower
+    mark converts that target notional into follower units. They are usually
+    almost identical, but must be distinct when source and destination are on
+    different Hyperliquid networks (for example mainnet master -> testnet follower).
     """
-    if master.mark_price <= 0 or follower.eligible_equity <= 0:
+    follower_mark = follower_mark_price if follower_mark_price is not None else master.mark_price
+    if master.mark_price <= 0 or follower_mark <= 0 or follower.eligible_equity <= 0:
         return Decimal(0)
-    target_notional = (
-        master.exposure_ratio * follower.eligible_equity * follower.multiplier
-    )
-    return target_notional / master.mark_price
+    target_notional = master.exposure_ratio * follower.eligible_equity * follower.multiplier
+    return target_notional / follower_mark
 
 
 def classify(target: Decimal, current: Decimal) -> OrderIntent:
-    """Decide what kind of move the delta represents."""
     if target == current:
         return OrderIntent.NONE
     if current == 0:
         return OrderIntent.OPEN
     if target == 0:
         return OrderIntent.CLOSE
-    # Sign change means the order would have to cross zero.
     if (target > 0) != (current > 0):
         return OrderIntent.REVERSE
     return OrderIntent.OPEN if abs(target) > abs(current) else OrderIntent.REDUCE
@@ -183,19 +167,14 @@ def plan(
     spec: AssetSpec,
     *,
     min_notional: Decimal = EXCHANGE_MIN_NOTIONAL,
+    follower_mark_price: Decimal | None = None,
 ) -> SizingResult:
-    """Turn master exposure and follower state into an executable order plan.
-
-    A delta below the exchange minimum is reported as NONE but the target is
-    left untouched, so the shortfall accumulates and clears on a later event.
-    Discarding it would reintroduce exactly the drift this module exists to
-    remove.
-    """
-    target = compute_target(master, follower)
+    """Turn master exposure and follower state into an executable order plan."""
+    price = follower_mark_price if follower_mark_price is not None else master.mark_price
+    target = compute_target(master, follower, price)
     current = follower.current_size
     delta = target - current
     intent = classify(target, current)
-    price = master.mark_price
 
     if intent is OrderIntent.NONE:
         return SizingResult(
@@ -212,14 +191,12 @@ def plan(
         )
 
     if intent is OrderIntent.REVERSE:
-        return _plan_reversal(master, follower, spec, target, current, min_notional)
+        return _plan_reversal(master, follower, spec, target, current, min_notional, price)
 
     order_size = round_size(delta, spec.sz_decimals)
     notional = order_size * price
     reduce_only = intent in (OrderIntent.REDUCE, OrderIntent.CLOSE)
 
-    # Never sell more than is held. Guards against a stale ledger producing a
-    # reduce-only order the exchange would reject outright.
     if reduce_only and order_size > abs(current):
         order_size = round_size(abs(current), spec.sz_decimals)
         notional = order_size * price
@@ -264,15 +241,9 @@ def _plan_reversal(
     target: Decimal,
     current: Decimal,
     min_notional: Decimal,
+    price: Decimal,
 ) -> SizingResult:
-    """Split a sign change into close-then-open.
-
-    A single order crossing zero is unsafe in both available forms: marked
-    reduce-only the exchange rejects the portion beyond flat, and not marked
-    reduce-only a partial fill can leave unintended exposure on the far side.
-    Two orders cost roughly 200ms more and cannot do either.
-    """
-    price = master.mark_price
+    """Split a sign change into close-then-open using the follower market price."""
     close_size = round_size(abs(current), spec.sz_decimals)
     open_size = round_size(abs(target), spec.sz_decimals)
     floor = max(min_notional, EXCHANGE_MIN_NOTIONAL)
@@ -283,7 +254,7 @@ def _plan_reversal(
             asset=master.asset,
             intent=OrderIntent.OPEN,
             target_size=target,
-            current_size=Decimal(0),      # by the time it runs, we are flat
+            current_size=Decimal(0),
             delta=target,
             order_size=open_size,
             is_buy=target > 0,
@@ -299,7 +270,7 @@ def _plan_reversal(
         current_size=current,
         delta=target - current,
         order_size=close_size,
-        is_buy=current < 0,               # buy to close a short
+        is_buy=current < 0,
         reduce_only=True,
         notional=close_size * price,
         secondary=secondary,
