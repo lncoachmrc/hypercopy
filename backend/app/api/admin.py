@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.hyperliquid import HyperliquidAdapter
-from app.adapters.ratelimit import Budget, WeightedRateLimiter
+from app.adapters.ratelimit import Budget, Priority, WeightedRateLimiter
 from app.api.deps import require_csrf, require_role
 from app.core.config import settings
 from app.db.redis import redis_client
@@ -24,6 +25,11 @@ admin = require_role(Role.ADMIN, Role.SUPERADMIN)
 superadmin = require_role(Role.SUPERADMIN)
 
 
+def _master_adapter() -> HyperliquidAdapter:
+    limiter = WeightedRateLimiter(redis_client(), Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN))
+    return HyperliquidAdapter(limiter, network=settings.master_network)
+
+
 @router.get('/system')
 async def system(user: User = Depends(admin), db: AsyncSession = Depends(get_db)):
     limiter = WeightedRateLimiter(redis_client(), Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN))
@@ -35,6 +41,45 @@ async def system(user: User = Depends(admin), db: AsyncSession = Depends(get_db)
     data['master_network'] = settings.master_network
     data['follower_network'] = settings.follower_network
     return data
+
+
+@router.get('/master-state')
+async def master_state(user: User = Depends(admin)):
+    """Read the configured master directly from Hyperliquid on demand.
+
+    This endpoint is intentionally not folded into /admin/system because the
+    Control Room polls /system every 10 seconds. Exchange state should be read
+    only when an operator explicitly asks for it, preserving the shared API
+    rate budget.
+    """
+    if not settings.HYPERLIQUID_MASTER_ADDRESS:
+        raise HTTPException(409, 'HYPERLIQUID_MASTER_ADDRESS is not configured')
+    hl = _master_adapter()
+    try:
+        snapshot = await hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
+        positions = []
+        for row in snapshot.perp_state.get('assetPositions', []):
+            position = row.get('position', row)
+            size = Decimal(str(position.get('szi', '0') or '0'))
+            if size == 0:
+                continue
+            positions.append({
+                'asset': str(position.get('coin') or ''),
+                'size': str(size),
+                'unrealized_pnl': str(position.get('unrealizedPnl') or '0'),
+            })
+        positions.sort(key=lambda x: x['asset'])
+        return {
+            'network': settings.master_network,
+            'address': settings.HYPERLIQUID_MASTER_ADDRESS,
+            'account_mode': snapshot.abstraction,
+            'equity': str(snapshot.account_value),
+            'free_margin': str(snapshot.free_margin),
+            'open_positions': len(positions),
+            'positions': positions,
+        }
+    except Exception as exc:
+        raise HTTPException(502, f'Master state read failed: {type(exc).__name__}: {exc}') from exc
 
 
 @router.get('/users')
@@ -114,8 +159,6 @@ async def emergency(body: AdminAction, actor: User = Depends(superadmin), db: As
 @router.post('/system/live-trading', dependencies=[Depends(require_csrf)])
 async def live_trading(body: AdminAction, actor: User = Depends(superadmin), db: AsyncSession = Depends(get_db)):
     if body.confirmation != 'ENABLE MAINNET': raise HTTPException(422,'Confirmation must be ENABLE MAINNET')
-    # The dangerous network is the one on which HyperCopy signs follower orders,
-    # not a read-only mainnet master source.
     if settings.follower_network != 'mainnet' or not settings.ENABLE_LIVE_TRADING: raise HTTPException(409,'Environment gates 1/2 are not enabled')
     await _flag(db,'live_trading',True,actor,body.reason); return {'ok':True}
 
