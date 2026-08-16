@@ -141,8 +141,6 @@ async def reconcile_user(
         ledger_rows = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user.id))).scalars().all()
         ledger_by_asset = {x.asset: x for x in ledger_rows}
 
-        # Calculate unmanaged margin before target sizing so follower eligible
-        # equity is the same in reconciliation and execution.
         unmanaged_margin = Decimal(0)
         for row in real_state.get('assetPositions', []):
             pos = row.get('position', row)
@@ -176,14 +174,12 @@ async def reconcile_user(
                 ledger.managed = True
 
             before = ledger.size
+            previous_target = ledger.target_size
             ledger.size = real
             ledger.mark_price = follower_mark
             ledger.exchange_verified_at = datetime.now(UTC)
             if before != real:
                 discrepancies.append({'asset': asset, 'ledger': str(before), 'real': str(real)})
-
-            if not create_jobs or user.copy_state == CopyState.PAUSED or asset in unresolved_assets:
-                continue
 
             master_pos = master_positions.get(asset, Decimal(0))
             master_mark = Decimal(str(source_mids.get(asset, '0') or '0'))
@@ -195,16 +191,22 @@ async def reconcile_user(
                     follower_mark,
                 )
 
-            # In SHADOW, current exchange size intentionally remains zero, so
-            # comparing desired target with real size would recreate the same
-            # job every minute. Compare against the last calculated target.
-            # In ACTIVE, compare desired target against the real exchange size.
-            basis = ledger.target_size if user.copy_state == CopyState.SHADOW else real
+            # Target is a desired state, not an order. Persist it even when the
+            # delta is too small to execute, so the Dashboard can distinguish
+            # a theoretical target from an actionable order.
+            ledger.target_size = desired_target
+
+            if not create_jobs or user.copy_state == CopyState.PAUSED or asset in unresolved_assets:
+                continue
+
+            # In SHADOW compare against the previously published theoretical
+            # target, otherwise every reconciliation would recreate the same
+            # job. ACTIVE compares against the real exchange position.
+            basis = previous_target if user.copy_state == CopyState.SHADOW else real
             drift_notional = abs(desired_target - basis) * follower_mark if follower_mark > 0 else Decimal(0)
             if drift_notional < min_notional:
                 continue
 
-            # Respect unmanaged/manual positions when the master has no exposure.
             if master_pos == 0 and real != 0 and not ledger.managed and user.manual_trade_policy.value != 'STRICT':
                 continue
 
