@@ -26,8 +26,16 @@ from app.services.reconcile import master_snapshot, reconcile_user
 router = APIRouter(tags=['user'])
 
 
-def _hl() -> HyperliquidAdapter:
-    return HyperliquidAdapter(WeightedRateLimiter(redis_client(), Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN)))
+def _limiter() -> WeightedRateLimiter:
+    return WeightedRateLimiter(redis_client(), Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN))
+
+
+def _follower_hl() -> HyperliquidAdapter:
+    return HyperliquidAdapter(_limiter(), network=settings.follower_network)
+
+
+def _master_hl() -> HyperliquidAdapter:
+    return HyperliquidAdapter(_limiter(), network=settings.master_network)
 
 
 async def _serialize_user(db: AsyncSession, user: User) -> dict:
@@ -41,7 +49,17 @@ async def _serialize_user(db: AsyncSession, user: User) -> dict:
         'copy_state': user.copy_state.value, 'manual_trade_policy': user.manual_trade_policy.value,
         'display_name': user.display_name, 'email': user.email, 'shadow_started_at': user.shadow_started_at,
         'risk_state': rs.state.value if rs else RiskHalt.NORMAL.value,
-        'trading_account': None if not account else {'account_address': account.account_address, 'agent_address': account.agent_address, 'agent_name': account.agent_name, 'verified_at': account.verified_at, 'credential_status': cred.status.value if cred else None, 'expires_at': cred.expires_at if cred else None},
+        'master_network': settings.master_network,
+        'follower_network': settings.follower_network,
+        'trading_account': None if not account else {
+            'account_address': account.account_address,
+            'network': settings.follower_network,
+            'agent_address': account.agent_address,
+            'agent_name': account.agent_name,
+            'verified_at': account.verified_at,
+            'credential_status': cred.status.value if cred else None,
+            'expires_at': cred.expires_at if cred else None,
+        },
     }
 
 
@@ -72,13 +90,18 @@ async def executions(user: User = Depends(current_user), db: AsyncSession = Depe
 
 @router.post('/trading-account', dependencies=[Depends(require_csrf)])
 async def link_trading_account(body: TradingAccountIn, request: Request, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    # Product invariant: the Web3 wallet that authenticated the user is the
-    # Hyperliquid follower account.  Users cannot redirect execution to a
-    # different account by supplying another address in this request.
+    # Product invariant: the authenticated Web3 wallet is the follower account.
+    # The same EVM address may be the master only when source and destination
+    # are different Hyperliquid networks. Identity is (network, address).
     account_address = normalize_address(user.auth_wallet)
     master_address = normalize_address(settings.HYPERLIQUID_MASTER_ADDRESS) if settings.HYPERLIQUID_MASTER_ADDRESS else ''
-    if master_address and account_address == master_address:
-        raise HTTPException(422, 'The master Hyperliquid account cannot also be linked as a follower account')
+    same_principal = (
+        settings.master_network == settings.follower_network
+        and master_address
+        and account_address == master_address
+    )
+    if same_principal:
+        raise HTTPException(422, 'The master Hyperliquid account cannot also be a follower on the same network')
 
     expected_agent_address = None
     if body.agent_address:
@@ -88,7 +111,7 @@ async def link_trading_account(body: TradingAccountIn, request: Request, user: U
             raise HTTPException(422, 'Invalid API Wallet address') from exc
 
     try:
-        verification = await _hl().verify_agent(
+        verification = await _follower_hl().verify_agent(
             account_address,
             body.agent_private_key,
             expected_agent_address=expected_agent_address,
@@ -113,7 +136,7 @@ async def link_trading_account(body: TradingAccountIn, request: Request, user: U
     blob = crypto.encrypt(body.agent_private_key, user_id=str(user.id), account_id=str(account.id))
     expires = datetime.fromtimestamp(verification.valid_until/1000, UTC) if verification.valid_until else None
     db.add(SigningCredential(trading_account_id=account.id, ciphertext_b64=blob.ciphertext_b64, nonce_b64=blob.nonce_b64, wrapped_dek_b64=blob.wrapped_dek_b64, wrap_nonce_b64=blob.wrap_nonce_b64, key_provider=blob.key_provider, key_reference=blob.key_reference, key_version=blob.key_version, agent_fingerprint=hashlib.sha256(verification.agent_address.encode()).hexdigest(), expires_at=expires, status=CredentialStatus.ACTIVE))
-    await audit(db, action='TRADING_ACCOUNT_LINKED', actor_id=user.id, subject_id=user.id, ip_hash=hash_ip(request.client.host if request.client else None), after={'account': account_address[:8]+'…', 'agent': verification.agent_address[:8]+'…', 'expires_at': expires.isoformat() if expires else None})
+    await audit(db, action='TRADING_ACCOUNT_LINKED', actor_id=user.id, subject_id=user.id, ip_hash=hash_ip(request.client.host if request.client else None), after={'account': account_address[:8]+'…', 'agent': verification.agent_address[:8]+'…', 'network': settings.follower_network, 'expires_at': expires.isoformat() if expires else None})
     await db.commit(); return await _serialize_user(db, user)
 
 
@@ -164,17 +187,20 @@ async def resume(user: User = Depends(current_user), db: AsyncSession = Depends(
     if rs and rs.state != RiskHalt.NORMAL: raise HTTPException(409, f'Cannot resume while {rs.state.value} is active')
     account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
     if not account: raise HTTPException(409, 'Connect a Hyperliquid trading account first')
-    # Reconcile against the exchange before enabling new exposure. While the
-    # user is still PAUSED/SHADOW, any reduction jobs are safe and openings are
-    # not allowed until this transaction flips the state to ACTIVE.
     try:
-        hl = _hl()
-        mp, meq, mids = await master_snapshot(hl)
-        await reconcile_user(db, hl, user, master_positions=mp, master_equity=meq, mids=mids)
+        master_hl = _master_hl()
+        follower_hl = _follower_hl()
+        mp, meq, master_mids = await master_snapshot(master_hl)
+        follower_mids = master_mids if settings.master_network == settings.follower_network else await follower_hl.mids()
+        await reconcile_user(
+            db, follower_hl, user,
+            master_positions=mp, master_equity=meq,
+            mids=follower_mids, master_mids=master_mids,
+        )
     except Exception as exc:
         raise HTTPException(503, 'Reconciliation must succeed before copytrading can resume') from exc
     user.copy_state = CopyState.ACTIVE
-    await audit(db, action='COPY_RESUMED', actor_id=user.id, subject_id=user.id)
+    await audit(db, action='COPY_RESUMED', actor_id=user.id, subject_id=user.id, after={'master_network': settings.master_network, 'follower_network': settings.follower_network})
     await db.commit()
     return await _serialize_user(db, user)
 
@@ -184,5 +210,5 @@ async def close_positions(body: ClosePositionsIn, user: User = Depends(current_u
     rows = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user.id, PositionLedger.managed.is_(True), PositionLedger.size != 0))).scalars().all()
     count = 0
     for row in rows:
-        db.add(CopyJob(user_id=user.id, asset=row.asset, origin='CLOSE_ALL', state='QUEUED', correlation_id=__import__('uuid').uuid4().hex, context={'master_position': '0', 'master_equity': '1', 'mark_price': '0'})); count += 1
+        db.add(CopyJob(user_id=user.id, asset=row.asset, origin='CLOSE_ALL', state='QUEUED', correlation_id=__import__('uuid').uuid4().hex, context={'master_position': '0', 'master_equity': '1', 'master_mark_price': '0', 'mark_price': '0'})); count += 1
     await audit(db, action='CLOSE_POSITIONS_REQUESTED', actor_id=user.id, subject_id=user.id, reason=body.reason, after={'jobs': count}); await db.commit(); return {'queued': count}
