@@ -41,7 +41,6 @@ async def challenge(body: ChallengeIn, request: Request, db: AsyncSession = Depe
 async def verify(body: VerifyIn, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     await scoped_rate_limit(request, 'auth-verify', 20, 300)
     address = normalize_address(body.address)
-    # Find latest unconsumed nonce for this address in PG, then atomically GETDEL Redis.
     nonce_row = (await db.execute(select(AuthNonce).where(AuthNonce.address == address, AuthNonce.consumed_at.is_(None), AuthNonce.expires_at > datetime.now(UTC)).order_by(AuthNonce.created_at.desc()).limit(1))).scalar_one_or_none()
     if not nonce_row:
         raise HTTPException(401, 'Challenge expired or already used')
@@ -68,8 +67,9 @@ async def verify(body: VerifyIn, request: Request, response: Response, db: Async
 
     token, csrf = create_session_token(str(user.id), user.auth_wallet, user.role.value)
     secure = settings.APP_ENV != 'development'
-    response.set_cookie(settings.SESSION_COOKIE_NAME, token, max_age=settings.SESSION_TTL_SECONDS, httponly=True, secure=secure, samesite='lax', path='/')
-    response.set_cookie(settings.CSRF_COOKIE_NAME, csrf, max_age=settings.SESSION_TTL_SECONDS, httponly=False, secure=secure, samesite='lax', path='/')
+    cookie_samesite = 'lax' if settings.APP_ENV == 'development' else 'none'
+    response.set_cookie(settings.SESSION_COOKIE_NAME, token, max_age=settings.SESSION_TTL_SECONDS, httponly=True, secure=secure, samesite=cookie_samesite, path='/')
+    response.set_cookie(settings.CSRF_COOKIE_NAME, csrf, max_age=settings.SESSION_TTL_SECONDS, httponly=False, secure=secure, samesite=cookie_samesite, path='/')
     ent = await entitlement(db, user)
     return SessionOut(user=SessionUser(id=str(user.id), auth_wallet=user.auth_wallet, role=user.role.value, state=user.state.value, copy_state=user.copy_state.value), entitlements=ent, csrf_token=csrf)
 
@@ -78,8 +78,10 @@ async def verify(body: VerifyIn, request: Request, response: Response, db: Async
 async def logout(response: Response, claims: dict = Depends(session_claims)):
     ttl = max(int(claims.get('exp', 0) - datetime.now(UTC).timestamp()), 1)
     await redis_client().setex(f"session:deny:{claims.get('jti','')}", ttl, '1')
-    response.delete_cookie(settings.SESSION_COOKIE_NAME, path='/')
-    response.delete_cookie(settings.CSRF_COOKIE_NAME, path='/')
+    secure = settings.APP_ENV != 'development'
+    cookie_samesite = 'lax' if settings.APP_ENV == 'development' else 'none'
+    response.delete_cookie(settings.SESSION_COOKIE_NAME, path='/', secure=secure, httponly=True, samesite=cookie_samesite)
+    response.delete_cookie(settings.CSRF_COOKIE_NAME, path='/', secure=secure, httponly=False, samesite=cookie_samesite)
 
 
 @router.get('/session', response_model=SessionOut)
