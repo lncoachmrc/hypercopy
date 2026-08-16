@@ -18,7 +18,11 @@ class UserOut(BaseModel):
 
 
 class TradingAccountIn(BaseModel):
-    account_address: str
+    # The follower account is always the authenticated Web3 wallet.  During the
+    # frontend rollout we still accept the legacy account_address field, but the
+    # API never trusts or uses it to choose a different trading account.
+    agent_address: str | None = None
+    account_address: str | None = None
     agent_private_key: str = Field(min_length=32, max_length=100)
 
 
