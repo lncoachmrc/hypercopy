@@ -17,8 +17,17 @@ def test_parse_filled_order_response():
 
 
 def test_parse_rejection():
-    r=parse_order_response({'response':{'data':{'statuses':[{'error':'Insufficient margin'}]}}})
+    r=parse_order_response({'response':{'data':{'statuses':[{'error':'Insufficient margin'}]}})
     assert r.state=='REJECTED'
+
+
+def test_adapter_selects_network_specific_endpoints():
+    main = HyperliquidAdapter(None, network='mainnet')
+    test = HyperliquidAdapter(None, network='testnet')
+    assert main.api_url == 'https://api.hyperliquid.xyz'
+    assert main.ws_url == 'wss://api.hyperliquid.xyz/ws'
+    assert test.api_url == 'https://api.hyperliquid-testnet.xyz'
+    assert test.ws_url == 'wss://api.hyperliquid-testnet.xyz/ws'
 
 
 @pytest.mark.asyncio
@@ -26,6 +35,6 @@ async def test_verify_agent_rejects_declared_address_key_mismatch():
     main = Account.create()
     agent = Account.create()
     wrong_agent = Account.create()
-    adapter = HyperliquidAdapter(None)  # mismatch is rejected before any network/rate-limit call
+    adapter = HyperliquidAdapter(None)
     with pytest.raises(ValueError, match='does not match'):
         await adapter.verify_agent(main.address, agent.key.hex(), wrong_agent.address)
