@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.adapters.hyperliquid import HyperliquidAdapter, fill_event_id
+from app.adapters.hyperliquid import HyperliquidAdapter, PositionConfig, fill_event_id, position_configs
 from app.adapters.ratelimit import Priority
 from app.core.config import settings
 from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, FollowerState, MasterExposure, compute_target
@@ -77,10 +77,12 @@ async def reconcile_user(
     master_equity: Decimal,
     mids: dict[str, str],
     master_mids: dict[str, str] | None = None,
+    master_configs: dict[str, PositionConfig] | None = None,
     create_jobs: bool = True,
 ) -> dict:
     follower_mids = mids
     source_mids = master_mids or mids
+    source_configs = master_configs or {}
     run = ReconciliationRun(user_id=user.id, before={}, after={})
     db.add(run); await db.flush()
     try:
@@ -93,6 +95,7 @@ async def reconcile_user(
         equity = snapshot.account_value
         free_margin = snapshot.free_margin
         account_mode = snapshot.abstraction
+        follower_configs = position_configs(real_state)
 
         try:
             synced_fills = await _sync_missing_fills(db, hl, user, account.account_address)
@@ -190,21 +193,34 @@ async def reconcile_user(
                     FollowerState(str(user.id), equity, unmanaged_margin, real, multiplier),
                     follower_mark,
                 )
-
-            # Target is a desired state, not an order. Persist it even when the
-            # delta is too small to execute, so the Dashboard can distinguish
-            # a theoretical target from an actionable order.
             ledger.target_size = desired_target
 
             if not create_jobs or user.copy_state == CopyState.PAUSED or asset in unresolved_assets:
                 continue
 
-            # In SHADOW compare against the previously published theoretical
-            # target, otherwise every reconciliation would recreate the same
-            # job. ACTIVE compares against the real exchange position.
+            allowed_asset = bool(risk) and (not risk.allow_assets or asset in risk.allow_assets) and asset not in risk.block_assets
+            master_config = source_configs.get(asset)
+            desired_leverage = None
+            desired_is_cross = None
+            leverage_mismatch = False
+            if user.copy_state == CopyState.ACTIVE and master_pos != 0 and master_config and risk and allowed_asset:
+                try:
+                    spec = await hl.asset_spec(asset)
+                    desired_leverage = max(1, min(master_config.leverage, int(risk.max_leverage), spec.max_leverage))
+                    desired_is_cross = bool(master_config.is_cross and not spec.only_isolated)
+                    follower_config = follower_configs.get(asset)
+                    leverage_mismatch = real != 0 and (
+                        follower_config is None
+                        or follower_config.leverage != desired_leverage
+                        or follower_config.is_cross != desired_is_cross
+                    )
+                except Exception:
+                    desired_leverage = None
+                    desired_is_cross = None
+
             basis = previous_target if user.copy_state == CopyState.SHADOW else real
             drift_notional = abs(desired_target - basis) * follower_mark if follower_mark > 0 else Decimal(0)
-            if drift_notional < min_notional:
+            if drift_notional < min_notional and not leverage_mismatch:
                 continue
 
             if master_pos == 0 and real != 0 and not ledger.managed and user.manual_trade_policy.value != 'STRICT':
@@ -219,20 +235,29 @@ async def reconcile_user(
             if pending:
                 continue
 
+            context = {
+                'master_position': str(master_pos),
+                'master_equity': str(master_equity),
+                'master_mark_price': str(master_mark),
+                'mark_price': str(master_mark),
+                'master_network': settings.master_network,
+                'follower_network': settings.follower_network,
+            }
+            if master_config is not None:
+                context['master_leverage'] = master_config.leverage
+                context['master_is_cross'] = master_config.is_cross
+            if desired_leverage is not None:
+                context['desired_follower_leverage'] = desired_leverage
+                context['desired_follower_is_cross'] = desired_is_cross
+                context['leverage_sync_only'] = bool(leverage_mismatch and drift_notional < min_notional)
+
             db.add(CopyJob(
                 user_id=user.id,
                 asset=asset,
                 origin='RECONCILE',
                 state=JobState.QUEUED,
                 correlation_id=uuid.uuid4().hex,
-                context={
-                    'master_position': str(master_pos),
-                    'master_equity': str(master_equity),
-                    'master_mark_price': str(master_mark),
-                    'mark_price': str(master_mark),
-                    'master_network': settings.master_network,
-                    'follower_network': settings.follower_network,
-                },
+                context=context,
             ))
 
         db.add(EquitySnapshot(user_id=user.id, account_value=equity, free_margin=free_margin, unmanaged_margin=unmanaged_margin, taken_at=datetime.now(UTC)))
@@ -253,7 +278,11 @@ async def reconcile_active_users(
     master_hl: HyperliquidAdapter | None = None,
 ) -> int:
     source_hl = master_hl or hl
-    mp, me, source_mids = await master_snapshot(source_hl)
+    source_snapshot = await source_hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
+    mp = _positions(source_snapshot.perp_state)
+    me = source_snapshot.account_value
+    source_mids = await source_hl.mids()
+    source_configs = position_configs(source_snapshot.perp_state)
     follower_mids = source_mids if source_hl is hl else await hl.mids()
     query = select(User).join(TradingAccount, TradingAccount.user_id == User.id).where(
         User.state == UserState.ACTIVE,
@@ -263,5 +292,12 @@ async def reconcile_active_users(
         query = query.limit(limit)
     users = (await db.execute(query)).scalars().all()
     for user in users:
-        await reconcile_user(db, hl, user, master_positions=mp, master_equity=me, mids=follower_mids, master_mids=source_mids)
+        await reconcile_user(
+            db, hl, user,
+            master_positions=mp,
+            master_equity=me,
+            mids=follower_mids,
+            master_mids=source_mids,
+            master_configs=source_configs,
+        )
     return len(users)
