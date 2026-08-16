@@ -23,14 +23,15 @@ def _event_time(fill: dict[str, Any]) -> datetime:
 
 async def persist_master_fill_and_jobs(
     db: AsyncSession, *, fill: dict[str, Any], master_equity: Decimal,
-    fencing_token: int, correlation_id: str,
+    fencing_token: int, correlation_id: str, source_network: str | None = None,
 ) -> tuple[MasterEvent | None, list[CopyJob]]:
     """Atomically persist the exchange fact then durable per-follower jobs."""
     lease = (await db.execute(text("SELECT fencing_token, expires_at FROM watcher_lease WHERE name='master-watcher' FOR SHARE"))).first()
     if lease is None or int(lease[0]) != fencing_token or lease[1] <= datetime.now(UTC):
         raise RuntimeError('Watcher fenced out or lease expired before master-event write')
 
-    eid = fill_event_id(fill)
+    raw_eid = fill_event_id(fill)
+    eid = f'{source_network}:{raw_eid}' if source_network else raw_eid
     existing = (await db.execute(select(MasterEvent).where(MasterEvent.exchange_event_id == eid))).scalar_one_or_none()
     if existing:
         return None, []
@@ -40,17 +41,18 @@ async def persist_master_fill_and_jobs(
     price = Decimal(str(fill['px']))
     start = Decimal(str(fill.get('startPosition', '0')))
     position_after = start + signed_fill_delta(fill)
+    raw = dict(fill)
+    if source_network:
+        raw['_hypercopy_network'] = source_network
     event = MasterEvent(
         exchange_event_id=eid, asset=asset, side=str(fill.get('side') or fill.get('dir') or ''),
         size=size, price=price, start_position=start, position_after=position_after,
-        master_equity=master_equity, event_ts=_event_time(fill), raw=fill,
+        master_equity=master_equity, event_ts=_event_time(fill), raw=raw,
         fencing_token=fencing_token,
     )
     db.add(event)
     await db.flush()
 
-    # Fan out durably to every active user with a linked trading account. Risk
-    # and entitlement gates are evaluated later, after target classification.
     eligible = (await db.execute(
         select(User.id).join(TradingAccount, TradingAccount.user_id == User.id)
         .where(User.state == UserState.ACTIVE)
@@ -66,10 +68,9 @@ async def persist_master_fill_and_jobs(
                 'master_position': str(position_after),
                 'master_equity': str(master_equity),
                 'master_mark_price': str(price),
-                # Legacy key retained so old workers can drain in-flight jobs
-                # safely during rolling deployment.
                 'mark_price': str(price),
                 'master_event_id': str(event.id),
+                'master_network': source_network,
             },
         ).on_conflict_do_nothing(constraint='uq_job_master_user').returning(CopyJob.id)
         inserted = (await db.execute(statement)).scalar_one_or_none()
