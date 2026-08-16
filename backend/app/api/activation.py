@@ -43,9 +43,9 @@ async def resume_copy_immediate(
 ):
     """Activate TESTNET copy and create current multi-asset jobs immediately.
 
-    This route intentionally precedes the legacy /copy/resume route.  It is
+    This route intentionally precedes the legacy /copy/resume route. It is
     restricted to TESTNET while the cross-network MAINNET->TESTNET pipeline is
-    being validated.  Activation preflights both exchanges, refuses to start
+    being validated. Activation preflights both exchanges, refuses to start
     with old pending jobs, and rolls back to PAUSED if the initial ACTIVE
     reconciliation cannot be completed.
     """
@@ -62,8 +62,6 @@ async def resume_copy_immediate(
     if not settings.HYPERLIQUID_MASTER_ADDRESS:
         raise HTTPException(409, 'HYPERLIQUID_MASTER_ADDRESS is not configured')
 
-    # Do not mix a fresh activation with historical work.  This keeps the
-    # transition deterministic and prevents stale SHADOW jobs from executing.
     pending = (await db.execute(select(CopyJob.id).where(
         CopyJob.user_id == user.id,
         CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),
@@ -75,7 +73,6 @@ async def resume_copy_immediate(
     master_hl = HyperliquidAdapter(limiter, network=settings.master_network)
     follower_hl = HyperliquidAdapter(limiter, network=settings.follower_network)
 
-    # Full preflight while the follower is still not ACTIVE.
     try:
         source_snapshot = await master_hl.account_snapshot(
             settings.HYPERLIQUID_MASTER_ADDRESS,
@@ -114,10 +111,7 @@ async def resume_copy_immediate(
             master_mids=master_mids,
             master_configs=master_configs,
         )
-        # reconcile_user commits the durable jobs; publish them immediately so
-        # activation does not wait for the next maintenance cycle.
-        async with db.begin():
-            published = await repair_stream(redis_client(), db)
+        published = await repair_stream(redis_client(), db)
         await audit(
             db,
             action='COPY_RESUMED',
@@ -139,8 +133,6 @@ async def resume_copy_immediate(
             'reconciliation': result,
         }
     except Exception as exc:
-        # Any jobs created by this failed activation are rendered inert before
-        # returning the follower to PAUSED.
         rows = (await db.execute(select(CopyJob).where(
             CopyJob.user_id == user.id,
             CopyJob.created_at >= activation_started,
