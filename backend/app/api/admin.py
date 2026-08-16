@@ -78,7 +78,7 @@ async def master_state(user: User = Depends(admin)):
         raise HTTPException(409, 'HYPERLIQUID_MASTER_ADDRESS is not configured')
     hl = _master_adapter()
     try:
-        snapshot = await hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
+        snapshot = await hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.DIAGNOSTIC)
         configs = position_configs(snapshot.perp_state)
         positions = []
         for row in snapshot.perp_state.get('assetPositions', []):
@@ -122,8 +122,8 @@ async def _position_config_diagnostic(db: AsyncSession, target: User, asset: str
     follower_hl = _follower_adapter()
     try:
         master_state, follower_state, spec = await asyncio.gather(
-            master_hl.user_state(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE),
-            follower_hl.user_state(account.account_address, priority=Priority.RECONCILE),
+            master_hl.user_state(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.DIAGNOSTIC),
+            follower_hl.user_state(account.account_address, priority=Priority.DIAGNOSTIC),
             follower_hl.asset_spec(asset),
         )
     except Exception as exc:
@@ -227,7 +227,7 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
         private_key = ''
 
     try:
-        follower_state = await follower_hl.user_state(account.account_address, priority=Priority.RECONCILE)
+        follower_state = await follower_hl.user_state(account.account_address, priority=Priority.DIAGNOSTIC)
         follower_cfg = position_configs(follower_state).get(asset)
     except Exception as exc:
         raise HTTPException(502, f'Leverage update sent, but verification read failed: {type(exc).__name__}: {exc}') from exc
