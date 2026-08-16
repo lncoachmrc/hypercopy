@@ -5,16 +5,20 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.adapters.hyperliquid import HyperliquidAdapter
+from app.adapters.hyperliquid import HyperliquidAdapter, position_configs
 from app.adapters.ratelimit import Budget, Priority, WeightedRateLimiter
 from app.api.deps import require_csrf, require_role
 from app.core.config import settings
+from app.core.crypto import EncryptedCredential, crypto
 from app.db.redis import redis_client
 from app.db.session import get_db
-from app.models.entities import AuditLog, CopyJob, CopyState, RiskHalt, RiskState, Role, SystemFlag, TradingAccount, User
+from app.models.entities import (
+    AuditLog, CopyJob, CopyState, CredentialStatus, RiskHalt, RiskProfile,
+    RiskState, Role, SigningCredential, SystemFlag, TradingAccount, User,
+)
 from app.schemas.admin import AdminAction, AdminReconcile
 from app.services.audit import audit
 from app.services.metrics import system_snapshot
@@ -25,14 +29,36 @@ admin = require_role(Role.ADMIN, Role.SUPERADMIN)
 superadmin = require_role(Role.SUPERADMIN)
 
 
+def _limiter() -> WeightedRateLimiter:
+    return WeightedRateLimiter(redis_client(), Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN))
+
+
 def _master_adapter() -> HyperliquidAdapter:
-    limiter = WeightedRateLimiter(redis_client(), Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN))
-    return HyperliquidAdapter(limiter, network=settings.master_network)
+    return HyperliquidAdapter(_limiter(), network=settings.master_network)
+
+
+def _follower_adapter() -> HyperliquidAdapter:
+    return HyperliquidAdapter(_limiter(), network=settings.follower_network)
+
+
+def _credential_blob(cred: SigningCredential) -> EncryptedCredential:
+    return EncryptedCredential(
+        cred.ciphertext_b64, cred.nonce_b64, cred.wrapped_dek_b64,
+        cred.wrap_nonce_b64, cred.key_provider, cred.key_reference, cred.key_version,
+    )
+
+
+def _credential_active(cred: SigningCredential | None) -> bool:
+    return bool(
+        cred
+        and cred.status in {CredentialStatus.ACTIVE, CredentialStatus.EXPIRING}
+        and (cred.expires_at is None or cred.expires_at > datetime.now(UTC))
+    )
 
 
 @router.get('/system')
 async def system(user: User = Depends(admin), db: AsyncSession = Depends(get_db)):
-    limiter = WeightedRateLimiter(redis_client(), Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN))
+    limiter = _limiter()
     try: rate = await limiter.snapshot()
     except Exception: rate = {'status':'redis_unavailable'}
     flags = (await db.execute(select(SystemFlag))).scalars().all()
@@ -45,28 +71,26 @@ async def system(user: User = Depends(admin), db: AsyncSession = Depends(get_db)
 
 @router.get('/master-state')
 async def master_state(user: User = Depends(admin)):
-    """Read the configured master directly from Hyperliquid on demand.
-
-    This endpoint is intentionally not folded into /admin/system because the
-    Control Room polls /system every 10 seconds. Exchange state should be read
-    only when an operator explicitly asks for it, preserving the shared API
-    rate budget.
-    """
     if not settings.HYPERLIQUID_MASTER_ADDRESS:
         raise HTTPException(409, 'HYPERLIQUID_MASTER_ADDRESS is not configured')
     hl = _master_adapter()
     try:
         snapshot = await hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
+        configs = position_configs(snapshot.perp_state)
         positions = []
         for row in snapshot.perp_state.get('assetPositions', []):
             position = row.get('position', row)
             size = Decimal(str(position.get('szi', '0') or '0'))
             if size == 0:
                 continue
+            asset = str(position.get('coin') or '')
+            cfg = configs.get(asset)
             positions.append({
-                'asset': str(position.get('coin') or ''),
+                'asset': asset,
                 'size': str(size),
                 'unrealized_pnl': str(position.get('unrealizedPnl') or '0'),
+                'leverage': cfg.leverage if cfg else None,
+                'margin_mode': ('cross' if cfg.is_cross else 'isolated') if cfg else None,
             })
         positions.sort(key=lambda x: x['asset'])
         return {
@@ -80,6 +104,129 @@ async def master_state(user: User = Depends(admin)):
         }
     except Exception as exc:
         raise HTTPException(502, f'Master state read failed: {type(exc).__name__}: {exc}') from exc
+
+
+async def _position_config_diagnostic(db: AsyncSession, target: User, asset: str) -> dict:
+    asset = asset.upper().strip()
+    account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == target.id))).scalar_one_or_none()
+    risk = (await db.execute(select(RiskProfile).where(RiskProfile.user_id == target.id))).scalar_one_or_none()
+    if not account or not risk:
+        raise HTTPException(409, 'Follower trading account or risk profile is missing')
+
+    master_hl = _master_adapter()
+    follower_hl = _follower_adapter()
+    master_snapshot = await master_hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
+    follower_snapshot = await follower_hl.account_snapshot(account.account_address, priority=Priority.RECONCILE)
+    master_cfg = position_configs(master_snapshot.perp_state).get(asset)
+    follower_cfg = position_configs(follower_snapshot.perp_state).get(asset)
+    if not master_cfg:
+        raise HTTPException(409, f'Master has no open {asset} position/configuration')
+    try:
+        spec = await follower_hl.asset_spec(asset)
+    except Exception as exc:
+        raise HTTPException(409, f'{asset} is unavailable on follower {settings.follower_network}: {exc}') from exc
+
+    desired_leverage = max(1, min(master_cfg.leverage, int(risk.max_leverage), spec.max_leverage))
+    desired_is_cross = bool(master_cfg.is_cross and not spec.only_isolated)
+    allowed_asset = (not risk.allow_assets or asset in risk.allow_assets) and asset not in risk.block_assets
+    latest_job = (await db.execute(
+        select(CopyJob).where(CopyJob.user_id == target.id, CopyJob.asset == asset)
+        .order_by(CopyJob.created_at.desc()).limit(1)
+    )).scalar_one_or_none()
+
+    return {
+        'user_id': str(target.id),
+        'asset': asset,
+        'copy_state': target.copy_state.value,
+        'master_network': settings.master_network,
+        'follower_network': settings.follower_network,
+        'master': {'leverage': master_cfg.leverage, 'margin_mode': 'cross' if master_cfg.is_cross else 'isolated'},
+        'follower': None if not follower_cfg else {'leverage': follower_cfg.leverage, 'margin_mode': 'cross' if follower_cfg.is_cross else 'isolated'},
+        'desired': {'leverage': desired_leverage, 'margin_mode': 'cross' if desired_is_cross else 'isolated'},
+        'allowed_asset': allowed_asset,
+        'risk_max_leverage': str(risk.max_leverage),
+        'exchange_max_leverage': spec.max_leverage,
+        'matches': bool(follower_cfg and follower_cfg.leverage == desired_leverage and follower_cfg.is_cross == desired_is_cross),
+        'latest_job': None if not latest_job else {
+            'id': str(latest_job.id),
+            'origin': latest_job.origin,
+            'state': latest_job.state.value,
+            'last_error': latest_job.last_error,
+            'created_at': latest_job.created_at,
+            'context': {
+                'master_leverage': (latest_job.context or {}).get('master_leverage'),
+                'desired_follower_leverage': (latest_job.context or {}).get('desired_follower_leverage'),
+                'leverage_sync_only': (latest_job.context or {}).get('leverage_sync_only'),
+            },
+        },
+    }
+
+
+@router.get('/users/{user_id}/position-config/{asset}')
+async def position_config_diagnostic(user_id: uuid.UUID, asset: str, actor: User = Depends(admin), db: AsyncSession = Depends(get_db)):
+    target = await db.get(User, user_id)
+    if not target:
+        raise HTTPException(404, 'User not found')
+    try:
+        return await _position_config_diagnostic(db, target, asset)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f'Position configuration read failed: {type(exc).__name__}: {exc}') from exc
+
+
+@router.post('/users/{user_id}/position-config/{asset}/sync', dependencies=[Depends(require_csrf)])
+async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction, actor: User = Depends(superadmin), db: AsyncSession = Depends(get_db)):
+    if settings.follower_network != 'testnet':
+        raise HTTPException(409, 'Direct position-config sync is restricted to TESTNET')
+    if body.confirmation != 'SYNC TESTNET LEVERAGE':
+        raise HTTPException(422, 'Confirmation must be SYNC TESTNET LEVERAGE')
+    target = await db.get(User, user_id)
+    if not target:
+        raise HTTPException(404, 'User not found')
+    if target.copy_state != CopyState.PAUSED:
+        raise HTTPException(409, 'Pause the follower before direct leverage synchronization')
+
+    asset = asset.upper().strip()
+    diagnostic = await _position_config_diagnostic(db, target, asset)
+    if not diagnostic['allowed_asset']:
+        raise HTTPException(409, f'{asset} is not permitted by the follower Risk Engine')
+    if diagnostic['matches']:
+        return {'ok': True, 'changed': False, 'verified': True, 'diagnostic': diagnostic}
+
+    account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == target.id))).scalar_one()
+    cred = (await db.execute(select(SigningCredential).where(SigningCredential.trading_account_id == account.id))).scalar_one_or_none()
+    if not _credential_active(cred):
+        raise HTTPException(409, 'Trading credential is unavailable')
+
+    desired = diagnostic['desired']
+    follower_hl = _follower_adapter()
+    private_key = crypto.decrypt(_credential_blob(cred), user_id=str(target.id), account_id=str(account.id))
+    try:
+        try:
+            response = await follower_hl.update_leverage(
+                account_address=account.account_address,
+                private_key=private_key,
+                asset=asset,
+                leverage=int(desired['leverage']),
+                is_cross=desired['margin_mode'] == 'cross',
+            )
+        except Exception as exc:
+            await audit(db, action='ADMIN_FOLLOWER_LEVERAGE_SYNC_FAILED', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'asset': asset, 'error': f'{type(exc).__name__}: {exc}'})
+            await db.commit()
+            raise HTTPException(502, f'Hyperliquid rejected leverage sync: {type(exc).__name__}: {exc}') from exc
+    finally:
+        private_key = ''
+
+    verified = await _position_config_diagnostic(db, target, asset)
+    if not verified['matches']:
+        await audit(db, action='ADMIN_FOLLOWER_LEVERAGE_SYNC_UNVERIFIED', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'asset': asset, 'response': response, 'diagnostic': verified})
+        await db.commit()
+        raise HTTPException(502, 'Hyperliquid acknowledged the leverage update but the follow-up state did not match the desired configuration')
+
+    await audit(db, action='ADMIN_FOLLOWER_LEVERAGE_SYNCED', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'asset': asset, 'response': response, 'diagnostic': verified})
+    await db.commit()
+    return {'ok': True, 'changed': True, 'verified': True, 'response': response, 'diagnostic': verified}
 
 
 @router.get('/users')
@@ -113,16 +260,13 @@ async def resume_user(user_id: uuid.UUID, body: AdminAction, actor: User = Depen
         raise HTTPException(409,f'Cannot resume while {rs.state.value} is active')
     account=(await db.execute(select(TradingAccount).where(TradingAccount.user_id==target.id))).scalar_one_or_none()
     if not account: raise HTTPException(409,'Follower has no Hyperliquid trading account')
-    limiter=WeightedRateLimiter(redis_client(),Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN))
+    limiter=_limiter()
     master_hl=HyperliquidAdapter(limiter,network=settings.master_network)
     follower_hl=HyperliquidAdapter(limiter,network=settings.follower_network)
     try:
         mp,meq,master_mids=await master_snapshot(master_hl)
         follower_mids=master_mids if settings.master_network == settings.follower_network else await follower_hl.mids()
-        await reconcile_user(
-            db,follower_hl,target,
-            master_positions=mp,master_equity=meq,mids=follower_mids,master_mids=master_mids,
-        )
+        await reconcile_user(db,follower_hl,target,master_positions=mp,master_equity=meq,mids=follower_mids,master_mids=master_mids)
     except Exception as exc:
         raise HTTPException(503,'Reconciliation must succeed before admin resume') from exc
     target.copy_state=CopyState.ACTIVE
