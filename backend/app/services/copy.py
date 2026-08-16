@@ -25,8 +25,8 @@ def _event_time(fill: dict[str, Any]) -> datetime:
 async def persist_master_fill_and_jobs(
     db: AsyncSession, *, fill: dict[str, Any], master_equity: Decimal,
     fencing_token: int, correlation_id: str, source_network: str | None = None,
+    master_leverage: int | None = None, master_is_cross: bool | None = None,
 ) -> tuple[MasterEvent | None, list[CopyJob]]:
-    """Atomically persist the exchange fact then durable per-follower jobs."""
     lease = (await db.execute(text("SELECT fencing_token, expires_at FROM watcher_lease WHERE name='master-watcher' FOR SHARE"))).first()
     if lease is None or int(lease[0]) != fencing_token or lease[1] <= datetime.now(UTC):
         raise RuntimeError('Watcher fenced out or lease expired before master-event write')
@@ -45,6 +45,9 @@ async def persist_master_fill_and_jobs(
     raw = dict(fill)
     if source_network:
         raw['_hypercopy_network'] = source_network
+    if master_leverage is not None:
+        raw['_hypercopy_master_leverage'] = master_leverage
+        raw['_hypercopy_master_is_cross'] = bool(master_is_cross)
     event = MasterEvent(
         exchange_event_id=eid, asset=asset, side=str(fill.get('side') or fill.get('dir') or ''),
         size=size, price=price, start_position=start, position_after=position_after,
@@ -62,18 +65,22 @@ async def persist_master_fill_and_jobs(
     jobs: list[CopyJob] = []
     for user_id in eligible:
         job_id = uuid.uuid5(uuid.UUID('8f6f61ae-7239-5e86-a501-8c8d95e94f20'), f'{event.id}:{user_id}')
+        context = {
+            'master_position': str(position_after),
+            'master_equity': str(master_equity),
+            'master_mark_price': str(price),
+            'mark_price': str(price),
+            'master_event_id': str(event.id),
+            'master_network': source_network or settings.master_network,
+            'follower_network': settings.follower_network,
+        }
+        if master_leverage is not None:
+            context['master_leverage'] = int(master_leverage)
+            context['master_is_cross'] = bool(master_is_cross)
         statement = insert(CopyJob).values(
             id=job_id, master_event_id=event.id, user_id=user_id, asset=asset,
             origin='EVENT', state='QUEUED', correlation_id=correlation_id,
-            context={
-                'master_position': str(position_after),
-                'master_equity': str(master_equity),
-                'master_mark_price': str(price),
-                'mark_price': str(price),
-                'master_event_id': str(event.id),
-                'master_network': source_network or settings.master_network,
-                'follower_network': settings.follower_network,
-            },
+            context=context,
         ).on_conflict_do_nothing(constraint='uq_job_master_user').returning(CopyJob.id)
         inserted = (await db.execute(statement)).scalar_one_or_none()
         if inserted:
