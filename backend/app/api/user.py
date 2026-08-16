@@ -72,14 +72,30 @@ async def executions(user: User = Depends(current_user), db: AsyncSession = Depe
 
 @router.post('/trading-account', dependencies=[Depends(require_csrf)])
 async def link_trading_account(body: TradingAccountIn, request: Request, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    account_address = normalize_address(body.account_address)
+    # Product invariant: the Web3 wallet that authenticated the user is the
+    # Hyperliquid follower account.  Users cannot redirect execution to a
+    # different account by supplying another address in this request.
+    account_address = normalize_address(user.auth_wallet)
     master_address = normalize_address(settings.HYPERLIQUID_MASTER_ADDRESS) if settings.HYPERLIQUID_MASTER_ADDRESS else ''
     if master_address and account_address == master_address:
         raise HTTPException(422, 'The master Hyperliquid account cannot also be linked as a follower account')
+
+    expected_agent_address = None
+    if body.agent_address:
+        try:
+            expected_agent_address = normalize_address(body.agent_address)
+        except Exception as exc:
+            raise HTTPException(422, 'Invalid API Wallet address') from exc
+
     try:
-        verification = await _hl().verify_agent(account_address, body.agent_private_key)
+        verification = await _hl().verify_agent(
+            account_address,
+            body.agent_private_key,
+            expected_agent_address=expected_agent_address,
+        )
     except Exception as exc:
         raise HTTPException(422, str(exc)) from exc
+
     account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
     if account and account.account_address.lower() != account_address.lower():
         open_managed = (await db.execute(select(PositionLedger.id).where(
