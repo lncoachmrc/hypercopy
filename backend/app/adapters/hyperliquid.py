@@ -201,6 +201,14 @@ class HyperliquidAdapter:
                         yield fill
         except asyncio.CancelledError:
             raise
+        except websockets.exceptions.ConnectionClosedOK as exc:
+            # Hyperliquid testnet may rotate a healthy session with close code
+            # 1000 and reason "Expired". This is a normal lifecycle event, not
+            # a watcher failure. The caller will replay from the durable
+            # PostgreSQL checkpoint before opening the next realtime session.
+            await self._metric_incr('ws_session_rotation_count')
+            log.info('Master websocket session closed normally; replay required', extra={'state': str(exc)})
+            return
         except Exception:
             await self._metric_incr('ws_reconnect_count')
             log.warning('Master websocket disconnected; watcher will replay before reconnect', exc_info=True)
