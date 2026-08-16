@@ -60,8 +60,8 @@ class Watcher:
         if self._equity>0 and now-self._equity_at<=10:
             return self._equity
         try:
-            state=await self.hl.user_state(settings.HYPERLIQUID_MASTER_ADDRESS,priority=Priority.MASTER_STATE)
-            self._equity=Decimal(str(state.get('marginSummary',{}).get('accountValue','0'))); self._equity_at=now
+            snapshot=await self.hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS,priority=Priority.MASTER_STATE)
+            self._equity=snapshot.account_value; self._equity_at=now
             return self._equity
         except Exception:
             async with SessionLocal() as db:
