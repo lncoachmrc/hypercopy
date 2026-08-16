@@ -67,7 +67,9 @@ async def release_stale_jobs(db: AsyncSession) -> int:
 
 
 async def live_trading_allowed(db: AsyncSession) -> bool:
-    if settings.HYPERLIQUID_NETWORK != 'mainnet':
+    # Testnet execution is allowed when a user is ACTIVE; mainnet follower
+    # execution additionally requires both environment and DB gates.
+    if settings.follower_network != 'mainnet':
         return True
     if not settings.ENABLE_LIVE_TRADING:
         return False
@@ -93,35 +95,47 @@ async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) ->
     ctx = job.context or {}
     master_pos = Decimal(str(ctx.get('master_position', '0')))
     master_eq = Decimal(str(ctx.get('master_equity', '0')))
-    mark = Decimal(str(ctx.get('mark_price', '0')))
-    if mark <= 0:
-        mids = await hl.mids()
-        mark = Decimal(str(mids[job.asset]))
+    master_mark = Decimal(str(ctx.get('master_mark_price', ctx.get('mark_price', '0'))))
     if master_eq <= 0:
         return await _retry_or_dead(db, job, 'Master equity unavailable')
     if not equity:
         return await _retry_or_dead(db, job, 'Follower equity not reconciled yet')
 
+    # Never use a mainnet source price as an executable testnet price. Read the
+    # destination market directly and use it for target units, risk valuation,
+    # minimum-notional checks and any eventual IOC order.
+    try:
+        follower_mids = await hl.mids()
+        follower_mark = Decimal(str(follower_mids[job.asset]))
+    except Exception:
+        return await _retry_or_dead(db, job, 'Follower market price unavailable')
+    if follower_mark <= 0:
+        return await _retry_or_dead(db, job, 'Follower market price unavailable')
+    if master_mark <= 0:
+        if settings.master_network == settings.follower_network:
+            master_mark = follower_mark
+        else:
+            return await _retry_or_dead(db, job, 'Master market price unavailable')
+
     spec = await hl.asset_spec(job.asset)
     sizing = plan(
-        MasterExposure(job.asset, master_pos, mark, master_eq),
+        MasterExposure(job.asset, master_pos, master_mark, master_eq),
         FollowerState(str(user.id), equity.account_value, equity.unmanaged_margin, current, risk.multiplier),
-        spec, min_notional=risk.min_notional,
+        spec,
+        min_notional=risk.min_notional,
+        follower_mark_price=follower_mark,
     )
     if ledger:
         ledger.target_size = sizing.target_size
     else:
-        ledger = PositionLedger(user_id=user.id, asset=job.asset, size=current, target_size=sizing.target_size, mark_price=mark, managed=True)
+        ledger = PositionLedger(user_id=user.id, asset=job.asset, size=current, target_size=sizing.target_size, mark_price=follower_mark, managed=True)
         db.add(ledger)
     await db.flush()
 
-    # Book exposure is valued per asset using the last exchange-verified mark
-    # stored in PostgreSQL. Never value BTC, ETH, SOL, ... with the current
-    # job's mark: that would make leverage/risk mathematically wrong.
-    ledger.mark_price = mark
+    ledger.mark_price = follower_mark
     ledgers = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user.id, PositionLedger.managed.is_(True)))).scalars().all()
     total_exposure = sum((abs(x.size) * max(x.mark_price or Decimal(0), Decimal(0)) for x in ledgers), Decimal(0))
-    asset_exposure = abs(current) * mark
+    asset_exposure = abs(current) * follower_mark
     stale = equity.taken_at < datetime.now(UTC) - timedelta(seconds=settings.LEDGER_STALE_SECONDS)
     allowed_asset = (not risk.allow_assets or job.asset in risk.allow_assets) and job.asset not in risk.block_assets
     profile_ctx = RiskContext(
@@ -152,7 +166,16 @@ async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) ->
         return await _finish(db, job, JobState.SKIPPED, decision.reason or 'Not actionable')
 
     if user.copy_state == CopyState.SHADOW:
-        await audit(db, action='SHADOW_TARGET', subject_id=user.id, reason='Shadow mode: no exchange order', correlation_id=job.correlation_id, after={'asset': job.asset, 'target': str(sizing.target_size), 'current': str(current), 'delta': str(sizing.delta)})
+        await audit(db, action='SHADOW_TARGET', subject_id=user.id, reason='Shadow mode: no exchange order', correlation_id=job.correlation_id, after={
+            'asset': job.asset,
+            'target': str(sizing.target_size),
+            'current': str(current),
+            'delta': str(sizing.delta),
+            'master_network': settings.master_network,
+            'follower_network': settings.follower_network,
+            'master_mark': str(master_mark),
+            'follower_mark': str(follower_mark),
+        })
         return await _finish(db, job, JobState.DONE, 'Shadow mode')
     if not await live_trading_allowed(db):
         return await _finish(db, job, JobState.SKIPPED, 'Mainnet live-trading gate is closed')
@@ -163,21 +186,20 @@ async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) ->
     private_key = crypto.decrypt(_blob(cred), user_id=str(user.id), account_id=str(account.id))
     try:
         primary = decision.plan
-        outcome = await _execute_leg(db, hl, job, user.id, account.account_address, private_key, primary, mark, risk.max_slippage_bps, 'c' if primary.intent.value == 'reverse' else 'o')
+        outcome = await _execute_leg(db, hl, job, user.id, account.account_address, private_key, primary, follower_mark, risk.max_slippage_bps, 'c' if primary.intent.value == 'reverse' else 'o')
         if outcome.state != 'FILLED':
             if outcome.state == 'UNKNOWN':
                 return await _retry_or_dead(db, job, outcome.reason or 'Ambiguous execution', ambiguous=True)
             return await _finish(db, job, JobState.SKIPPED, outcome.reason or 'Order rejected')
         await _apply_fill_to_ledger(db, ledger, primary, outcome)
         if primary.secondary:
-            # Never open the second leg unless the close-to-flat was confirmed.
-            outcome2 = await _execute_leg(db, hl, job, user.id, account.account_address, private_key, primary.secondary, mark, risk.max_slippage_bps, 'o')
+            outcome2 = await _execute_leg(db, hl, job, user.id, account.account_address, private_key, primary.secondary, follower_mark, risk.max_slippage_bps, 'o')
             if outcome2.state != 'FILLED':
                 if outcome2.state == 'UNKNOWN':
                     return await _retry_or_dead(db, job, outcome2.reason or 'Ambiguous reversal open', ambiguous=True)
                 return await _finish(db, job, JobState.SKIPPED, outcome2.reason or 'Reversal open rejected')
             await _apply_fill_to_ledger(db, ledger, primary.secondary, outcome2)
-        await audit(db, action='COPY_JOB_EXECUTED', subject_id=user.id, correlation_id=job.correlation_id, after={'asset': job.asset, 'target': str(sizing.target_size), 'ledger_size': str(ledger.size)})
+        await audit(db, action='COPY_JOB_EXECUTED', subject_id=user.id, correlation_id=job.correlation_id, after={'asset': job.asset, 'target': str(sizing.target_size), 'ledger_size': str(ledger.size), 'network': settings.follower_network})
         return await _finish(db, job, JobState.DONE, None)
     finally:
         private_key = ''
@@ -189,8 +211,6 @@ async def _execute_leg(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob, u
     if existing:
         if existing.state in TERMINAL_EXEC:
             return OrderOutcome(existing.state.value, existing.exchange_oid, existing.filled_size, existing.avg_price, existing.reject_reason, existing.response)
-        # Intent exists from a prior crash/timeout. Exchange is the arbiter; do
-        # not submit another order until cloid resolution is terminal.
         resolved = await _resolve_cloid(hl, account_address, cloid)
         if resolved.state != 'UNKNOWN':
             await _persist_outcome(db, existing, resolved)
@@ -202,7 +222,7 @@ async def _execute_leg(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob, u
     limit_px = mark * (Decimal(1)+slip if leg.is_buy else Decimal(1)-slip)
     execution = Execution(copy_job_id=job.id, user_id=user_id, attempt_kind=kind, cloid=cloid, state=ExecutionState.SUBMITTING, asset=job.asset, is_buy=leg.is_buy, requested_size=size, reduce_only=leg.reduce_only, limit_px=limit_px)
     db.add(execution)
-    await db.commit()  # critical invariant: durable intent BEFORE external effect
+    await db.commit()
     try:
         outcome = await hl.place_ioc(account_address=account_address, private_key=private_key, asset=job.asset, is_buy=leg.is_buy, size=size, mark_price=mark, slippage_bps=slippage_bps, reduce_only=leg.reduce_only, cloid=cloid)
     except Exception as exc:
@@ -265,7 +285,6 @@ async def _apply_fill_to_ledger(db: AsyncSession, ledger: PositionLedger, leg: S
     ledger.size += signed
     if outcome.avg_price is not None:
         ledger.mark_price = outcome.avg_price
-    # exact exchange state is set by reconciliation; this update is the low-latency estimate.
     await db.commit()
 
 
@@ -282,8 +301,6 @@ async def _retry_or_dead(db: AsyncSession, job: CopyJob, reason: str, ambiguous:
     job.last_error = reason
     job.owner = None
     job.locked_until = None
-    # Ambiguous effects are deliberately never blindly re-submitted. The next
-    # claim finds the persistent Execution and resolves its cloid first.
     if job.attempt_count >= settings.MAX_JOB_RETRIES:
         job.state = JobState.DEAD
     else:
