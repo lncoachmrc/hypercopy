@@ -4,10 +4,8 @@ export type Session = { user: SessionUser; entitlements: Record<string,unknown>;
 const cfg = () => window.__HYPERCOPY_CONFIG__ ?? {};
 
 // Security/session invariant: deployed HyperCopy browser traffic must stay on
-// the frontend origin and reach the API through Nginx /api/v1.  This prevents
-// a stale Railway API_BASE_URL from silently reintroducing cross-site cookies
-// (which privacy browsers such as Brave may block).  An absolute API URL is
-// honoured only during explicit local development.
+// the frontend origin and reach the API through Nginx /api/v1. This prevents
+// stale absolute Railway URLs from reintroducing cross-site cookie problems.
 const isLocalDev = () => ['localhost','127.0.0.1','::1'].includes(location.hostname);
 const base = () => {
   const configured=(cfg().API_BASE_URL || '').replace(/\/$/, '');
@@ -19,6 +17,8 @@ export const setCsrf = (value:string) => { csrf=value; };
 
 export class ApiError extends Error { constructor(public status:number,message:string,public code?:string){super(message);} }
 
+const API_TIMEOUT_MS = 15_000;
+
 export async function api<T>(path:string, init:RequestInit={}):Promise<T>{
   const method=(init.method||'GET').toUpperCase();
   const headers=new Headers(init.headers);
@@ -27,7 +27,25 @@ export async function api<T>(path:string, init:RequestInit={}):Promise<T>{
     headers.set('X-Requested-With','HyperCopy');
     if (csrf) headers.set('X-CSRF-Token',csrf);
   }
-  const res=await fetch(`${base()}${path}`,{...init,headers,credentials:'include'});
+
+  const controller = new AbortController();
+  const timer = window.setTimeout(()=>controller.abort(), API_TIMEOUT_MS);
+  const externalSignal = init.signal;
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    else externalSignal.addEventListener('abort',()=>controller.abort(),{once:true});
+  }
+
+  let res:Response;
+  try {
+    res=await fetch(`${base()}${path}`,{...init,headers,credentials:'include',signal:controller.signal});
+  } catch (e) {
+    if (controller.signal.aborted) throw new ApiError(0,'Il server HyperCopy non ha risposto entro 15 secondi. Riprova o verifica lo stato dei servizi.','API_TIMEOUT');
+    throw e;
+  } finally {
+    window.clearTimeout(timer);
+  }
+
   if (!res.ok){
     let message=`Request failed (${res.status})`, code='';
     try { const body=await res.json(); message=body?.error?.message||body?.detail||message; code=body?.error?.code||''; } catch {}
