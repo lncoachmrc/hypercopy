@@ -289,6 +289,7 @@ async def refresh_ai_intelligence(db: AsyncSession, *, force: bool = False) -> d
             select(MasterEvent).where(MasterEvent.event_ts >= cutoff).order_by(MasterEvent.event_ts.desc()).limit(5000)
         )).scalars().all()
         events = list(reversed(events))
+        latest_event = events[-1] if events else None
         profile = learn_master_strategy(events)
         preferred = os.getenv('LLM_PREFERRED_MODEL', '').strip()
         system = (
@@ -311,6 +312,8 @@ async def refresh_ai_intelligence(db: AsyncSession, *, force: bool = False) -> d
                 'provider_failures': runtime['failures'],
                 'strategy_profile': profile,
                 'analysis': _validated_analysis(raw),
+                'source_event_ts': latest_event.event_ts.isoformat() if latest_event else None,
+                'source_event_id': latest_event.exchange_event_id if latest_event else None,
                 'updated_at': now.isoformat(),
             }
         except Exception as exc:
@@ -322,6 +325,8 @@ async def refresh_ai_intelligence(db: AsyncSession, *, force: bool = False) -> d
                 'preferred_model': preferred,
                 'last_error': f'{type(exc).__name__}: {exc}'[:1200],
                 'strategy_profile': profile,
+                'attempted_source_event_ts': latest_event.event_ts.isoformat() if latest_event else None,
+                'attempted_source_event_id': latest_event.exchange_event_id if latest_event else None,
                 'updated_at': now.isoformat(),
             }
 

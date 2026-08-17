@@ -1,0 +1,17 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+watchPatterns = [
+  "/backend/app/workers/ai_intelligence_worker.py",
+  "/backend/app/services/ai_intelligence.py",
+  "/backend/app/core/**", "/backend/app/db/**", "/backend/app/models/**",
+  "/backend/alembic/**", "/backend/requirements.txt", "/backend/Dockerfile",
+  "/backend/railway.ai.toml"
+]
+
+[deploy]
+startCommand = "python -m app.workers.ai_intelligence_worker"
+restartPolicyType = "ALWAYS"
+numReplicas = 1
+overlapSeconds = 10
+drainingSeconds = 30
