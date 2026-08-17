@@ -63,6 +63,10 @@ def _candidate_prompt(candidates: list[dict], profile: dict, eligible_equity: De
         'follower_eligible_equity_usd': str(eligible_equity),
         'recommended_capital_for_target_coverage_usd': str(recommended_capital),
         'target_coverage_pct': settings.LLM_RECOMMENDED_COVERAGE_PCT,
+        'hard_limits': {
+            'max_tracking_error_pct': settings.LLM_MAX_TRACKING_ERROR_PCT,
+            'max_allocation_scale': settings.LLM_MAX_ALLOCATION_SCALE,
+        },
         'master_strategy': {
             'event_count': profile.get('event_count', 0),
             'asset_count': profile.get('asset_count', 0),
@@ -105,6 +109,28 @@ async def _learn_profile(db: AsyncSession) -> MasterStrategyProfile:
     row.learned_at = datetime.now(UTC)
     await db.flush()
     return row
+
+
+def _bounded_candidates(candidates: list[dict]) -> list[dict]:
+    """Remove every smart policy that exceeds deterministic hard limits.
+
+    Exact Ratio always survives as the fail-safe candidate. The LLM therefore
+    never even sees a candidate that violates Traxion's concentration/tracking
+    envelope.
+    """
+    bounded: list[dict] = []
+    for candidate in candidates:
+        if candidate.get('id') == 'exact':
+            bounded.append(candidate)
+            continue
+        tracking_error = _d(candidate.get('tracking_error_pct'))
+        allocation_scale = _d(candidate.get('allocation_scale'))
+        if tracking_error > _d(settings.LLM_MAX_TRACKING_ERROR_PCT):
+            continue
+        if allocation_scale > _d(settings.LLM_MAX_ALLOCATION_SCALE):
+            continue
+        bounded.append(candidate)
+    return bounded
 
 
 async def refresh_capital_intelligence(db: AsyncSession, master_hl) -> dict:
@@ -160,7 +186,7 @@ async def refresh_capital_intelligence(db: AsyncSession, master_hl) -> dict:
             and asset not in risk.block_assets
         }
         floor = max(_d(risk.min_notional), EXCHANGE_MIN_NOTIONAL)
-        candidates = build_capital_candidates(
+        candidates = _bounded_candidates(build_capital_candidates(
             master_positions=allowed_positions,
             master_mids=master_mids,
             master_equity=master_equity,
@@ -168,7 +194,11 @@ async def refresh_capital_intelligence(db: AsyncSession, master_hl) -> dict:
             multiplier=_d(risk.multiplier),
             min_notional=floor,
             persistence=persistence,
-        )
+        ))
+        # Exact Ratio is constructed unconditionally and must always remain.
+        if not candidates:
+            raise RuntimeError('Capital optimizer produced no bounded candidates')
+
         recommended = recommended_capital_for_coverage(
             master_positions=allowed_positions,
             master_mids=master_mids,
@@ -220,11 +250,19 @@ async def refresh_capital_intelligence(db: AsyncSession, master_hl) -> dict:
                     status = 'FALLBACK_EXACT'
                 else:
                     status = 'LLM_INVALID'
+        elif settings.LLM_CAPITAL_MODE == 'active':
+            # An explicitly active mode with the LLM disabled must not activate
+            # a compressed candidate implicitly. Exact Ratio is the safe path.
+            selected = next(c for c in candidates if c['id'] == 'exact')
+            summary = 'LLM disabled while active mode is configured; exact-ratio fail-safe applied.'
+            status = 'FALLBACK_EXACT'
 
         policy = {
             'candidate_id': selected['id'],
             'candidate_label': selected['label'],
             'selected_assets': selected['selected_assets'],
+            'known_master_assets': sorted(master_positions),
+            'follower_available_assets': sorted(follower_available),
             'buffer_pct': selected['buffer_pct'],
             'allocation_scale': selected.get('allocation_scale', '1'),
             # Snapshot weights are retained for audit/UI only. Live targeting
@@ -236,7 +274,6 @@ async def refresh_capital_intelligence(db: AsyncSession, master_hl) -> dict:
             'min_notional': str(floor),
             'master_network': settings.master_network,
             'follower_network': settings.follower_network,
-            'follower_available_assets': sorted(follower_available),
             'strategy_profile_learned_at': profile_row.learned_at.isoformat(),
         }
         db.add(CapitalIntelligenceDecision(
@@ -270,14 +307,16 @@ async def refresh_capital_intelligence(db: AsyncSession, master_hl) -> dict:
 async def active_policy_for_user(db: AsyncSession, user_id, *, risk_multiplier: Decimal, min_notional: Decimal) -> dict | None:
     """Return a fresh bounded policy only when AI capital mode is ACTIVE.
 
-    A stale decision or a changed risk profile is ignored, which reverts the
-    execution path to the existing exact-ratio algorithm.
+    A stale decision, a shadow decision, changed risk limits, changed network
+    topology or a policy exceeding the current hard limits is ignored. The
+    calling execution path then falls back to the original Exact Ratio logic.
     """
     if settings.LLM_CAPITAL_MODE != 'active':
         return None
     cutoff = datetime.now(UTC) - timedelta(seconds=settings.LLM_DECISION_MAX_AGE_SECONDS)
     row = (await db.execute(select(CapitalIntelligenceDecision).where(
         CapitalIntelligenceDecision.user_id == user_id,
+        CapitalIntelligenceDecision.mode == 'active',
         CapitalIntelligenceDecision.created_at >= cutoff,
     ).order_by(CapitalIntelligenceDecision.created_at.desc()).limit(1))).scalar_one_or_none()
     if not row:
@@ -293,4 +332,13 @@ async def active_policy_for_user(db: AsyncSession, user_id, *, risk_multiplier: 
         return None
     if not isinstance(policy.get('selected_assets'), list):
         return None
+    if not isinstance(policy.get('known_master_assets'), list):
+        return None
+    if not isinstance(policy.get('follower_available_assets'), list):
+        return None
+    if policy.get('candidate_id') != 'exact':
+        if _d(policy.get('tracking_error_pct')) > _d(settings.LLM_MAX_TRACKING_ERROR_PCT):
+            return None
+        if _d(policy.get('allocation_scale')) > _d(settings.LLM_MAX_ALLOCATION_SCALE):
+            return None
     return policy
