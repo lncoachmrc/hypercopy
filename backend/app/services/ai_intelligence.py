@@ -29,7 +29,7 @@ def _provider_models() -> dict[str, str]:
     return {
         'openai': os.getenv('OPENAI_MODEL', '').strip(),
         'anthropic': os.getenv('ANTHROPIC_MODEL', '').strip(),
-        'deepseek': os.getenv('DEEPSEEK_MODEL', 'deepseek-chat').strip(),
+        'deepseek': os.getenv('DEEPSEEK_MODEL', 'deepseek-v4-flash').strip(),
     }
 
 
