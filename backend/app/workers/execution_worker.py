@@ -16,6 +16,7 @@ from app.db.redis import redis_client
 from app.db.session import SessionLocal, engine
 from app.db.schema import assert_schema
 from app.models.entities import CopyJob, JobState, User, WorkerHeartbeat
+from app.services.ai_intelligence import refresh_ai_intelligence
 from app.services.execution import claim_job, process_job, release_stale_jobs
 from app.services.credentials import monitor_credential_expiry
 from app.services.queue import ensure_group, repair_stream
@@ -118,9 +119,6 @@ class Worker:
             raw=await db.get(CopyJob,uid)
             if not raw or raw.state in {JobState.DONE,JobState.SKIPPED,JobState.DEAD}: return True
 
-            # Historical jobs created before a network split (or under a
-            # different source/destination pair) must never update targets or
-            # submit orders in the current topology.
             if not _job_matches_current_networks(raw):
                 raw.state=JobState.SKIPPED
                 raw.last_error='Stale job from a different or unversioned Hyperliquid network topology'
@@ -182,6 +180,7 @@ class Worker:
             await asyncio.sleep(settings.RECONCILE_INTERVAL_SECONDS)
 
     async def run_reconcile_if_leader(self):
+        acquired = False
         async with engine.connect() as conn:
             acquired=bool((await conn.execute(text("SELECT pg_try_advisory_lock(hashtext('hypercopy:reconciler'))"))).scalar_one())
             if not acquired: return
@@ -190,6 +189,25 @@ class Worker:
                     await reconcile_active_users(db,self.follower_hl,master_hl=self.master_hl)
             finally:
                 await conn.execute(text("SELECT pg_advisory_unlock(hashtext('hypercopy:reconciler'))")); await conn.commit()
+
+        # LLM work can take seconds or fail over across providers. Keep it
+        # outside the reconciliation advisory lock so AI can never delay the
+        # next deterministic reconciliation cycle.
+        if acquired:
+            try:
+                async with SessionLocal() as db:
+                    ai_state = await refresh_ai_intelligence(db)
+                if ai_state.get('status') in {'ok', 'degraded'}:
+                    log.info('AI capital intelligence refreshed', extra={
+                        'status': ai_state.get('status'),
+                        'provider': ai_state.get('provider'),
+                        'model': ai_state.get('model'),
+                        'mode': ai_state.get('mode'),
+                    })
+            except Exception:
+                # AI is strictly advisory. It must never make reconciliation
+                # or execution unavailable.
+                log.warning('AI capital intelligence refresh failed', exc_info=True)
 
     async def run(self):
         async with SessionLocal() as db: await assert_schema(db)
