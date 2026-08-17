@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters import stripe_client
 from app.api.deps import current_user, require_csrf
+from app.core.config import settings
 from app.db.session import get_db
 from app.models.entities import Plan, StripeEvent, Subscription, User
 from app.services.entitlement import entitlement
@@ -58,6 +59,14 @@ async def plans():
         'currency': 'USD',
         'yearly_discount_pct': 50,
         'minimum_portfolio_usd': 500,
+        'trial': {
+            'days': settings.TRIAL_DAYS,
+            'portfolio_up_to_usd': 1000,
+            'max_positions': 3,
+            'max_notional_per_trade_usd': 500,
+            'max_multiplier': 1,
+            'card_required': False,
+        },
         'plans': [
             {
                 **p,

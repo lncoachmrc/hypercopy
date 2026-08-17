@@ -59,9 +59,15 @@ async def verify(body: VerifyIn, request: Request, response: Response, db: Async
         db.add(user); await db.flush()
         db.add(RiskProfile(user_id=user.id)); db.add(RiskState(user_id=user.id))
         if not await db.get(Plan, 'trial'):
-            db.add(Plan(slug='trial', name='Trial', limits={'max_multiplier': 1, 'max_notional_per_trade': 1000}))
+            db.add(Plan(slug='trial', name='Trial', limits={
+                'max_multiplier': 1,
+                'max_notional_per_trade': 500,
+                'max_positions': 3,
+                'max_equity_usd': 1000,
+            }))
             await db.flush()
-        db.add(Subscription(user_id=user.id, plan_slug='trial', status='trialing', trial_end=datetime.now(UTC)+timedelta(days=settings.TRIAL_DAYS), period_end=datetime.now(UTC)+timedelta(days=settings.TRIAL_DAYS)))
+        trial_end = datetime.now(UTC) + timedelta(days=settings.TRIAL_DAYS)
+        db.add(Subscription(user_id=user.id, plan_slug='trial', status='trialing', trial_end=trial_end, period_end=trial_end))
     await audit(db, action='AUTH_LOGIN', actor_id=user.id, subject_id=user.id, ip_hash=hash_ip(request.client.host if request.client else None))
     await db.commit()
 
