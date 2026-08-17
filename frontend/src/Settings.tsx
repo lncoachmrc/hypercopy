@@ -35,20 +35,93 @@ type Risk={
   block_assets:string[];
 };
 
+type RiskMode='basic'|'pro';
+type BasicProfile='prudent'|'balanced'|'faithful'|'custom';
+type BasicMarkets='all'|'majors'|'btc'|'custom';
+
+type BasicProfileConfig={
+  title:string;
+  badge?:string;
+  description:string;
+  multiplier:number;
+  maxLeverage:number;
+  maxPositions:number;
+  maxDrawdown:number;
+  dailyLoss:number;
+  exposureFactor:number;
+  assetShare:number;
+};
+
+const MAJOR_ASSETS=['BTC','ETH','SOL','XRP','BNB','ADA','AVAX','LINK','LTC','BCH'];
+
+const BASIC_PROFILES:Record<Exclude<BasicProfile,'custom'>,BasicProfileConfig>={
+  prudent:{
+    title:'Prudente',
+    description:'Copia metà della size proporzionale e limita maggiormente leva ed esposizione.',
+    multiplier:0.5,
+    maxLeverage:3,
+    maxPositions:10,
+    maxDrawdown:10,
+    dailyLoss:5,
+    exposureFactor:1,
+    assetShare:0.15,
+  },
+  balanced:{
+    title:'Bilanciato',
+    badge:'Consigliato',
+    description:'Buon equilibrio tra fedeltà al Master e protezione del capitale.',
+    multiplier:0.75,
+    maxLeverage:5,
+    maxPositions:20,
+    maxDrawdown:15,
+    dailyLoss:7.5,
+    exposureFactor:1.5,
+    assetShare:0.20,
+  },
+  faithful:{
+    title:'Fedele al Master',
+    description:'Replica il 100% della size proporzionale e lascia più spazio alla leva del Master.',
+    multiplier:1,
+    maxLeverage:40,
+    maxPositions:50,
+    maxDrawdown:20,
+    dailyLoss:10,
+    exposureFactor:3,
+    assetShare:0.25,
+  },
+};
+
 export default function Settings(){
   const {refresh}=useAuth();
   const [me,setMe]=useState<Me|null>(null);
   const [risk,setRisk]=useState<Risk|null>(null);
+  const [equity,setEquity]=useState<number|null>(null);
   const [agent,setAgent]=useState('');
   const [key,setKey]=useState('');
   const [msg,setMsg]=useState('');
+  const [riskMode,setRiskMode]=useState<RiskMode>(()=>localStorage.getItem('hypercopy:risk-mode')==='pro'?'pro':'basic');
+  const [basicProfile,setBasicProfile]=useState<BasicProfile>('custom');
+  const [basicMarkets,setBasicMarkets]=useState<BasicMarkets>('custom');
 
   const load=async()=>{
-    setMe(await get('/me'));
-    setRisk(await get('/risk-profile'));
+    const [meValue,riskValue,dashboard]=await Promise.all([
+      get<Me>('/me'),
+      get<Risk>('/risk-profile'),
+      get<{equity:number|null}>('/dashboard'),
+    ]);
+    setMe(meValue);
+    setRisk(riskValue);
+    setEquity(dashboard.equity);
+    setBasicProfile(inferBasicProfile(riskValue));
+    setBasicMarkets(inferBasicMarkets(riskValue));
   };
 
   useEffect(()=>{void load()},[]);
+
+  const switchRiskMode=(mode:RiskMode)=>{
+    setRiskMode(mode);
+    localStorage.setItem('hypercopy:risk-mode',mode);
+  };
 
   const link=async()=>{
     setMsg('Verifica API Wallet…');
@@ -68,6 +141,20 @@ export default function Settings(){
     const stored=await put('/risk-profile',value) as Risk;
     setRisk(stored);
     setMsg('Profilo rischio salvato.');
+  };
+
+  const applyBasic=async()=>{
+    if(!risk)return;
+    if(basicProfile==='custom'){
+      setMsg('La configurazione attuale è personalizzata. Scegli Prudente, Bilanciato o Fedele al Master per applicare la modalità Basic.');
+      return;
+    }
+    const next=buildBasicRisk(risk,basicProfile,basicMarkets,equity);
+    const stored=await put('/risk-profile',next) as Risk;
+    setRisk(stored);
+    setBasicProfile(inferBasicProfile(stored));
+    setBasicMarkets(inferBasicMarkets(stored));
+    setMsg(`Profilo Basic “${BASIC_PROFILES[basicProfile].title}” applicato. Il copy state non è stato modificato.`);
   };
 
   const presetBtc=async()=>{
@@ -162,31 +249,185 @@ export default function Settings(){
         <p className="muted">SHADOW calcola target e delta senza inviare ordini. "Attiva copy" abilita invece l'esecuzione sulla rete follower indicata.</p>
       </section>
 
-      <section className="panel">
-        <h2>Risk Engine</h2>
-        {risk&&<div className="formgrid">
-          <Num label="Multiplier" value={risk.multiplier} set={v=>setRisk({...risk,multiplier:v})}/>
-          <Num label="Max / trade $" value={risk.max_notional_per_trade} set={v=>setRisk({...risk,max_notional_per_trade:v})}/>
-          <Num label="Max exposure $" value={risk.max_total_exposure} set={v=>setRisk({...risk,max_total_exposure:v})}/>
-          <Num label="Max asset $" value={risk.max_asset_exposure} set={v=>setRisk({...risk,max_asset_exposure:v})}/>
-          <Num label="Max leverage" value={risk.max_leverage} set={v=>setRisk({...risk,max_leverage:v})}/>
-          <Num label="Max positions" value={String(risk.max_positions)} set={v=>setRisk({...risk,max_positions:Math.max(1,Number(v)||1)})}/>
-          <Num label="Min notional $" value={risk.min_notional} set={v=>setRisk({...risk,min_notional:v})}/>
-          <Num label="Max drawdown %" value={risk.max_drawdown_pct} set={v=>setRisk({...risk,max_drawdown_pct:v})}/>
-          <Num label="Daily loss %" value={risk.max_daily_loss_pct} set={v=>setRisk({...risk,max_daily_loss_pct:v})}/>
-          <Num label="Slippage bps" value={String(risk.max_slippage_bps)} set={v=>setRisk({...risk,max_slippage_bps:Number(v)})}/>
-          <label>Asset consentiti (CSV)<input value={risk.allow_assets.join(', ')} onChange={e=>setRisk({...risk,allow_assets:e.target.value.split(',').map(x=>x.trim().toUpperCase()).filter(Boolean)})} placeholder="vuoto = tutti"/></label>
-          <label>Asset bloccati (CSV)<input value={risk.block_assets.join(', ')} onChange={e=>setRisk({...risk,block_assets:e.target.value.split(',').map(x=>x.trim().toUpperCase()).filter(Boolean)})} placeholder="es. BTC, ETH"/></label>
-          <label className="check"><input type="checkbox" checked={risk.close_only} onChange={e=>setRisk({...risk,close_only:e.target.checked})}/> Close-only</label>
-          {me?.follower_network==='testnet'&&<button onClick={()=>void presetBtc()}>Preset test BTC sicuro</button>}
-          {me?.follower_network==='testnet'&&me?.role==='SUPERADMIN'&&<button onClick={()=>void presetMulti()}>Preset test multi-asset TESTNET</button>}
-          <button className="primary" onClick={()=>void save()}>Salva limiti</button>
-        </div>}
+      <section className="panel risk-panel">
+        <div className="risk-heading">
+          <div>
+            <h2>Risk Engine</h2>
+            <p className="muted">Scegli una configurazione guidata oppure passa ai controlli avanzati.</p>
+          </div>
+          <div className="risk-mode-toggle" aria-label="Modalità Risk Engine">
+            <button className={riskMode==='basic'?'active':''} onClick={()=>switchRiskMode('basic')}>Basic</button>
+            <button className={riskMode==='pro'?'active':''} onClick={()=>switchRiskMode('pro')}>Pro</button>
+          </div>
+        </div>
+
+        {risk&&riskMode==='basic'&&<BasicRisk
+          risk={risk}
+          equity={equity}
+          profile={basicProfile}
+          markets={basicMarkets}
+          setProfile={setBasicProfile}
+          setMarkets={setBasicMarkets}
+          apply={()=>void applyBasic()}
+          openPro={()=>switchRiskMode('pro')}
+        />}
+
+        {risk&&riskMode==='pro'&&<>
+          <div className="pro-warning">Modalità Pro: controllo completo dei limiti. Le modifiche possono cambiare direttamente sizing, leva consentita e comportamento del copytrading.</div>
+          <div className="formgrid">
+            <Num label="Multiplier" value={risk.multiplier} set={v=>setRisk({...risk,multiplier:v})}/>
+            <Num label="Max / trade $" value={risk.max_notional_per_trade} set={v=>setRisk({...risk,max_notional_per_trade:v})}/>
+            <Num label="Max exposure $" value={risk.max_total_exposure} set={v=>setRisk({...risk,max_total_exposure:v})}/>
+            <Num label="Max asset $" value={risk.max_asset_exposure} set={v=>setRisk({...risk,max_asset_exposure:v})}/>
+            <Num label="Max leverage" value={risk.max_leverage} set={v=>setRisk({...risk,max_leverage:v})}/>
+            <Num label="Max positions" value={String(risk.max_positions)} set={v=>setRisk({...risk,max_positions:Math.max(1,Number(v)||1)})}/>
+            <Num label="Min notional $" value={risk.min_notional} set={v=>setRisk({...risk,min_notional:v})}/>
+            <Num label="Max drawdown %" value={risk.max_drawdown_pct} set={v=>setRisk({...risk,max_drawdown_pct:v})}/>
+            <Num label="Daily loss %" value={risk.max_daily_loss_pct} set={v=>setRisk({...risk,max_daily_loss_pct:v})}/>
+            <Num label="Slippage bps" value={String(risk.max_slippage_bps)} set={v=>setRisk({...risk,max_slippage_bps:Number(v)})}/>
+            <label>Asset consentiti (CSV)<input value={risk.allow_assets.join(', ')} onChange={e=>setRisk({...risk,allow_assets:e.target.value.split(',').map(x=>x.trim().toUpperCase()).filter(Boolean)})} placeholder="vuoto = tutti"/></label>
+            <label>Asset bloccati (CSV)<input value={risk.block_assets.join(', ')} onChange={e=>setRisk({...risk,block_assets:e.target.value.split(',').map(x=>x.trim().toUpperCase()).filter(Boolean)})} placeholder="es. BTC, ETH"/></label>
+            <label className="check"><input type="checkbox" checked={risk.close_only} onChange={e=>setRisk({...risk,close_only:e.target.checked})}/> Close-only</label>
+            {me?.follower_network==='testnet'&&<button onClick={()=>void presetBtc()}>Preset test BTC sicuro</button>}
+            {me?.follower_network==='testnet'&&me?.role==='SUPERADMIN'&&<button onClick={()=>void presetMulti()}>Preset test multi-asset TESTNET</button>}
+            <button className="primary" onClick={()=>void save()}>Salva limiti</button>
+          </div>
+        </>}
       </section>
     </div>
     {msg&&<div className="toast">{msg}</div>}
   </>;
 }
+
+function BasicRisk({risk,equity,profile,markets,setProfile,setMarkets,apply,openPro}:{
+  risk:Risk;
+  equity:number|null;
+  profile:BasicProfile;
+  markets:BasicMarkets;
+  setProfile:(v:BasicProfile)=>void;
+  setMarkets:(v:BasicMarkets)=>void;
+  apply:()=>void;
+  openPro:()=>void;
+}){
+  const preview=buildBasicRisk(risk,profile,markets,equity);
+  return <div className="basic-risk">
+    <div className="basic-section">
+      <div className="basic-section-title"><span>1</span><div><h3>Come vuoi copiare il Master?</h3><p>HyperCopy traduce questa scelta nei limiti tecnici del Risk Engine.</p></div></div>
+      <div className="risk-choice-grid">
+        {(Object.keys(BASIC_PROFILES) as Exclude<BasicProfile,'custom'>[]).map(key=>{
+          const item=BASIC_PROFILES[key];
+          return <button key={key} className={`risk-choice ${profile===key?'active':''}`} onClick={()=>setProfile(key)}>
+            <div className="risk-choice-top"><strong>{item.title}</strong>{item.badge&&<span className="choice-badge">{item.badge}</span>}</div>
+            <span>{item.description}</span>
+            <small>Copia {Math.round(item.multiplier*100)}% · leva max {item.maxLeverage}× · drawdown {item.maxDrawdown}%</small>
+          </button>;
+        })}
+        {profile==='custom'&&<button className="risk-choice active custom" onClick={openPro}>
+          <div className="risk-choice-top"><strong>Personalizzato</strong><span className="choice-badge">PRO</span></div>
+          <span>I valori attuali non corrispondono a un preset Basic.</span>
+          <small>Apri Pro per vedere o mantenere la configurazione esatta.</small>
+        </button>}
+      </div>
+    </div>
+
+    <div className="basic-section">
+      <div className="basic-section-title"><span>2</span><div><h3>Quali mercati vuoi copiare?</h3><p>Gli asset non disponibili sulla rete follower vengono comunque ignorati automaticamente.</p></div></div>
+      <div className="market-choice-grid">
+        <button className={`market-choice ${markets==='all'?'active':''}`} onClick={()=>setMarkets('all')}><strong>Tutti</strong><span>Tutti i perpetual supportati</span></button>
+        <button className={`market-choice ${markets==='majors'?'active':''}`} onClick={()=>setMarkets('majors')}><strong>Major</strong><span>BTC, ETH, SOL e principali large cap</span></button>
+        <button className={`market-choice ${markets==='btc'?'active':''}`} onClick={()=>setMarkets('btc')}><strong>Solo BTC</strong><span>Un solo mercato, massima semplicità</span></button>
+        {markets==='custom'&&<button className="market-choice active custom" onClick={openPro}><strong>Personalizzati</strong><span>Whitelist/blacklist definite in modalità Pro</span></button>}
+      </div>
+    </div>
+
+    <div className="basic-summary">
+      <div className="basic-summary-head"><div><h3>Riepilogo</h3><p>Questi sono i principali limiti che HyperCopy applicherà.</p></div>{equity!=null&&<span className="badge">Equity {usd(equity)}</span>}</div>
+      <div className="basic-summary-grid">
+        <SummaryItem label="Intensità copy" value={`${Math.round(Number(preview.multiplier)*100)}%`}/>
+        <SummaryItem label="Leva follower" value={`Master fino a ${Number(preview.max_leverage)}×`}/>
+        <SummaryItem label="Soglia drawdown" value={`${Number(preview.max_drawdown_pct)}%`}/>
+        <SummaryItem label="Perdita giornaliera" value={`${Number(preview.max_daily_loss_pct)}%`}/>
+        <SummaryItem label="Max posizioni" value={String(preview.max_positions)}/>
+        <SummaryItem label="Mercati" value={marketLabel(markets)}/>
+      </div>
+      <p className="basic-footnote">I tetti monetari vengono calibrati automaticamente sull'equity disponibile quando è presente. La leva viene copiata dal Master ma non può superare il limite del profilo o quello del singolo mercato.</p>
+      <div className="actions basic-actions">
+        <button className="primary" onClick={apply} disabled={profile==='custom'}>Applica profilo Basic</button>
+        <button onClick={openPro}>Vedi parametri Pro</button>
+      </div>
+    </div>
+  </div>;
+}
+
+function SummaryItem({label,value}:{label:string;value:string}){
+  return <div className="summary-item"><span>{label}</span><strong>{value}</strong></div>;
+}
+
+function buildBasicRisk(risk:Risk,profile:BasicProfile,markets:BasicMarkets,equity:number|null):Risk{
+  let next:Risk={...risk,allow_assets:[...risk.allow_assets],block_assets:[...risk.block_assets]};
+  if(profile!=='custom'){
+    const p=BASIC_PROFILES[profile];
+    next={
+      ...next,
+      multiplier:cleanNumber(p.multiplier),
+      max_leverage:cleanNumber(p.maxLeverage),
+      max_positions:p.maxPositions,
+      max_drawdown_pct:cleanNumber(p.maxDrawdown),
+      max_daily_loss_pct:cleanNumber(p.dailyLoss),
+      min_notional:'10',
+      max_slippage_bps:50,
+      close_only:false,
+    };
+    if(equity!=null&&equity>0){
+      const total=Math.max(10,roundMoney(equity*p.exposureFactor));
+      const asset=Math.max(10,Math.min(total,roundMoney(total*p.assetShare)));
+      next.max_total_exposure=cleanNumber(total);
+      next.max_asset_exposure=cleanNumber(asset);
+      next.max_notional_per_trade=cleanNumber(asset);
+    }
+  }
+
+  if(markets!=='custom'){
+    next.allow_assets=markets==='all'?[]:markets==='btc'?['BTC']:[...MAJOR_ASSETS];
+    next.block_assets=[];
+  }
+  return next;
+}
+
+function inferBasicProfile(risk:Risk):BasicProfile{
+  const candidates=(Object.keys(BASIC_PROFILES) as Exclude<BasicProfile,'custom'>[]);
+  for(const key of candidates){
+    const p=BASIC_PROFILES[key];
+    if(close(Number(risk.multiplier),p.multiplier)&&close(Number(risk.max_leverage),p.maxLeverage)&&close(Number(risk.max_drawdown_pct),p.maxDrawdown)&&close(Number(risk.max_daily_loss_pct),p.dailyLoss))return key;
+  }
+  return 'custom';
+}
+
+function inferBasicMarkets(risk:Risk):BasicMarkets{
+  if(risk.block_assets.length)return 'custom';
+  if(risk.allow_assets.length===0)return 'all';
+  if(sameAssets(risk.allow_assets,['BTC']))return 'btc';
+  if(sameAssets(risk.allow_assets,MAJOR_ASSETS))return 'majors';
+  return 'custom';
+}
+
+function sameAssets(a:string[],b:string[]){
+  const aa=[...a].map(x=>x.toUpperCase()).sort();
+  const bb=[...b].map(x=>x.toUpperCase()).sort();
+  return aa.length===bb.length&&aa.every((x,i)=>x===bb[i]);
+}
+
+function marketLabel(markets:BasicMarkets){
+  if(markets==='all')return 'Tutti';
+  if(markets==='majors')return 'Major';
+  if(markets==='btc')return 'Solo BTC';
+  return 'Personalizzati';
+}
+
+function cleanNumber(value:number){return Number(value.toFixed(2)).toString()}
+function roundMoney(value:number){return Math.round(value*100)/100}
+function close(a:number,b:number){return Number.isFinite(a)&&Math.abs(a-b)<0.0001}
+function usd(value:number){return value.toLocaleString('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2})}
 
 function Num({label,value,set}:{label:string;value:string;set:(v:string)=>void}){
   return <label>{label}<input type="number" step="any" value={value} onChange={e=>set(e.target.value)}/></label>;
