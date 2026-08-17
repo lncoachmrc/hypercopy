@@ -74,7 +74,10 @@ async def test_safe_read_retries_transient_502_then_succeeds(monkeypatch):
     result=await adapter._read(flaky_read,weight=2,priority=Priority.MASTER_STATE,timeout=1)
     assert result=={'ok':True}
     assert calls==3
-    assert adapter._metric_incr.await_count==2
+    metric_names=[call.args[0] for call in adapter._metric_incr.await_args_list]
+    assert metric_names.count('hl_5xx_count')==2
+    assert metric_names.count('hl_safe_read_retry_count')==2
+    assert adapter._metric_incr.await_count==4
 
 
 @pytest.mark.asyncio
