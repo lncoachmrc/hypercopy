@@ -95,14 +95,19 @@ export default function Dashboard(){
 function IntelligencePanel({data}:{data:Intelligence|null}){
   const last=data?.last;
   const strategy=data?.strategy;
-  const actualModel=last?.model||data?.preferred_model||'—';
-  const provider=last?.provider?last.provider.toUpperCase():'DETERMINISTIC';
+  const modelDisplay=last?.model
+    ? `${last.provider?.toUpperCase()||'LLM'} · ${last.model}`
+    : last
+      ? 'Nessun LLM · Motore deterministico'
+      : data?.preferred_model
+        ? `Preferito · ${data.preferred_model}`
+        : '—';
   const mode=(data?.mode||'off').toUpperCase();
   return <section className="panel intelligence-panel">
     <div className="panelhead intelligence-head"><div><h2>Traxion Intelligence</h2><p>Capital allocation + apprendimento progressivo della strategia operativa del master.</p></div><div className="intelligence-badges"><span className={`badge ${data?.mode==='active'?'live':''}`}>AI {mode}</span>{last?.fallback_count?<span className="badge">Failover {last.fallback_count}×</span>:null}</div></div>
     {last?<>
       <div className="intelligence-grid">
-        <IntelMetric label="Modello in uso" value={`${provider} · ${actualModel}`}/>
+        <IntelMetric label="Modello in uso" value={modelDisplay}/>
         <IntelMetric label="Policy" value={last.candidate_label||last.candidate_id}/>
         <IntelMetric label="Copertura strategia" value={`${Number(last.coverage_pct).toFixed(1)}%`}/>
         <IntelMetric label="Capitale consigliato" value={money(Number(last.recommended_capital))}/>
