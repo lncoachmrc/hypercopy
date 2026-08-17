@@ -107,6 +107,10 @@ async def positions(user: User = Depends(current_user), db: AsyncSession = Depen
             'status': status,
             'reason': reason,
             'managed': r.managed,
+            'master_leverage': r.master_leverage,
+            'master_is_cross': r.master_is_cross,
+            'follower_leverage': r.follower_leverage,
+            'follower_is_cross': r.follower_is_cross,
             'exchange_verified_at': r.exchange_verified_at,
         })
     return out
@@ -114,11 +118,33 @@ async def positions(user: User = Depends(current_user), db: AsyncSession = Depen
 
 @router.get('/executions')
 async def executions(user: User = Depends(current_user), db: AsyncSession = Depends(get_db), limit: int = 50, offset: int = 0, state: str | None = None, asset: str | None = None):
-    q = select(Execution).where(Execution.user_id == user.id)
+    q = select(Execution, CopyJob).join(CopyJob, CopyJob.id == Execution.copy_job_id).where(Execution.user_id == user.id)
     if state: q = q.where(Execution.state == state)
     if asset: q = q.where(Execution.asset == asset)
-    rows = (await db.execute(q.order_by(Execution.created_at.desc()).offset(offset).limit(min(limit, 200)))).scalars().all()
-    return [{'id': str(r.id), 'asset': r.asset, 'state': r.state.value, 'is_buy': r.is_buy, 'requested_size': r.requested_size, 'filled_size': r.filled_size, 'avg_price': r.avg_price, 'reduce_only': r.reduce_only, 'reject_reason': r.reject_reason, 'cloid': r.cloid, 'created_at': r.created_at} for r in rows]
+    rows = (await db.execute(q.order_by(Execution.created_at.desc()).offset(offset).limit(min(limit, 200)))).all()
+    out = []
+    for execution, job in rows:
+        ctx = job.context or {}
+        leverage = ctx.get('desired_follower_leverage', ctx.get('master_leverage'))
+        is_cross = ctx.get('desired_follower_is_cross')
+        if is_cross is None:
+            is_cross = ctx.get('master_is_cross')
+        out.append({
+            'id': str(execution.id),
+            'asset': execution.asset,
+            'state': execution.state.value,
+            'is_buy': execution.is_buy,
+            'requested_size': execution.requested_size,
+            'filled_size': execution.filled_size,
+            'avg_price': execution.avg_price,
+            'reduce_only': execution.reduce_only,
+            'reject_reason': execution.reject_reason,
+            'cloid': execution.cloid,
+            'leverage': leverage,
+            'is_cross': is_cross,
+            'created_at': execution.created_at,
+        })
+    return out
 
 
 @router.post('/trading-account', dependencies=[Depends(require_csrf)])
