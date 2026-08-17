@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 
-from app.api import activation, admin, analytics, auth, billing, leverage, user, ws
+from app.api import activation, admin, analytics, auth, billing, intelligence, leverage, user, ws
 from app.api.deps import api_rate_limit
 
 api_router = APIRouter(prefix='/api/v1')
@@ -11,6 +11,7 @@ http_router.include_router(auth.router)
 http_router.include_router(activation.router)
 http_router.include_router(user.router)
 http_router.include_router(leverage.router)
+http_router.include_router(intelligence.router)
 http_router.include_router(analytics.router)
 http_router.include_router(billing.router)
 http_router.include_router(admin.router)
