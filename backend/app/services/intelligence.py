@@ -107,7 +107,7 @@ async def refresh_capital_intelligence(db: AsyncSession, master_hl) -> dict:
     snapshot = await master_hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
     master_positions = _positions(snapshot.perp_state)
     master_equity = snapshot.account_value
-    master_mids = await master_hl.mids(priority=Priority.MASTER_STATE)
+    master_mids = await master_hl.mids()
     profile = profile_row.profile or {}
     persistence = {
         asset: values.get('persistence_score', 0.5)
@@ -163,20 +163,21 @@ async def refresh_capital_intelligence(db: AsyncSession, master_hl) -> dict:
         status = 'DETERMINISTIC'
 
         if settings.LLM_ENABLED and settings.LLM_CAPITAL_MODE != 'off':
+            valid = {c['id']: c for c in candidates}
             try:
                 result = await router.complete_json(
                     system_prompt=SYSTEM_PROMPT,
                     user_prompt=_candidate_prompt(candidates, profile, eligible_equity, recommended),
+                    allowed_candidate_ids=set(valid),
                 )
                 attempts = result.attempts
-                requested = str(result.data.get('candidate_id') or '')
-                valid = {c['id']: c for c in candidates}
-                if requested not in valid:
-                    raise ValueError(f'LLM selected unknown candidate {requested!r}')
-                selected = valid[requested]
+                selected = valid[str(result.data.get('candidate_id'))]
                 provider = result.provider
                 model = result.model
-                confidence = max(Decimal(0), min(Decimal(1), _d(result.data.get('confidence', '0.5'))))
+                try:
+                    confidence = max(Decimal(0), min(Decimal(1), _d(result.data.get('confidence', '0.5'))))
+                except Exception:
+                    confidence = Decimal('0.5')
                 summary = str(result.data.get('summary') or '').strip()[:500] or f'{selected["label"]} selected by {model}'
                 status = 'OK'
             except LLMUnavailable as exc:
@@ -197,10 +198,14 @@ async def refresh_capital_intelligence(db: AsyncSession, master_hl) -> dict:
                     status = 'LLM_INVALID'
 
         policy = {
+            'candidate_id': selected['id'],
             'candidate_label': selected['label'],
-            'signed_equity_weights': selected['signed_equity_weights'],
             'selected_assets': selected['selected_assets'],
             'buffer_pct': selected['buffer_pct'],
+            'allocation_scale': selected.get('allocation_scale', '1'),
+            # Snapshot weights are retained for audit/UI only. Live targeting
+            # always re-applies the structural policy to current master state.
+            'signed_equity_weights': selected['signed_equity_weights'],
             'coverage_pct': selected['coverage_pct'],
             'tracking_error_pct': selected['tracking_error_pct'],
             'risk_multiplier': str(risk.multiplier),
@@ -236,7 +241,7 @@ async def active_policy_for_user(db: AsyncSession, user_id, *, risk_multiplier: 
     """Return a fresh bounded policy only when AI capital mode is ACTIVE.
 
     A stale decision or a changed risk profile is ignored, which reverts the
-    reconciliation path to the existing exact-ratio algorithm.
+    execution path to the existing exact-ratio algorithm.
     """
     if settings.LLM_CAPITAL_MODE != 'active':
         return None
@@ -254,5 +259,8 @@ async def active_policy_for_user(db: AsyncSession, user_id, *, risk_multiplier: 
         return None
     if policy.get('master_network') != settings.master_network or policy.get('follower_network') != settings.follower_network:
         return None
-    weights = policy.get('signed_equity_weights')
-    return policy if isinstance(weights, dict) else None
+    if policy.get('candidate_id') not in {'exact', 'smart_fidelity', 'smart_balanced', 'smart_defensive'}:
+        return None
+    if not isinstance(policy.get('selected_assets'), list):
+        return None
+    return policy
