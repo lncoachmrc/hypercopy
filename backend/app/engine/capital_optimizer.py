@@ -102,8 +102,6 @@ def _compressed_candidate(entries: list[dict], follower_equity: Decimal, floor: 
         under = [x for x in selected if allocations[x['asset']] < floor]
         if not under:
             break
-        # Remove the least important sub-minimum leg. Persistence is used only
-        # as a tie-breaker; it never changes the master-derived weight itself.
         loser = min(
             under,
             key=lambda x: (allocations[x['asset']], x['persistence'], x['master_notional']),
@@ -125,9 +123,6 @@ def _compressed_candidate(entries: list[dict], follower_equity: Decimal, floor: 
         'id': candidate_id,
         'label': label,
         'buffer_pct': str(buffer_pct),
-        # Structural policy: at execution time current master exposure is
-        # multiplied by this scale. Therefore closes, reversals and scale-ins
-        # remain responsive even between LLM refreshes.
         'allocation_scale': str(allocation_scale),
         'coverage_pct': str(_coverage(entries, selected_assets).quantize(Decimal('0.01'))),
         'tracking_error_pct': str(_tracking_error(exact_targets, candidate_targets).quantize(Decimal('0.01'))),
@@ -197,8 +192,6 @@ def choose_deterministic_candidate(candidates: list[dict], target_coverage_pct: 
     eligible = [x for x in candidates if x['id'] != 'exact' and x.get('selected_assets')]
     if not eligible:
         return exact
-    # Prefer candidates that reach the requested coverage; among them minimize
-    # tracking error. Otherwise maximize coverage and then minimize error.
     reaching = [x for x in eligible if _d(x['coverage_pct']) >= target]
     pool = reaching or eligible
     return min(
@@ -210,32 +203,9 @@ def choose_deterministic_candidate(candidates: list[dict], target_coverage_pct: 
     )
 
 
-def live_policy_weight(
-    *,
-    policy: Mapping,
-    asset: str,
-    master_position: Decimal,
-    master_mark: Decimal,
-    master_equity: Decimal,
-    multiplier: Decimal,
-) -> Decimal:
-    """Apply a structural AI policy to the *current* master state.
-
-    Current master flat => zero immediately; reversals flip immediately; scale
-    changes use current master exposure. A market known to be unavailable on the
-    follower remains zero. If master and follower share the same network, a
-    brand-new master asset can temporarily use Exact Ratio. Across different
-    networks a new asset waits for the next follower-universe refresh so an
-    unsupported market can never be inferred from the master catalog.
-    """
-    position = _d(master_position)
-    mark = _d(master_mark)
-    equity = _d(master_equity)
-    mult = _d(multiplier)
-    if position == 0 or mark <= 0 or equity <= 0:
+def _adjust_exact_weight(policy: Mapping, asset: str, signed_exact: Decimal) -> Decimal:
+    if signed_exact == 0:
         return ZERO
-    signed_exact = (ONE if position > 0 else Decimal('-1')) * (abs(position) * mark / equity) * mult
-
     known_assets = set(policy.get('known_master_assets') or [])
     available_assets = set(policy.get('follower_available_assets') or [])
     if known_assets and asset not in known_assets:
@@ -248,8 +218,45 @@ def live_policy_weight(
         return ZERO
     if str(policy.get('candidate_id') or '') == 'exact':
         return signed_exact
-    selected = set(policy.get('selected_assets') or [])
-    if asset not in selected:
+    if asset not in set(policy.get('selected_assets') or []):
         return ZERO
     scale = max(ZERO, _d(policy.get('allocation_scale') or '0'))
     return signed_exact * scale
+
+
+def live_policy_tracking_error_pct(policy: Mapping, exact_signed_weights: Mapping[str, Decimal] | None) -> Decimal | None:
+    """Recompute tracking error against the current master portfolio.
+
+    A Smart policy is valid for trading only when current master exposure can be
+    proven and still stays inside the configured tracking envelope. Exact Ratio
+    has zero structural tracking error by definition.
+    """
+    if str(policy.get('candidate_id') or '') == 'exact':
+        return ZERO
+    if exact_signed_weights is None:
+        return None
+    exact = {asset: _d(weight) for asset, weight in exact_signed_weights.items() if _d(weight) != 0}
+    if not exact:
+        return ZERO
+    candidate = {asset: _adjust_exact_weight(policy, asset, weight) for asset, weight in exact.items()}
+    return _tracking_error(exact, candidate)
+
+
+def live_policy_weight(
+    *,
+    policy: Mapping,
+    asset: str,
+    master_position: Decimal,
+    master_mark: Decimal,
+    master_equity: Decimal,
+    multiplier: Decimal,
+) -> Decimal:
+    """Apply a structural AI policy to the current master state."""
+    position = _d(master_position)
+    mark = _d(master_mark)
+    equity = _d(master_equity)
+    mult = _d(multiplier)
+    if position == 0 or mark <= 0 or equity <= 0:
+        return ZERO
+    signed_exact = (ONE if position > 0 else Decimal('-1')) * (abs(position) * mark / equity) * mult
+    return _adjust_exact_weight(policy, asset, signed_exact)
