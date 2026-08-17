@@ -57,7 +57,7 @@ const MAJOR_ASSETS=['BTC','ETH','SOL','XRP','BNB','ADA','AVAX','LINK','LTC','BCH
 const BASIC_PROFILES:Record<Exclude<BasicProfile,'custom'>,BasicProfileConfig>={
   prudent:{
     title:'Prudente',
-    description:'Copia metà della size proporzionale e limita maggiormente leva ed esposizione.',
+    description:'Utilizza il 50% dell’esposizione strategica e limita maggiormente leva e capitale impiegato.',
     multiplier:0.5,
     maxLeverage:3,
     maxPositions:10,
@@ -69,7 +69,7 @@ const BASIC_PROFILES:Record<Exclude<BasicProfile,'custom'>,BasicProfileConfig>={
   balanced:{
     title:'Bilanciato',
     badge:'Consigliato',
-    description:'Buon equilibrio tra fedeltà al Master e protezione del capitale.',
+    description:'Equilibrio tra adesione alla strategia ibrida e protezione del capitale.',
     multiplier:0.75,
     maxLeverage:5,
     maxPositions:20,
@@ -79,8 +79,8 @@ const BASIC_PROFILES:Record<Exclude<BasicProfile,'custom'>,BasicProfileConfig>={
     assetShare:0.20,
   },
   faithful:{
-    title:'Fedele al Master',
-    description:'Replica il 100% della size proporzionale e lascia più spazio alla leva del Master.',
+    title:'Strategia completa',
+    description:'Utilizza il 100% dell’esposizione proporzionale prevista dalla strategia e lascia più spazio alla leva operativa.',
     multiplier:1,
     maxLeverage:40,
     maxPositions:50,
@@ -146,7 +146,7 @@ export default function Settings(){
   const applyBasic=async()=>{
     if(!risk)return;
     if(basicProfile==='custom'){
-      setMsg('La configurazione attuale è personalizzata. Scegli Prudente, Bilanciato o Fedele al Master per applicare la modalità Basic.');
+      setMsg('La configurazione attuale è personalizzata. Scegli Prudente, Bilanciato o Strategia completa per applicare la modalità Basic.');
       return;
     }
     const next=buildBasicRisk(risk,basicProfile,basicMarkets,equity);
@@ -154,7 +154,7 @@ export default function Settings(){
     setRisk(stored);
     setBasicProfile(inferBasicProfile(stored));
     setBasicMarkets(inferBasicMarkets(stored));
-    setMsg(`Profilo Basic “${BASIC_PROFILES[basicProfile].title}” applicato. Il copy state non è stato modificato.`);
+    setMsg(`Profilo Basic “${BASIC_PROFILES[basicProfile].title}” applicato. Lo stato operativo non è stato modificato.`);
   };
 
   const presetBtc=async()=>{
@@ -173,7 +173,7 @@ export default function Settings(){
       close_only:false,
     };
     await save(next);
-    setMsg('Preset TESTNET BTC pronto: 1 posizione, solo BTC, max $25, leva massima 2×. Copy non viene attivato automaticamente.');
+    setMsg('Preset TESTNET BTC pronto: 1 posizione, solo BTC, max $25, leva massima 2×. La strategia non viene attivata automaticamente.');
   };
 
   const presetMulti=async()=>{
@@ -192,37 +192,37 @@ export default function Settings(){
       close_only:false,
     };
     await save(next);
-    setMsg('Preset TESTNET multi-asset pronto: tutti i mercati disponibili, max 50 posizioni, $100 per asset/trade, $1000 esposizione totale. Leva copiata dal Master fino a 40× e al limite del singolo mercato. Copy non viene attivato automaticamente.');
+    setMsg('Preset TESTNET multi-asset pronto: tutti i mercati disponibili, max 50 posizioni, $100 per asset/trade, $1000 esposizione totale. Leva allineata alla strategia sorgente fino a 40× e al limite del singolo mercato. La strategia non viene attivata automaticamente.');
   };
 
   const setShadow=async()=>{
     await post('/copy/shadow');
     await load();
     await refresh();
-    setMsg('Modalità SHADOW attiva: i target vengono calcolati ma non vengono inviati ordini.');
+    setMsg('Modalità SHADOW attiva: target e controlli vengono calcolati ma non vengono inviati ordini.');
   };
 
   return <>
     <div className="title">
       <div>
         <h1>Configurazione</h1>
-        <p>Il wallet con cui accedi a HyperCopy è anche il tuo account Hyperliquid follower. Per autorizzare gli ordini usa soltanto un API Wallet Hyperliquid nominato <code>hypercopy</code>.</p>
+        <p>Il wallet con cui accedi a HyperCopy è anche il tuo account operativo Hyperliquid. Per autorizzare gli ordini usa soltanto un API Wallet Hyperliquid nominato <code>hypercopy</code>.</p>
       </div>
     </div>
 
     <div className="cols">
       <section className="panel">
-        <h2>Account copytrading</h2>
+        <h2>Account operativo</h2>
         {me&&<dl>
-          <dt>Rete Master</dt><dd>{me.master_network.toUpperCase()}</dd>
-          <dt>Rete Follower</dt><dd>{me.follower_network.toUpperCase()}</dd>
-          <dt>Modalità copy</dt><dd>{me.copy_state}</dd>
+          <dt>Rete strategia</dt><dd>{me.master_network.toUpperCase()}</dd>
+          <dt>Rete account</dt><dd>{me.follower_network.toUpperCase()}</dd>
+          <dt>Modalità operativa</dt><dd>{me.copy_state}</dd>
         </dl>}
 
         {me?.trading_account?<>
           <dl>
-            <dt>Wallet cliente / account follower</dt><dd>{me.trading_account.account_address}</dd>
-            <dt>Rete account follower</dt><dd>{me.trading_account.network.toUpperCase()}</dd>
+            <dt>Wallet / account operativo</dt><dd>{me.trading_account.account_address}</dd>
+            <dt>Rete account operativo</dt><dd>{me.trading_account.network.toUpperCase()}</dd>
             <dt>API Wallet / Agent</dt><dd>{me.trading_account.agent_address}</dd>
             <dt>Nome Agent</dt><dd>{me.trading_account.agent_name||'hypercopy'}</dd>
             <dt>Stato credenziale</dt><dd>{me.trading_account.credential_status}</dd>
@@ -231,7 +231,7 @@ export default function Settings(){
           <p className="muted">La private key del wallet principale non viene mai richiesta da HyperCopy.</p>
           <button className="danger" onClick={async()=>{await del('/trading-account');await load()}}>Scollega API Wallet</button>
         </>:<>
-          <dl><dt>Wallet cliente / account follower</dt><dd>{me?.auth_wallet||'Caricamento…'}</dd></dl>
+          <dl><dt>Wallet / account operativo</dt><dd>{me?.auth_wallet||'Caricamento…'}</dd></dl>
           <p className="muted">Questo indirizzo deriva dal wallet con cui hai effettuato l'accesso e non può essere sostituito con un altro account.</p>
           <label>API Wallet Address<input value={agent} onChange={e=>setAgent(e.target.value)} placeholder="0x…" autoComplete="off"/></label>
           <label>API Wallet Private Key<input type="password" autoComplete="off" value={key} onChange={e=>setKey(e.target.value)} placeholder="0x…"/></label>
@@ -243,10 +243,10 @@ export default function Settings(){
         <div className="actions">
           <button onClick={async()=>{await post('/copy/pause');await load();await refresh()}} disabled={me?.copy_state==='PAUSED'}>Pausa</button>
           <button className="primary" onClick={()=>void setShadow()} disabled={!me?.trading_account||me?.copy_state==='SHADOW'}>Modalità SHADOW</button>
-          <button onClick={async()=>{if(confirm(`Attivare il copytrading con invio ordini sulla rete ${me?.follower_network?.toUpperCase()||''}?`)){await post('/copy/resume');await load();await refresh()}}} disabled={!me?.trading_account||me?.copy_state==='ACTIVE'}>Attiva copy {me?.follower_network?.toUpperCase()||''}</button>
+          <button onClick={async()=>{if(confirm(`Attivare il trading automatizzato della strategia ibrida sulla rete ${me?.follower_network?.toUpperCase()||''}?`)){await post('/copy/resume');await load();await refresh()}}} disabled={!me?.trading_account||me?.copy_state==='ACTIVE'}>Attiva strategia {me?.follower_network?.toUpperCase()||''}</button>
           <button className="danger" onClick={async()=>{if(confirm('Generare ordini reduce-only per chiudere tutte le posizioni gestite?')){await post('/copy/close-positions',{confirmation:'CLOSE',reason:'User requested close all'});setMsg('Chiusure accodate.')}}}>Chiudi posizioni</button>
         </div>
-        <p className="muted">SHADOW calcola target e delta senza inviare ordini. "Attiva copy" abilita invece l'esecuzione sulla rete follower indicata.</p>
+        <p className="muted">SHADOW calcola target, sizing e controlli senza inviare ordini. “Attiva strategia” abilita l'esecuzione automatizzata sul tuo account operativo.</p>
       </section>
 
       <section className="panel risk-panel">
@@ -273,7 +273,7 @@ export default function Settings(){
         />}
 
         {risk&&riskMode==='pro'&&<>
-          <div className="pro-warning">Modalità Pro: controllo completo dei limiti. Le modifiche possono cambiare direttamente sizing, leva consentita e comportamento del copytrading.</div>
+          <div className="pro-warning">Modalità Pro: controllo completo dei limiti. Le modifiche possono cambiare direttamente sizing, leva consentita e comportamento dell'esecuzione automatizzata.</div>
           <div className="formgrid">
             <Num label="Multiplier" value={risk.multiplier} set={v=>setRisk({...risk,multiplier:v})}/>
             <Num label="Max / trade $" value={risk.max_notional_per_trade} set={v=>setRisk({...risk,max_notional_per_trade:v})}/>
@@ -312,14 +312,14 @@ function BasicRisk({risk,equity,profile,markets,setProfile,setMarkets,apply,open
   const preview=buildBasicRisk(risk,profile,markets,equity);
   return <div className="basic-risk">
     <div className="basic-section">
-      <div className="basic-section-title"><span>1</span><div><h3>Come vuoi copiare il Master?</h3><p>HyperCopy traduce questa scelta nei limiti tecnici del Risk Engine.</p></div></div>
+      <div className="basic-section-title"><span>1</span><div><h3>Quanto vuoi seguire la strategia?</h3><p>HyperCopy traduce questa scelta in sizing, leva e limiti tecnici del Risk Engine.</p></div></div>
       <div className="risk-choice-grid">
         {(Object.keys(BASIC_PROFILES) as Exclude<BasicProfile,'custom'>[]).map(key=>{
           const item=BASIC_PROFILES[key];
           return <button key={key} className={`risk-choice ${profile===key?'active':''}`} onClick={()=>setProfile(key)}>
             <div className="risk-choice-top"><strong>{item.title}</strong>{item.badge&&<span className="choice-badge">{item.badge}</span>}</div>
             <span>{item.description}</span>
-            <small>Copia {Math.round(item.multiplier*100)}% · leva max {item.maxLeverage}× · drawdown {item.maxDrawdown}%</small>
+            <small>Intensità {Math.round(item.multiplier*100)}% · leva max {item.maxLeverage}× · drawdown {item.maxDrawdown}%</small>
           </button>;
         })}
         {profile==='custom'&&<button className="risk-choice active custom" onClick={openPro}>
@@ -331,7 +331,7 @@ function BasicRisk({risk,equity,profile,markets,setProfile,setMarkets,apply,open
     </div>
 
     <div className="basic-section">
-      <div className="basic-section-title"><span>2</span><div><h3>Quali mercati vuoi copiare?</h3><p>Gli asset non disponibili sulla rete follower vengono comunque ignorati automaticamente.</p></div></div>
+      <div className="basic-section-title"><span>2</span><div><h3>Quali mercati vuoi utilizzare?</h3><p>Gli asset non disponibili sulla rete del tuo account vengono ignorati automaticamente.</p></div></div>
       <div className="market-choice-grid">
         <button className={`market-choice ${markets==='all'?'active':''}`} onClick={()=>setMarkets('all')}><strong>Tutti</strong><span>Tutti i perpetual supportati</span></button>
         <button className={`market-choice ${markets==='majors'?'active':''}`} onClick={()=>setMarkets('majors')}><strong>Major</strong><span>BTC, ETH, SOL e principali large cap</span></button>
@@ -341,16 +341,16 @@ function BasicRisk({risk,equity,profile,markets,setProfile,setMarkets,apply,open
     </div>
 
     <div className="basic-summary">
-      <div className="basic-summary-head"><div><h3>Riepilogo</h3><p>Questi sono i principali limiti che HyperCopy applicherà.</p></div>{equity!=null&&<span className="badge">Equity {usd(equity)}</span>}</div>
+      <div className="basic-summary-head"><div><h3>Riepilogo</h3><p>Questi sono i principali limiti che HyperCopy applicherà alla strategia.</p></div>{equity!=null&&<span className="badge">Equity {usd(equity)}</span>}</div>
       <div className="basic-summary-grid">
-        <SummaryItem label="Intensità copy" value={`${Math.round(Number(preview.multiplier)*100)}%`}/>
-        <SummaryItem label="Leva follower" value={`Master fino a ${Number(preview.max_leverage)}×`}/>
+        <SummaryItem label="Intensità strategia" value={`${Math.round(Number(preview.multiplier)*100)}%`}/>
+        <SummaryItem label="Leva account" value={`Strategia fino a ${Number(preview.max_leverage)}×`}/>
         <SummaryItem label="Soglia drawdown" value={`${Number(preview.max_drawdown_pct)}%`}/>
         <SummaryItem label="Perdita giornaliera" value={`${Number(preview.max_daily_loss_pct)}%`}/>
         <SummaryItem label="Max posizioni" value={String(preview.max_positions)}/>
         <SummaryItem label="Mercati" value={marketLabel(markets)}/>
       </div>
-      <p className="basic-footnote">I tetti monetari vengono calibrati automaticamente sull'equity disponibile quando è presente. La leva viene copiata dal Master ma non può superare il limite del profilo o quello del singolo mercato.</p>
+      <p className="basic-footnote">I tetti monetari vengono calibrati automaticamente sull'equity disponibile quando è presente. La leva viene allineata alla strategia sorgente ma non può superare il limite del profilo o quello del singolo mercato.</p>
       <div className="actions basic-actions">
         <button className="primary" onClick={apply} disabled={profile==='custom'}>Applica profilo Basic</button>
         <button onClick={openPro}>Vedi parametri Pro</button>
