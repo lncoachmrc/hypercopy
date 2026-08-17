@@ -66,7 +66,9 @@ LLM_MAX_ALLOCATION_SCALE=1.5
 
 Exact Ratio always remains available. A stored policy that later exceeds the current limits is ignored automatically.
 
-A master asset that opens after the last LLM analysis temporarily follows Exact Ratio until the next intelligence refresh. A market already verified as unavailable on the follower remains excluded.
+The tracking-error limit is also recalculated against the **current** master portfolio on every realtime fill and every reconciliation cycle. If a previously valid Smart policy drifts beyond the hard limit, or current master exposure cannot be proven, Traxion immediately falls back to Exact Ratio instead of waiting for the next LLM refresh.
+
+Asset-universe safety is network-aware. If master and follower use the same Hyperliquid network, a brand-new master asset may temporarily use Exact Ratio until the next intelligence refresh. Across different networks (for example mainnet master → testnet follower), a brand-new asset waits for the next follower-universe refresh so Traxion never assumes that a mainnet market exists on testnet. A market already verified as unavailable on the follower remains excluded.
 
 ## Railway variables
 
@@ -149,4 +151,4 @@ No LLM environment variable or provider secret is required. The authenticated fr
 7. Only after validation set `LLM_CAPITAL_MODE=active` consistently on `execution-worker`, `master-watcher` and `api`.
 8. Keep follower mainnet disabled until the project's existing mainnet Definition of Done is independently satisfied.
 
-Changing from `shadow` to `active` never bypasses risk or live-trading gates. A stale intelligence decision, a shadow-mode decision, changed risk multiplier/minimum notional, changed network topology or a policy outside the current hard limits causes automatic fallback to the original Exact Ratio algorithm.
+Changing from `shadow` to `active` never bypasses risk or live-trading gates. A stale intelligence decision, a shadow-mode decision, changed risk multiplier/minimum notional, changed network topology, current tracking error above the configured hard limit or a policy outside the current hard limits causes automatic fallback to the original Exact Ratio algorithm.
