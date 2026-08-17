@@ -81,25 +81,33 @@ def test_live_policy_uses_current_master_direction_and_closes_immediately():
     assert excluded == 0
 
 
-def test_live_policy_uses_exact_for_new_asset_but_zero_for_known_unavailable_market():
-    policy = {
+def test_new_asset_uses_exact_on_same_network_and_waits_on_split_network():
+    base_policy = {
         'candidate_id': 'smart_balanced',
         'selected_assets': ['BTC'],
         'allocation_scale': '1.2',
         'known_master_assets': ['BTC', 'UNAV'],
         'follower_available_assets': ['BTC'],
     }
-    new_asset = live_policy_weight(
-        policy=policy, asset='ETH', master_position=Decimal('10'),
+    same_network = {**base_policy, 'master_network': 'mainnet', 'follower_network': 'mainnet'}
+    split_network = {**base_policy, 'master_network': 'mainnet', 'follower_network': 'testnet'}
+
+    same_new_asset = live_policy_weight(
+        policy=same_network, asset='ETH', master_position=Decimal('10'),
         master_mark=Decimal('2'), master_equity=Decimal('100'), multiplier=Decimal('1'),
     )
-    unavailable = live_policy_weight(
-        policy=policy, asset='UNAV', master_position=Decimal('10'),
+    split_new_asset = live_policy_weight(
+        policy=split_network, asset='ETH', master_position=Decimal('10'),
+        master_mark=Decimal('2'), master_equity=Decimal('100'), multiplier=Decimal('1'),
+    )
+    known_unavailable = live_policy_weight(
+        policy=split_network, asset='UNAV', master_position=Decimal('10'),
         master_mark=Decimal('2'), master_equity=Decimal('100'), multiplier=Decimal('1'),
     )
 
-    assert new_asset == Decimal('0.2')
-    assert unavailable == 0
+    assert same_new_asset == Decimal('0.2')
+    assert split_new_asset == 0
+    assert known_unavailable == 0
 
 
 def test_exact_policy_never_compresses_current_master_exposure():
