@@ -77,13 +77,13 @@ export default function Dashboard(){
   },[range]);
 
   return <>
-    <div className="title"><div><h1>Dashboard</h1><p>Stato reale, target e delta del tuo account Hyperliquid.</p></div><span className={`badge ${live}`}>{live}</span></div>
+    <div className="title"><div><h1>Dashboard</h1><p>Stato reale della strategia ibrida, del Risk Engine e del tuo account Hyperliquid.</p></div><span className={`badge ${live}`}>{live}</span></div>
     <div className="stats"><Card label="Equity" value={money(d?.equity)}/><Card label="PnL periodo" value={money(d?.pnl_absolute)} tone={pnlTone(d?.pnl_absolute)}/><Card label="Max drawdown" value={d?`${d.max_drawdown_pct.toFixed(2)}%`:'—'}/><Card label="Sharpe" value={d?.sharpe==null?'—':d.sharpe.toFixed(2)}/></div>
 
     <PnlChart data={pnl} range={range} setRange={setRange} error={pnlError}/>
 
-    <section className="panel"><div className="panelhead"><h2>Position targeting</h2><span className="badge">{d?.user.copy_state||user?.copy_state} · {d?.user.risk_state||'NORMAL'}</span></div><table><thead><tr><th>Asset</th><th>Attuale</th><th>Target</th><th>Delta</th><th>Leva M → F</th><th>Stato</th><th>Verifica exchange</th></tr></thead><tbody>{pos.length?pos.map(p=><tr key={p.asset}><td><b>{p.asset}</b></td><td>{p.current_size}</td><td>{p.status==='UNAVAILABLE'?'—':p.target_size}</td><td className={p.status==='UNAVAILABLE'?'':Number(p.delta)>=0?'up':'down'}>{p.status==='UNAVAILABLE'?'—':p.delta}</td><td><PositionLeverage p={p} live={liveLeverage[p.asset]}/></td><td><TargetStatus p={p}/></td><td>{p.exchange_verified_at?new Date(p.exchange_verified_at).toLocaleString():'—'}</td></tr>):<tr><td colSpan={7}>Nessuna posizione gestita.</td></tr>}</tbody></table></section>
-    <section className="panel"><div className="panelhead"><h2>Ultime execution</h2><span className="muted">Cloid persistente + reconciliation</span></div><table><thead><tr><th>Ora</th><th>Asset</th><th>Lato</th><th>Size</th><th>Leva</th><th>Stato</th><th>Motivo</th></tr></thead><tbody>{execs.map(x=><tr key={x.id}><td>{new Date(x.created_at).toLocaleString()}</td><td>{x.asset}</td><td className={x.is_buy?'up':'down'}>{x.is_buy?'BUY':'SELL'}{x.reduce_only?' RO':''}</td><td>{x.requested_size}</td><td>{formatLeverage(x.leverage,x.is_cross)}</td><td><span className="badge">{x.state}</span></td><td>{x.reject_reason||'—'}</td></tr>)}</tbody></table></section>
+    <section className="panel"><div className="panelhead"><h2>Posizionamento strategia</h2><span className="badge">{d?.user.copy_state||user?.copy_state} · {d?.user.risk_state||'NORMAL'}</span></div><table><thead><tr><th>Asset</th><th>Attuale</th><th>Target strategia</th><th>Delta</th><th>Leva strategia → account</th><th>Stato</th><th>Verifica exchange</th></tr></thead><tbody>{pos.length?pos.map(p=><tr key={p.asset}><td><b>{p.asset}</b></td><td>{p.current_size}</td><td>{p.status==='UNAVAILABLE'?'—':p.target_size}</td><td className={p.status==='UNAVAILABLE'?'':Number(p.delta)>=0?'up':'down'}>{p.status==='UNAVAILABLE'?'—':p.delta}</td><td><PositionLeverage p={p} live={liveLeverage[p.asset]}/></td><td><TargetStatus p={p}/></td><td>{p.exchange_verified_at?new Date(p.exchange_verified_at).toLocaleString():'—'}</td></tr>):<tr><td colSpan={7}>Nessuna posizione gestita dalla strategia.</td></tr>}</tbody></table></section>
+    <section className="panel"><div className="panelhead"><h2>Ultime operazioni</h2><span className="muted">Esecuzione persistente + reconciliation</span></div><table><thead><tr><th>Ora</th><th>Asset</th><th>Lato</th><th>Size</th><th>Leva</th><th>Stato</th><th>Motivo</th></tr></thead><tbody>{execs.map(x=><tr key={x.id}><td>{new Date(x.created_at).toLocaleString()}</td><td>{x.asset}</td><td className={x.is_buy?'up':'down'}>{x.is_buy?'BUY':'SELL'}{x.reduce_only?' RO':''}</td><td>{x.requested_size}</td><td>{formatLeverage(x.leverage,x.is_cross)}</td><td><span className="badge">{x.state}</span></td><td>{x.reject_reason||'—'}</td></tr>)}</tbody></table></section>
   </>;
 }
 
@@ -129,8 +129,8 @@ function PositionLeverage({p,live}:{p:Pos;live?:LiveLev}){
   const comparable=masterLeverage!=null&&followerLeverage!=null;
   const match=comparable&&Number(masterLeverage)===Number(followerLeverage)&&masterIsCross===followerIsCross;
   return <div className="leverage-pair">
-    <span><b>M</b> {master}</span>
-    <span className={comparable?(match?'up':'down'):'muted'}><b>F</b> {follower}</span>
+    <span><b>S</b> {master}</span>
+    <span className={comparable?(match?'up':'down'):'muted'}><b>A</b> {follower}</span>
   </div>;
 }
 
