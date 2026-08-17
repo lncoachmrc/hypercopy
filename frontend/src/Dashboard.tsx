@@ -9,6 +9,7 @@ type Exec={id:string;asset:string;state:string;is_buy:boolean;requested_size:str
 type PnlRange='1d'|'7d'|'30d'|'90d'|'all';
 type PnlPoint={at:string;value:number;bucket_value:number};
 type PnlHistory={range:PnlRange;pnl_absolute:number;pnl_pct:number|null;start_equity:number|null;current_equity:number|null;points:PnlPoint[];source:'realized_net'};
+type CardTone='positive'|'negative'|'neutral';
 
 const RANGE_OPTIONS:{key:PnlRange;label:string}[]=[
   {key:'1d',label:'1D'},
@@ -63,7 +64,7 @@ export default function Dashboard(){
 
   return <>
     <div className="title"><div><h1>Dashboard</h1><p>Stato reale, target e delta del tuo account Hyperliquid.</p></div><span className={`badge ${live}`}>{live}</span></div>
-    <div className="stats"><Card label="Equity" value={money(d?.equity)}/><Card label="PnL periodo" value={money(d?.pnl_absolute)}/><Card label="Max drawdown" value={d?`${d.max_drawdown_pct.toFixed(2)}%`:'—'}/><Card label="Sharpe" value={d?.sharpe==null?'—':d.sharpe.toFixed(2)}/></div>
+    <div className="stats"><Card label="Equity" value={money(d?.equity)}/><Card label="PnL periodo" value={money(d?.pnl_absolute)} tone={pnlTone(d?.pnl_absolute)}/><Card label="Max drawdown" value={d?`${d.max_drawdown_pct.toFixed(2)}%`:'—'}/><Card label="Sharpe" value={d?.sharpe==null?'—':d.sharpe.toFixed(2)}/></div>
 
     <PnlChart data={pnl} range={range} setRange={setRange} error={pnlError}/>
 
@@ -122,6 +123,7 @@ function pnlAxis(v:number){
 }
 
 function TargetStatus({p}:{p:Pos}){if(p.status==='UNAVAILABLE')return <span className="badge" title={p.reason||''}>Non disponibile TESTNET</span>;if(p.status==='BELOW_MIN')return <span className="badge" title={p.reason||''}>Sotto minimo · ${Number(p.delta_notional).toFixed(2)}</span>;if(p.status==='READY')return <span className="badge live">Pronto · ${Number(p.delta_notional).toFixed(2)}</span>;return <span className="muted">Allineato</span>}
-function Card({label,value}:{label:string;value:string}){return <div className="panel stat"><span>{label}</span><strong>{value}</strong></div>}
+function Card({label,value,tone='neutral'}:{label:string;value:string;tone?:CardTone}){const cls=tone==='positive'?'up':tone==='negative'?'down':'';return <div className="panel stat"><span>{label}</span><strong className={cls}>{value}</strong></div>}
+function pnlTone(v:number|null|undefined):CardTone{return v==null||v===0?'neutral':v>0?'positive':'negative'}
 function money(v:number|null|undefined){return v==null?'—':v.toLocaleString('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2})}
 function signedMoney(v:number|null|undefined){if(v==null)return'—';const abs=Math.abs(v).toLocaleString('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2});return `${v>0?'+':v<0?'-':''}${abs}`}
