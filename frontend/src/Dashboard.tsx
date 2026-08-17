@@ -76,25 +76,12 @@ function PnlChart({data,range,setRange,error}:{data:PnlHistory|null;range:PnlRan
   const positive=(data?.pnl_absolute??0)>=0;
   const stroke=positive?'#66d9a2':'#ff7b89';
   const fillId=positive?'pnlPositiveFill':'pnlNegativeFill';
-  const pct=data?.pnl_pct;
   return <section className="panel pnl-panel">
-    <div className="pnl-head">
-      <div>
-        <div className="pnl-kicker">Andamento PnL</div>
-        <div className={`pnl-value ${positive?'up':'down'}`}>{signedMoney(data?.pnl_absolute)}</div>
-        <div className="pnl-subline">
-          {pct==null?'Percentuale non disponibile':<span className={positive?'up':'down'}>{positive?'↑':'↓'} {Math.abs(pct).toFixed(2)}%</span>}
-          <span> · PnL realizzato netto</span>
-        </div>
+    <div className="panelhead pnl-chart-head">
+      <h2>Andamento PnL</h2>
+      <div className="pnl-ranges" aria-label="Intervallo grafico PnL">
+        {RANGE_OPTIONS.map(x=><button key={x.key} className={range===x.key?'active':''} onClick={()=>setRange(x.key)}>{x.label}</button>)}
       </div>
-      <div className="pnl-balance">
-        <span>Equity attuale</span>
-        <strong>{money(data?.current_equity)}</strong>
-      </div>
-    </div>
-
-    <div className="pnl-ranges" aria-label="Intervallo grafico PnL">
-      {RANGE_OPTIONS.map(x=><button key={x.key} className={range===x.key?'active':''} onClick={()=>setRange(x.key)}>{x.label}</button>)}
     </div>
 
     {error?<div className="pnl-empty">{error}</div>:<div className="pnl-chart">
