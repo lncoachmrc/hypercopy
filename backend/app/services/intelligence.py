@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.hyperliquid import HyperliquidAdapter
 from app.adapters.llm import LLMRouter, LLMUnavailable
-from app.adapters.ratelimit import Priority
+from app.adapters.ratelimit import Priority, WEIGHT_STANDARD_INFO
 from app.core.config import settings
 from app.engine.capital_optimizer import (
     build_capital_candidates,
@@ -141,17 +141,21 @@ async def refresh_capital_intelligence(db: AsyncSession, master_hl) -> dict:
     master_equity = snapshot.account_value
     master_mids = await master_hl.mids()
 
-    # Capital efficiency must be based on markets the follower can actually
-    # trade. This matters especially for mainnet-master -> testnet-follower
-    # validation where the universes are intentionally different.
+    # One metadata read gives the complete follower perp universe. Doing one
+    # asset_spec call per absent mainnet market would repeatedly fetch `meta`
+    # and could exhaust the 80-weight METADATA lane during a single AI cycle.
     follower_hl = HyperliquidAdapter(master_hl.limiter, network=settings.follower_network)
-    follower_available: set[str] = set()
-    for asset in master_positions:
-        try:
-            await follower_hl.asset_spec(asset)
-        except KeyError:
-            continue
-        follower_available.add(asset)
+    follower_meta = await follower_hl._read(
+        follower_hl.info.meta,
+        weight=WEIGHT_STANDARD_INFO,
+        priority=Priority.METADATA,
+        timeout=15,
+    )
+    follower_available = {
+        str(row.get('name') or '')
+        for row in (follower_meta.get('universe') or [])
+        if row.get('name')
+    }
 
     profile = profile_row.profile or {}
     persistence = {
