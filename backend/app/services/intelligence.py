@@ -7,6 +7,7 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.adapters.hyperliquid import HyperliquidAdapter
 from app.adapters.llm import LLMRouter, LLMUnavailable
 from app.adapters.ratelimit import Priority
 from app.core.config import settings
@@ -16,7 +17,7 @@ from app.engine.capital_optimizer import (
     recommended_capital_for_coverage,
 )
 from app.engine.sizing import EXCHANGE_MIN_NOTIONAL
-from app.models.entities import CopyState, EquitySnapshot, MasterEvent, RiskProfile, User
+from app.models.entities import CopyState, EquitySnapshot, MasterEvent, RiskProfile, User, UserState
 from app.models.intelligence import CapitalIntelligenceDecision, MasterStrategyProfile
 from app.services.master_learning import learn_master_strategy
 
@@ -77,8 +78,13 @@ def _candidate_prompt(candidates: list[dict], profile: dict, eligible_equity: De
 
 async def _learn_profile(db: AsyncSession) -> MasterStrategyProfile:
     since = datetime.now(UTC) - timedelta(days=settings.LLM_STRATEGY_WINDOW_DAYS)
+    # Master event IDs are network-prefixed by the watcher. Never train a
+    # current mainnet profile on historical testnet behavior (or vice versa).
     events = (await db.execute(
-        select(MasterEvent).where(MasterEvent.event_ts >= since).order_by(MasterEvent.event_ts)
+        select(MasterEvent).where(
+            MasterEvent.event_ts >= since,
+            MasterEvent.exchange_event_id.like(f'{settings.master_network}:%'),
+        ).order_by(MasterEvent.event_ts)
     )).scalars().all()
     learned = learn_master_strategy(events)
     row = (await db.execute(select(MasterStrategyProfile).where(
@@ -108,12 +114,28 @@ async def refresh_capital_intelligence(db: AsyncSession, master_hl) -> dict:
     master_positions = _positions(snapshot.perp_state)
     master_equity = snapshot.account_value
     master_mids = await master_hl.mids()
+
+    # Capital efficiency must be based on markets the follower can actually
+    # trade. This matters especially for mainnet-master -> testnet-follower
+    # validation where the universes are intentionally different.
+    follower_hl = HyperliquidAdapter(master_hl.limiter, network=settings.follower_network)
+    follower_available: set[str] = set()
+    for asset in master_positions:
+        try:
+            await follower_hl.asset_spec(asset)
+        except KeyError:
+            continue
+        follower_available.add(asset)
+
     profile = profile_row.profile or {}
     persistence = {
         asset: values.get('persistence_score', 0.5)
         for asset, values in (profile.get('assets') or {}).items()
     }
-    users = (await db.execute(select(User).where(User.copy_state.in_([CopyState.SHADOW, CopyState.ACTIVE])))).scalars().all()
+    users = (await db.execute(select(User).where(
+        User.state == UserState.ACTIVE,
+        User.copy_state.in_([CopyState.SHADOW, CopyState.ACTIVE]),
+    ))).scalars().all()
     router = LLMRouter()
     decisions = 0
 
@@ -133,7 +155,9 @@ async def refresh_capital_intelligence(db: AsyncSession, master_hl) -> dict:
 
         allowed_positions = {
             asset: size for asset, size in master_positions.items()
-            if (not risk.allow_assets or asset in risk.allow_assets) and asset not in risk.block_assets
+            if asset in follower_available
+            and (not risk.allow_assets or asset in risk.allow_assets)
+            and asset not in risk.block_assets
         }
         floor = max(_d(risk.min_notional), EXCHANGE_MIN_NOTIONAL)
         candidates = build_capital_candidates(
@@ -212,6 +236,7 @@ async def refresh_capital_intelligence(db: AsyncSession, master_hl) -> dict:
             'min_notional': str(floor),
             'master_network': settings.master_network,
             'follower_network': settings.follower_network,
+            'follower_available_assets': sorted(follower_available),
             'strategy_profile_learned_at': profile_row.learned_at.isoformat(),
         }
         db.add(CapitalIntelligenceDecision(
@@ -234,7 +259,12 @@ async def refresh_capital_intelligence(db: AsyncSession, master_hl) -> dict:
         decisions += 1
 
     await db.commit()
-    return {'users': decisions, 'master_events': profile_row.event_count, 'master_assets': profile_row.asset_count}
+    return {
+        'users': decisions,
+        'master_events': profile_row.event_count,
+        'master_assets': profile_row.asset_count,
+        'follower_available_master_assets': len(follower_available),
+    }
 
 
 async def active_policy_for_user(db: AsyncSession, user_id, *, risk_multiplier: Decimal, min_notional: Decimal) -> dict | None:
