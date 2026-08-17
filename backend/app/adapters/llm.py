@@ -142,8 +142,9 @@ class LLMRouter:
     """Provider failover with no trading authority.
 
     The preferred model is attempted first when it matches a configured provider.
-    Any timeout, credit/rate-limit error, provider outage, malformed response, or
-    authentication failure advances to the next configured provider.
+    Any timeout, credit/rate-limit error, provider outage, malformed/invalid
+    policy response, or authentication failure advances to the next configured
+    provider. API secrets never leave this backend adapter.
     """
 
     def _configured(self) -> list[tuple[str, str, str]]:
@@ -162,7 +163,13 @@ class LLMRouter:
             rows.sort(key=lambda row: 0 if row[1] == preferred else 1)
         return rows
 
-    async def complete_json(self, *, system_prompt: str, user_prompt: str) -> LLMResult:
+    async def complete_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        allowed_candidate_ids: set[str] | None = None,
+    ) -> LLMResult:
         attempts: list[dict] = []
         for provider, model, key in self._configured():
             started = time.perf_counter()
@@ -171,6 +178,10 @@ class LLMRouter:
                     asyncio.to_thread(_provider_sync, provider, model, key, system_prompt, user_prompt),
                     timeout=settings.LLM_TIMEOUT_SECONDS + 2,
                 )
+                if allowed_candidate_ids is not None:
+                    candidate_id = str(data.get('candidate_id') or '')
+                    if candidate_id not in allowed_candidate_ids:
+                        raise ValueError(f'Unknown candidate_id {candidate_id!r}')
                 latency = int((time.perf_counter() - started) * 1000)
                 attempts.append({'provider': provider, 'model': model, 'status': 'ok', 'latency_ms': latency})
                 return LLMResult(provider=provider, model=model, data=data, latency_ms=latency, attempts=attempts)
