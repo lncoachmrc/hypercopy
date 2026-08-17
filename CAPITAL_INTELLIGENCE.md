@@ -1,5 +1,7 @@
 # Traxion Capital Intelligence
 
+> Rollout policy: deploy and observe in **shadow** before any active influence on TESTNET targets.
+
 ## Purpose
 
 Capital Intelligence improves master-to-follower portfolio fidelity when follower capital is too small to reproduce every master leg above Hyperliquid's minimum order notional.
