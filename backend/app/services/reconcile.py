@@ -39,13 +39,6 @@ def _is_liquidity_reject(reason: str | None) -> bool:
 
 
 async def _liquidity_backoff_seconds(db: AsyncSession, user_id, asset: str) -> int:
-    """Back off consecutive IOC no-liquidity rejects for one follower market.
-
-    Reconciliation runs frequently. A terminal IOC reject must not cause it to
-    create a brand-new identical order on every cycle while the TESTNET book is
-    empty. Consecutive liquidity rejects back off 1m, 2m, 4m, 8m, then 10m.
-    Any non-liquidity terminal execution breaks the sequence naturally.
-    """
     rows = (await db.execute(
         select(Execution).where(
             Execution.user_id == user_id,
@@ -242,11 +235,17 @@ async def reconcile_user(
                 )
             ledger.target_size = desired_target
 
+            master_config = source_configs.get(asset)
+            follower_config = follower_configs.get(asset)
+            ledger.master_leverage = master_config.leverage if master_pos != 0 and master_config else None
+            ledger.master_is_cross = master_config.is_cross if master_pos != 0 and master_config else None
+            ledger.follower_leverage = follower_config.leverage if real != 0 and follower_config else None
+            ledger.follower_is_cross = follower_config.is_cross if real != 0 and follower_config else None
+
             if not create_jobs or user.copy_state == CopyState.PAUSED or asset in unresolved_assets:
                 continue
 
             allowed_asset = bool(risk) and (not risk.allow_assets or asset in risk.allow_assets) and asset not in risk.block_assets
-            master_config = source_configs.get(asset)
             desired_leverage = None
             desired_is_cross = None
             leverage_mismatch = False
@@ -255,7 +254,6 @@ async def reconcile_user(
                     spec = await hl.asset_spec(asset)
                     desired_leverage = max(1, min(master_config.leverage, int(risk.max_leverage), spec.max_leverage))
                     desired_is_cross = bool(master_config.is_cross and not spec.only_isolated)
-                    follower_config = follower_configs.get(asset)
                     leverage_mismatch = real != 0 and (
                         follower_config is None
                         or follower_config.leverage != desired_leverage
