@@ -13,26 +13,19 @@ with per-endpoint weights:
     all other info requests                              weight 20
     userFills et al: additional weight per 20 items returned
 
-This is the binding constraint on the whole product, and it is the one thing
-none of the reference implementations modelled. A naive fan-out spends
-clearinghouseState (2) plus an order (1) per follower per master fill. With a
-hundred followers that is 300 weight per fill, or roughly four master trades a
-minute before the platform starts getting throttled.
+This is the binding constraint on the whole product. The bucket lives in Redis
+because Railway replicas can share one egress IP and therefore one exchange
+quota. Lanes reserve capacity for product-critical work while still respecting
+the single global ceiling.
 
-Two consequences shape this module:
+The production priority order is:
 
-* The limit is per *IP*, and Railway replicas share an egress IP. A limiter
-  living in process memory would let N replicas each believe they had the full
-  budget. The bucket therefore lives in Redis and is shared.
+    ORDER > MASTER_STATE > RECONCILE > METADATA > DIAGNOSTIC
 
-* When the budget runs short, something has to lose. Orders win over
-  reconciliation: executing a follower's trade matters more than verifying it,
-  and the verification will happen on the next cycle anyway.
-
-The window is a Redis sorted set holding one member per acquisition, scored by
-timestamp. Trimming by score gives an exact sliding window rather than the
-boundary spikes a fixed-window counter allows -- worth the small extra cost
-when the penalty for overshooting is a 429 in the middle of placing a trade.
+MASTER_STATE has a deliberately larger lane because every follower target is
+anchored to a trustworthy master snapshot. Starving that lane makes both the
+watcher and reconciliation unable to prove leverage/equity, which correctly
+causes opening exposure to fail closed.
 """
 from __future__ import annotations
 
@@ -61,28 +54,30 @@ WEIGHT_USER_FILLS_MAX = 120
 class Priority(IntEnum):
     """Independent consumer lanes sharing the same global REST ceiling."""
 
-    RECONCILE = 10      # verifying follower state: can always wait a cycle
-    DIAGNOSTIC = 15     # explicit operator reads; must not compete with watcher
-    METADATA = 20       # asset specs: cached for minutes anyway
-    MASTER_STATE = 30   # reading the master: drives everything downstream
-    ORDER = 40          # placing a follower's trade: never deferred first
+    RECONCILE = 10      # verifying follower state: can wait a cycle
+    DIAGNOSTIC = 15     # explicit operator reads; lowest operational priority
+    METADATA = 20       # asset specs: cached for minutes
+    MASTER_STATE = 30   # master equity/positions/leverage: drives all targets
+    ORDER = 40          # follower exchange actions: never deferred first
 
 
 @dataclass(frozen=True, slots=True)
 class Budget:
     """Per-consumer share of the per-minute IP budget.
 
-    Operator diagnostics have a small dedicated lane. This prevents Control
-    Room reads from starving the master watcher while keeping the same global
-    Hyperliquid 1200 weight/minute ceiling.
+    The previous 120-weight MASTER_STATE lane could be exhausted by a bursty
+    master plus the reconciler. Once exhausted, opening jobs had no verified
+    leverage and correctly failed closed. Give master-state reads 25% of the
+    global budget and trim lower-priority lanes instead. The sum remains exactly
+    1200, including a 40-weight emergency reserve.
     """
 
     total_per_minute: int = 1200
-    orders: int = 660
-    reconcile: int = 220
-    diagnostic: int = 60
-    master_state: int = 120
-    metadata: int = 100
+    orders: int = 560
+    reconcile: int = 180
+    diagnostic: int = 40
+    master_state: int = 300
+    metadata: int = 80
     reserve: int = 40
 
     def allowance(self, priority: Priority) -> int:
@@ -107,7 +102,7 @@ class Budget:
 
 
 class RateLimitExhausted(RuntimeError):
-    """Raised when the caller asked not to wait and there was no headroom."""
+    """Raised when capacity could not be acquired before the caller timeout."""
 
 
 class WeightedRateLimiter:
@@ -134,8 +129,7 @@ class WeightedRateLimiter:
         return sum(_weight_of(m) for m in members)
 
     async def headroom(self, priority: Priority) -> int:
-        """Remaining weight for this consumer, respecting both its own share
-        and the global ceiling."""
+        """Remaining weight for this consumer, respecting lane and global caps."""
         global_used = await self.used()
         lane_used = await self.used(priority)
         return max(
@@ -198,12 +192,7 @@ class WeightedRateLimiter:
         timeout: float = 30.0,
         poll: float = 0.25,
     ) -> None:
-        """Wait for headroom, then take it.
-
-        Callers on the order path should pass a short timeout: a trade held for
-        thirty seconds is usually worse than a trade not placed, because the
-        price that justified it is gone. Reconciliation can afford to wait.
-        """
+        """Wait for headroom, then take it."""
         deadline = time.monotonic() + timeout
         while True:
             if await self.try_acquire(weight, priority):
@@ -216,7 +205,7 @@ class WeightedRateLimiter:
             await asyncio.sleep(poll)
 
     async def snapshot(self) -> dict[str, int | float]:
-        """For the admin control room: what the budget looks like right now."""
+        """For the admin control room: current global and per-lane usage."""
         global_used = await self.used()
         lanes = {p.name: await self.used(p) for p in Priority}
         return {
@@ -236,11 +225,6 @@ def _weight_of(member: str) -> int:
 
 
 def followers_per_minute(budget: Budget | None = None) -> int:
-    """How many follower executions per minute the IP budget allows.
-
-    Useful as a sanity check before promising capacity: each execution costs
-    one order (weight 1) plus, in the worst case where the equity cache misses,
-    one clearinghouseState (weight 2).
-    """
+    """Conservative follower-execution throughput from the order lane."""
     b = budget or Budget()
     return b.orders // (WEIGHT_EXCHANGE_ACTION + WEIGHT_CHEAP_INFO)

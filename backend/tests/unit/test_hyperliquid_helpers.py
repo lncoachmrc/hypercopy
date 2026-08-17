@@ -4,7 +4,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from eth_account import Account
 
-from app.adapters.hyperliquid import HyperliquidAdapter, deterministic_cloid, parse_order_response, position_configs
+from app.adapters.hyperliquid import HyperliquidAdapter, _transient_read_error, deterministic_cloid, parse_order_response, position_configs
+from app.adapters.ratelimit import Priority
 
 
 def test_cloid_is_exactly_128_bits_and_deterministic():
@@ -22,6 +23,13 @@ def test_parse_filled_order_response():
 def test_parse_rejection():
     r=parse_order_response({'response':{'data':{'statuses':[{'error':'Insufficient margin'}]}}})
     assert r.state=='REJECTED'
+
+
+def test_transient_read_error_only_matches_retryable_transport_failures():
+    assert _transient_read_error(RuntimeError('502 Bad Gateway')) is True
+    assert _transient_read_error(RuntimeError('504 Gateway Timeout')) is True
+    assert _transient_read_error(RuntimeError('connection reset by peer')) is True
+    assert _transient_read_error(RuntimeError('Insufficient margin')) is False
 
 
 def test_adapter_selects_network_specific_endpoints(monkeypatch):
@@ -45,6 +53,49 @@ def test_position_configs_extracts_master_leverage_and_margin_mode():
     assert configs['BTC'].is_cross is True
     assert configs['ETH'].leverage==5
     assert configs['ETH'].is_cross is False
+
+
+@pytest.mark.asyncio
+async def test_safe_read_retries_transient_502_then_succeeds(monkeypatch):
+    monkeypatch.setattr('app.adapters.hyperliquid.Info', MagicMock())
+    monkeypatch.setattr('app.adapters.hyperliquid.settings.HL_SAFE_READ_RETRIES', 3)
+    monkeypatch.setattr('app.adapters.hyperliquid.settings.HL_SAFE_READ_BACKOFF_SECONDS', 0)
+    adapter=HyperliquidAdapter(None, network='testnet')
+    adapter._metric_incr=AsyncMock()
+    calls=0
+
+    def flaky_read():
+        nonlocal calls
+        calls+=1
+        if calls<3:
+            raise RuntimeError('502 Bad Gateway')
+        return {'ok':True}
+
+    result=await adapter._read(flaky_read,weight=2,priority=Priority.MASTER_STATE,timeout=1)
+    assert result=={'ok':True}
+    assert calls==3
+    metric_names=[call.args[0] for call in adapter._metric_incr.await_args_list]
+    assert metric_names.count('hl_5xx_count')==2
+    assert metric_names.count('hl_safe_read_retry_count')==2
+    assert adapter._metric_incr.await_count==4
+
+
+@pytest.mark.asyncio
+async def test_safe_read_does_not_retry_non_transient_failure(monkeypatch):
+    monkeypatch.setattr('app.adapters.hyperliquid.Info', MagicMock())
+    monkeypatch.setattr('app.adapters.hyperliquid.settings.HL_SAFE_READ_RETRIES', 3)
+    monkeypatch.setattr('app.adapters.hyperliquid.settings.HL_SAFE_READ_BACKOFF_SECONDS', 0)
+    adapter=HyperliquidAdapter(None, network='testnet')
+    calls=0
+
+    def bad_read():
+        nonlocal calls
+        calls+=1
+        raise RuntimeError('semantic validation failure')
+
+    with pytest.raises(RuntimeError,match='semantic validation failure'):
+        await adapter._read(bad_read,weight=2,priority=Priority.MASTER_STATE,timeout=1)
+    assert calls==1
 
 
 @pytest.mark.asyncio

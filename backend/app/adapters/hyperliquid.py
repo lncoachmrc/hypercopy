@@ -125,6 +125,16 @@ def _unrealized_pnl(state: dict) -> Decimal:
     return total
 
 
+def _transient_read_error(exc: Exception) -> bool:
+    """Whether an idempotent REST read is safe and useful to retry."""
+    msg = str(exc).lower()
+    return any(token in msg for token in (
+        '502', '503', '504', 'bad gateway', 'service unavailable',
+        'gateway timeout', 'connection reset', 'connection aborted',
+        'temporarily unavailable', 'timed out', 'timeout',
+    ))
+
+
 class HyperliquidAdapter:
     def __init__(self, limiter: WeightedRateLimiter | None, network: Network | None = None):
         self.limiter = limiter
@@ -149,28 +159,57 @@ class HyperliquidAdapter:
             msg = str(exc).lower()
             if '429' in msg or 'rate limit' in msg or 'too many requests' in msg:
                 await self._metric_incr('hl_429_count')
+            if any(token in msg for token in ('502', '503', '504', 'bad gateway', 'service unavailable', 'gateway timeout')):
+                await self._metric_incr('hl_5xx_count')
             raise
 
-    async def _acquire(self, weight: int, priority: Priority, timeout: int) -> None:
+    async def _acquire(self, weight: int, priority: Priority, timeout: int | float) -> None:
         if self.limiter is None:
             return
         await self.limiter.acquire(weight, priority, timeout=timeout)
 
+    async def _read(self, func, *args, weight: int, priority: Priority, timeout: int | float):
+        """Retry only idempotent Hyperliquid reads, accounting for every try.
+
+        Exchange actions never pass through this helper. Each retry acquires its
+        own weighted budget before issuing another HTTP request, so resilience
+        cannot silently exceed the shared IP quota.
+        """
+        attempts = settings.HL_SAFE_READ_RETRIES
+        for attempt in range(attempts):
+            await self._acquire(weight, priority, timeout=timeout)
+            try:
+                return await self._call(func, *args)
+            except Exception as exc:
+                if attempt + 1 >= attempts or not _transient_read_error(exc):
+                    raise
+                await self._metric_incr('hl_safe_read_retry_count')
+                delay = settings.HL_SAFE_READ_BACKOFF_SECONDS * (2 ** attempt)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+        raise RuntimeError('unreachable Hyperliquid read retry state')
+
     async def user_state(self, address: str, *, priority: Priority = Priority.RECONCILE) -> dict:
-        await self._acquire(WEIGHT_CHEAP_INFO, priority, timeout=10)
-        return await self._call(self.info.user_state, address)
+        return await self._read(
+            self.info.user_state, address,
+            weight=WEIGHT_CHEAP_INFO, priority=priority, timeout=10,
+        )
 
     async def spot_user_state(self, address: str, *, priority: Priority = Priority.RECONCILE) -> dict:
-        await self._acquire(WEIGHT_CHEAP_INFO, priority, timeout=10)
-        return await self._call(self.info.spot_user_state, address)
+        return await self._read(
+            self.info.spot_user_state, address,
+            weight=WEIGHT_CHEAP_INFO, priority=priority, timeout=10,
+        )
 
     async def user_abstraction(self, address: str, *, priority: Priority = Priority.RECONCILE) -> str:
         key = address.lower()
         cached = self._abstraction_cache.get(key)
         if cached and cached[0] > time.monotonic():
             return cached[1]
-        await self._acquire(WEIGHT_STANDARD_INFO, priority, timeout=15)
-        value = await self._call(self.info.post, '/info', {'type': 'userAbstraction', 'user': address})
+        value = await self._read(
+            self.info.post, '/info', {'type': 'userAbstraction', 'user': address},
+            weight=WEIGHT_STANDARD_INFO, priority=priority, timeout=15,
+        )
         abstraction = str(value or 'default')
         self._abstraction_cache[key] = (time.monotonic() + 300, abstraction)
         return abstraction
@@ -200,12 +239,16 @@ class HyperliquidAdapter:
         )
 
     async def mids(self) -> dict[str, str]:
-        await self._acquire(WEIGHT_CHEAP_INFO, Priority.MASTER_STATE, timeout=10)
-        return await self._call(self.info.all_mids)
+        return await self._read(
+            self.info.all_mids,
+            weight=WEIGHT_CHEAP_INFO, priority=Priority.MASTER_STATE, timeout=10,
+        )
 
     async def extra_agents(self, account: str) -> list[dict]:
-        await self._acquire(WEIGHT_STANDARD_INFO, Priority.METADATA, timeout=15)
-        return await self._call(self.info.extra_agents, account)
+        return await self._read(
+            self.info.extra_agents, account,
+            weight=WEIGHT_STANDARD_INFO, priority=Priority.METADATA, timeout=15,
+        )
 
     async def verify_agent(
         self,
@@ -238,8 +281,10 @@ class HyperliquidAdapter:
         cached = self._specs.get(asset)
         if cached and cached[0] > time.monotonic():
             return cached[1]
-        await self._acquire(WEIGHT_STANDARD_INFO, Priority.METADATA, timeout=15)
-        meta = await self._call(self.info.meta)
+        meta = await self._read(
+            self.info.meta,
+            weight=WEIGHT_STANDARD_INFO, priority=Priority.METADATA, timeout=15,
+        )
         expiry = time.monotonic() + settings.HL_MARKET_CACHE_TTL_SECONDS
         for row in meta.get('universe', []):
             spec = AssetSpec(
@@ -271,18 +316,24 @@ class HyperliquidAdapter:
         local = Account.from_key(private_key)
         exchange = Exchange(local, self.api_url, account_address=account_address)
         exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
+        # Exchange actions are intentionally one-shot. Ambiguous results are
+        # resolved later by Cloid rather than blindly resubmitted.
         response = await self._call(exchange.update_leverage, leverage, asset, is_cross)
         if not isinstance(response, dict) or response.get('status') not in (None, 'ok'):
             raise RuntimeError(f'Hyperliquid leverage update failed: {response}')
         return response
 
     async def query_order_by_cloid(self, account: str, cloid: str) -> dict:
-        await self._acquire(WEIGHT_CHEAP_INFO, Priority.ORDER, timeout=10)
-        return await self._call(self.info.query_order_by_cloid, account, Cloid.from_str(cloid))
+        return await self._read(
+            self.info.query_order_by_cloid, account, Cloid.from_str(cloid),
+            weight=WEIGHT_CHEAP_INFO, priority=Priority.ORDER, timeout=10,
+        )
 
     async def user_fills_by_time(self, account: str, start_ms: int, end_ms: int | None = None) -> list[dict]:
-        await self._acquire(WEIGHT_USER_FILLS_MAX, Priority.RECONCILE, timeout=30)
-        return await self._call(self.info.user_fills_by_time, account, start_ms, end_ms)
+        return await self._read(
+            self.info.user_fills_by_time, account, start_ms, end_ms,
+            weight=WEIGHT_USER_FILLS_MAX, priority=Priority.RECONCILE, timeout=30,
+        )
 
     async def place_ioc(
         self, *, account_address: str, private_key: str, asset: str, is_buy: bool,
@@ -306,36 +357,53 @@ class HyperliquidAdapter:
         response = await self._call(_submit)
         return parse_order_response(response)
 
+    async def _heartbeat(self, ws, stop_event: asyncio.Event) -> None:
+        """Send Hyperliquid's documented JSON heartbeat independent of fills."""
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=settings.HL_WS_HEARTBEAT_SECONDS)
+                return
+            except TimeoutError:
+                await ws.send(json.dumps({'method': 'ping'}))
+                await self._metric_incr('ws_heartbeat_count')
+
     async def master_fills(self, address: str, stop_event: asyncio.Event) -> AsyncIterator[dict]:
         try:
             async with websockets.connect(
                 self.ws_url,
-                ping_interval=20,
-                ping_timeout=20,
+                # Hyperliquid documents an application-level JSON heartbeat.
+                # Disable protocol ping frames and run that heartbeat ourselves.
+                ping_interval=None,
                 close_timeout=5,
             ) as ws:
                 await ws.send(json.dumps({
                     'method': 'subscribe',
                     'subscription': {'type': 'userFills', 'user': address},
                 }))
-                while not stop_event.is_set():
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                    except TimeoutError:
-                        await ws.send(json.dumps({'method': 'ping'}))
-                        continue
+                heartbeat = asyncio.create_task(self._heartbeat(ws, stop_event))
+                try:
+                    while not stop_event.is_set():
+                        try:
+                            # Periodically return control to observe SIGTERM while
+                            # the heartbeat task independently keeps the socket alive.
+                            raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                        except TimeoutError:
+                            continue
 
-                    message = json.loads(raw)
-                    channel = message.get('channel')
-                    if channel in {'pong', 'subscriptionResponse'}:
-                        continue
-                    if channel != 'userFills':
-                        continue
+                        message = json.loads(raw)
+                        channel = message.get('channel')
+                        if channel in {'pong', 'subscriptionResponse'}:
+                            continue
+                        if channel != 'userFills':
+                            continue
 
-                    data = message.get('data', {})
-                    fills = data.get('fills', []) if isinstance(data, dict) else []
-                    for fill in fills:
-                        yield fill
+                        data = message.get('data', {})
+                        fills = data.get('fills', []) if isinstance(data, dict) else []
+                        for fill in fills:
+                            yield fill
+                finally:
+                    heartbeat.cancel()
+                    await asyncio.gather(heartbeat, return_exceptions=True)
         except asyncio.CancelledError:
             raise
         except websockets.exceptions.ConnectionClosedOK as exc:
