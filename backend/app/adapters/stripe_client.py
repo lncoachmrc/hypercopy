@@ -9,7 +9,24 @@ from app.core.config import settings
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
-PRICE_BY_PLAN = {'basic': settings.STRIPE_PRICE_BASIC, 'pro': settings.STRIPE_PRICE_PRO, 'enterprise': settings.STRIPE_PRICE_ENTERPRISE}
+
+def price_for(plan: str, billing_period: str) -> str:
+    period = billing_period.lower()
+    if period not in {'monthly', 'yearly'}:
+        return ''
+    mapping = {
+        ('starter', 'monthly'): settings.STRIPE_PRICE_STARTER_MONTHLY or settings.STRIPE_PRICE_BASIC,
+        ('starter', 'yearly'): settings.STRIPE_PRICE_STARTER_YEARLY,
+        ('plus', 'monthly'): settings.STRIPE_PRICE_PLUS_MONTHLY or settings.STRIPE_PRICE_PRO,
+        ('plus', 'yearly'): settings.STRIPE_PRICE_PLUS_YEARLY,
+        ('pro_10k', 'monthly'): settings.STRIPE_PRICE_PRO_MONTHLY or settings.STRIPE_PRICE_ENTERPRISE,
+        ('pro_10k', 'yearly'): settings.STRIPE_PRICE_PRO_YEARLY,
+    }
+    return mapping.get((plan, period), '')
+
+
+def plan_configured(plan: str, billing_period: str) -> bool:
+    return bool(price_for(plan, billing_period))
 
 
 def _period_end(subscription) -> datetime | None:
@@ -22,15 +39,16 @@ def _period_end(subscription) -> datetime | None:
     return datetime.fromtimestamp(max(ends), UTC) if ends else None
 
 
-async def checkout(*, customer_id: str | None, customer_email: str | None, user_id: str, plan: str) -> str:
-    price = PRICE_BY_PLAN.get(plan)
+async def checkout(*, customer_id: str | None, customer_email: str | None, user_id: str, plan: str, billing_period: str = 'monthly') -> str:
+    price = price_for(plan, billing_period)
     if not price:
-        raise ValueError('Stripe price is not configured for this plan')
+        raise ValueError(f'Stripe price is not configured for {plan}/{billing_period}')
     kwargs = dict(
         mode='subscription', line_items=[{'price': price, 'quantity': 1}],
         success_url=f'{settings.PUBLIC_APP_URL}/billing?checkout=success', cancel_url=f'{settings.PUBLIC_APP_URL}/billing',
-        client_reference_id=user_id, metadata={'user_id': user_id, 'plan': plan},
-        subscription_data={'metadata': {'user_id': user_id, 'plan': plan}},
+        client_reference_id=user_id,
+        metadata={'user_id': user_id, 'plan': plan, 'billing_period': billing_period},
+        subscription_data={'metadata': {'user_id': user_id, 'plan': plan, 'billing_period': billing_period}},
     )
     if customer_id:
         kwargs['customer'] = customer_id

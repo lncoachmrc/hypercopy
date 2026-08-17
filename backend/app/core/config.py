@@ -3,7 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -55,6 +55,17 @@ class Settings(BaseSettings):
 
     STRIPE_SECRET_KEY: str = ''
     STRIPE_WEBHOOK_SECRET: str = ''
+
+    # New portfolio-based commercial catalog.
+    STRIPE_PRICE_STARTER_MONTHLY: str = ''
+    STRIPE_PRICE_STARTER_YEARLY: str = ''
+    STRIPE_PRICE_PLUS_MONTHLY: str = ''
+    STRIPE_PRICE_PLUS_YEARLY: str = ''
+    STRIPE_PRICE_PRO_MONTHLY: str = ''
+    STRIPE_PRICE_PRO_YEARLY: str = ''
+
+    # Legacy monthly price IDs remain supported as safe fallbacks while Stripe
+    # products are migrated: BASIC -> Starter, PRO -> Plus, ENTERPRISE -> Pro.
     STRIPE_PRICE_BASIC: str = ''
     STRIPE_PRICE_PRO: str = ''
     STRIPE_PRICE_ENTERPRISE: str = ''

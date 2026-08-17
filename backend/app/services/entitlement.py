@@ -1,21 +1,21 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.models.entities import Plan, Subscription, User
+from app.models.entities import EquitySnapshot, Plan, Subscription, User
 
 ACTIVE = {'active', 'trialing'}
+LEGACY_PLAN_MAP = {'basic': 'starter', 'pro': 'plus', 'enterprise': 'pro_10k'}
 
 
 async def entitlement(db: AsyncSession, user: User) -> dict:
     sub = (await db.execute(select(Subscription).where(Subscription.user_id == user.id))).scalar_one_or_none()
-    plan = None
-    if sub:
-        plan = await db.get(Plan, sub.plan_slug)
+    plan = await db.get(Plan, sub.plan_slug) if sub else None
     now = datetime.now(UTC)
     entitled = False
     if sub and sub.status in ACTIVE:
@@ -23,20 +23,41 @@ async def entitlement(db: AsyncSession, user: User) -> dict:
         entitled = deadline is None or deadline > now
 
     limits = dict(plan.limits if plan else {})
-    # Staging-only operator override: commercial plan limits must not prevent
-    # a SUPERADMIN from validating the full multi-asset execution pipeline on
-    # Hyperliquid TESTNET. Production/customer entitlements are unchanged.
-    if (
+    operator_override = (
         settings.APP_ENV != 'production'
         and settings.follower_network == 'testnet'
         and user.role.value == 'SUPERADMIN'
-    ):
+    )
+
+    # Staging-only operator override: commercial plan limits must not prevent a
+    # SUPERADMIN from validating the complete TESTNET execution pipeline.
+    if operator_override:
         limits['max_positions'] = max(int(limits.get('max_positions', 0) or 0), 100)
 
+    latest_equity = (await db.execute(
+        select(EquitySnapshot)
+        .where(EquitySnapshot.user_id == user.id)
+        .order_by(EquitySnapshot.taken_at.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    portfolio_equity = latest_equity.account_value if latest_equity else None
+    max_equity = limits.get('max_equity_usd')
+    portfolio_limit_exceeded = False
+    if max_equity is not None and portfolio_equity is not None and not operator_override:
+        portfolio_limit_exceeded = portfolio_equity > Decimal(str(max_equity))
+        if portfolio_limit_exceeded:
+            entitled = False
+
+    raw_plan = sub.plan_slug if sub else None
+    commercial_plan = LEGACY_PLAN_MAP.get(raw_plan, raw_plan)
     return {
         'entitled': entitled,
         'status': sub.status if sub else 'none',
-        'plan': sub.plan_slug if sub else None,
+        'plan': raw_plan,
+        'commercial_plan': commercial_plan,
         'period_end': sub.period_end.isoformat() if sub and sub.period_end else None,
         'limits': limits,
+        'portfolio_equity': float(portfolio_equity) if portfolio_equity is not None else None,
+        'portfolio_limit_usd': float(max_equity) if max_equity is not None else None,
+        'portfolio_limit_exceeded': portfolio_limit_exceeded,
     }
