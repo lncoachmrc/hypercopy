@@ -27,7 +27,7 @@ Every intelligence refresh learns from persisted `master_events` inside `LLM_STR
 - micro-fill ratio;
 - per-asset persistence score.
 
-The profile becomes more representative as history accumulates. The LLM receives only compact aggregate features and deterministic candidate metrics.
+The profile becomes more representative as history accumulates. The LLM receives only compact aggregate features and deterministic candidate metrics. Learning is isolated by master network so historical testnet behavior is never mixed with current mainnet behavior.
 
 ## Provider failover
 
@@ -46,7 +46,7 @@ When all providers are unavailable:
 - `shadow`: the deterministic optimizer continues and the failure is visible in the decision status;
 - `active`: Traxion persists and applies the deterministic **Exact Ratio** fail-safe policy.
 
-## Candidate policies
+## Candidate policies and hard limits
 
 - **Exact Ratio** — existing proportional position-targeting behavior.
 - **Smart Fidelity** — compresses sub-minimum legs with a 5% capital buffer.
@@ -54,6 +54,17 @@ When all providers are unavailable:
 - **Smart Defensive** — 15% buffer.
 
 Smart policies choose a structural set of participating assets and a bounded allocation scale. They do **not** freeze position direction or size. Current master exposure is reapplied on every realtime event and reconciliation cycle, so a master close becomes zero immediately and a reversal changes sign immediately even between LLM refreshes.
+
+Before the LLM sees the candidates, Traxion deterministically removes any Smart candidate exceeding:
+
+```env
+LLM_MAX_TRACKING_ERROR_PCT=35
+LLM_MAX_ALLOCATION_SCALE=1.5
+```
+
+Exact Ratio always remains available. A stored policy that later exceeds the current limits is ignored automatically.
+
+A master asset that opens after the last LLM analysis temporarily follows Exact Ratio until the next intelligence refresh. A market already verified as unavailable on the follower remains excluded.
 
 ## Railway variables
 
@@ -79,10 +90,12 @@ LLM_MAX_OUTPUT_TOKENS=700
 LLM_ANALYSIS_INTERVAL_SECONDS=300
 LLM_STRATEGY_WINDOW_DAYS=30
 LLM_RECOMMENDED_COVERAGE_PCT=90
+LLM_MAX_TRACKING_ERROR_PCT=35
+LLM_MAX_ALLOCATION_SCALE=1.5
 LLM_DECISION_MAX_AGE_SECONDS=900
 ```
 
-Provider API keys belong only on `execution-worker`.
+Provider API keys belong **only** on `execution-worker`.
 
 ### api — non-secret variables only
 
@@ -99,23 +112,39 @@ DEEPSEEK_MODEL=deepseek-v4-pro
 LLM_ANALYSIS_INTERVAL_SECONDS=300
 LLM_STRATEGY_WINDOW_DAYS=30
 LLM_RECOMMENDED_COVERAGE_PCT=90
+LLM_MAX_TRACKING_ERROR_PCT=35
+LLM_MAX_ALLOCATION_SCALE=1.5
 LLM_DECISION_MAX_AGE_SECONDS=900
 ```
 
-Do not place `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` or `DEEPSEEK_API_KEY` on the frontend service.
+No provider API key belongs on `api` or `frontend`.
 
-### master-watcher / frontend
+### master-watcher — non-secret policy variables
 
-No LLM provider secret is required.
+Realtime EVENT jobs are created by the watcher, so it must know whether an already-persisted active policy may be applied. It does **not** need provider API keys.
+
+```env
+LLM_CAPITAL_MODE=shadow
+LLM_MAX_TRACKING_ERROR_PCT=35
+LLM_MAX_ALLOCATION_SCALE=1.5
+LLM_DECISION_MAX_AGE_SECONDS=900
+```
+
+When TESTNET validation moves the feature to active mode, set `LLM_CAPITAL_MODE=active` consistently on `execution-worker`, `master-watcher` and `api`.
+
+### frontend
+
+No LLM environment variable or provider secret is required. The authenticated frontend reads model/provider status from `/api/v1/intelligence`.
 
 ## Rollout
 
 1. Deploy migration `0008_capital_intelligence`.
-2. Set provider secrets on `execution-worker`.
-3. Set `LLM_ENABLED=true`, `LLM_CAPITAL_MODE=shadow`.
-4. Observe candidate selection, coverage, recommended capital, failover behavior and learned master profile in the dashboard.
-5. Compare shadow recommendations against Exact Ratio on TESTNET.
-6. Only after validation set `LLM_CAPITAL_MODE=active` on both `execution-worker` and `api`.
-7. Keep follower mainnet disabled until the project's existing mainnet Definition of Done is independently satisfied.
+2. Set provider secrets only on `execution-worker`.
+3. Set the non-secret intelligence variables on `execution-worker`, `master-watcher` and `api` as described above.
+4. Start with `LLM_ENABLED=true`, `LLM_CAPITAL_MODE=shadow`.
+5. Observe candidate selection, coverage, recommended capital, failover behavior and learned master profile in the dashboard.
+6. Compare shadow recommendations against Exact Ratio on TESTNET.
+7. Only after validation set `LLM_CAPITAL_MODE=active` consistently on `execution-worker`, `master-watcher` and `api`.
+8. Keep follower mainnet disabled until the project's existing mainnet Definition of Done is independently satisfied.
 
-Changing from `shadow` to `active` never bypasses risk or live-trading gates. A stale intelligence decision, changed risk multiplier/minimum notional or changed network topology causes automatic fallback to the original Exact Ratio algorithm.
+Changing from `shadow` to `active` never bypasses risk or live-trading gates. A stale intelligence decision, a shadow-mode decision, changed risk multiplier/minimum notional, changed network topology or a policy outside the current hard limits causes automatic fallback to the original Exact Ratio algorithm.
