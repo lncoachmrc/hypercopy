@@ -3,6 +3,7 @@ from decimal import Decimal
 from app.engine.capital_optimizer import (
     build_capital_candidates,
     choose_deterministic_candidate,
+    live_policy_tracking_error_pct,
     live_policy_weight,
     recommended_capital_for_coverage,
 )
@@ -108,6 +109,39 @@ def test_new_asset_uses_exact_on_same_network_and_waits_on_split_network():
     assert same_new_asset == Decimal('0.2')
     assert split_new_asset == 0
     assert known_unavailable == 0
+
+
+def test_live_tracking_error_is_recomputed_from_current_master_weights():
+    policy = {
+        'candidate_id': 'smart_balanced',
+        'selected_assets': ['A'],
+        'allocation_scale': '1',
+        'known_master_assets': ['A', 'B'],
+        'follower_available_assets': ['A', 'B'],
+        'master_network': 'mainnet',
+        'follower_network': 'mainnet',
+    }
+    original = live_policy_tracking_error_pct(policy, {'A': Decimal('0.8'), 'B': Decimal('0.2')})
+    shifted = live_policy_tracking_error_pct(policy, {'A': Decimal('0.2'), 'B': Decimal('0.8')})
+
+    assert original == Decimal('20')
+    assert shifted == Decimal('80')
+    assert shifted > Decimal('35')
+
+
+def test_pre_multiplier_weight_keeps_risk_multiplier_single_application():
+    policy = {'candidate_id': 'exact', 'selected_assets': [], 'allocation_scale': '1'}
+    pre_multiplier = live_policy_weight(
+        policy=policy, asset='SOL', master_position=Decimal('-5'), master_mark=Decimal('20'),
+        master_equity=Decimal('1000'), multiplier=Decimal('1'),
+    )
+    final_weight = live_policy_weight(
+        policy=policy, asset='SOL', master_position=Decimal('-5'), master_mark=Decimal('20'),
+        master_equity=Decimal('1000'), multiplier=Decimal('1.5'),
+    )
+
+    assert pre_multiplier == Decimal('-0.1')
+    assert final_weight == pre_multiplier * Decimal('1.5')
 
 
 def test_exact_policy_never_compresses_current_master_exposure():
