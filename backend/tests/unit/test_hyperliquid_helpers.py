@@ -42,6 +42,42 @@ def test_adapter_selects_network_specific_endpoints(monkeypatch):
     assert test.ws_url=='wss://api.hyperliquid-testnet.xyz/ws'
 
 
+def test_adapter_constructor_seeds_metadata_and_performs_no_eager_sdk_fetch(monkeypatch):
+    constructor=MagicMock(return_value=MagicMock())
+    monkeypatch.setattr('app.adapters.hyperliquid.Info', constructor)
+    HyperliquidAdapter(None, network='testnet')
+    kwargs=constructor.call_args.kwargs
+    assert kwargs['skip_ws'] is True
+    assert kwargs['meta']=={'universe':[]}
+    assert kwargs['spot_meta']=={'universe':[],'tokens':[]}
+
+
+def test_exchange_constructor_reuses_prefetched_perp_meta(monkeypatch):
+    monkeypatch.setattr('app.adapters.hyperliquid.Info', MagicMock())
+    exchange_constructor=MagicMock(return_value=MagicMock())
+    monkeypatch.setattr('app.adapters.hyperliquid.Exchange', exchange_constructor)
+    adapter=HyperliquidAdapter(None, network='testnet')
+    meta={'universe':[{'name':'BTC','szDecimals':5,'maxLeverage':40}]}
+    adapter._perp_meta=meta
+    local=Account.create()
+    adapter._exchange(local, '0x0000000000000000000000000000000000000001')
+    kwargs=exchange_constructor.call_args.kwargs
+    assert kwargs['meta'] is meta
+    assert kwargs['spot_meta']=={'universe':[],'tokens':[]}
+    assert kwargs['account_address']=='0x0000000000000000000000000000000000000001'
+
+
+@pytest.mark.asyncio
+async def test_asset_spec_persists_meta_for_exchange_signing(monkeypatch):
+    monkeypatch.setattr('app.adapters.hyperliquid.Info', MagicMock())
+    adapter=HyperliquidAdapter(None, network='testnet')
+    meta={'universe':[{'name':'BTC','szDecimals':5,'maxLeverage':40,'onlyIsolated':False}]}
+    adapter.info.meta=MagicMock(return_value=meta)
+    spec=await adapter.asset_spec('BTC')
+    assert spec.name=='BTC'
+    assert adapter._perp_meta is meta
+
+
 @pytest.mark.asyncio
 async def test_mids_uses_order_lane_not_master_state(monkeypatch):
     monkeypatch.setattr('app.adapters.hyperliquid.Info', MagicMock())
