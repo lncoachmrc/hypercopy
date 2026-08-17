@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.adapters.hyperliquid import HyperliquidAdapter, PositionConfig, fill_event_id, position_configs
 from app.adapters.ratelimit import Priority
 from app.core.config import settings
-from app.engine.capital_optimizer import live_policy_weight
+from app.engine.capital_optimizer import live_policy_tracking_error_pct, live_policy_weight
 from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, FollowerState, MasterExposure, compute_target
 from app.models.entities import CopyJob, CopyState, EquitySnapshot, Execution, ExecutionState, Fill, JobState, PositionLedger, ReconciliationRun, RiskHalt, RiskProfile, RiskState, TradingAccount, User, UserState
 from app.services.audit import audit
@@ -32,6 +32,21 @@ def _positions(state: dict) -> dict[str, Decimal]:
     for row in state.get('assetPositions', []):
         p = row.get('position', row)
         out[str(p.get('coin'))] = Decimal(str(p.get('szi', '0')))
+    return out
+
+
+def _master_exact_weights(master_positions: dict[str, Decimal], master_mids: dict[str, str], master_equity: Decimal) -> dict[str, Decimal] | None:
+    if master_equity <= 0:
+        return None
+    out: dict[str, Decimal] = {}
+    for asset, position in master_positions.items():
+        if position == 0:
+            continue
+        mark = Decimal(str(master_mids.get(asset, '0') or '0'))
+        if mark <= 0:
+            return None
+        notional = abs(position) * mark
+        out[asset] = notional / master_equity if position > 0 else -(notional / master_equity)
     return out
 
 
@@ -210,6 +225,14 @@ async def reconcile_user(
         intelligence_policy = await active_policy_for_user(
             db, user.id, risk_multiplier=multiplier, min_notional=min_notional,
         ) if risk else None
+        live_tracking_error = None
+        if intelligence_policy:
+            live_tracking_error = live_policy_tracking_error_pct(
+                intelligence_policy,
+                _master_exact_weights(master_positions, source_mids, master_equity),
+            )
+            if live_tracking_error is None or live_tracking_error > Decimal(str(settings.LLM_MAX_TRACKING_ERROR_PCT)):
+                intelligence_policy = None
         eligible_equity = max(equity - unmanaged_margin, Decimal(0))
 
         for asset in assets:
@@ -234,6 +257,7 @@ async def reconcile_user(
             master_mark = Decimal(str(source_mids.get(asset, '0') or '0'))
             desired_target = Decimal(0)
             policy_weight = None
+            execution_policy_weight = None
             if intelligence_policy and follower_mark > 0:
                 policy_weight = live_policy_weight(
                     policy=intelligence_policy,
@@ -242,6 +266,14 @@ async def reconcile_user(
                     master_mark=master_mark,
                     master_equity=master_equity,
                     multiplier=multiplier,
+                )
+                execution_policy_weight = live_policy_weight(
+                    policy=intelligence_policy,
+                    asset=asset,
+                    master_position=master_pos,
+                    master_mark=master_mark,
+                    master_equity=master_equity,
+                    multiplier=Decimal(1),
                 )
                 desired_target = policy_weight * eligible_equity / follower_mark
             elif master_pos != 0 and master_equity > 0 and master_mark > 0 and follower_mark > 0:
@@ -307,15 +339,13 @@ async def reconcile_user(
                     liquidity_backoffs.append({'asset': asset, 'seconds': wait_seconds})
                     continue
 
-            # Reconciliation jobs feed the same deterministic execution engine as
-            # realtime jobs. Normalize an active AI policy into a signed equity
-            # ratio so process_job recomputes exactly the same target. Actual
-            # master values remain in context for audit and leverage semantics.
             context_master_position = master_pos
             context_master_equity = master_equity
             context_master_mark = master_mark
             if intelligence_policy:
-                context_master_position = policy_weight if policy_weight is not None else Decimal(0)
+                # process_job applies risk.multiplier itself. Use the pre-
+                # multiplier policy weight in the normalized synthetic context.
+                context_master_position = execution_policy_weight if execution_policy_weight is not None else Decimal(0)
                 context_master_equity = Decimal(1)
                 context_master_mark = Decimal(1)
 
@@ -334,6 +364,7 @@ async def reconcile_user(
                 context['capital_intelligence_candidate'] = intelligence_policy.get('candidate_label')
                 context['capital_intelligence_candidate_id'] = intelligence_policy.get('candidate_id')
                 context['capital_intelligence_coverage_pct'] = intelligence_policy.get('coverage_pct')
+                context['capital_intelligence_live_tracking_error_pct'] = str(live_tracking_error)
             if master_config is not None:
                 context['master_leverage'] = master_config.leverage
                 context['master_is_cross'] = master_config.is_cross
@@ -353,8 +384,8 @@ async def reconcile_user(
 
         db.add(EquitySnapshot(user_id=user.id, account_value=equity, free_margin=free_margin, unmanaged_margin=unmanaged_margin, taken_at=datetime.now(UTC)))
 
-        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'capital_intelligence': intelligence_policy.get('candidate_label') if intelligence_policy else None}; run.finished_at = datetime.now(UTC)
-        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs, 'capital_intelligence': intelligence_policy.get('candidate_label') if intelligence_policy else None})
+        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'capital_intelligence': intelligence_policy.get('candidate_label') if intelligence_policy else None, 'capital_intelligence_live_tracking_error_pct': str(live_tracking_error) if live_tracking_error is not None else None}; run.finished_at = datetime.now(UTC)
+        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs, 'capital_intelligence': intelligence_policy.get('candidate_label') if intelligence_policy else None, 'capital_intelligence_live_tracking_error_pct': str(live_tracking_error) if live_tracking_error is not None else None})
         await db.commit()
         return {'status': 'OK', 'discrepancies': discrepancies, 'equity': str(equity), 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs}
     except Exception as exc:
