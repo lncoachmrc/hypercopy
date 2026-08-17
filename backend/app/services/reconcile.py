@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.adapters.hyperliquid import HyperliquidAdapter, PositionConfig, fill_event_id, position_configs
 from app.adapters.ratelimit import Priority
 from app.core.config import settings
+from app.engine.capital_optimizer import live_policy_weight
 from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, FollowerState, MasterExposure, compute_target
 from app.models.entities import CopyJob, CopyState, EquitySnapshot, Execution, ExecutionState, Fill, JobState, PositionLedger, ReconciliationRun, RiskHalt, RiskProfile, RiskState, TradingAccount, User, UserState
 from app.services.audit import audit
@@ -209,7 +210,6 @@ async def reconcile_user(
         intelligence_policy = await active_policy_for_user(
             db, user.id, risk_multiplier=multiplier, min_notional=min_notional,
         ) if risk else None
-        policy_weights = (intelligence_policy or {}).get('signed_equity_weights') if intelligence_policy else None
         eligible_equity = max(equity - unmanaged_margin, Decimal(0))
 
         for asset in assets:
@@ -233,9 +233,17 @@ async def reconcile_user(
             master_pos = master_positions.get(asset, Decimal(0))
             master_mark = Decimal(str(source_mids.get(asset, '0') or '0'))
             desired_target = Decimal(0)
-            if isinstance(policy_weights, dict) and follower_mark > 0:
-                signed_weight = Decimal(str(policy_weights.get(asset, '0') or '0'))
-                desired_target = signed_weight * eligible_equity / follower_mark
+            policy_weight = None
+            if intelligence_policy and follower_mark > 0:
+                policy_weight = live_policy_weight(
+                    policy=intelligence_policy,
+                    asset=asset,
+                    master_position=master_pos,
+                    master_mark=master_mark,
+                    master_equity=master_equity,
+                    multiplier=multiplier,
+                )
+                desired_target = policy_weight * eligible_equity / follower_mark
             elif master_pos != 0 and master_equity > 0 and master_mark > 0 and follower_mark > 0:
                 desired_target = compute_target(
                     MasterExposure(asset, master_pos, master_mark, master_equity),
@@ -299,16 +307,32 @@ async def reconcile_user(
                     liquidity_backoffs.append({'asset': asset, 'seconds': wait_seconds})
                     continue
 
+            # Reconciliation jobs feed the same deterministic execution engine as
+            # realtime jobs. Normalize an active AI policy into a signed equity
+            # ratio so process_job recomputes exactly the same target. Actual
+            # master values remain in context for audit and leverage semantics.
+            context_master_position = master_pos
+            context_master_equity = master_equity
+            context_master_mark = master_mark
+            if intelligence_policy:
+                context_master_position = policy_weight if policy_weight is not None else Decimal(0)
+                context_master_equity = Decimal(1)
+                context_master_mark = Decimal(1)
+
             context = {
-                'master_position': str(master_pos),
-                'master_equity': str(master_equity),
-                'master_mark_price': str(master_mark),
-                'mark_price': str(master_mark),
+                'master_position': str(context_master_position),
+                'master_equity': str(context_master_equity),
+                'master_mark_price': str(context_master_mark),
+                'mark_price': str(context_master_mark),
                 'master_network': settings.master_network,
                 'follower_network': settings.follower_network,
+                'actual_master_position': str(master_pos),
+                'actual_master_equity': str(master_equity),
+                'actual_master_mark_price': str(master_mark),
             }
             if intelligence_policy:
                 context['capital_intelligence_candidate'] = intelligence_policy.get('candidate_label')
+                context['capital_intelligence_candidate_id'] = intelligence_policy.get('candidate_id')
                 context['capital_intelligence_coverage_pct'] = intelligence_policy.get('coverage_pct')
             if master_config is not None:
                 context['master_leverage'] = master_config.leverage
