@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
-from app.adapters.hyperliquid import AccountSnapshot, HyperliquidAdapter, position_configs
+from app.adapters.hyperliquid import AccountSnapshot, HyperliquidAdapter, position_configs, signed_fill_delta
 from app.adapters.ratelimit import Budget, Priority, WeightedRateLimiter
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
@@ -47,6 +47,32 @@ async def _set_checkpoint(db,time_ms:int,event_id:str):
     await db.commit()
 
 
+def _signed_position_notionals(perp_state: dict) -> dict[str, Decimal] | None:
+    """Extract a complete signed current-notional map from clearinghouseState.
+
+    Hyperliquid provides `positionValue` for open perp positions. Smart AI policy
+    validation is fail-closed: if an open position lacks a provable current
+    notional, return None so realtime falls back to Exact Ratio.
+    """
+    out: dict[str, Decimal] = {}
+    for row in perp_state.get('assetPositions', []):
+        position=row.get('position',row)
+        size=Decimal(str(position.get('szi','0') or '0'))
+        if size==0:
+            continue
+        raw=position.get('positionValue')
+        if raw in (None,''):
+            return None
+        value=abs(Decimal(str(raw)))
+        if value<=0:
+            return None
+        asset=str(position.get('coin') or '')
+        if not asset:
+            return None
+        out[asset]=value if size>0 else -value
+    return out
+
+
 class Watcher:
     def __init__(self):
         self.redis=redis_client()
@@ -57,21 +83,16 @@ class Watcher:
         self._snapshot_at=0.0
         self._equity=Decimal(0)
         self._equity_at=0.0
+        # Rolling signed notionals let bursty fills update the live portfolio
+        # without re-reading clearinghouseState for every event.
+        self._live_notionals: dict[str,Decimal] | None = None
+        self._live_notionals_snapshot_at=-1.0
 
     async def _metric_incr(self,name:str):
         try: await self.redis.incr(f'hypercopy:metrics:{name}')
         except Exception: pass
 
     async def master_snapshot(self,*,force_refresh:bool=False)->AccountSnapshot:
-        """Return a recent verified master snapshot with a short stale bridge.
-
-        Bursty masters can emit many fills in one second. Re-reading
-        clearinghouseState for every fill wastes the per-IP budget and can
-        starve the very lane needed to prove leverage. Reuse a snapshot for a
-        couple of seconds, then refresh. If Hyperliquid is transiently 5xx/rate
-        limited, a last-known-good snapshot may bridge only the configured short
-        stale window; after that the normal fail-closed path takes over.
-        """
         now=asyncio.get_running_loop().time()
         age=now-self._snapshot_at if self._snapshot is not None else float('inf')
         if not force_refresh and self._snapshot is not None and age<=settings.HL_MASTER_SNAPSHOT_TTL_SECONDS:
@@ -106,6 +127,32 @@ class Watcher:
                 return self._equity
         raise RuntimeError('Master equity unavailable and no persisted fallback exists')
 
+    def _live_master_weights(self,snapshot:AccountSnapshot|None,equity:Decimal,fill:dict)->dict[str,Decimal]|None:
+        if snapshot is not None and self._live_notionals_snapshot_at != self._snapshot_at:
+            self._live_notionals=_signed_position_notionals(snapshot.perp_state)
+            self._live_notionals_snapshot_at=self._snapshot_at
+        if self._live_notionals is None or equity<=0:
+            return None
+
+        # Apply the fill to the rolling map even when a 2-second cached snapshot
+        # is reused, so rapid multi-asset bursts cannot keep a stale tracking
+        # error estimate until the next REST refresh.
+        asset=str(fill.get('coin') or '')
+        try:
+            start=Decimal(str(fill.get('startPosition','0') or '0'))
+            after=start+signed_fill_delta(fill)
+            price=Decimal(str(fill.get('px','0') or '0'))
+            if after==0:
+                self._live_notionals.pop(asset,None)
+            elif price>0 and asset:
+                notional=abs(after)*price
+                self._live_notionals[asset]=notional if after>0 else -notional
+            else:
+                return None
+        except Exception:
+            return None
+        return {asset:notional/equity for asset,notional in self._live_notionals.items() if notional!=0}
+
     async def master_equity(self)->Decimal:
         try:
             return (await self.master_snapshot()).account_value
@@ -115,13 +162,11 @@ class Watcher:
     async def process_fill(self,fill:dict):
         asset=str(fill.get('coin') or '')
         config=None
+        snapshot:AccountSnapshot|None=None
         try:
             snapshot=await self.master_snapshot()
             configs=position_configs(snapshot.perp_state)
             config=configs.get(asset)
-            # A fresh cache can predate the very first fill that opens a new
-            # asset. Force one refresh when the asset is absent before deciding
-            # leverage is unavailable.
             if config is None:
                 snapshot=await self.master_snapshot(force_refresh=True)
                 config=position_configs(snapshot.perp_state).get(asset)
@@ -133,6 +178,7 @@ class Watcher:
             await self._metric_incr('master_leverage_unavailable_count')
             log.warning('Master leverage unavailable for realtime fill; increasing exposure will wait for reconciliation',extra={'asset':asset})
 
+        live_weights=self._live_master_weights(snapshot,equity,fill)
         cid=uuid.uuid4().hex
         async with SessionLocal() as db:
             event,jobs=await persist_master_fill_and_jobs(
@@ -140,6 +186,7 @@ class Watcher:
                 correlation_id=cid,source_network=settings.master_network,
                 master_leverage=config.leverage if config else None,
                 master_is_cross=config.is_cross if config else None,
+                master_live_weights=live_weights,
             )
             if not event: return
             for job in jobs:
