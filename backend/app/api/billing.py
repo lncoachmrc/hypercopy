@@ -27,7 +27,7 @@ PLAN_CATALOG = [
         'monthly_usd': 12,
         'yearly_usd': 72,
         'yearly_monthly_equivalent_usd': 6,
-        'description': 'Per iniziare con il copytrading automatizzato in modo semplice.',
+        'description': 'Per iniziare con il trading ibrido automatizzato in modo semplice.',
     },
     {
         'slug': 'plus',
@@ -36,7 +36,7 @@ PLAN_CATALOG = [
         'monthly_usd': 19.5,
         'yearly_usd': 117,
         'yearly_monthly_equivalent_usd': 9.75,
-        'description': 'Per portafogli in crescita che vogliono più capacità senza cambiare strategia.',
+        'description': 'Per portafogli in crescita che vogliono più capacità mantenendo la stessa strategia ibrida.',
     },
     {
         'slug': 'pro_10k',
@@ -45,7 +45,7 @@ PLAN_CATALOG = [
         'monthly_usd': 33,
         'yearly_usd': 198,
         'yearly_monthly_equivalent_usd': 16.5,
-        'description': 'Per utenti avanzati e portafogli più grandi che vogliono il massimo margine operativo.',
+        'description': 'Per utenti avanzati e portafogli più grandi che vogliono il massimo margine operativo e controllo del rischio.',
     },
 ]
 
