@@ -6,7 +6,7 @@ import uuid
 
 from sqlalchemy import select, text
 
-from app.adapters.hyperliquid import HyperliquidAdapter
+from app.adapters.hyperliquid import HyperliquidAdapter, position_configs
 from app.adapters.ratelimit import Budget, WeightedRateLimiter
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
@@ -73,10 +73,13 @@ class Worker:
                 user=await db.get(User,raw.user_id)
                 if user:
                     mp,me,master_mids=await master_snapshot(self.master_hl)
+                    master_state=await self.master_hl.user_state(settings.HYPERLIQUID_MASTER_ADDRESS)
+                    master_configs=position_configs(master_state)
                     follower_mids=master_mids if settings.master_network == settings.follower_network else await self.follower_hl.mids()
                     await reconcile_user(
                         db,self.follower_hl,user,
                         master_positions=mp,master_equity=me,mids=follower_mids,master_mids=master_mids,
+                        master_configs=master_configs,
                     )
                     await repair_stream(self.redis,db)
                 raw.state=JobState.DONE; await db.commit(); return True
