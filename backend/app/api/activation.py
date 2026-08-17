@@ -41,7 +41,7 @@ async def resume_copy_immediate(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Activate TESTNET copy and create current multi-asset jobs immediately.
+    """Activate TESTNET strategy execution and create current multi-asset jobs immediately.
 
     This route intentionally precedes the legacy /copy/resume route. It is
     restricted to TESTNET while the cross-network MAINNET->TESTNET pipeline is
@@ -60,14 +60,14 @@ async def resume_copy_immediate(
     if not account:
         raise HTTPException(409, 'Connect a Hyperliquid trading account first')
     if not settings.HYPERLIQUID_MASTER_ADDRESS:
-        raise HTTPException(409, 'HYPERLIQUID_MASTER_ADDRESS is not configured')
+        raise HTTPException(409, 'Strategy source account is not configured')
 
     pending = (await db.execute(select(CopyJob.id).where(
         CopyJob.user_id == user.id,
         CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),
     ).limit(1))).scalar_one_or_none()
     if pending:
-        raise HTTPException(409, 'Pending copy jobs exist; wait for Queue to return to 0 before activation')
+        raise HTTPException(409, 'Pending strategy jobs exist; wait for Queue to return to 0 before activation')
 
     limiter = _limiter()
     master_hl = HyperliquidAdapter(limiter, network=settings.master_network)
@@ -83,7 +83,7 @@ async def resume_copy_immediate(
         master_mids = await master_hl.mids()
         follower_mids = master_mids if settings.master_network == settings.follower_network else await follower_hl.mids()
     except Exception as exc:
-        raise HTTPException(503, f'Activation preflight failed: {type(exc).__name__}: {exc}') from exc
+        raise HTTPException(503, f'Strategy activation preflight failed: {type(exc).__name__}: {exc}') from exc
 
     activation_started = datetime.now(UTC)
     user.copy_state = CopyState.ACTIVE
@@ -152,4 +152,4 @@ async def resume_copy_immediate(
             reason=f'{type(exc).__name__}: {exc}',
         )
         await db.commit()
-        raise HTTPException(503, f'Activation failed and follower was paused: {type(exc).__name__}: {exc}') from exc
+        raise HTTPException(503, f'Strategy activation failed and the account was paused: {type(exc).__name__}: {exc}') from exc
