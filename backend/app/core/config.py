@@ -57,11 +57,11 @@ class Settings(BaseSettings):
     LLM_ENABLED: bool = False
     LLM_CAPITAL_MODE: Literal['off', 'shadow', 'active'] = 'shadow'
     LLM_PROVIDER_ORDER: str = 'openai,anthropic,deepseek'
-    LLM_PREFERRED_MODEL: str = 'gpt-5.6-terra'
+    LLM_PREFERRED_MODEL: str = 'gpt-5.4'
     OPENAI_API_KEY: str = ''
-    OPENAI_MODEL: str = 'gpt-5.6-terra'
+    OPENAI_MODEL: str = 'gpt-5.4'
     ANTHROPIC_API_KEY: str = ''
-    ANTHROPIC_MODEL: str = 'claude-sonnet-5'
+    ANTHROPIC_MODEL: str = 'claude-sonnet-4-20250514'
     DEEPSEEK_API_KEY: str = ''
     DEEPSEEK_MODEL: str = 'deepseek-v4-pro'
     LLM_TIMEOUT_SECONDS: float = 12.0
