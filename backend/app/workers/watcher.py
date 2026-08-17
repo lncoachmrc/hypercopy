@@ -63,6 +63,7 @@ class Watcher:
         self._snapshot_at=0.0
         self._equity=Decimal(0)
         self._equity_at=0.0
+        self._background_tasks:set[asyncio.Task]=set()
 
     async def _metric_incr(self,name:str):
         try: await self.redis.incr(f'hypercopy:metrics:{name}')
@@ -81,6 +82,11 @@ class Watcher:
             await self.redis.ltrim(queue,0,9999)
         except Exception:
             log.warning('AI intelligence trigger publish failed; PostgreSQL fallback remains available',exc_info=True)
+
+    def _spawn_ai_trigger(self,payload:dict):
+        task=asyncio.create_task(self._publish_ai_trigger(payload))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def master_snapshot(self,*,force_refresh:bool=False)->AccountSnapshot:
         """Return a recent verified master snapshot with a short stale bridge.
@@ -179,7 +185,7 @@ class Watcher:
         # Fire-and-forget by design. Copy jobs were already persisted/published,
         # so an unavailable AI subsystem cannot add latency to trading.
         if ai_payload:
-            asyncio.create_task(self._publish_ai_trigger(ai_payload))
+            self._spawn_ai_trigger(ai_payload)
 
         try: await self.redis.publish(f'{settings.REALTIME_CHANNEL_PREFIX}:system',json.dumps({'type':'master_fill','asset':event.asset,'price':str(event.price),'size':str(event.size),'at':event.event_ts.isoformat(),'network':settings.master_network}))
         except Exception: pass
@@ -228,6 +234,10 @@ class Watcher:
                 if await self.lease.try_acquire(): await self.run_leader()
                 else: await asyncio.sleep(2)
             except Exception: log.exception('Watcher leader cycle failed'); await asyncio.sleep(5)
+        for task in tuple(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks,return_exceptions=True)
 
 
 async def main():
