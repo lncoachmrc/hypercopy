@@ -223,9 +223,10 @@ def live_policy_weight(
 
     Current master flat => zero immediately; reversals flip immediately; scale
     changes use current master exposure. A market known to be unavailable on the
-    follower remains zero. A brand-new master asset that did not exist when the
-    policy was selected temporarily uses Exact Ratio until the next intelligence
-    refresh, preventing a significant new position from being silently ignored.
+    follower remains zero. If master and follower share the same network, a
+    brand-new master asset can temporarily use Exact Ratio. Across different
+    networks a new asset waits for the next follower-universe refresh so an
+    unsupported market can never be inferred from the master catalog.
     """
     position = _d(master_position)
     mark = _d(master_mark)
@@ -238,6 +239,10 @@ def live_policy_weight(
     known_assets = set(policy.get('known_master_assets') or [])
     available_assets = set(policy.get('follower_available_assets') or [])
     if known_assets and asset not in known_assets:
+        master_network = str(policy.get('master_network') or '')
+        follower_network = str(policy.get('follower_network') or '')
+        if master_network and follower_network and master_network != follower_network:
+            return ZERO
         return signed_exact
     if available_assets and asset not in available_assets:
         return ZERO
