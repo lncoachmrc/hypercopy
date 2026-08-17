@@ -52,6 +52,25 @@ class Settings(BaseSettings):
     ENABLE_LIVE_TRADING: bool = False
     DEFAULT_SHADOW_MODE: bool = True
 
+    # Capital Intelligence. The LLM only chooses among deterministic candidate
+    # portfolios. It never receives signing keys and never submits orders.
+    LLM_ENABLED: bool = False
+    LLM_CAPITAL_MODE: Literal['off', 'shadow', 'active'] = 'shadow'
+    LLM_PROVIDER_ORDER: str = 'openai,anthropic,deepseek'
+    LLM_PREFERRED_MODEL: str = 'gpt-5.6-terra'
+    OPENAI_API_KEY: str = ''
+    OPENAI_MODEL: str = 'gpt-5.6-terra'
+    ANTHROPIC_API_KEY: str = ''
+    ANTHROPIC_MODEL: str = 'claude-sonnet-5'
+    DEEPSEEK_API_KEY: str = ''
+    DEEPSEEK_MODEL: str = 'deepseek-v4-pro'
+    LLM_TIMEOUT_SECONDS: float = 12.0
+    LLM_MAX_OUTPUT_TOKENS: int = 700
+    LLM_ANALYSIS_INTERVAL_SECONDS: int = 300
+    LLM_STRATEGY_WINDOW_DAYS: int = 30
+    LLM_RECOMMENDED_COVERAGE_PCT: float = 90.0
+    LLM_DECISION_MAX_AGE_SECONDS: int = 900
+
     SESSION_SECRET: str = 'development-only-change-me'
     SESSION_TTL_SECONDS: int = 3600
     SESSION_COOKIE_NAME: str = 'hc_session'
@@ -137,6 +156,18 @@ class Settings(BaseSettings):
             raise ValueError('HL_SAFE_READ_RETRIES must be between 1 and 5')
         if self.HL_SAFE_READ_BACKOFF_SECONDS < 0:
             raise ValueError('HL_SAFE_READ_BACKOFF_SECONDS cannot be negative')
+        if self.LLM_TIMEOUT_SECONDS <= 0:
+            raise ValueError('LLM_TIMEOUT_SECONDS must be positive')
+        if not 100 <= self.LLM_MAX_OUTPUT_TOKENS <= 4000:
+            raise ValueError('LLM_MAX_OUTPUT_TOKENS must be between 100 and 4000')
+        if self.LLM_ANALYSIS_INTERVAL_SECONDS < 60:
+            raise ValueError('LLM_ANALYSIS_INTERVAL_SECONDS must be at least 60 seconds')
+        if self.LLM_STRATEGY_WINDOW_DAYS < 1:
+            raise ValueError('LLM_STRATEGY_WINDOW_DAYS must be positive')
+        if not 50 <= self.LLM_RECOMMENDED_COVERAGE_PCT <= 100:
+            raise ValueError('LLM_RECOMMENDED_COVERAGE_PCT must be between 50 and 100')
+        if self.LLM_DECISION_MAX_AGE_SECONDS < self.LLM_ANALYSIS_INTERVAL_SECONDS:
+            raise ValueError('LLM_DECISION_MAX_AGE_SECONDS must be >= analysis interval')
         return self
 
     @property
