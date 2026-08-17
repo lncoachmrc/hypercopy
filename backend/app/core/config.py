@@ -69,6 +69,8 @@ class Settings(BaseSettings):
     LLM_ANALYSIS_INTERVAL_SECONDS: int = 300
     LLM_STRATEGY_WINDOW_DAYS: int = 30
     LLM_RECOMMENDED_COVERAGE_PCT: float = 90.0
+    LLM_MAX_TRACKING_ERROR_PCT: float = 35.0
+    LLM_MAX_ALLOCATION_SCALE: float = 1.5
     LLM_DECISION_MAX_AGE_SECONDS: int = 900
 
     SESSION_SECRET: str = 'development-only-change-me'
@@ -166,6 +168,10 @@ class Settings(BaseSettings):
             raise ValueError('LLM_STRATEGY_WINDOW_DAYS must be positive')
         if not 50 <= self.LLM_RECOMMENDED_COVERAGE_PCT <= 100:
             raise ValueError('LLM_RECOMMENDED_COVERAGE_PCT must be between 50 and 100')
+        if not 0 <= self.LLM_MAX_TRACKING_ERROR_PCT <= 100:
+            raise ValueError('LLM_MAX_TRACKING_ERROR_PCT must be between 0 and 100')
+        if not 1 <= self.LLM_MAX_ALLOCATION_SCALE <= 3:
+            raise ValueError('LLM_MAX_ALLOCATION_SCALE must be between 1 and 3')
         if self.LLM_DECISION_MAX_AGE_SECONDS < self.LLM_ANALYSIS_INTERVAL_SECONDS:
             raise ValueError('LLM_DECISION_MAX_AGE_SECONDS must be >= analysis interval')
         return self
