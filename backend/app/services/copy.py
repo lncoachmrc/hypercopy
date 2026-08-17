@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.adapters.hyperliquid import fill_event_id, signed_fill_delta
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.engine.capital_optimizer import live_policy_weight
+from app.engine.capital_optimizer import live_policy_tracking_error_pct, live_policy_weight
 from app.engine.sizing import EXCHANGE_MIN_NOTIONAL
 from app.models.entities import CopyJob, MasterEvent, RiskProfile, TradingAccount, User, UserState
 from app.services.intelligence import active_policy_for_user
@@ -29,6 +29,7 @@ async def persist_master_fill_and_jobs(
     db: AsyncSession, *, fill: dict[str, Any], master_equity: Decimal,
     fencing_token: int, correlation_id: str, source_network: str | None = None,
     master_leverage: int | None = None, master_is_cross: bool | None = None,
+    master_live_weights: dict[str, Decimal] | None = None,
 ) -> tuple[MasterEvent | None, list[CopyJob]]:
     lease = (await db.execute(text("SELECT fencing_token, expires_at FROM watcher_lease WHERE name='master-watcher' FOR SHARE"))).first()
     if lease is None or int(lease[0]) != fencing_token or lease[1] <= datetime.now(UTC):
@@ -67,15 +68,11 @@ async def persist_master_fill_and_jobs(
 
     jobs: list[CopyJob] = []
     for user_id in eligible:
-        # Active AI mode changes only the exposure ratio fed into the existing
-        # deterministic sizing/risk/execution pipeline. The actual master
-        # position is evaluated for every event, so closes/reversals never wait
-        # for the next LLM cycle. When no fresh policy exists we fall back to
-        # the original exact-ratio context below.
         target_position = position_after
         target_equity = master_equity
         target_mark = price
         policy = None
+        live_tracking_error = None
         risk = (await db.execute(select(RiskProfile).where(RiskProfile.user_id == user_id))).scalar_one_or_none()
         if risk:
             floor = max(risk.min_notional, EXCHANGE_MIN_NOTIONAL)
@@ -83,19 +80,27 @@ async def persist_master_fill_and_jobs(
                 db, user_id, risk_multiplier=risk.multiplier, min_notional=floor,
             )
             if policy:
-                target_position = live_policy_weight(
-                    policy=policy,
-                    asset=asset,
-                    master_position=position_after,
-                    master_mark=price,
-                    master_equity=master_equity,
-                    multiplier=risk.multiplier,
-                )
-                # Normalize the synthetic exposure so the existing position
-                # targeting engine reads target_position as a signed equity
-                # ratio. No order code needs to trust or understand the LLM.
-                target_equity = Decimal(1)
-                target_mark = Decimal(1)
+                live_tracking_error = live_policy_tracking_error_pct(policy, master_live_weights)
+                # A Smart policy must prove its current tracking error on every
+                # master event. Missing live portfolio evidence or a breached
+                # hard limit immediately falls back to the original Exact Ratio
+                # path; Exact Ratio itself always reports zero error.
+                if live_tracking_error is None or live_tracking_error > Decimal(str(settings.LLM_MAX_TRACKING_ERROR_PCT)):
+                    policy = None
+                else:
+                    # process_job() applies risk.multiplier through FollowerState.
+                    # Feed it a pre-multiplier signed equity ratio so the risk
+                    # multiplier is applied exactly once, not squared.
+                    target_position = live_policy_weight(
+                        policy=policy,
+                        asset=asset,
+                        master_position=position_after,
+                        master_mark=price,
+                        master_equity=master_equity,
+                        multiplier=Decimal(1),
+                    )
+                    target_equity = Decimal(1)
+                    target_mark = Decimal(1)
 
         job_id = uuid.uuid5(uuid.UUID('8f6f61ae-7239-5e86-a501-8c8d95e94f20'), f'{event.id}:{user_id}')
         context = {
@@ -113,6 +118,7 @@ async def persist_master_fill_and_jobs(
         if policy:
             context['capital_intelligence_candidate'] = policy.get('candidate_label')
             context['capital_intelligence_candidate_id'] = policy.get('candidate_id')
+            context['capital_intelligence_live_tracking_error_pct'] = str(live_tracking_error)
         if master_leverage is not None:
             context['master_leverage'] = int(master_leverage)
             context['master_is_cross'] = bool(master_is_cross)
