@@ -21,6 +21,9 @@ from app.adapters.ratelimit import Priority, WEIGHT_CHEAP_INFO, WEIGHT_EXCHANGE_
 
 log = get_logger(__name__)
 
+_EMPTY_PERP_META = {'universe': []}
+_EMPTY_SPOT_META = {'universe': [], 'tokens': []}
+
 
 @dataclass(frozen=True, slots=True)
 class AgentVerification:
@@ -141,8 +144,19 @@ class HyperliquidAdapter:
         self.network: Network = network or settings.follower_network
         self.api_url = settings.hyperliquid_url_for(self.network)
         self.ws_url = self.api_url.replace('https://', 'wss://') + '/ws'
-        self.info = Info(self.api_url, skip_ws=True)
+        # Info normally performs spotMeta + meta HTTP requests in its constructor.
+        # Those eager calls bypass our shared limiter/retry path and can crash the
+        # worker before it starts when Hyperliquid briefly returns 502. Seed empty
+        # metadata because this adapter uses Info only for direct read methods;
+        # real perp metadata is fetched lazily by asset_spec through _read().
+        self.info = Info(
+            self.api_url,
+            skip_ws=True,
+            meta={'universe': []},
+            spot_meta={'universe': [], 'tokens': []},
+        )
         self._specs: dict[str, tuple[float, AssetSpec]] = {}
+        self._perp_meta: dict | None = None
         self._abstraction_cache: dict[str, tuple[float, str]] = {}
 
     async def _metric_incr(self, name: str) -> None:
@@ -284,12 +298,13 @@ class HyperliquidAdapter:
 
     async def asset_spec(self, asset: str) -> AssetSpec:
         cached = self._specs.get(asset)
-        if cached and cached[0] > time.monotonic():
+        if cached and cached[0] > time.monotonic() and self._perp_meta is not None:
             return cached[1]
         meta = await self._read(
             self.info.meta,
             weight=WEIGHT_STANDARD_INFO, priority=Priority.METADATA, timeout=15,
         )
+        self._perp_meta = meta
         expiry = time.monotonic() + settings.HL_MARKET_CACHE_TTL_SECONDS
         for row in meta.get('universe', []):
             spec = AssetSpec(
@@ -302,6 +317,23 @@ class HyperliquidAdapter:
         if asset not in self._specs:
             raise ValueError(f'Unknown Hyperliquid perpetual asset: {asset}')
         return self._specs[asset][1]
+
+    def _exchange(self, local, account_address: str) -> Exchange:
+        """Build Exchange without SDK constructor network calls.
+
+        asset_spec() must run first so the real perp metadata is available for
+        name_to_asset signing. Supplying both meta objects prevents Exchange's
+        nested Info constructor from issuing its own eager spotMeta/meta reads.
+        """
+        if self._perp_meta is None:
+            raise RuntimeError('Perp metadata must be loaded before Exchange construction')
+        return Exchange(
+            local,
+            self.api_url,
+            meta=self._perp_meta,
+            account_address=account_address,
+            spot_meta={'universe': [], 'tokens': []},
+        )
 
     async def update_leverage(
         self,
@@ -319,7 +351,7 @@ class HyperliquidAdapter:
         if spec.only_isolated:
             is_cross = False
         local = Account.from_key(private_key)
-        exchange = Exchange(local, self.api_url, account_address=account_address)
+        exchange = self._exchange(local, account_address)
         exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
         # Exchange actions are intentionally one-shot. Ambiguous results are
         # resolved later by Cloid rather than blindly resubmitted.
@@ -350,7 +382,7 @@ class HyperliquidAdapter:
         aggressive = mark_price * (Decimal(1) + slip if is_buy else Decimal(1) - slip)
         px = round_price(aggressive, spec.sz_decimals)
         local = Account.from_key(private_key)
-        exchange = Exchange(local, self.api_url, account_address=account_address)
+        exchange = self._exchange(local, account_address)
         exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
 
         def _submit():
