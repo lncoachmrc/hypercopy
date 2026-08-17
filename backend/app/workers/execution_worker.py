@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import signal
 import uuid
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, text
 
@@ -36,6 +37,25 @@ def _job_matches_current_networks(job: CopyJob) -> bool:
     )
 
 
+async def _retry_admin_job(db, job_id: uuid.UUID, reason: str) -> str:
+    await db.rollback()
+    job = await db.get(CopyJob, job_id)
+    if not job:
+        return JobState.DEAD.value
+    job.last_error = reason
+    job.owner = None
+    job.locked_until = None
+    if job.attempt_count >= settings.MAX_JOB_RETRIES:
+        job.state = JobState.DEAD
+        job.next_attempt_at = None
+    else:
+        job.state = JobState.RETRYING
+        job.next_attempt_at = datetime.now(UTC) + timedelta(seconds=min(2 ** max(job.attempt_count, 1), 60))
+        job.enqueued_at = None
+    await db.commit()
+    return job.state.value
+
+
 class Worker:
     def __init__(self):
         self.id = replica_identity()
@@ -49,7 +69,47 @@ class Worker:
         async with SessionLocal() as db:
             hb=await db.get(WorkerHeartbeat,self.id)
             if not hb: hb=WorkerHeartbeat(worker_id=self.id,service='execution-worker'); db.add(hb)
-            hb.seen_at=__import__('datetime').datetime.now(__import__('datetime').UTC); hb.current_job_id=self.current_job; await db.commit()
+            hb.seen_at=datetime.now(UTC); hb.current_job_id=self.current_job; await db.commit()
+
+    async def _run_admin_reconcile(self, db, job: CopyJob) -> str:
+        user=await db.get(User,job.user_id)
+        if not user:
+            job.state=JobState.DEAD
+            job.last_error='User no longer exists'
+            job.owner=None
+            job.locked_until=None
+            await db.commit()
+            return JobState.DEAD.value
+
+        async def operation():
+            mp,me,master_mids=await master_snapshot(self.master_hl)
+            master_state=await self.master_hl.user_state(settings.HYPERLIQUID_MASTER_ADDRESS)
+            master_configs=position_configs(master_state)
+            follower_mids=master_mids if settings.master_network == settings.follower_network else await self.follower_hl.mids()
+            await reconcile_user(
+                db,self.follower_hl,user,
+                master_positions=mp,master_equity=me,mids=follower_mids,master_mids=master_mids,
+                master_configs=master_configs,
+            )
+            await repair_stream(self.redis,db)
+
+        timeout=max(min(settings.JOB_LEASE_SECONDS - 10, 90), 30)
+        try:
+            await asyncio.wait_for(operation(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return await _retry_admin_job(db, job.id, f'ADMIN_RECONCILE timed out after {timeout}s')
+        except Exception as exc:
+            log.warning('Admin reconcile failed', extra={'job_id': str(job.id)}, exc_info=True)
+            return await _retry_admin_job(db, job.id, f'{type(exc).__name__}: {exc}')
+
+        await db.refresh(job)
+        job.state=JobState.DONE
+        job.last_error=None
+        job.owner=None
+        job.locked_until=None
+        job.next_attempt_at=None
+        await db.commit()
+        return JobState.DONE.value
 
     async def handle_job_id(self,job_id:str)->bool:
         try: uid=uuid.UUID(job_id)
@@ -69,25 +129,20 @@ class Worker:
                 await db.commit()
                 return True
 
-            if raw.origin=='ADMIN_RECONCILE':
-                user=await db.get(User,raw.user_id)
-                if user:
-                    mp,me,master_mids=await master_snapshot(self.master_hl)
-                    master_state=await self.master_hl.user_state(settings.HYPERLIQUID_MASTER_ADDRESS)
-                    master_configs=position_configs(master_state)
-                    follower_mids=master_mids if settings.master_network == settings.follower_network else await self.follower_hl.mids()
-                    await reconcile_user(
-                        db,self.follower_hl,user,
-                        master_positions=mp,master_equity=me,mids=follower_mids,master_mids=master_mids,
-                        master_configs=master_configs,
-                    )
-                    await repair_stream(self.redis,db)
-                raw.state=JobState.DONE; await db.commit(); return True
             job=await claim_job(db,self.id,uid)
             if not job: return True
-            self.current_job=job.id; await self.heartbeat()
-            result=await process_job(db,self.follower_hl,job)
-            self.current_job=None
+            self.current_job=job.id
+            await self.heartbeat()
+            try:
+                if job.origin=='ADMIN_RECONCILE':
+                    result=await self._run_admin_reconcile(db,job)
+                else:
+                    result=await process_job(db,self.follower_hl,job)
+            finally:
+                self.current_job=None
+                try: await self.heartbeat()
+                except Exception: pass
+
             try:
                 await self.redis.publish(
                     f'{settings.REALTIME_CHANNEL_PREFIX}:user:{job.user_id}',
