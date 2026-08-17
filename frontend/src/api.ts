@@ -54,7 +54,17 @@ export async function api<T>(path:string, init:RequestInit={}):Promise<T>{
   if(res.status===204) return undefined as T;
   return res.json() as Promise<T>;
 }
-export const get=<T>(p:string)=>api<T>(p);
+export const get=async<T>(p:string):Promise<T>=>{
+  try{return await api<T>(p)}
+  catch(e){
+    // Intelligence is an observability/advisory panel, not a dependency of the
+    // trading dashboard. During a rolling API/frontend deploy an older API
+    // replica may briefly lack /intelligence. Keep equity/positions/executions
+    // usable and render the panel as unavailable until the next refresh.
+    if(p==='/intelligence') return null as T;
+    throw e;
+  }
+};
 export const post=<T>(p:string,b?:unknown)=>api<T>(p,{method:'POST',body:b===undefined?undefined:JSON.stringify(b)});
 export const put=<T>(p:string,b:unknown)=>api<T>(p,{method:'PUT',body:JSON.stringify(b)});
 export const del=<T>(p:string)=>api<T>(p,{method:'DELETE'});
