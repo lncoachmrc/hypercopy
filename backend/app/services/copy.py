@@ -12,7 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.adapters.hyperliquid import fill_event_id, signed_fill_delta
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.models.entities import CopyJob, MasterEvent, TradingAccount, User, UserState
+from app.engine.capital_optimizer import live_policy_weight
+from app.engine.sizing import EXCHANGE_MIN_NOTIONAL
+from app.models.entities import CopyJob, MasterEvent, RiskProfile, TradingAccount, User, UserState
+from app.services.intelligence import active_policy_for_user
 
 log = get_logger(__name__)
 
@@ -64,16 +67,52 @@ async def persist_master_fill_and_jobs(
 
     jobs: list[CopyJob] = []
     for user_id in eligible:
+        # Active AI mode changes only the exposure ratio fed into the existing
+        # deterministic sizing/risk/execution pipeline. The actual master
+        # position is evaluated for every event, so closes/reversals never wait
+        # for the next LLM cycle. When no fresh policy exists we fall back to
+        # the original exact-ratio context below.
+        target_position = position_after
+        target_equity = master_equity
+        target_mark = price
+        policy = None
+        risk = (await db.execute(select(RiskProfile).where(RiskProfile.user_id == user_id))).scalar_one_or_none()
+        if risk:
+            floor = max(risk.min_notional, EXCHANGE_MIN_NOTIONAL)
+            policy = await active_policy_for_user(
+                db, user_id, risk_multiplier=risk.multiplier, min_notional=floor,
+            )
+            if policy:
+                target_position = live_policy_weight(
+                    policy=policy,
+                    asset=asset,
+                    master_position=position_after,
+                    master_mark=price,
+                    master_equity=master_equity,
+                    multiplier=risk.multiplier,
+                )
+                # Normalize the synthetic exposure so the existing position
+                # targeting engine reads target_position as a signed equity
+                # ratio. No order code needs to trust or understand the LLM.
+                target_equity = Decimal(1)
+                target_mark = Decimal(1)
+
         job_id = uuid.uuid5(uuid.UUID('8f6f61ae-7239-5e86-a501-8c8d95e94f20'), f'{event.id}:{user_id}')
         context = {
-            'master_position': str(position_after),
-            'master_equity': str(master_equity),
-            'master_mark_price': str(price),
-            'mark_price': str(price),
+            'master_position': str(target_position),
+            'master_equity': str(target_equity),
+            'master_mark_price': str(target_mark),
+            'mark_price': str(target_mark),
             'master_event_id': str(event.id),
             'master_network': source_network or settings.master_network,
             'follower_network': settings.follower_network,
+            'actual_master_position': str(position_after),
+            'actual_master_equity': str(master_equity),
+            'actual_master_mark_price': str(price),
         }
+        if policy:
+            context['capital_intelligence_candidate'] = policy.get('candidate_label')
+            context['capital_intelligence_candidate_id'] = policy.get('candidate_id')
         if master_leverage is not None:
             context['master_leverage'] = int(master_leverage)
             context['master_is_cross'] = bool(master_is_cross)
