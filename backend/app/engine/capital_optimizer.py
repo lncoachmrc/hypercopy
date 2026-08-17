@@ -221,10 +221,11 @@ def live_policy_weight(
 ) -> Decimal:
     """Apply a structural AI policy to the *current* master state.
 
-    The LLM-selected policy never freezes a position direction or notional.
     Current master flat => zero immediately; reversals flip immediately; scale
-    changes flow through the current master exposure ratio. Smart policies only
-    decide whether the asset participates and the bounded allocation scale.
+    changes use current master exposure. A market known to be unavailable on the
+    follower remains zero. A brand-new master asset that did not exist when the
+    policy was selected temporarily uses Exact Ratio until the next intelligence
+    refresh, preventing a significant new position from being silently ignored.
     """
     position = _d(master_position)
     mark = _d(master_mark)
@@ -233,6 +234,13 @@ def live_policy_weight(
     if position == 0 or mark <= 0 or equity <= 0:
         return ZERO
     signed_exact = (ONE if position > 0 else Decimal('-1')) * (abs(position) * mark / equity) * mult
+
+    known_assets = set(policy.get('known_master_assets') or [])
+    available_assets = set(policy.get('follower_available_assets') or [])
+    if known_assets and asset not in known_assets:
+        return signed_exact
+    if available_assets and asset not in available_assets:
+        return ZERO
     if str(policy.get('candidate_id') or '') == 'exact':
         return signed_exact
     selected = set(policy.get('selected_assets') or [])
