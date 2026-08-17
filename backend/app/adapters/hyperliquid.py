@@ -239,9 +239,14 @@ class HyperliquidAdapter:
         )
 
     async def mids(self) -> dict[str, str]:
+        # allMids is shared market data used directly on the follower order hot
+        # path. It is not master account state. Charging it to MASTER_STATE let
+        # normal follower sizing consume the capacity reserved for verified
+        # master equity/positions/leverage. Keep it in the ORDER lane instead;
+        # reconciliation only calls it a handful of times per cycle.
         return await self._read(
             self.info.all_mids,
-            weight=WEIGHT_CHEAP_INFO, priority=Priority.MASTER_STATE, timeout=10,
+            weight=WEIGHT_CHEAP_INFO, priority=Priority.ORDER, timeout=10,
         )
 
     async def extra_agents(self, account: str) -> list[dict]:
