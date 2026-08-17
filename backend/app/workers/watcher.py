@@ -48,12 +48,6 @@ async def _set_checkpoint(db,time_ms:int,event_id:str):
 
 
 def _signed_position_notionals(perp_state: dict) -> dict[str, Decimal] | None:
-    """Extract a complete signed current-notional map from clearinghouseState.
-
-    Hyperliquid provides `positionValue` for open perp positions. Smart AI policy
-    validation is fail-closed: if an open position lacks a provable current
-    notional, return None so realtime falls back to Exact Ratio.
-    """
     out: dict[str, Decimal] = {}
     for row in perp_state.get('assetPositions', []):
         position=row.get('position',row)
@@ -83,8 +77,6 @@ class Watcher:
         self._snapshot_at=0.0
         self._equity=Decimal(0)
         self._equity_at=0.0
-        # Rolling signed notionals let bursty fills update the live portfolio
-        # without re-reading clearinghouseState for every event.
         self._live_notionals: dict[str,Decimal] | None = None
         self._live_notionals_snapshot_at=-1.0
 
@@ -133,10 +125,6 @@ class Watcher:
             self._live_notionals_snapshot_at=self._snapshot_at
         if self._live_notionals is None or equity<=0:
             return None
-
-        # Apply the fill to the rolling map even when a 2-second cached snapshot
-        # is reused, so rapid multi-asset bursts cannot keep a stale tracking
-        # error estimate until the next REST refresh.
         asset=str(fill.get('coin') or '')
         try:
             start=Decimal(str(fill.get('startPosition','0') or '0'))
@@ -159,7 +147,7 @@ class Watcher:
         except Exception:
             return await self._persisted_master_equity()
 
-    async def process_fill(self,fill:dict):
+    async def process_fill(self,fill:dict,*,allow_smart_policy:bool=True):
         asset=str(fill.get('coin') or '')
         config=None
         snapshot:AccountSnapshot|None=None
@@ -178,7 +166,12 @@ class Watcher:
             await self._metric_incr('master_leverage_unavailable_count')
             log.warning('Master leverage unavailable for realtime fill; increasing exposure will wait for reconciliation',extra={'asset':asset})
 
-        live_weights=self._live_master_weights(snapshot,equity,fill)
+        # Historical replay deliberately withholds live portfolio proof. This
+        # forces active Smart policies onto the original Exact Ratio path while
+        # replay catches up; the next current-state reconciliation can then
+        # apply a freshly proven Smart target without executing stale compressed
+        # intermediate states.
+        live_weights=self._live_master_weights(snapshot,equity,fill) if allow_smart_policy else None
         cid=uuid.uuid4().hex
         async with SessionLocal() as db:
             event,jobs=await persist_master_fill_and_jobs(
@@ -207,7 +200,7 @@ class Watcher:
             new=[f for f in fills if int(f.get('time',0))>=cursor]
             if not new: return
             for fill in new:
-                await self.process_fill(fill); seen+=1
+                await self.process_fill(fill,allow_smart_policy=False); seen+=1
             if len(fills)<2000: return
             cursor=max(int(f.get('time',cursor)) for f in fills)+1
             if seen>=settings.HL_REPLAY_MAX_FILLS: break
