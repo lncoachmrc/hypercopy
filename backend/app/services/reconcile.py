@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -17,6 +17,13 @@ from app.services.audit import audit
 
 log = __import__('app.core.logging', fromlist=['get_logger']).get_logger(__name__)
 
+_LIQUIDITY_REJECT_MARKERS = (
+    'could not immediately match against any resting orders',
+    'no liquidity',
+    'marketordernoliquidityrejected',
+    'ioccancelrejected',
+)
+
 
 def _positions(state: dict) -> dict[str, Decimal]:
     out: dict[str, Decimal] = {}
@@ -24,6 +31,45 @@ def _positions(state: dict) -> dict[str, Decimal]:
         p = row.get('position', row)
         out[str(p.get('coin'))] = Decimal(str(p.get('szi', '0')))
     return out
+
+
+def _is_liquidity_reject(reason: str | None) -> bool:
+    text = (reason or '').lower()
+    return any(marker in text for marker in _LIQUIDITY_REJECT_MARKERS)
+
+
+async def _liquidity_backoff_seconds(db: AsyncSession, user_id, asset: str) -> int:
+    """Back off consecutive IOC no-liquidity rejects for one follower market.
+
+    Reconciliation runs frequently. A terminal IOC reject must not cause it to
+    create a brand-new identical order on every cycle while the TESTNET book is
+    empty. Consecutive liquidity rejects back off 1m, 2m, 4m, 8m, then 10m.
+    Any non-liquidity terminal execution breaks the sequence naturally.
+    """
+    rows = (await db.execute(
+        select(Execution).where(
+            Execution.user_id == user_id,
+            Execution.asset == asset,
+            Execution.state.in_([ExecutionState.REJECTED, ExecutionState.CANCELED, ExecutionState.FILLED]),
+        ).order_by(Execution.created_at.desc()).limit(8)
+    )).scalars().all()
+    if not rows or rows[0].state == ExecutionState.FILLED:
+        return 0
+
+    consecutive = 0
+    latest_at = None
+    for execution in rows:
+        if execution.state not in {ExecutionState.REJECTED, ExecutionState.CANCELED} or not _is_liquidity_reject(execution.reject_reason):
+            break
+        if latest_at is None:
+            latest_at = execution.created_at
+        consecutive += 1
+
+    if not latest_at or consecutive == 0:
+        return 0
+    delay_seconds = min(60 * (2 ** (consecutive - 1)), 600)
+    remaining = (latest_at + timedelta(seconds=delay_seconds) - datetime.now(UTC)).total_seconds()
+    return max(int(remaining), 0)
 
 
 async def _sync_missing_fills(db: AsyncSession, hl: HyperliquidAdapter, user: User, account_address: str) -> int:
@@ -163,6 +209,7 @@ async def reconcile_user(
         )).scalars().all())
         assets = set(master_positions) | set(real_positions) | set(ledger_by_asset)
         discrepancies = []
+        liquidity_backoffs = []
         multiplier = risk.multiplier if risk else Decimal(1)
         min_notional = max(risk.min_notional if risk else EXCHANGE_MIN_NOTIONAL, EXCHANGE_MIN_NOTIONAL)
 
@@ -235,6 +282,16 @@ async def reconcile_user(
             if pending:
                 continue
 
+            increasing_exposure = (
+                real == 0 and desired_target != 0
+                or real * desired_target > 0 and abs(desired_target) > abs(real)
+            )
+            if user.copy_state == CopyState.ACTIVE and increasing_exposure and drift_notional >= min_notional:
+                wait_seconds = await _liquidity_backoff_seconds(db, user.id, asset)
+                if wait_seconds > 0:
+                    liquidity_backoffs.append({'asset': asset, 'seconds': wait_seconds})
+                    continue
+
             context = {
                 'master_position': str(master_pos),
                 'master_equity': str(master_equity),
@@ -262,10 +319,10 @@ async def reconcile_user(
 
         db.add(EquitySnapshot(user_id=user.id, account_value=equity, free_margin=free_margin, unmanaged_margin=unmanaged_margin, taken_at=datetime.now(UTC)))
 
-        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode}; run.finished_at = datetime.now(UTC)
-        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity)})
+        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs}; run.finished_at = datetime.now(UTC)
+        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs})
         await db.commit()
-        return {'status': 'OK', 'discrepancies': discrepancies, 'equity': str(equity), 'account_mode': account_mode}
+        return {'status': 'OK', 'discrepancies': discrepancies, 'equity': str(equity), 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs}
     except Exception as exc:
         run.status = 'FAILED'; run.error = f'{type(exc).__name__}: {exc}'; run.finished_at = datetime.now(UTC); await db.commit(); raise
 
