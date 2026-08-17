@@ -34,6 +34,20 @@ class Settings(BaseSettings):
     HL_AGENT_NAME: str = 'hypercopy'
     HL_MARKET_CACHE_TTL_SECONDS: int = 300
     HL_REPLAY_MAX_FILLS: int = 10_000
+    # Reuse one verified master account snapshot across bursts of fills instead
+    # of spending a clearinghouseState request on every fill. A very short
+    # last-known-good window bridges transient 429/5xx responses without
+    # allowing old leverage data to live indefinitely.
+    HL_MASTER_SNAPSHOT_TTL_SECONDS: float = 2.0
+    HL_MASTER_SNAPSHOT_STALE_SECONDS: float = 15.0
+    # Hyperliquid closes websocket connections that receive no server message
+    # for 60s. Send the documented application heartbeat independently of fill
+    # traffic so quiet subscriptions remain alive.
+    HL_WS_HEARTBEAT_SECONDS: float = 30.0
+    # Safe retries apply only to idempotent/read-only Hyperliquid calls. Exchange
+    # actions are deliberately never automatically retried.
+    HL_SAFE_READ_RETRIES: int = 3
+    HL_SAFE_READ_BACKOFF_SECONDS: float = 0.5
 
     ENABLE_LIVE_TRADING: bool = False
     DEFAULT_SHADOW_MODE: bool = True
@@ -113,6 +127,16 @@ class Settings(BaseSettings):
             raise ValueError('ENABLE_LIVE_TRADING is only meaningful for mainnet follower execution')
         if self.WATCHER_LEASE_RENEW_SECONDS >= self.WATCHER_LEASE_TTL_SECONDS:
             raise ValueError('watcher lease renew interval must be lower than TTL')
+        if self.HL_MASTER_SNAPSHOT_TTL_SECONDS <= 0:
+            raise ValueError('HL_MASTER_SNAPSHOT_TTL_SECONDS must be positive')
+        if self.HL_MASTER_SNAPSHOT_STALE_SECONDS < self.HL_MASTER_SNAPSHOT_TTL_SECONDS:
+            raise ValueError('HL_MASTER_SNAPSHOT_STALE_SECONDS must be >= snapshot TTL')
+        if not 0 < self.HL_WS_HEARTBEAT_SECONDS < 60:
+            raise ValueError('HL_WS_HEARTBEAT_SECONDS must be between 0 and 60 seconds')
+        if not 1 <= self.HL_SAFE_READ_RETRIES <= 5:
+            raise ValueError('HL_SAFE_READ_RETRIES must be between 1 and 5')
+        if self.HL_SAFE_READ_BACKOFF_SECONDS < 0:
+            raise ValueError('HL_SAFE_READ_BACKOFF_SECONDS cannot be negative')
         return self
 
     @property
