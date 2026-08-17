@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
-from app.adapters.hyperliquid import HyperliquidAdapter, position_configs
+from app.adapters.hyperliquid import AccountSnapshot, HyperliquidAdapter, position_configs
 from app.adapters.ratelimit import Budget, Priority, WeightedRateLimiter
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
@@ -53,36 +53,86 @@ class Watcher:
         self.limiter=WeightedRateLimiter(self.redis,Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN))
         self.hl=HyperliquidAdapter(self.limiter,network=settings.master_network)
         self.lease=WatcherLease(SessionLocal,ttl_seconds=settings.WATCHER_LEASE_TTL_SECONDS,renew_seconds=settings.WATCHER_LEASE_RENEW_SECONDS)
-        self._equity=Decimal(0); self._equity_at=0.0
+        self._snapshot: AccountSnapshot | None = None
+        self._snapshot_at=0.0
+        self._equity=Decimal(0)
+        self._equity_at=0.0
 
-    async def master_equity(self)->Decimal:
+    async def _metric_incr(self,name:str):
+        try: await self.redis.incr(f'hypercopy:metrics:{name}')
+        except Exception: pass
+
+    async def master_snapshot(self,*,force_refresh:bool=False)->AccountSnapshot:
+        """Return a recent verified master snapshot with a short stale bridge.
+
+        Bursty masters can emit many fills in one second. Re-reading
+        clearinghouseState for every fill wastes the per-IP budget and can
+        starve the very lane needed to prove leverage. Reuse a snapshot for a
+        couple of seconds, then refresh. If Hyperliquid is transiently 5xx/rate
+        limited, a last-known-good snapshot may bridge only the configured short
+        stale window; after that the normal fail-closed path takes over.
+        """
         now=asyncio.get_running_loop().time()
-        if self._equity>0 and now-self._equity_at<=10:
-            return self._equity
+        age=now-self._snapshot_at if self._snapshot is not None else float('inf')
+        if not force_refresh and self._snapshot is not None and age<=settings.HL_MASTER_SNAPSHOT_TTL_SECONDS:
+            await self._metric_incr('master_snapshot_cache_hit_count')
+            return self._snapshot
         try:
             snapshot=await self.hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS,priority=Priority.MASTER_STATE)
-            self._equity=snapshot.account_value; self._equity_at=now
-            return self._equity
         except Exception:
-            async with SessionLocal() as db:
-                last=(await db.execute(select(MasterEvent).order_by(MasterEvent.event_ts.desc()).limit(1))).scalar_one_or_none()
-                if last and last.master_equity and last.master_equity>0:
-                    self._equity=last.master_equity; self._equity_at=now
-                    log.warning('Using last persisted master equity while live refresh is unavailable')
-                    return self._equity
+            if self._snapshot is not None and age<=settings.HL_MASTER_SNAPSHOT_STALE_SECONDS:
+                await self._metric_incr('master_snapshot_stale_fallback_count')
+                log.warning('Using recent cached master snapshot while live refresh is unavailable',extra={'age_seconds':round(age,3)})
+                return self._snapshot
+            await self._metric_incr('master_snapshot_unavailable_count')
             raise
+        self._snapshot=snapshot
+        self._snapshot_at=now
+        self._equity=snapshot.account_value
+        self._equity_at=now
+        await self._metric_incr('master_snapshot_refresh_count')
+        return snapshot
+
+    async def _persisted_master_equity(self)->Decimal:
+        now=asyncio.get_running_loop().time()
+        if self._equity>0 and now-self._equity_at<=settings.HL_MASTER_SNAPSHOT_STALE_SECONDS:
+            return self._equity
+        async with SessionLocal() as db:
+            last=(await db.execute(select(MasterEvent).order_by(MasterEvent.event_ts.desc()).limit(1))).scalar_one_or_none()
+            if last and last.master_equity and last.master_equity>0:
+                self._equity=last.master_equity; self._equity_at=now
+                await self._metric_incr('master_equity_persisted_fallback_count')
+                log.warning('Using last persisted master equity while live refresh is unavailable')
+                return self._equity
+        raise RuntimeError('Master equity unavailable and no persisted fallback exists')
+
+    async def master_equity(self)->Decimal:
+        try:
+            return (await self.master_snapshot()).account_value
+        except Exception:
+            return await self._persisted_master_equity()
 
     async def process_fill(self,fill:dict):
         asset=str(fill.get('coin') or '')
         config=None
         try:
-            snapshot=await self.hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS,priority=Priority.MASTER_STATE)
+            snapshot=await self.master_snapshot()
+            configs=position_configs(snapshot.perp_state)
+            config=configs.get(asset)
+            # A fresh cache can predate the very first fill that opens a new
+            # asset. Force one refresh when the asset is absent before deciding
+            # leverage is unavailable.
+            if config is None:
+                snapshot=await self.master_snapshot(force_refresh=True)
+                config=position_configs(snapshot.perp_state).get(asset)
             equity=snapshot.account_value
-            self._equity=equity; self._equity_at=asyncio.get_running_loop().time()
-            config=position_configs(snapshot.perp_state).get(asset)
         except Exception:
-            equity=await self.master_equity()
+            equity=await self._persisted_master_equity()
+
+        if config is None:
+            await self._metric_incr('master_leverage_unavailable_count')
             log.warning('Master leverage unavailable for realtime fill; increasing exposure will wait for reconciliation',extra={'asset':asset})
+
         cid=uuid.uuid4().hex
         async with SessionLocal() as db:
             event,jobs=await persist_master_fill_and_jobs(
