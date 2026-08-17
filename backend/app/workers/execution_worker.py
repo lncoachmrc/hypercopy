@@ -18,6 +18,7 @@ from app.db.schema import assert_schema
 from app.models.entities import CopyJob, JobState, User, WorkerHeartbeat
 from app.services.execution import claim_job, process_job, release_stale_jobs
 from app.services.credentials import monitor_credential_expiry
+from app.services.intelligence import refresh_capital_intelligence
 from app.services.queue import ensure_group, repair_stream
 from app.services.reconcile import master_snapshot, reconcile_active_users, reconcile_user
 
@@ -191,13 +192,38 @@ class Worker:
             finally:
                 await conn.execute(text("SELECT pg_advisory_unlock(hashtext('hypercopy:reconciler'))")); await conn.commit()
 
+    async def capital_intelligence(self):
+        # Keep LLM latency and provider failures completely isolated from order
+        # consumption and the one-minute deterministic reconciliation loop.
+        await asyncio.sleep(5)
+        while not stop.is_set():
+            if settings.LLM_CAPITAL_MODE != 'off':
+                try:
+                    async with engine.connect() as conn:
+                        acquired=bool((await conn.execute(text("SELECT pg_try_advisory_lock(hashtext('hypercopy:capital-intelligence'))"))).scalar_one())
+                        if acquired:
+                            try:
+                                async with SessionLocal() as db:
+                                    result=await refresh_capital_intelligence(db,self.master_hl)
+                                    log.info('Capital intelligence refreshed',extra=result)
+                            finally:
+                                await conn.execute(text("SELECT pg_advisory_unlock(hashtext('hypercopy:capital-intelligence'))")); await conn.commit()
+                except Exception:
+                    log.warning('Capital intelligence refresh failed',exc_info=True)
+            try:
+                await asyncio.wait_for(stop.wait(),timeout=settings.LLM_ANALYSIS_INTERVAL_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+
     async def run(self):
         async with SessionLocal() as db: await assert_schema(db)
         log.info('Execution worker networks', extra={'master_network': settings.master_network, 'follower_network': settings.follower_network})
-        consume=asyncio.create_task(self.consume()); maintenance=asyncio.create_task(self.maintenance())
+        consume=asyncio.create_task(self.consume())
+        maintenance=asyncio.create_task(self.maintenance())
+        intelligence=asyncio.create_task(self.capital_intelligence())
         await stop.wait()
-        maintenance.cancel()
-        await asyncio.gather(maintenance, return_exceptions=True)
+        maintenance.cancel(); intelligence.cancel()
+        await asyncio.gather(maintenance,intelligence,return_exceptions=True)
         try:
             await asyncio.wait_for(consume, timeout=55)
         except asyncio.TimeoutError:
