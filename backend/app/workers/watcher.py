@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import signal
 import uuid
 from datetime import UTC, datetime
@@ -29,6 +31,10 @@ def _stop(*_): stop.set()
 
 def _checkpoint_slug() -> str:
     return f'master_checkpoint:{settings.master_network}:{settings.HYPERLIQUID_MASTER_ADDRESS.lower()}'
+
+
+def _ai_event_queue() -> str:
+    return os.getenv('LLM_EVENT_QUEUE', 'hypercopy:ai:master-events').strip() or 'hypercopy:ai:master-events'
 
 
 async def _checkpoint(db) -> int:
@@ -61,6 +67,20 @@ class Watcher:
     async def _metric_incr(self,name:str):
         try: await self.redis.incr(f'hypercopy:metrics:{name}')
         except Exception: pass
+
+    async def _publish_ai_trigger(self, payload: dict):
+        """Best-effort intelligence signal; trading must never wait for it.
+
+        PostgreSQL master_events remains authoritative. The dedicated AI worker
+        also checks PostgreSQL as a fallback, so losing this transient Redis
+        notification cannot lose strategy-learning data.
+        """
+        try:
+            queue=_ai_event_queue()
+            await self.redis.lpush(queue,json.dumps(payload,separators=(',',':')))
+            await self.redis.ltrim(queue,0,9999)
+        except Exception:
+            log.warning('AI intelligence trigger publish failed; PostgreSQL fallback remains available',exc_info=True)
 
     async def master_snapshot(self,*,force_refresh:bool=False)->AccountSnapshot:
         """Return a recent verified master snapshot with a short stale bridge.
@@ -134,6 +154,7 @@ class Watcher:
             log.warning('Master leverage unavailable for realtime fill; increasing exposure will wait for reconciliation',extra={'asset':asset})
 
         cid=uuid.uuid4().hex
+        ai_payload=None
         async with SessionLocal() as db:
             event,jobs=await persist_master_fill_and_jobs(
                 db,fill=fill,master_equity=equity,fencing_token=self.lease.token,
@@ -147,7 +168,20 @@ class Watcher:
                 except Exception: log.warning('Redis publish failed; durable job remains in PostgreSQL',extra={'job_id':str(job.id)},exc_info=True)
             await db.commit()
             await _set_checkpoint(db,int(event.event_ts.timestamp()*1000),event.exchange_event_id)
-        try: await self.redis.publish(f'{settings.REALTIME_CHANNEL_PREFIX}:system',__import__('json').dumps({'type':'master_fill','asset':event.asset,'price':str(event.price),'size':str(event.size),'at':event.event_ts.isoformat(),'network':settings.master_network}))
+            ai_payload={
+                'master_event_id':str(event.id),
+                'exchange_event_id':event.exchange_event_id,
+                'asset':event.asset,
+                'event_ts':event.event_ts.isoformat(),
+                'network':settings.master_network,
+            }
+
+        # Fire-and-forget by design. Copy jobs were already persisted/published,
+        # so an unavailable AI subsystem cannot add latency to trading.
+        if ai_payload:
+            asyncio.create_task(self._publish_ai_trigger(ai_payload))
+
+        try: await self.redis.publish(f'{settings.REALTIME_CHANNEL_PREFIX}:system',json.dumps({'type':'master_fill','asset':event.asset,'price':str(event.price),'size':str(event.size),'at':event.event_ts.isoformat(),'network':settings.master_network}))
         except Exception: pass
 
     async def replay(self):
