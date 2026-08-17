@@ -7,6 +7,7 @@ type Dash={equity:number|null;pnl_absolute:number;max_drawdown_pct:number;sharpe
 type Pos={asset:string;current_size:string;target_size:string;delta:string;mark_price:string;delta_notional:string;status:'READY'|'BELOW_MIN'|'UNAVAILABLE'|'ON_TARGET';reason:string|null;managed:boolean;master_leverage:number|null;master_is_cross:boolean|null;follower_leverage:number|null;follower_is_cross:boolean|null;exchange_verified_at:string|null};
 type LiveLev={asset:string;master_leverage:number|null;master_is_cross:boolean|null;follower_leverage:number|null;follower_is_cross:boolean|null};
 type Exec={id:string;asset:string;state:string;is_buy:boolean;requested_size:string;filled_size:string;avg_price:string|null;reduce_only:boolean;reject_reason:string|null;leverage:number|string|null;is_cross:boolean|null;created_at:string};
+type Intelligence={enabled:boolean;mode:'off'|'shadow'|'active';preferred_model:string;models:Record<string,string>;provider_order:string[];last:null|{status:string;provider:string|null;model:string|null;candidate_id:string;candidate_label:string|null;confidence:number|null;follower_equity:number;eligible_equity:number;recommended_capital:number;coverage_pct:number;tracking_error_pct:number;buffer_pct:string|null;selected_positions:number;summary:string|null;fallback_count:number;attempts:{provider:string|null;model:string|null;status:string|null}[];created_at:string};strategy:null|{event_count:number;asset_count:number;window_days:number;observed_days:number|null;micro_fill_ratio:number|null;median_event_interval_seconds:number|null;top_assets:{asset:string;fills:number;persistence_score:number}[];learned_at:string}};
 type PnlRange='1d'|'7d'|'30d'|'90d'|'all';
 type PnlPoint={at:string;value:number;bucket_value:number};
 type PnlHistory={range:PnlRange;pnl_absolute:number;pnl_pct:number|null;start_equity:number|null;current_equity:number|null;points:PnlPoint[];source:'realized_net'};
@@ -26,18 +27,20 @@ export default function Dashboard(){
   const [pos,setPos]=useState<Pos[]>([]);
   const [liveLeverage,setLiveLeverage]=useState<Record<string,LiveLev>>({});
   const [execs,setExec]=useState<Exec[]>([]);
+  const [intel,setIntel]=useState<Intelligence|null>(null);
   const [live,setLive]=useState('connecting');
   const [range,setRange]=useState<PnlRange>('1d');
   const [pnl,setPnl]=useState<PnlHistory|null>(null);
   const [pnlError,setPnlError]=useState('');
 
   const load=async()=>{
-    const [a,b,c]=await Promise.all([
+    const [a,b,c,i]=await Promise.all([
       get<Dash>('/dashboard'),
       get<Pos[]>('/positions'),
       get<Exec[]>('/executions?limit=25'),
+      get<Intelligence>('/intelligence'),
     ]);
-    setD(a);setPos(b);setExec(c);
+    setD(a);setPos(b);setExec(c);setIntel(i);
   };
 
   const loadLeverage=async()=>{
@@ -63,11 +66,12 @@ export default function Dashboard(){
     void load();
     void loadLeverage();
     const leverageTimer=window.setInterval(()=>void loadLeverage(),60000);
+    const intelligenceTimer=window.setInterval(()=>void load(),60000);
     const ws=new WebSocket(wsUrl());
     ws.onopen=()=>setLive('live');
     ws.onclose=()=>setLive('offline');
     ws.onmessage=e=>{try{const m=JSON.parse(e.data);if(m.type!=='heartbeat')void load();}catch{}};
-    return()=>{window.clearInterval(leverageTimer);ws.close()};
+    return()=>{window.clearInterval(leverageTimer);window.clearInterval(intelligenceTimer);ws.close()};
   },[]);
 
   useEffect(()=>{
@@ -80,12 +84,38 @@ export default function Dashboard(){
     <div className="title"><div><h1>Dashboard</h1><p>Stato reale della strategia ibrida, del Risk Engine e del tuo account Hyperliquid.</p></div><span className={`badge ${live}`}>{live}</span></div>
     <div className="stats"><Card label="Equity" value={money(d?.equity)}/><Card label="PnL periodo" value={money(d?.pnl_absolute)} tone={pnlTone(d?.pnl_absolute)}/><Card label="Max drawdown" value={d?`${d.max_drawdown_pct.toFixed(2)}%`:'—'}/><Card label="Sharpe" value={d?.sharpe==null?'—':d.sharpe.toFixed(2)}/></div>
 
+    <IntelligencePanel data={intel}/>
     <PnlChart data={pnl} range={range} setRange={setRange} error={pnlError}/>
 
     <section className="panel"><div className="panelhead"><h2>Posizionamento strategia</h2><span className="badge">{d?.user.copy_state||user?.copy_state} · {d?.user.risk_state||'NORMAL'}</span></div><table><thead><tr><th>Asset</th><th>Attuale</th><th>Target strategia</th><th>Delta</th><th>Leva strategia → account</th><th>Stato</th><th>Verifica exchange</th></tr></thead><tbody>{pos.length?pos.map(p=><tr key={p.asset}><td><b>{p.asset}</b></td><td>{p.current_size}</td><td>{p.status==='UNAVAILABLE'?'—':p.target_size}</td><td className={p.status==='UNAVAILABLE'?'':Number(p.delta)>=0?'up':'down'}>{p.status==='UNAVAILABLE'?'—':p.delta}</td><td><PositionLeverage p={p} live={liveLeverage[p.asset]}/></td><td><TargetStatus p={p}/></td><td>{p.exchange_verified_at?new Date(p.exchange_verified_at).toLocaleString():'—'}</td></tr>):<tr><td colSpan={7}>Nessuna posizione gestita dalla strategia.</td></tr>}</tbody></table></section>
     <section className="panel"><div className="panelhead"><h2>Ultime operazioni</h2><span className="muted">Esecuzione persistente + reconciliation</span></div><table><thead><tr><th>Ora</th><th>Asset</th><th>Lato</th><th>Size</th><th>Leva</th><th>Stato</th><th>Motivo</th></tr></thead><tbody>{execs.map(x=><tr key={x.id}><td>{new Date(x.created_at).toLocaleString()}</td><td>{x.asset}</td><td className={x.is_buy?'up':'down'}>{x.is_buy?'BUY':'SELL'}{x.reduce_only?' RO':''}</td><td>{x.requested_size}</td><td>{formatLeverage(x.leverage,x.is_cross)}</td><td><span className="badge">{x.state}</span></td><td>{x.reject_reason||'—'}</td></tr>)}</tbody></table></section>
   </>;
 }
+
+function IntelligencePanel({data}:{data:Intelligence|null}){
+  const last=data?.last;
+  const strategy=data?.strategy;
+  const actualModel=last?.model||data?.preferred_model||'—';
+  const provider=last?.provider?last.provider.toUpperCase():'DETERMINISTIC';
+  const mode=(data?.mode||'off').toUpperCase();
+  return <section className="panel intelligence-panel">
+    <div className="panelhead intelligence-head"><div><h2>Traxion Intelligence</h2><p>Capital allocation + apprendimento progressivo della strategia operativa del master.</p></div><div className="intelligence-badges"><span className={`badge ${data?.mode==='active'?'live':''}`}>AI {mode}</span>{last?.fallback_count?<span className="badge">Failover {last.fallback_count}×</span>:null}</div></div>
+    {last?<>
+      <div className="intelligence-grid">
+        <IntelMetric label="Modello in uso" value={`${provider} · ${actualModel}`}/>
+        <IntelMetric label="Policy" value={last.candidate_label||last.candidate_id}/>
+        <IntelMetric label="Copertura strategia" value={`${Number(last.coverage_pct).toFixed(1)}%`}/>
+        <IntelMetric label="Capitale consigliato" value={money(Number(last.recommended_capital))}/>
+        <IntelMetric label="Posizioni selezionate" value={String(last.selected_positions)}/>
+        <IntelMetric label="Tracking error" value={`${Number(last.tracking_error_pct).toFixed(1)}%`}/>
+      </div>
+      <div className="intelligence-summary"><span>Decisione AI</span><strong>{last.summary||'Analisi completata.'}</strong><small>{last.confidence==null?'':`Confidence ${(Number(last.confidence)*100).toFixed(0)}% · `}{new Date(last.created_at).toLocaleString()}</small></div>
+    </>:<div className="intelligence-empty">In attesa della prima analisi del Capital Intelligence Engine.</div>}
+    <div className="intelligence-learning"><span>Master learning</span><strong>{strategy?`${strategy.event_count} eventi · ${strategy.asset_count} asset · ${Number(strategy.observed_days||0).toFixed(1)} giorni osservati`:'Profilo in costruzione'}</strong>{strategy?.top_assets?.length?<small>Più osservati: {strategy.top_assets.map(x=>`${x.asset} (${Math.round(Number(x.persistence_score||0)*100)}%)`).join(' · ')}</small>:null}</div>
+  </section>;
+}
+
+function IntelMetric({label,value}:{label:string;value:string}){return <div className="intelligence-metric"><span>{label}</span><strong>{value}</strong></div>}
 
 function PnlChart({data,range,setRange,error}:{data:PnlHistory|null;range:PnlRange;setRange:(r:PnlRange)=>void;error:string}){
   const positive=(data?.pnl_absolute??0)>=0;
