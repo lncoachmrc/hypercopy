@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import os
 import signal
 from datetime import UTC, datetime
@@ -85,11 +84,21 @@ class AIIntelligenceWorker:
         self._source_ts=_parse_ts(state.get('source_event_ts'))
         return state
 
-    async def _has_unanalysed_events(self) -> bool:
-        latest=await self._latest_master_event()
-        if latest is None:
+    def _is_new_event(self, event: MasterEvent | None) -> bool:
+        if event is None:
             return False
-        return self._source_ts is None or latest.event_ts > self._source_ts
+        return self._source_ts is None or event.event_ts > self._source_ts
+
+    async def _has_unanalysed_events(self) -> bool:
+        return self._is_new_event(await self._latest_master_event())
+
+    def _mark_pending_from_event_time(self,event_ts:datetime):
+        now_mono=asyncio.get_running_loop().time()
+        event_age=max((datetime.now(UTC)-event_ts).total_seconds(),0.0)
+        self._pending=True
+        # Preserve the real quiet period. A PostgreSQL fallback detected 60s
+        # after the event must still wait the remaining debounce time.
+        self._last_signal_mono=now_mono-min(event_age,float(self.debounce))
 
     @staticmethod
     def _state_age_seconds(state: dict) -> float:
@@ -168,11 +177,13 @@ class AIIntelligenceWorker:
         if now-self._last_db_poll < self.db_poll:
             return
         self._last_db_poll=now
-        if await self._has_unanalysed_events():
-            self._pending=True
-            # The DB event may already be older than the debounce window. Analyze
-            # immediately once min-refresh allows instead of waiting another 3m.
-            self._last_signal_mono=now-self.debounce
+        # Never overwrite a live Redis-driven debounce window. PostgreSQL is a
+        # recovery path for a notification that was missed, not a faster trigger.
+        if self._pending:
+            return
+        latest=await self._latest_master_event()
+        if self._is_new_event(latest):
+            self._mark_pending_from_event_time(latest.event_ts)
 
     async def run(self):
         async with SessionLocal() as db:
@@ -191,10 +202,10 @@ class AIIntelligenceWorker:
                 await asyncio.sleep(30)
             return
 
-        state=await self._sync_source_from_state()
-        if await self._has_unanalysed_events():
-            self._pending=True
-            self._last_signal_mono=asyncio.get_running_loop().time()-self.debounce
+        await self._sync_source_from_state()
+        latest=await self._latest_master_event()
+        if self._is_new_event(latest):
+            self._mark_pending_from_event_time(latest.event_ts)
 
         while not stop.is_set():
             await self._consume_signal()
@@ -212,8 +223,12 @@ class AIIntelligenceWorker:
                     if ran:
                         # An event may have landed while provider calls were in
                         # flight. Compare against PostgreSQL before clearing.
-                        self._pending=await self._has_unanalysed_events()
-                        self._last_signal_mono=asyncio.get_running_loop().time() if self._pending else None
+                        latest=await self._latest_master_event()
+                        self._pending=self._is_new_event(latest)
+                        if self._pending and latest is not None:
+                            self._mark_pending_from_event_time(latest.event_ts)
+                        else:
+                            self._last_signal_mono=None
                     continue
 
             if not self._pending and age >= self.max_refresh:
