@@ -42,6 +42,16 @@ def test_adapter_selects_network_specific_endpoints(monkeypatch):
     assert test.ws_url=='wss://api.hyperliquid-testnet.xyz/ws'
 
 
+@pytest.mark.asyncio
+async def test_mids_uses_order_lane_not_master_state(monkeypatch):
+    monkeypatch.setattr('app.adapters.hyperliquid.Info', MagicMock())
+    adapter=HyperliquidAdapter(None, network='testnet')
+    adapter._read=AsyncMock(return_value={'BTC':'60000'})
+    result=await adapter.mids()
+    assert result=={'BTC':'60000'}
+    assert adapter._read.await_args.kwargs['priority'] == Priority.ORDER
+
+
 def test_position_configs_extracts_master_leverage_and_margin_mode():
     configs=position_configs({
         'assetPositions':[
