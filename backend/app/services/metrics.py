@@ -13,6 +13,91 @@ from app.models.entities import (
 )
 
 
+PNL_RANGE_CONFIG = {
+    '1d': (timedelta(days=1), 5 * 60),
+    '7d': (timedelta(days=7), 30 * 60),
+    '30d': (timedelta(days=30), 2 * 60 * 60),
+    '90d': (timedelta(days=90), 6 * 60 * 60),
+    'all': (None, 24 * 60 * 60),
+}
+
+
+async def pnl_history_for_user(db: AsyncSession, user_id, range_key: str = '1d') -> dict:
+    key = range_key.lower()
+    if key not in PNL_RANGE_CONFIG:
+        raise ValueError('Unsupported PnL range')
+
+    now = datetime.now(UTC)
+    delta, bucket_seconds = PNL_RANGE_CONFIG[key]
+    start = now - delta if delta else None
+
+    net_pnl = func.coalesce(Fill.closed_pnl, 0) - func.coalesce(Fill.fee, 0)
+    bucket = func.floor(func.extract('epoch', Fill.ts) / bucket_seconds)
+    query = select(
+        bucket.label('bucket'),
+        func.min(Fill.ts).label('at'),
+        func.coalesce(func.sum(net_pnl), 0).label('net'),
+    ).where(Fill.user_id == user_id)
+    if start is not None:
+        query = query.where(Fill.ts >= start)
+    query = query.group_by(bucket).order_by(bucket)
+    rows = (await db.execute(query)).all()
+
+    latest_equity = (await db.execute(
+        select(EquitySnapshot)
+        .where(EquitySnapshot.user_id == user_id)
+        .order_by(EquitySnapshot.taken_at.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+
+    if start is None:
+        baseline = (await db.execute(
+            select(EquitySnapshot)
+            .where(EquitySnapshot.user_id == user_id)
+            .order_by(EquitySnapshot.taken_at.asc())
+            .limit(1)
+        )).scalar_one_or_none()
+        start_at = baseline.taken_at if baseline else (rows[0].at if rows else now)
+    else:
+        baseline = (await db.execute(
+            select(EquitySnapshot)
+            .where(EquitySnapshot.user_id == user_id, EquitySnapshot.taken_at <= start)
+            .order_by(EquitySnapshot.taken_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        if baseline is None:
+            baseline = (await db.execute(
+                select(EquitySnapshot)
+                .where(EquitySnapshot.user_id == user_id, EquitySnapshot.taken_at >= start)
+                .order_by(EquitySnapshot.taken_at.asc())
+                .limit(1)
+            )).scalar_one_or_none()
+        start_at = start
+
+    total = 0.0
+    points = [{'at': start_at.isoformat(), 'value': 0.0, 'bucket_value': 0.0}]
+    for row in rows:
+        bucket_value = float(row.net or 0)
+        total += bucket_value
+        points.append({'at': row.at.isoformat(), 'value': total, 'bucket_value': bucket_value})
+
+    if not points or points[-1]['at'] != now.isoformat():
+        points.append({'at': now.isoformat(), 'value': total, 'bucket_value': 0.0})
+
+    start_equity = float(baseline.account_value) if baseline else None
+    pnl_pct = (total / start_equity * 100) if start_equity and start_equity > 0 else None
+
+    return {
+        'range': key,
+        'pnl_absolute': total,
+        'pnl_pct': pnl_pct,
+        'start_equity': start_equity,
+        'current_equity': float(latest_equity.account_value) if latest_equity else None,
+        'points': points,
+        'source': 'realized_net',
+    }
+
+
 async def dashboard_for_user(db: AsyncSession, user_id) -> dict:
     since = datetime.now(UTC)-timedelta(days=90)
     latest = (await db.execute(select(EquitySnapshot).where(EquitySnapshot.user_id == user_id).order_by(EquitySnapshot.taken_at.desc()).limit(1))).scalar_one_or_none()
@@ -52,7 +137,6 @@ async def dashboard_for_user(db: AsyncSession, user_id) -> dict:
         'max_drawdown_pct': max_dd,
         'sharpe': sharpe,
         'sharpe_observations': len(returns),
-        'equity_history': [{'at': p.taken_at.isoformat(), 'value': float(p.account_value)} for p in points],
         'positions': len([p for p in positions if p.size != 0]),
     }
 
