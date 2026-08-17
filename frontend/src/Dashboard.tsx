@@ -5,6 +5,7 @@ import {useAuth} from './auth';
 
 type Dash={equity:number|null;pnl_absolute:number;max_drawdown_pct:number;sharpe:number|null;positions:number;user:{copy_state:string;risk_state:string}};
 type Pos={asset:string;current_size:string;target_size:string;delta:string;mark_price:string;delta_notional:string;status:'READY'|'BELOW_MIN'|'UNAVAILABLE'|'ON_TARGET';reason:string|null;managed:boolean;master_leverage:number|null;master_is_cross:boolean|null;follower_leverage:number|null;follower_is_cross:boolean|null;exchange_verified_at:string|null};
+type LiveLev={asset:string;master_leverage:number|null;master_is_cross:boolean|null;follower_leverage:number|null;follower_is_cross:boolean|null};
 type Exec={id:string;asset:string;state:string;is_buy:boolean;requested_size:string;filled_size:string;avg_price:string|null;reduce_only:boolean;reject_reason:string|null;leverage:number|string|null;is_cross:boolean|null;created_at:string};
 type PnlRange='1d'|'7d'|'30d'|'90d'|'all';
 type PnlPoint={at:string;value:number;bucket_value:number};
@@ -23,6 +24,7 @@ export default function Dashboard(){
   const {user}=useAuth();
   const [d,setD]=useState<Dash|null>(null);
   const [pos,setPos]=useState<Pos[]>([]);
+  const [liveLeverage,setLiveLeverage]=useState<Record<string,LiveLev>>({});
   const [execs,setExec]=useState<Exec[]>([]);
   const [live,setLive]=useState('connecting');
   const [range,setRange]=useState<PnlRange>('1d');
@@ -38,6 +40,16 @@ export default function Dashboard(){
     setD(a);setPos(b);setExec(c);
   };
 
+  const loadLeverage=async()=>{
+    try{
+      const rows=await get<LiveLev[]>('/position-leverage');
+      setLiveLeverage(Object.fromEntries(rows.map(row=>[row.asset,row])));
+    }catch{
+      // Keep the last known live leverage snapshot. The ledger values remain
+      // available as a fallback and no trading state is affected by this read.
+    }
+  };
+
   const loadPnl=async(selected:PnlRange)=>{
     try{
       setPnlError('');
@@ -49,11 +61,13 @@ export default function Dashboard(){
 
   useEffect(()=>{
     void load();
+    void loadLeverage();
+    const leverageTimer=window.setInterval(()=>void loadLeverage(),60000);
     const ws=new WebSocket(wsUrl());
     ws.onopen=()=>setLive('live');
     ws.onclose=()=>setLive('offline');
     ws.onmessage=e=>{try{const m=JSON.parse(e.data);if(m.type!=='heartbeat')void load();}catch{}};
-    return()=>ws.close();
+    return()=>{window.clearInterval(leverageTimer);ws.close()};
   },[]);
 
   useEffect(()=>{
@@ -68,7 +82,7 @@ export default function Dashboard(){
 
     <PnlChart data={pnl} range={range} setRange={setRange} error={pnlError}/>
 
-    <section className="panel"><div className="panelhead"><h2>Position targeting</h2><span className="badge">{d?.user.copy_state||user?.copy_state} · {d?.user.risk_state||'NORMAL'}</span></div><table><thead><tr><th>Asset</th><th>Attuale</th><th>Target</th><th>Delta</th><th>Leva M → F</th><th>Stato</th><th>Verifica exchange</th></tr></thead><tbody>{pos.length?pos.map(p=><tr key={p.asset}><td><b>{p.asset}</b></td><td>{p.current_size}</td><td>{p.status==='UNAVAILABLE'?'—':p.target_size}</td><td className={p.status==='UNAVAILABLE'?'':Number(p.delta)>=0?'up':'down'}>{p.status==='UNAVAILABLE'?'—':p.delta}</td><td><PositionLeverage p={p}/></td><td><TargetStatus p={p}/></td><td>{p.exchange_verified_at?new Date(p.exchange_verified_at).toLocaleString():'—'}</td></tr>):<tr><td colSpan={7}>Nessuna posizione gestita.</td></tr>}</tbody></table></section>
+    <section className="panel"><div className="panelhead"><h2>Position targeting</h2><span className="badge">{d?.user.copy_state||user?.copy_state} · {d?.user.risk_state||'NORMAL'}</span></div><table><thead><tr><th>Asset</th><th>Attuale</th><th>Target</th><th>Delta</th><th>Leva M → F</th><th>Stato</th><th>Verifica exchange</th></tr></thead><tbody>{pos.length?pos.map(p=><tr key={p.asset}><td><b>{p.asset}</b></td><td>{p.current_size}</td><td>{p.status==='UNAVAILABLE'?'—':p.target_size}</td><td className={p.status==='UNAVAILABLE'?'':Number(p.delta)>=0?'up':'down'}>{p.status==='UNAVAILABLE'?'—':p.delta}</td><td><PositionLeverage p={p} live={liveLeverage[p.asset]}/></td><td><TargetStatus p={p}/></td><td>{p.exchange_verified_at?new Date(p.exchange_verified_at).toLocaleString():'—'}</td></tr>):<tr><td colSpan={7}>Nessuna posizione gestita.</td></tr>}</tbody></table></section>
     <section className="panel"><div className="panelhead"><h2>Ultime execution</h2><span className="muted">Cloid persistente + reconciliation</span></div><table><thead><tr><th>Ora</th><th>Asset</th><th>Lato</th><th>Size</th><th>Leva</th><th>Stato</th><th>Motivo</th></tr></thead><tbody>{execs.map(x=><tr key={x.id}><td>{new Date(x.created_at).toLocaleString()}</td><td>{x.asset}</td><td className={x.is_buy?'up':'down'}>{x.is_buy?'BUY':'SELL'}{x.reduce_only?' RO':''}</td><td>{x.requested_size}</td><td>{formatLeverage(x.leverage,x.is_cross)}</td><td><span className="badge">{x.state}</span></td><td>{x.reject_reason||'—'}</td></tr>)}</tbody></table></section>
   </>;
 }
@@ -105,11 +119,15 @@ function PnlChart({data,range,setRange,error}:{data:PnlHistory|null;range:PnlRan
   </section>;
 }
 
-function PositionLeverage({p}:{p:Pos}){
-  const master=formatLeverage(p.master_leverage,p.master_is_cross);
-  const follower=formatLeverage(p.follower_leverage,p.follower_is_cross);
-  const comparable=p.master_leverage!=null&&p.follower_leverage!=null;
-  const match=comparable&&Number(p.master_leverage)===Number(p.follower_leverage)&&p.master_is_cross===p.follower_is_cross;
+function PositionLeverage({p,live}:{p:Pos;live?:LiveLev}){
+  const masterLeverage=live?.master_leverage??p.master_leverage;
+  const masterIsCross=live?.master_is_cross??p.master_is_cross;
+  const followerLeverage=live?.follower_leverage??p.follower_leverage;
+  const followerIsCross=live?.follower_is_cross??p.follower_is_cross;
+  const master=formatLeverage(masterLeverage,masterIsCross);
+  const follower=formatLeverage(followerLeverage,followerIsCross);
+  const comparable=masterLeverage!=null&&followerLeverage!=null;
+  const match=comparable&&Number(masterLeverage)===Number(followerLeverage)&&masterIsCross===followerIsCross;
   return <div className="leverage-pair">
     <span><b>M</b> {master}</span>
     <span className={comparable?(match?'up':'down'):'muted'}><b>F</b> {follower}</span>
