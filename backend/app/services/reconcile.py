@@ -14,6 +14,7 @@ from app.core.config import settings
 from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, FollowerState, MasterExposure, compute_target
 from app.models.entities import CopyJob, CopyState, EquitySnapshot, Execution, ExecutionState, Fill, JobState, PositionLedger, ReconciliationRun, RiskHalt, RiskProfile, RiskState, TradingAccount, User, UserState
 from app.services.audit import audit
+from app.services.intelligence import active_policy_for_user
 
 log = __import__('app.core.logging', fromlist=['get_logger']).get_logger(__name__)
 
@@ -205,6 +206,11 @@ async def reconcile_user(
         liquidity_backoffs = []
         multiplier = risk.multiplier if risk else Decimal(1)
         min_notional = max(risk.min_notional if risk else EXCHANGE_MIN_NOTIONAL, EXCHANGE_MIN_NOTIONAL)
+        intelligence_policy = await active_policy_for_user(
+            db, user.id, risk_multiplier=multiplier, min_notional=min_notional,
+        ) if risk else None
+        policy_weights = (intelligence_policy or {}).get('signed_equity_weights') if intelligence_policy else None
+        eligible_equity = max(equity - unmanaged_margin, Decimal(0))
 
         for asset in assets:
             real = real_positions.get(asset, Decimal(0))
@@ -227,7 +233,10 @@ async def reconcile_user(
             master_pos = master_positions.get(asset, Decimal(0))
             master_mark = Decimal(str(source_mids.get(asset, '0') or '0'))
             desired_target = Decimal(0)
-            if master_pos != 0 and master_equity > 0 and master_mark > 0 and follower_mark > 0:
+            if isinstance(policy_weights, dict) and follower_mark > 0:
+                signed_weight = Decimal(str(policy_weights.get(asset, '0') or '0'))
+                desired_target = signed_weight * eligible_equity / follower_mark
+            elif master_pos != 0 and master_equity > 0 and master_mark > 0 and follower_mark > 0:
                 desired_target = compute_target(
                     MasterExposure(asset, master_pos, master_mark, master_equity),
                     FollowerState(str(user.id), equity, unmanaged_margin, real, multiplier),
@@ -298,6 +307,9 @@ async def reconcile_user(
                 'master_network': settings.master_network,
                 'follower_network': settings.follower_network,
             }
+            if intelligence_policy:
+                context['capital_intelligence_candidate'] = intelligence_policy.get('candidate_label')
+                context['capital_intelligence_coverage_pct'] = intelligence_policy.get('coverage_pct')
             if master_config is not None:
                 context['master_leverage'] = master_config.leverage
                 context['master_is_cross'] = master_config.is_cross
@@ -317,8 +329,8 @@ async def reconcile_user(
 
         db.add(EquitySnapshot(user_id=user.id, account_value=equity, free_margin=free_margin, unmanaged_margin=unmanaged_margin, taken_at=datetime.now(UTC)))
 
-        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs}; run.finished_at = datetime.now(UTC)
-        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs})
+        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'capital_intelligence': intelligence_policy.get('candidate_label') if intelligence_policy else None}; run.finished_at = datetime.now(UTC)
+        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs, 'capital_intelligence': intelligence_policy.get('candidate_label') if intelligence_policy else None})
         await db.commit()
         return {'status': 'OK', 'discrepancies': discrepancies, 'equity': str(equity), 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs}
     except Exception as exc:
