@@ -68,6 +68,8 @@ Exact Ratio always remains available. A stored policy that later exceeds the cur
 
 The tracking-error limit is also recalculated against the **current** master portfolio on every realtime fill and every reconciliation cycle. If a previously valid Smart policy drifts beyond the hard limit, or current master exposure cannot be proven, Traxion immediately falls back to Exact Ratio instead of waiting for the next LLM refresh.
 
+Historical replay deliberately uses the original Exact Ratio path. Smart compression is applied again only after current-state reconciliation proves the live portfolio, preventing stale compressed intermediate states from being executed while the watcher catches up.
+
 Asset-universe safety is network-aware. If master and follower use the same Hyperliquid network, a brand-new master asset may temporarily use Exact Ratio until the next intelligence refresh. Across different networks (for example mainnet master → testnet follower), a brand-new asset waits for the next follower-universe refresh so Traxion never assumes that a mainnet market exists on testnet. A market already verified as unavailable on the follower remains excluded.
 
 ## Railway variables
@@ -78,13 +80,13 @@ Asset-universe safety is network-aware. If master and follower use the same Hype
 LLM_ENABLED=true
 LLM_CAPITAL_MODE=shadow
 LLM_PROVIDER_ORDER=openai,anthropic,deepseek
-LLM_PREFERRED_MODEL=gpt-5.6-terra
+LLM_PREFERRED_MODEL=gpt-5.4
 
 OPENAI_API_KEY=<secret>
-OPENAI_MODEL=gpt-5.6-terra
+OPENAI_MODEL=gpt-5.4
 
 ANTHROPIC_API_KEY=<secret>
-ANTHROPIC_MODEL=claude-sonnet-5
+ANTHROPIC_MODEL=claude-sonnet-4-20250514
 
 DEEPSEEK_API_KEY=<secret>
 DEEPSEEK_MODEL=deepseek-v4-pro
@@ -109,9 +111,9 @@ The API needs the public configuration values so the authenticated frontend can 
 LLM_ENABLED=true
 LLM_CAPITAL_MODE=shadow
 LLM_PROVIDER_ORDER=openai,anthropic,deepseek
-LLM_PREFERRED_MODEL=gpt-5.6-terra
-OPENAI_MODEL=gpt-5.6-terra
-ANTHROPIC_MODEL=claude-sonnet-5
+LLM_PREFERRED_MODEL=gpt-5.4
+OPENAI_MODEL=gpt-5.4
+ANTHROPIC_MODEL=claude-sonnet-4-20250514
 DEEPSEEK_MODEL=deepseek-v4-pro
 LLM_ANALYSIS_INTERVAL_SECONDS=300
 LLM_STRATEGY_WINDOW_DAYS=30
