@@ -1,10 +1,14 @@
 # HyperCopy
 
-Production-oriented SaaS copytrading platform for **Hyperliquid Perpetuals**.
+Production-oriented SaaS platform for **hybrid trading execution on Hyperliquid Perpetuals**.
+
+HyperCopy applies to each connected account a strategy whose source trading process combines **human analysts and AI systems**. The platform itself is responsible for controlled execution, proportional sizing, leverage/margin synchronization, risk management, reconciliation, auditability and account-level monitoring.
 
 **Mandatory deployment path:** GitHub → Railway → Hyperliquid.
 
 `SPEC.md` is the product/architecture source of truth. This repository is the concrete implementation candidate derived from that specification. Mainnet trading remains deliberately gated until testnet, chaos, restore and rollback validation are completed.
+
+> Note: internal identifiers such as `CopyJob`, `copy_state` and `/copy/*` are legacy technical names in the execution engine. They are not the product positioning and do not mean the user-facing service is presented as social/copy trading.
 
 ## Architecture
 
@@ -42,7 +46,9 @@ PostgreSQL owns `master_events → copy_jobs → executions → fills`, the posi
 
 ## Trading correctness
 
-The engine does **hybrid position targeting**, not blind fill replication. A master fill is the low-latency trigger, but each follower order is the delta between the follower's current managed position and the target implied by the master's current exposure ratio. Periodic reconciliation converges the ledger after partial fills, missed events, rejects and restarts.
+The engine performs **hybrid position targeting**, not blind fill replication. A source-strategy fill is the low-latency trigger, but each account order is the delta between the account's current managed position and the target implied by the strategy source's current exposure ratio. Periodic reconciliation converges the ledger after partial fills, missed events, rejects and restarts.
+
+The source strategy is produced outside the execution layer by a hybrid decision process that combines analyst input and AI-assisted systems. HyperCopy does not claim that the execution engine independently invents those trades: it receives the resulting source positioning and applies it to connected accounts under each user's Risk Engine limits.
 
 Every external order is preceded by a durable `Execution(SUBMITTING)` row and a deterministic 128-bit Hyperliquid `cloid`. Ambiguous outcomes are resolved against Hyperliquid before any further action; reconciliation refuses to create a replacement job while an unresolved external effect exists.
 
