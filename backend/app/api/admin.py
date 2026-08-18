@@ -14,6 +14,7 @@ from app.adapters.ratelimit import Budget, Priority, WeightedRateLimiter
 from app.api.deps import require_csrf, require_role
 from app.core.config import settings
 from app.core.crypto import EncryptedCredential, crypto
+from app.core.logging import get_logger
 from app.db.redis import redis_client
 from app.db.session import get_db
 from app.models.entities import (
@@ -23,10 +24,11 @@ from app.models.entities import (
 from app.schemas.admin import AdminAction, AdminReconcile
 from app.services.audit import audit
 from app.services.metrics import system_snapshot
-from app.services.queue import repair_stream
+from app.services.queue import publish_job, repair_stream
 from app.services.reconcile import master_snapshot, reconcile_user
 
 router = APIRouter(prefix='/admin', tags=['admin'])
+log = get_logger(__name__)
 admin = require_role(Role.ADMIN, Role.SUPERADMIN)
 superadmin = require_role(Role.SUPERADMIN)
 
@@ -342,10 +344,46 @@ async def queue_reconcile(user_id: uuid.UUID, body: AdminReconcile, actor: User 
     target = await db.get(User, user_id)
     if not target:
         raise HTTPException(404, 'User not found')
-    db.add(CopyJob(user_id=target.id, asset='__RECONCILE__', origin='ADMIN_RECONCILE', state='QUEUED', correlation_id=uuid.uuid4().hex, context={'reason': body.reason}))
-    await audit(db, action='ADMIN_RECONCILE_REQUESTED', actor_id=actor.id, subject_id=target.id, reason=body.reason)
+    job = CopyJob(
+        user_id=target.id,
+        asset='__RECONCILE__',
+        origin='ADMIN_RECONCILE',
+        state='QUEUED',
+        correlation_id=uuid.uuid4().hex,
+        context={'reason': body.reason},
+    )
+    db.add(job)
+    await db.flush()
+
+    published = False
+    try:
+        await publish_job(redis_client(), db, job)
+        published = True
+    except Exception:
+        # PostgreSQL remains the durable source of truth. The worker's
+        # repair_stream loop will recover the job if Redis is unavailable.
+        job.enqueued_at = None
+        log.warning(
+            'Immediate admin reconcile publish failed; durable repair will retry',
+            extra={'job_id': str(job.id), 'user_id': str(target.id)},
+            exc_info=True,
+        )
+
+    await audit(
+        db,
+        action='ADMIN_RECONCILE_REQUESTED',
+        actor_id=actor.id,
+        subject_id=target.id,
+        reason=body.reason,
+        after={'job_id': str(job.id), 'stream_published': published},
+    )
     await db.commit()
-    return {'queued': True}
+    return {
+        'queued': True,
+        'job_id': str(job.id),
+        'state': job.state.value,
+        'stream_published': published,
+    }
 
 
 async def _flag(db: AsyncSession, slug: str, enabled: bool, actor: User, reason: str):
