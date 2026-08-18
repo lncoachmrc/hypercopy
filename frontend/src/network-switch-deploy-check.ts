@@ -1,1 +1,0 @@
-export const NETWORK_SWITCH_DEPLOY_CHECK = '2026-08-19-v2';
