@@ -2,14 +2,15 @@ import {useEffect,useState} from 'react';
 import {Area,AreaChart,CartesianGrid,ReferenceLine,ResponsiveContainer,Tooltip,XAxis,YAxis} from 'recharts';
 import {get,wsUrl} from './api';
 import {useAuth} from './auth';
+import './dashboard.css';
 
-type Dash={equity:number|null;pnl_absolute:number;max_drawdown_pct:number;sharpe:number|null;positions:number;user:{copy_state:string;risk_state:string}};
+type Dash={equity:number|null;collateral_balance:number|null;unrealized_pnl:number|null;free_margin:number|null;account_mode:string|null;snapshot_at:string|null;snapshot_age_seconds:number|null;pnl_absolute:number;max_drawdown_pct:number;sharpe:number|null;positions:number;user:{copy_state:string;risk_state:string}};
 type Pos={asset:string;current_size:string;target_size:string;delta:string;mark_price:string;delta_notional:string;status:'READY'|'BELOW_MIN'|'UNAVAILABLE'|'ON_TARGET';reason:string|null;managed:boolean;master_leverage:number|null;master_is_cross:boolean|null;follower_leverage:number|null;follower_is_cross:boolean|null;exchange_verified_at:string|null};
 type LiveLev={asset:string;master_leverage:number|null;master_is_cross:boolean|null;follower_leverage:number|null;follower_is_cross:boolean|null};
 type Exec={id:string;asset:string;state:string;is_buy:boolean;requested_size:string;filled_size:string;avg_price:string|null;reduce_only:boolean;reject_reason:string|null;leverage:number|string|null;is_cross:boolean|null;created_at:string};
 type PnlRange='1d'|'7d'|'30d'|'90d'|'all';
 type PnlPoint={at:string;value:number;bucket_value:number};
-type PnlHistory={range:PnlRange;pnl_absolute:number;pnl_pct:number|null;start_equity:number|null;current_equity:number|null;points:PnlPoint[];source:'realized_net'};
+type PnlHistory={range:PnlRange;pnl_absolute:number;pnl_pct:number|null;start_equity:number|null;current_equity:number|null;last_realized_at:string|null;points:PnlPoint[];source:'realized_net'};
 type CardTone='positive'|'negative'|'neutral';
 
 const RANGE_OPTIONS:{key:PnlRange;label:string}[]=[
@@ -30,14 +31,19 @@ export default function Dashboard(){
   const [range,setRange]=useState<PnlRange>('1d');
   const [pnl,setPnl]=useState<PnlHistory|null>(null);
   const [pnlError,setPnlError]=useState('');
+  const [snapshotError,setSnapshotError]=useState('');
 
   const load=async()=>{
-    const [a,b,c]=await Promise.all([
-      get<Dash>('/dashboard'),
-      get<Pos[]>('/positions'),
-      get<Exec[]>('/executions?limit=25'),
-    ]);
-    setD(a);setPos(b);setExec(c);
+    try{
+      const [a,b,c]=await Promise.all([
+        get<Dash>('/dashboard'),
+        get<Pos[]>('/positions'),
+        get<Exec[]>('/executions?limit=25'),
+      ]);
+      setD(a);setPos(b);setExec(c);setSnapshotError('');
+    }catch(e){
+      setSnapshotError(e instanceof Error?e.message:'Aggiornamento dati non riuscito');
+    }
   };
 
   const loadLeverage=async()=>{
@@ -62,12 +68,13 @@ export default function Dashboard(){
   useEffect(()=>{
     void load();
     void loadLeverage();
+    const dashboardTimer=window.setInterval(()=>void load(),30000);
     const leverageTimer=window.setInterval(()=>void loadLeverage(),60000);
     const ws=new WebSocket(wsUrl());
     ws.onopen=()=>setLive('live');
     ws.onclose=()=>setLive('offline');
     ws.onmessage=e=>{try{const m=JSON.parse(e.data);if(m.type!=='heartbeat')void load();}catch{}};
-    return()=>{window.clearInterval(leverageTimer);ws.close()};
+    return()=>{window.clearInterval(dashboardTimer);window.clearInterval(leverageTimer);ws.close()};
   },[]);
 
   useEffect(()=>{
@@ -76,9 +83,19 @@ export default function Dashboard(){
     return()=>window.clearInterval(timer);
   },[range]);
 
+  const snapshotStale=d?.snapshot_age_seconds==null||d.snapshot_age_seconds>120;
   return <>
-    <div className="title"><div><h1>Dashboard</h1><p>Stato reale della strategia ibrida, del Risk Engine e del tuo account Hyperliquid.</p></div><span className={`badge ${live}`}>{live}</span></div>
-    <div className="stats"><Card label="Equity" value={money(d?.equity)}/><Card label="PnL periodo" value={money(d?.pnl_absolute)} tone={pnlTone(d?.pnl_absolute)}/><Card label="Max drawdown" value={d?`${d.max_drawdown_pct.toFixed(2)}%`:'—'}/><Card label="Sharpe" value={d?.sharpe==null?'—':d.sharpe.toFixed(2)}/></div>
+    <div className="title"><div><h1>Dashboard</h1><p>Stato reale della strategia ibrida, del Risk Engine e del tuo account Hyperliquid.</p></div><div className="freshness"><span className={`badge ${live}`}>{live}</span><span className={`badge ${snapshotStale?'offline':'live'}`} title={d?.snapshot_at?new Date(d.snapshot_at).toLocaleString():''}>{snapshotLabel(d)}</span></div></div>
+    {snapshotError&&<div className="alert error dashboard-alert">{snapshotError}. Restano visibili gli ultimi dati ricevuti.</div>}
+    <div className="stats account-stats">
+      <Card label="Saldo USDC" value={money(d?.collateral_balance)} hint="Collateral prima del PnL aperto"/>
+      <Card label="Equity" value={money(d?.equity)} hint="Saldo USDC + PnL aperto"/>
+      <Card label="PnL aperto" value={signedMoney(d?.unrealized_pnl)} tone={pnlTone(d?.unrealized_pnl)} hint="Varia con le posizioni aperte"/>
+      <Card label={`PnL chiuso · ${range.toUpperCase()}`} value={signedMoney(pnl?.pnl_absolute)} tone={pnlTone(pnl?.pnl_absolute)} hint="PnL realizzato meno fee"/>
+      <Card label="Margine disponibile" value={money(d?.free_margin)} hint="Disponibile per nuove operazioni"/>
+      <Card label="Max drawdown" value={d?`${d.max_drawdown_pct.toFixed(2)}%`:'—'}/>
+      <Card label="Sharpe" value={d?.sharpe==null?'—':d.sharpe.toFixed(2)}/>
+    </div>
 
     <PnlChart data={pnl} range={range} setRange={setRange} error={pnlError}/>
 
@@ -115,7 +132,8 @@ function PnlChart({data,range,setRange,error}:{data:PnlHistory|null;range:PnlRan
         </AreaChart>
       </ResponsiveContainer>
     </div>}
-    <div className="pnl-foot">Il grafico usa esclusivamente PnL chiuso meno fee. Depositi, prelievi e variazioni di collateral non vengono conteggiati come profitto.</div>
+    <div className="pnl-status">{pnlActivityLabel(data)}</div>
+    <div className="pnl-foot">Il grafico usa esclusivamente PnL chiuso meno fee. Depositi, prelievi, PnL aperto e variazioni di collateral non vengono conteggiati come profitto.</div>
   </section>;
 }
 
@@ -158,7 +176,9 @@ function pnlAxis(v:number){
 }
 
 function TargetStatus({p}:{p:Pos}){if(p.status==='UNAVAILABLE')return <span className="badge" title={p.reason||''}>Non disponibile TESTNET</span>;if(p.status==='BELOW_MIN')return <span className="badge" title={p.reason||''}>Sotto minimo · ${Number(p.delta_notional).toFixed(2)}</span>;if(p.status==='READY')return <span className="badge live">Pronto · ${Number(p.delta_notional).toFixed(2)}</span>;return <span className="muted">Allineato</span>}
-function Card({label,value,tone='neutral'}:{label:string;value:string;tone?:CardTone}){const cls=tone==='positive'?'up':tone==='negative'?'down':'';return <div className="panel stat"><span>{label}</span><strong className={cls}>{value}</strong></div>}
+function Card({label,value,tone='neutral',hint}:{label:string;value:string;tone?:CardTone;hint?:string}){const cls=tone==='positive'?'up':tone==='negative'?'down':'';return <div className="panel stat"><span>{label}</span><strong className={cls}>{value}</strong>{hint&&<small>{hint}</small>}</div>}
 function pnlTone(v:number|null|undefined):CardTone{return v==null||v===0?'neutral':v>0?'positive':'negative'}
 function money(v:number|null|undefined){return v==null?'—':v.toLocaleString('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2})}
 function signedMoney(v:number|null|undefined){if(v==null)return'—';const abs=Math.abs(v).toLocaleString('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2});return `${v>0?'+':v<0?'-':''}${abs}`}
+function snapshotLabel(d:Dash|null){if(!d?.snapshot_at)return'Dati Hyperliquid non disponibili';const seconds=Math.max(Math.round(d.snapshot_age_seconds??0),0);if(seconds<90)return'Dati Hyperliquid aggiornati';return `Dati Hyperliquid di ${Math.max(Math.round(seconds/60),1)} min fa`}
+function pnlActivityLabel(data:PnlHistory|null){if(!data)return'Caricamento delle chiusure…';if(!data.last_realized_at)return'Nessuna posizione chiusa nell’intervallo selezionato.';return `Ultima chiusura registrata: ${new Date(data.last_realized_at).toLocaleString()}. La linea resta stabile fino alla prossima chiusura.`}
