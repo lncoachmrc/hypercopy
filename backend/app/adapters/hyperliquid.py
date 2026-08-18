@@ -49,6 +49,8 @@ class AccountSnapshot:
     abstraction: str
     account_value: Decimal
     free_margin: Decimal
+    collateral_balance: Decimal
+    unrealized_pnl: Decimal
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +233,7 @@ class HyperliquidAdapter:
     async def account_snapshot(self, address: str, *, priority: Priority = Priority.RECONCILE) -> AccountSnapshot:
         perp = await self.user_state(address, priority=priority)
         abstraction = await self.user_abstraction(address, priority=priority)
+        unrealized_pnl = _unrealized_pnl(perp)
 
         if abstraction == 'portfolioMargin':
             raise ValueError('Portfolio Margin accounts are not yet supported by HyperCopy')
@@ -238,18 +241,23 @@ class HyperliquidAdapter:
         if abstraction == 'unifiedAccount':
             spot = await self.spot_user_state(address, priority=priority)
             usdc_total, usdc_hold = _spot_usdc(spot)
-            pnl = _unrealized_pnl(perp)
-            account_value = max(usdc_total + pnl, Decimal(0))
+            account_value = max(usdc_total + unrealized_pnl, Decimal(0))
             margin_used = _decimal(perp.get('marginSummary', {}).get('totalMarginUsed'))
             free_margin = max(account_value - usdc_hold - margin_used, Decimal(0))
-            return AccountSnapshot(perp, spot, abstraction, account_value, free_margin)
+            return AccountSnapshot(
+                perp, spot, abstraction, account_value, free_margin,
+                usdc_total, unrealized_pnl,
+            )
 
+        account_value = _perp_account_value(perp)
         return AccountSnapshot(
             perp_state=perp,
             spot_state=None,
             abstraction=abstraction,
-            account_value=_perp_account_value(perp),
+            account_value=account_value,
             free_margin=_perp_free_margin(perp),
+            collateral_balance=account_value - unrealized_pnl,
+            unrealized_pnl=unrealized_pnl,
         )
 
     async def mids(self) -> dict[str, str]:
