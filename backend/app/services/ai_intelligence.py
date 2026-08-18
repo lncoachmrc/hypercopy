@@ -257,9 +257,20 @@ def _validated_analysis(raw: dict) -> dict:
         confidence = max(0.0, min(float(raw.get('confidence', 0.5)), 1.0))
     except Exception:
         confidence = 0.5
+
+    patterns_raw = raw.get('observed_patterns', [])
+    if isinstance(patterns_raw, dict):
+        patterns = [f'{key}: {value}' for key, value in patterns_raw.items()]
+    elif isinstance(patterns_raw, (list, tuple)):
+        patterns = list(patterns_raw)
+    elif patterns_raw in (None, ''):
+        patterns = []
+    else:
+        patterns = [patterns_raw]
+
     return {
         'summary': str(raw.get('summary', ''))[:1200],
-        'observed_patterns': [str(x)[:300] for x in raw.get('observed_patterns', [])[:12]],
+        'observed_patterns': [str(x)[:300] for x in patterns[:12]],
         'capital_policy': {
             'buffer_pct': clamp('buffer_pct', 0.10, 0.05, 0.30),
             'minimum_coverage_pct': clamp('minimum_coverage_pct', 0.75, 0.60, 0.95),

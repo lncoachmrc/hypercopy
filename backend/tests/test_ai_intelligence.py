@@ -65,3 +65,19 @@ def test_provider_chain_honors_preference_and_fallback(monkeypatch):
         ('openai', 'gpt-test'),
         ('deepseek', 'deepseek-chat'),
     ]
+
+def test_analysis_accepts_object_observed_patterns():
+    result = _validated_analysis({
+        'summary': 'x',
+        'observed_patterns': {
+            'scaling': 'frequent',
+            'micro_positions': 'limited',
+        },
+        'confidence': 0.7,
+        'capital_policy': {},
+    })
+
+    assert result['observed_patterns'] == [
+        'scaling: frequent',
+        'micro_positions: limited',
+    ]
