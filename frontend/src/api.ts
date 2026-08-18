@@ -18,8 +18,9 @@ export const setCsrf = (value:string) => { csrf=value; };
 export class ApiError extends Error { constructor(public status:number,message:string,public code?:string){super(message);} }
 
 const API_TIMEOUT_MS = 15_000;
+export const ACTIVATION_TIMEOUT_MS = 60_000;
 
-export async function api<T>(path:string, init:RequestInit={}):Promise<T>{
+export async function api<T>(path:string, init:RequestInit={}, timeoutMs=API_TIMEOUT_MS):Promise<T>{
   const method=(init.method||'GET').toUpperCase();
   const headers=new Headers(init.headers);
   if (init.body) headers.set('Content-Type','application/json');
@@ -29,7 +30,7 @@ export async function api<T>(path:string, init:RequestInit={}):Promise<T>{
   }
 
   const controller = new AbortController();
-  const timer = window.setTimeout(()=>controller.abort(), API_TIMEOUT_MS);
+  const timer = window.setTimeout(()=>controller.abort(), timeoutMs);
   const externalSignal = init.signal;
   if (externalSignal) {
     if (externalSignal.aborted) controller.abort();
@@ -40,7 +41,7 @@ export async function api<T>(path:string, init:RequestInit={}):Promise<T>{
   try {
     res=await fetch(`${base()}${path}`,{...init,headers,credentials:'include',signal:controller.signal});
   } catch (e) {
-    if (controller.signal.aborted) throw new ApiError(0,'Il server HyperCopy non ha risposto entro 15 secondi. Riprova o verifica lo stato dei servizi.','API_TIMEOUT');
+    if (controller.signal.aborted) throw new ApiError(0,`Il server HyperCopy non ha risposto entro ${Math.round(timeoutMs/1000)} secondi. Riprova o verifica lo stato dei servizi.`,'API_TIMEOUT');
     throw e;
   } finally {
     window.clearTimeout(timer);
@@ -55,7 +56,7 @@ export async function api<T>(path:string, init:RequestInit={}):Promise<T>{
   return res.json() as Promise<T>;
 }
 export const get=<T>(p:string)=>api<T>(p);
-export const post=<T>(p:string,b?:unknown)=>api<T>(p,{method:'POST',body:b===undefined?undefined:JSON.stringify(b)});
+export const post=<T>(p:string,b?:unknown,timeoutMs?:number)=>api<T>(p,{method:'POST',body:b===undefined?undefined:JSON.stringify(b)},timeoutMs);
 export const put=<T>(p:string,b:unknown)=>api<T>(p,{method:'PUT',body:JSON.stringify(b)});
 export const del=<T>(p:string)=>api<T>(p,{method:'DELETE'});
 
