@@ -19,7 +19,18 @@ def upgrade() -> None:
     )
     op.add_column(
         "users",
-        sa.Column("network_started_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("network_started_at", sa.DateTime(timezone=True), nullable=True),
+    )
+    # Existing TRAXION follower history is TESTNET in the current rollout. Use
+    # each user's creation time as the first network epoch so the migration does
+    # not make existing equity/PnL history disappear from the dashboard.
+    op.execute("UPDATE users SET network_started_at = created_at WHERE network_started_at IS NULL")
+    op.alter_column(
+        "users",
+        "network_started_at",
+        existing_type=sa.DateTime(timezone=True),
+        nullable=False,
+        server_default=sa.func.now(),
     )
     op.create_index("ix_users_execution_network", "users", ["execution_network"], unique=False)
 
