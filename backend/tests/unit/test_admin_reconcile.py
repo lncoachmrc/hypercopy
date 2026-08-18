@@ -15,6 +15,7 @@ def test_reconcile_job_payload_exposes_worker_completion():
         attempt_count=1,
         correlation_id=uuid.uuid4().hex,
         context={
+            'follower_network': 'testnet',
             'result': {'status': 'OK', 'jobs_created': 2},
             'stream_published': 2,
             'completed_at': '2026-08-18T20:00:00+00:00',
@@ -24,6 +25,7 @@ def test_reconcile_job_payload_exposes_worker_completion():
     assert _reconcile_job_payload(job) == {
         'job_id': str(job_id),
         'state': 'DONE',
+        'network': 'testnet',
         'last_error': None,
         'attempt_count': 1,
         'next_attempt_at': None,
@@ -43,11 +45,12 @@ def test_reconcile_job_payload_handles_incomplete_job():
         attempt_count=2,
         correlation_id=uuid.uuid4().hex,
         last_error='TimeoutError',
-        context={'reason': 'Operational control'},
+        context={'reason': 'Operational control', 'follower_network': 'mainnet'},
     )
 
     payload = _reconcile_job_payload(job)
     assert payload['state'] == 'RETRYING'
+    assert payload['network'] == 'mainnet'
     assert payload['attempt_count'] == 2
     assert payload['last_error'] == 'TimeoutError'
     assert payload['result'] is None

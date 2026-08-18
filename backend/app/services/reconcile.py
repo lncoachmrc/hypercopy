@@ -14,6 +14,7 @@ from app.core.config import settings
 from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, FollowerState, MasterExposure, compute_target
 from app.models.entities import CopyJob, CopyState, EquitySnapshot, Execution, ExecutionState, Fill, JobState, PositionLedger, ReconciliationRun, RiskHalt, RiskProfile, RiskState, TradingAccount, User, UserState
 from app.services.audit import audit
+from app.services.networking import user_network_state
 
 log = __import__('app.core.logging', fromlist=['get_logger']).get_logger(__name__)
 
@@ -48,11 +49,12 @@ def _is_liquidity_reject(reason: str | None) -> bool:
     return any(marker in text for marker in _LIQUIDITY_REJECT_MARKERS)
 
 
-async def _liquidity_backoff_seconds(db: AsyncSession, user_id, asset: str) -> int:
+async def _liquidity_backoff_seconds(db: AsyncSession, user_id, asset: str, started_at: datetime) -> int:
     rows = (await db.execute(
         select(Execution).where(
             Execution.user_id == user_id,
             Execution.asset == asset,
+            Execution.created_at >= started_at,
             Execution.state.in_([ExecutionState.REJECTED, ExecutionState.CANCELED, ExecutionState.FILLED]),
         ).order_by(Execution.created_at.desc()).limit(8)
     )).scalars().all()
@@ -75,10 +77,11 @@ async def _liquidity_backoff_seconds(db: AsyncSession, user_id, asset: str) -> i
     return max(int(remaining), 0)
 
 
-async def _sync_missing_fills(db: AsyncSession, hl: HyperliquidAdapter, user: User, account_address: str) -> int:
+async def _sync_missing_fills(db: AsyncSession, hl: HyperliquidAdapter, user: User, account_address: str, started_at: datetime) -> int:
     missing = (await db.execute(
         select(Execution).where(
             Execution.user_id == user.id,
+            Execution.created_at >= started_at,
             Execution.state == ExecutionState.FILLED,
             Execution.exchange_oid.is_not(None),
             ~select(Fill.id).where(Fill.execution_id == Execution.id).exists(),
@@ -129,6 +132,11 @@ async def reconcile_user(
     master_configs: dict[str, PositionConfig] | None = None,
     create_jobs: bool = True,
 ) -> dict:
+    network_state = await user_network_state(db, user.id)
+    network = network_state.network
+    if hl.network != network:
+        raise RuntimeError(f'Follower adapter {hl.network} does not match user network {network}')
+
     follower_mids = mids
     source_mids = master_mids or mids
     source_configs = master_configs or {}
@@ -148,10 +156,10 @@ async def reconcile_user(
         follower_configs = position_configs(real_state)
 
         try:
-            synced_fills = await _sync_missing_fills(db, hl, user, account.account_address)
+            synced_fills = await _sync_missing_fills(db, hl, user, account.account_address, network_state.started_at)
         except Exception:
             synced_fills = 0
-            log.warning('Deferred fill-history synchronization', extra={'user_id': str(user.id)}, exc_info=True)
+            log.warning('Deferred fill-history synchronization', extra={'user_id': str(user.id), 'network': network}, exc_info=True)
 
         real_positions = _positions(real_state)
         risk_state = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
@@ -208,6 +216,7 @@ async def reconcile_user(
         unresolved_assets = set((await db.execute(
             select(Execution.asset).where(
                 Execution.user_id == user.id,
+                Execution.created_at >= network_state.started_at,
                 Execution.state.in_([ExecutionState.SUBMITTING, ExecutionState.UNKNOWN]),
             )
         )).scalars().all())
@@ -286,6 +295,7 @@ async def reconcile_user(
                 CopyJob.user_id == user.id,
                 CopyJob.asset == asset,
                 CopyJob.origin == 'RECONCILE',
+                CopyJob.created_at >= network_state.started_at,
                 CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),
             ).limit(1))).scalar_one_or_none()
             if pending:
@@ -296,7 +306,7 @@ async def reconcile_user(
                 or real * desired_target > 0 and abs(desired_target) > abs(real)
             )
             if user.copy_state == CopyState.ACTIVE and increasing_exposure and drift_notional >= min_notional:
-                wait_seconds = await _liquidity_backoff_seconds(db, user.id, asset)
+                wait_seconds = await _liquidity_backoff_seconds(db, user.id, asset, network_state.started_at)
                 if wait_seconds > 0:
                     liquidity_backoffs.append({'asset': asset, 'seconds': wait_seconds})
                     continue
@@ -307,7 +317,7 @@ async def reconcile_user(
                 'master_mark_price': str(master_mark),
                 'mark_price': str(master_mark),
                 'master_network': settings.master_network,
-                'follower_network': settings.follower_network,
+                'follower_network': network,
             }
             if master_config is not None:
                 context['master_leverage'] = master_config.leverage
@@ -338,10 +348,10 @@ async def reconcile_user(
             taken_at=datetime.now(UTC),
         ))
 
-        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created}; run.finished_at = datetime.now(UTC)
-        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created})
+        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'network': network, 'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created}; run.finished_at = datetime.now(UTC)
+        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'network': network, 'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created})
         await db.commit()
-        return {'status': 'OK', 'discrepancies': discrepancies, 'equity': str(equity), 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created}
+        return {'status': 'OK', 'network': network, 'discrepancies': discrepancies, 'equity': str(equity), 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created}
     except Exception as exc:
         run.status = 'FAILED'; run.error = f'{type(exc).__name__}: {exc}'; run.finished_at = datetime.now(UTC); await db.commit(); raise
 
@@ -359,15 +369,17 @@ async def reconcile_active_users(
     me = source_snapshot.account_value
     source_mids = await source_hl.mids()
     source_configs = position_configs(source_snapshot.perp_state)
-    follower_mids = source_mids if source_hl is hl else await hl.mids()
+    follower_mids = source_mids if source_hl.network == hl.network else await hl.mids()
     query = select(User).join(TradingAccount, TradingAccount.user_id == User.id).where(
         User.state == UserState.ACTIVE,
         User.copy_state.in_([CopyState.ACTIVE, CopyState.SHADOW, CopyState.PAUSED]),
     ).order_by(User.created_at)
-    if limit is not None:
-        query = query.limit(limit)
     users = (await db.execute(query)).scalars().all()
+    reconciled = 0
     for user in users:
+        network_state = await user_network_state(db, user.id)
+        if network_state.network != hl.network:
+            continue
         await reconcile_user(
             db, hl, user,
             master_positions=mp,
@@ -376,4 +388,7 @@ async def reconcile_active_users(
             master_mids=source_mids,
             master_configs=source_configs,
         )
-    return len(users)
+        reconciled += 1
+        if limit is not None and reconciled >= limit:
+            break
+    return reconciled

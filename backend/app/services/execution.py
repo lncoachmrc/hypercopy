@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.hyperliquid import HyperliquidAdapter, OrderOutcome, deterministic_cloid
-from app.core.config import settings
+from app.core.config import Network, settings
 from app.core.crypto import EncryptedCredential, crypto
 from app.core.logging import get_logger
 from app.engine.risk import RiskAction, RiskContext, evaluate
@@ -21,6 +21,7 @@ from app.models.entities import (
 )
 from app.services.audit import audit
 from app.services.entitlement import entitlement
+from app.services.networking import user_network_state
 
 log = get_logger(__name__)
 TERMINAL_EXEC = {ExecutionState.FILLED, ExecutionState.REJECTED, ExecutionState.CANCELED}
@@ -74,8 +75,8 @@ async def release_stale_jobs(db: AsyncSession) -> int:
     return len(rows)
 
 
-async def live_trading_allowed(db: AsyncSession) -> bool:
-    if settings.follower_network != 'mainnet':
+async def live_trading_allowed(db: AsyncSession, network: Network) -> bool:
+    if network != 'mainnet':
         return True
     if not settings.ENABLE_LIVE_TRADING:
         return False
@@ -87,6 +88,16 @@ async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) ->
     user = await db.get(User, job.user_id)
     if not user:
         return await _finish(db, job, JobState.DEAD, 'User no longer exists')
+
+    network_state = await user_network_state(db, user.id)
+    network = network_state.network
+    ctx = job.context or {}
+    job_network = str(ctx.get('follower_network') or network).lower()
+    if job_network != network:
+        return await _finish(db, job, JobState.SKIPPED, 'Stale job from a previous Hyperliquid network epoch')
+    if hl.network != network:
+        return await _finish(db, job, JobState.SKIPPED, 'Execution worker adapter does not match the user network')
+
     account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
     risk = (await db.execute(select(RiskProfile).where(RiskProfile.user_id == user.id))).scalar_one_or_none()
     risk_state = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
@@ -94,11 +105,13 @@ async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) ->
         return await _finish(db, job, JobState.SKIPPED, 'Trading account or risk profile missing')
     cred = (await db.execute(select(SigningCredential).where(SigningCredential.trading_account_id == account.id))).scalar_one_or_none()
     ent = await entitlement(db, user)
-    equity = (await db.execute(select(EquitySnapshot).where(EquitySnapshot.user_id == user.id).order_by(EquitySnapshot.taken_at.desc()).limit(1))).scalar_one_or_none()
+    equity = (await db.execute(select(EquitySnapshot).where(
+        EquitySnapshot.user_id == user.id,
+        EquitySnapshot.taken_at >= network_state.started_at,
+    ).order_by(EquitySnapshot.taken_at.desc()).limit(1))).scalar_one_or_none()
     ledger = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user.id, PositionLedger.asset == job.asset))).scalar_one_or_none()
     current = ledger.size if ledger else Decimal(0)
 
-    ctx = job.context or {}
     master_pos = Decimal(str(ctx.get('master_position', '0')))
     master_eq = Decimal(str(ctx.get('master_equity', '0')))
     master_mark = Decimal(str(ctx.get('master_mark_price', ctx.get('mark_price', '0'))))
@@ -115,7 +128,7 @@ async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) ->
     if follower_mark <= 0:
         return await _retry_or_dead(db, job, 'Follower market price unavailable')
     if master_mark <= 0:
-        if settings.master_network == settings.follower_network:
+        if settings.master_network == network:
             master_mark = follower_mark
         else:
             return await _retry_or_dead(db, job, 'Master market price unavailable')
@@ -188,7 +201,7 @@ async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) ->
     if user.copy_state == CopyState.SHADOW:
         await audit(db, action='SHADOW_TARGET', subject_id=user.id, reason='Shadow mode: no exchange order', correlation_id=job.correlation_id, after={
             'asset': job.asset, 'target': str(sizing.target_size), 'current': str(current), 'delta': str(sizing.delta),
-            'master_network': settings.master_network, 'follower_network': settings.follower_network,
+            'master_network': settings.master_network, 'follower_network': network,
             'master_mark': str(master_mark), 'follower_mark': str(follower_mark),
             'master_leverage': master_leverage, 'desired_follower_leverage': desired_leverage,
         })
@@ -202,7 +215,7 @@ async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) ->
             return await _finish(db, job, JobState.SKIPPED, 'Trading credential is unavailable')
         if desired_leverage is None:
             return await _retry_or_dead(db, job, 'Master leverage unavailable')
-        if not await live_trading_allowed(db):
+        if not await live_trading_allowed(db, network):
             return await _finish(db, job, JobState.SKIPPED, 'Mainnet live-trading gate is closed')
         private_key = crypto.decrypt(_blob(cred), user_id=str(user.id), account_id=str(account.id))
         try:
@@ -218,16 +231,16 @@ async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) ->
                 return await _retry_or_dead(db, job, f'Leverage synchronization failed: {type(exc).__name__}: {exc}')
             await audit(db, action='FOLLOWER_LEVERAGE_SYNCED', subject_id=user.id, correlation_id=job.correlation_id, after={
                 'asset': job.asset, 'leverage': desired_leverage, 'margin_mode': 'cross' if desired_is_cross else 'isolated',
-                'network': settings.follower_network, 'response': response,
+                'network': network, 'response': response,
             })
             return await _finish(db, job, JobState.DONE, None)
         finally:
             private_key = ''
 
     if decision.action in {RiskAction.DENY, RiskAction.SKIP}:
-        await audit(db, action='COPY_JOB_BLOCKED', subject_id=user.id, reason=decision.reason, correlation_id=job.correlation_id, after={'asset': job.asset, 'target': str(sizing.target_size), 'current': str(current)})
+        await audit(db, action='COPY_JOB_BLOCKED', subject_id=user.id, reason=decision.reason, correlation_id=job.correlation_id, after={'asset': job.asset, 'target': str(sizing.target_size), 'current': str(current), 'network': network})
         return await _finish(db, job, JobState.SKIPPED, decision.reason or 'Not actionable')
-    if not await live_trading_allowed(db):
+    if not await live_trading_allowed(db, network):
         return await _finish(db, job, JobState.SKIPPED, 'Mainnet live-trading gate is closed')
     if not cred:
         return await _finish(db, job, JobState.SKIPPED, 'Credential unavailable')
@@ -253,7 +266,7 @@ async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) ->
                 return await _retry_or_dead(db, job, f'Leverage synchronization failed: {type(exc).__name__}: {exc}')
             await audit(db, action='FOLLOWER_LEVERAGE_SYNCED', subject_id=user.id, correlation_id=job.correlation_id, after={
                 'asset': job.asset, 'leverage': desired_leverage,
-                'margin_mode': 'cross' if desired_is_cross else 'isolated', 'network': settings.follower_network,
+                'margin_mode': 'cross' if desired_is_cross else 'isolated', 'network': network,
             })
 
         primary = decision.plan
@@ -272,7 +285,7 @@ async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) ->
             await _apply_fill_to_ledger(db, ledger, primary.secondary, outcome2)
         await audit(db, action='COPY_JOB_EXECUTED', subject_id=user.id, correlation_id=job.correlation_id, after={
             'asset': job.asset, 'target': str(sizing.target_size), 'ledger_size': str(ledger.size),
-            'network': settings.follower_network, 'leverage': desired_leverage,
+            'network': network, 'leverage': desired_leverage,
             'margin_mode': 'cross' if desired_is_cross else 'isolated',
         })
         return await _finish(db, job, JobState.DONE, None)

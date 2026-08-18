@@ -1,5 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal
 from pydantic import BaseModel, Field
 
 
@@ -17,8 +18,12 @@ class UserOut(BaseModel):
     risk_state: str = 'NORMAL'
 
 
+class TradingNetworkIn(BaseModel):
+    network: Literal['testnet', 'mainnet']
+
+
 class TradingAccountIn(BaseModel):
-    # The follower account is always the authenticated Web3 wallet.  During the
+    # The follower account is always the authenticated Web3 wallet. During the
     # frontend rollout we still accept the legacy account_address field, but the
     # API never trusts or uses it to choose a different trading account.
     agent_address: str | None = None
