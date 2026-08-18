@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.adapters.hyperliquid import HyperliquidAdapter, position_configs
 from app.adapters.ratelimit import Budget, Priority, WeightedRateLimiter
 from app.api.deps import require_csrf, require_role
-from app.core.config import settings
+from app.core.config import Network, settings
 from app.core.crypto import EncryptedCredential, crypto
 from app.core.logging import get_logger
 from app.db.redis import redis_client
@@ -23,7 +23,9 @@ from app.models.entities import (
 )
 from app.schemas.admin import AdminAction, AdminReconcile
 from app.services.audit import audit
+from app.services.execution import live_trading_allowed
 from app.services.metrics import system_snapshot
+from app.services.networking import user_network_state
 from app.services.queue import publish_job, repair_stream
 from app.services.reconcile import master_snapshot, reconcile_user
 
@@ -41,8 +43,8 @@ def _master_adapter() -> HyperliquidAdapter:
     return HyperliquidAdapter(_limiter(), network=settings.master_network)
 
 
-def _follower_adapter() -> HyperliquidAdapter:
-    return HyperliquidAdapter(_limiter(), network=settings.follower_network)
+def _follower_adapter(network: Network) -> HyperliquidAdapter:
+    return HyperliquidAdapter(_limiter(), network=network)
 
 
 def _credential_blob(cred: SigningCredential) -> EncryptedCredential:
@@ -71,7 +73,9 @@ async def system(user: User = Depends(admin), db: AsyncSession = Depends(get_db)
     data = await system_snapshot(db, rate)
     data['flags'] = {f.slug: f.enabled for f in flags}
     data['master_network'] = settings.master_network
-    data['follower_network'] = settings.follower_network
+    data['follower_network'] = 'per-user'
+    data['default_follower_network'] = settings.follower_network
+    data['live_trading_env_enabled'] = settings.ENABLE_LIVE_TRADING
     return data
 
 
@@ -114,6 +118,8 @@ async def master_state(user: User = Depends(admin)):
 
 async def _position_config_diagnostic(db: AsyncSession, target: User, asset: str) -> dict:
     asset = asset.upper().strip()
+    network_state = await user_network_state(db, target.id)
+    network = network_state.network
     account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == target.id))).scalar_one_or_none()
     risk = (await db.execute(select(RiskProfile).where(RiskProfile.user_id == target.id))).scalar_one_or_none()
     if not account or not risk:
@@ -122,7 +128,7 @@ async def _position_config_diagnostic(db: AsyncSession, target: User, asset: str
         raise HTTPException(409, 'HYPERLIQUID_MASTER_ADDRESS is not configured')
 
     master_hl = _master_adapter()
-    follower_hl = _follower_adapter()
+    follower_hl = _follower_adapter(network)
     try:
         master_state, follower_state, spec = await asyncio.gather(
             master_hl.user_state(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.DIAGNOSTIC),
@@ -141,8 +147,11 @@ async def _position_config_diagnostic(db: AsyncSession, target: User, asset: str
     desired_is_cross = bool(master_cfg.is_cross and not spec.only_isolated)
     allowed_asset = (not risk.allow_assets or asset in risk.allow_assets) and asset not in risk.block_assets
     latest_job = (await db.execute(
-        select(CopyJob).where(CopyJob.user_id == target.id, CopyJob.asset == asset)
-        .order_by(CopyJob.created_at.desc()).limit(1)
+        select(CopyJob).where(
+            CopyJob.user_id == target.id,
+            CopyJob.asset == asset,
+            CopyJob.created_at >= network_state.started_at,
+        ).order_by(CopyJob.created_at.desc()).limit(1)
     )).scalar_one_or_none()
 
     return {
@@ -150,7 +159,7 @@ async def _position_config_diagnostic(db: AsyncSession, target: User, asset: str
         'asset': asset,
         'copy_state': target.copy_state.value,
         'master_network': settings.master_network,
-        'follower_network': settings.follower_network,
+        'follower_network': network,
         'master': {'leverage': master_cfg.leverage, 'margin_mode': 'cross' if master_cfg.is_cross else 'isolated'},
         'follower': None if not follower_cfg else {'leverage': follower_cfg.leverage, 'margin_mode': 'cross' if follower_cfg.is_cross else 'isolated'},
         'desired': {'leverage': desired_leverage, 'margin_mode': 'cross' if desired_is_cross else 'isolated'},
@@ -188,13 +197,14 @@ async def position_config_diagnostic(user_id: uuid.UUID, asset: str, actor: User
 
 @router.post('/users/{user_id}/position-config/{asset}/sync', dependencies=[Depends(require_csrf)])
 async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction, actor: User = Depends(superadmin), db: AsyncSession = Depends(get_db)):
-    if settings.follower_network != 'testnet':
-        raise HTTPException(409, 'Direct position-config sync is restricted to TESTNET')
     if body.confirmation != 'SYNC TESTNET LEVERAGE':
         raise HTTPException(422, 'Confirmation must be SYNC TESTNET LEVERAGE')
     target = await db.get(User, user_id)
     if not target:
         raise HTTPException(404, 'User not found')
+    network = (await user_network_state(db, target.id)).network
+    if network != 'testnet':
+        raise HTTPException(409, 'Direct position-config sync is restricted to TESTNET')
     if target.copy_state != CopyState.PAUSED:
         raise HTTPException(409, 'Pause the follower before direct leverage synchronization')
 
@@ -211,7 +221,7 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
         raise HTTPException(409, 'Trading credential is unavailable')
 
     desired = diagnostic['desired']
-    follower_hl = _follower_adapter()
+    follower_hl = _follower_adapter(network)
     private_key = crypto.decrypt(_credential_blob(cred), user_id=str(target.id), account_id=str(account.id))
     try:
         try:
@@ -223,7 +233,7 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
                 is_cross=desired['margin_mode'] == 'cross',
             )
         except Exception as exc:
-            await audit(db, action='ADMIN_FOLLOWER_LEVERAGE_SYNC_FAILED', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'asset': asset, 'error': f'{type(exc).__name__}: {exc}'})
+            await audit(db, action='ADMIN_FOLLOWER_LEVERAGE_SYNC_FAILED', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'asset': asset, 'network': network, 'error': f'{type(exc).__name__}: {exc}'})
             await db.commit()
             raise HTTPException(502, f'Hyperliquid rejected leverage sync: {type(exc).__name__}: {exc}') from exc
     finally:
@@ -247,14 +257,14 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
             'leverage': follower_cfg.leverage,
             'margin_mode': 'cross' if follower_cfg.is_cross else 'isolated',
         }
-        await audit(db, action='ADMIN_FOLLOWER_LEVERAGE_SYNC_UNVERIFIED', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'asset': asset, 'response': response, 'desired': desired, 'observed': observed})
+        await audit(db, action='ADMIN_FOLLOWER_LEVERAGE_SYNC_UNVERIFIED', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'asset': asset, 'network': network, 'response': response, 'desired': desired, 'observed': observed})
         await db.commit()
         raise HTTPException(502, f'Hyperliquid acknowledged the leverage update but follower state is {observed}; expected {desired}')
 
     verified = dict(diagnostic)
     verified['follower'] = {'leverage': follower_cfg.leverage, 'margin_mode': 'cross' if follower_cfg.is_cross else 'isolated'}
     verified['matches'] = True
-    await audit(db, action='ADMIN_FOLLOWER_LEVERAGE_SYNCED', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'asset': asset, 'response': response, 'diagnostic': verified})
+    await audit(db, action='ADMIN_FOLLOWER_LEVERAGE_SYNCED', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'asset': asset, 'network': network, 'response': response, 'diagnostic': verified})
     await db.commit()
     return {'ok': True, 'changed': True, 'verified': True, 'response': response, 'diagnostic': verified}
 
@@ -265,7 +275,11 @@ async def users(user: User = Depends(admin), db: AsyncSession = Depends(get_db),
     if q:
         query = query.where(User.auth_wallet.ilike(f'%{q}%'))
     rows = (await db.execute(query.order_by(User.created_at.desc()).offset(offset).limit(min(limit, 200)))).scalars().all()
-    return [{'id': str(x.id), 'auth_wallet': x.auth_wallet, 'role': x.role.value, 'state': x.state.value, 'copy_state': x.copy_state.value, 'created_at': x.created_at} for x in rows]
+    result=[]
+    for row in rows:
+        network=(await user_network_state(db,row.id)).network
+        result.append({'id': str(row.id), 'auth_wallet': row.auth_wallet, 'role': row.role.value, 'state': row.state.value, 'copy_state': row.copy_state.value, 'execution_network': network, 'created_at': row.created_at})
+    return result
 
 
 @router.get('/users/{user_id}')
@@ -273,7 +287,8 @@ async def user_detail(user_id: uuid.UUID, actor: User = Depends(admin), db: Asyn
     target = await db.get(User, user_id)
     if not target:
         raise HTTPException(404, 'User not found')
-    return {'id': str(target.id), 'auth_wallet': target.auth_wallet, 'role': target.role.value, 'state': target.state.value, 'copy_state': target.copy_state.value, 'manual_trade_policy': target.manual_trade_policy.value}
+    network=(await user_network_state(db,target.id)).network
+    return {'id': str(target.id), 'auth_wallet': target.auth_wallet, 'role': target.role.value, 'state': target.state.value, 'copy_state': target.copy_state.value, 'execution_network': network, 'manual_trade_policy': target.manual_trade_policy.value}
 
 
 @router.post('/users/{user_id}/pause', dependencies=[Depends(require_csrf)])
@@ -282,7 +297,8 @@ async def pause_user(user_id: uuid.UUID, body: AdminAction, actor: User = Depend
     if not target:
         raise HTTPException(404, 'User not found')
     target.copy_state = CopyState.PAUSED
-    await audit(db, action='ADMIN_USER_PAUSE', actor_id=actor.id, subject_id=target.id, reason=body.reason)
+    network=(await user_network_state(db,target.id)).network
+    await audit(db, action='ADMIN_USER_PAUSE', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'follower_network': network})
     await db.commit()
     return {'ok': True}
 
@@ -292,6 +308,9 @@ async def resume_user(user_id: uuid.UUID, body: AdminAction, actor: User = Depen
     target = await db.get(User, user_id)
     if not target:
         raise HTTPException(404, 'User not found')
+    network=(await user_network_state(db,target.id)).network
+    if not await live_trading_allowed(db, network):
+        raise HTTPException(409, 'Mainnet live-trading gate is closed')
     rs = (await db.execute(select(RiskState).where(RiskState.user_id == target.id))).scalar_one_or_none()
     if rs and rs.state != RiskHalt.NORMAL:
         raise HTTPException(409, f'Cannot resume while {rs.state.value} is active')
@@ -300,7 +319,7 @@ async def resume_user(user_id: uuid.UUID, body: AdminAction, actor: User = Depen
         raise HTTPException(409, 'Follower has no Hyperliquid trading account')
     limiter = _limiter()
     master_hl = HyperliquidAdapter(limiter, network=settings.master_network)
-    follower_hl = HyperliquidAdapter(limiter, network=settings.follower_network)
+    follower_hl = HyperliquidAdapter(limiter, network=network)
     target.copy_state = CopyState.ACTIVE
     try:
         mp, meq, master_mids = await master_snapshot(master_hl)
@@ -309,7 +328,7 @@ async def resume_user(user_id: uuid.UUID, body: AdminAction, actor: User = Depen
             priority=Priority.RECONCILE,
         )
         master_configs = position_configs(master_state)
-        follower_mids = master_mids if settings.master_network == settings.follower_network else await follower_hl.mids()
+        follower_mids = master_mids if settings.master_network == network else await follower_hl.mids()
         result = await reconcile_user(
             db,
             follower_hl,
@@ -326,7 +345,7 @@ async def resume_user(user_id: uuid.UUID, body: AdminAction, actor: User = Depen
         raise HTTPException(503, f'Admin activation failed: {type(exc).__name__}: {exc}') from exc
     await audit(db, action='ADMIN_USER_RESUME', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={
         'master_network': settings.master_network,
-        'follower_network': settings.follower_network,
+        'follower_network': network,
         'reconciliation': result,
         'stream_published': published,
     })
@@ -334,6 +353,7 @@ async def resume_user(user_id: uuid.UUID, body: AdminAction, actor: User = Depen
     return {
         'ok': True,
         'copy_state': target.copy_state.value,
+        'network': network,
         'stream_published': published,
         'reconciliation': result,
     }
@@ -344,13 +364,14 @@ async def queue_reconcile(user_id: uuid.UUID, body: AdminReconcile, actor: User 
     target = await db.get(User, user_id)
     if not target:
         raise HTTPException(404, 'User not found')
+    network=(await user_network_state(db,target.id)).network
     job = CopyJob(
         user_id=target.id,
         asset='__RECONCILE__',
         origin='ADMIN_RECONCILE',
         state='QUEUED',
         correlation_id=uuid.uuid4().hex,
-        context={'reason': body.reason},
+        context={'reason': body.reason, 'master_network': settings.master_network, 'follower_network': network},
     )
     db.add(job)
     await db.flush()
@@ -360,12 +381,10 @@ async def queue_reconcile(user_id: uuid.UUID, body: AdminReconcile, actor: User 
         await publish_job(redis_client(), db, job)
         published = True
     except Exception:
-        # PostgreSQL remains the durable source of truth. The worker's
-        # repair_stream loop will recover the job if Redis is unavailable.
         job.enqueued_at = None
         log.warning(
             'Immediate admin reconcile publish failed; durable repair will retry',
-            extra={'job_id': str(job.id), 'user_id': str(target.id)},
+            extra={'job_id': str(job.id), 'user_id': str(target.id), 'network': network},
             exc_info=True,
         )
 
@@ -375,13 +394,14 @@ async def queue_reconcile(user_id: uuid.UUID, body: AdminReconcile, actor: User 
         actor_id=actor.id,
         subject_id=target.id,
         reason=body.reason,
-        after={'job_id': str(job.id), 'stream_published': published},
+        after={'job_id': str(job.id), 'stream_published': published, 'follower_network': network},
     )
     await db.commit()
     return {
         'queued': True,
         'job_id': str(job.id),
         'state': job.state.value,
+        'network': network,
         'stream_published': published,
     }
 
@@ -416,8 +436,8 @@ async def emergency(body: AdminAction, actor: User = Depends(superadmin), db: As
 async def live_trading(body: AdminAction, actor: User = Depends(superadmin), db: AsyncSession = Depends(get_db)):
     if body.confirmation != 'ENABLE MAINNET':
         raise HTTPException(422, 'Confirmation must be ENABLE MAINNET')
-    if settings.follower_network != 'mainnet' or not settings.ENABLE_LIVE_TRADING:
-        raise HTTPException(409, 'Environment gates 1/2 are not enabled')
+    if not settings.ENABLE_LIVE_TRADING:
+        raise HTTPException(409, 'ENABLE_LIVE_TRADING environment gate is not enabled')
     await _flag(db, 'live_trading', True, actor, body.reason)
     return {'ok': True}
 
