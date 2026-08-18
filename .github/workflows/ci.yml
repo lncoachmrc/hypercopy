@@ -6,103 +6,13 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  sync-pr39-spec:
-    if: github.event_name == 'pull_request' && github.event.pull_request.number == 39 && github.actor != 'github-actions[bot]'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: feature/per-user-hyperliquid-network
-          fetch-depth: 0
-      - name: Align SPEC and clean temporary workflows
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch origin main
-          python - <<'PY'
-          from pathlib import Path
-
-          p = Path('SPEC.md')
-          s = p.read_text()
-          marker = '## Per-user Hyperliquid execution network (normative)'
-          if marker not in s:
-              section = r'''
-
-## Per-user Hyperliquid execution network (normative)
-
-Questa sezione governa la selezione della rete dell'account operativo e prevale su eventuali riferimenti legacy che descrivono la rete follower come una singola proprietà globale del deployment.
-
-### Modello di rete
-
-- La rete della strategia sorgente resta deployment-scoped tramite la configurazione master prevista dal runtime.
-- Ogni utente possiede `execution_network`, con valori ammessi `testnet` o `mainnet`, e `network_started_at` che delimita l'epoch operativa corrente.
-- `testnet` è il default fail-safe per utenti esistenti e nuovi salvo una scelta esplicita dell'utente.
-- Worker, riconciliazione, leverage, diagnostica, metriche operative e fan-out devono selezionare l'adapter Hyperliquid usando la rete persistita dell'utente, non una rete follower globale.
-
-### Cambio TESTNET / MAINNET
-
-La pagina Configurazione espone un toggle TESTNET / MAINNET. Il cambio rete è consentito quando sono contemporaneamente vere queste condizioni:
-
-1. strategia utente in `PAUSED`;
-2. nessuna posizione TRAXION gestita aperta;
-3. nessun `CopyJob` `QUEUED`, `PROCESSING` o `RETRYING` nell'epoch corrente;
-4. nessuna esecuzione `SUBMITTING` o `UNKNOWN` nell'epoch corrente.
-
-Se una condizione manca, la UI mostra la checklist aggiornata e continua a verificare lo stato. Quando i requisiti sono soddisfatti il toggle diventa disponibile senza ulteriori passaggi manuali.
-
-Al cambio rete TRAXION deve eseguire atomicamente o in una transazione coerente le seguenti operazioni:
-
-- mantenere lo stato `PAUSED`;
-- eliminare il `TradingAccount` operativo precedente e la relativa credenziale di signing;
-- preservare storico esecuzioni, fill e audit;
-- reinizializzare lo stato derivato che appartiene alla vecchia rete, incluso `PositionLedger` e `RiskState` quando previsto dall'implementazione;
-- aggiornare `execution_network` e aprire una nuova `network_started_at` epoch;
-- mostrare immediatamente la card di configurazione dell'API/Agent Wallet della nuova rete.
-
-Prima del passaggio a MAINNET la UI deve mostrare un avvertimento esplicito che la rete utilizza fondi reali.
-
-### API/Agent Wallet
-
-TRAXION resta non-custodial. L'utente configura esclusivamente un API/Agent Wallet Hyperliquid dedicato e revocabile. Seed phrase e chiave privata del wallet principale non devono essere richieste, accettate, memorizzate o utilizzate. Dopo ogni cambio rete la nuova credenziale deve essere verificata sulla rete selezionata prima di qualsiasi attivazione della strategia.
-
-### Gate di esecuzione MAINNET
-
-La selezione `mainnet` configura la rete dell'utente ma non costituisce da sola autorizzazione a inviare ordini reali. Per l'esecuzione MAINNET devono continuare a essere soddisfatti i gate deterministici della piattaforma, inclusi almeno:
-
-- `execution_network=mainnet` per l'utente;
-- API/Agent Wallet MAINNET verificato;
-- `ENABLE_LIVE_TRADING=true` nel deployment;
-- flag PostgreSQL `live_trading=true` abilitato esplicitamente dal SUPERADMIN;
-- entitlement, account e credenziale attivi;
-- Risk Engine in stato normale e limiti rispettati;
-- assenza di global pause, emergency stop o altri blocchi deterministici;
-- in produzione, protezione delle credenziali secondo il provider KMS previsto dall'architettura.
-
-Lo staging può esercitare il flusso di configurazione TESTNET / MAINNET mantenendo chiusi i gate che autorizzano ordini reali.
-
-### Isolamento storico e riconciliazione
-
-Dashboard, PnL, equity, diagnostica operativa, job pendenti ed esecuzioni ambigue devono essere valutati rispetto alla `network_started_at` epoch corrente quando il dato è network-specifico. La riconciliazione amministrativa mantiene il tracking fino al completamento del worker e non deve creare job duplicati già in corso nella stessa epoch.
-'''
-              p.write_text(s.rstrip() + section + '\n')
-          PY
-          git checkout origin/main -- .github/workflows/ci.yml
-          git rm -f .github/workflows/sync-pr39-spec.yml || true
-          git add SPEC.md .github/workflows/ci.yml
-          git diff --check
-          git status --short
-          git commit -m "Align SPEC and finalize per-user network branch"
-          git push origin HEAD:feature/per-user-hyperliquid-network
-
   backend:
     runs-on: ubuntu-latest
     services:
