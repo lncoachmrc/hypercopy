@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.db.redis import redis_client
 from app.db.session import get_db
 from app.models.entities import TradingAccount, User
+from app.services.networking import user_network_state
 
 router = APIRouter(tags=['user'])
 
@@ -26,13 +27,7 @@ async def position_leverage(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return current per-asset leverage/margin mode directly from Hyperliquid.
-
-    This endpoint is intentionally lightweight: it reads only clearinghouseState
-    for the configured Master and the authenticated follower. It does not place
-    orders or mutate risk/copy state. The Dashboard uses it at a low cadence so
-    leverage visibility is not coupled to reconciliation/ledger timing.
-    """
+    """Return current per-asset leverage/margin mode directly from Hyperliquid."""
     if not settings.HYPERLIQUID_MASTER_ADDRESS:
         raise HTTPException(409, 'HYPERLIQUID_MASTER_ADDRESS is not configured')
 
@@ -42,9 +37,10 @@ async def position_leverage(
     if not account:
         return []
 
+    network = (await user_network_state(db, user.id)).network
     limiter = _limiter()
     master_hl = HyperliquidAdapter(limiter, network=settings.master_network)
-    follower_hl = HyperliquidAdapter(limiter, network=settings.follower_network)
+    follower_hl = HyperliquidAdapter(limiter, network=network)
 
     try:
         master_state, follower_state = await asyncio.gather(
@@ -61,6 +57,7 @@ async def position_leverage(
     return [
         {
             'asset': asset,
+            'network': network,
             'master_leverage': master_configs[asset].leverage if asset in master_configs else None,
             'master_is_cross': master_configs[asset].is_cross if asset in master_configs else None,
             'follower_leverage': follower_configs[asset].leverage if asset in follower_configs else None,
