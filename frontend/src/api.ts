@@ -41,7 +41,7 @@ export async function api<T>(path:string, init:RequestInit={}, timeoutMs=API_TIM
   try {
     res=await fetch(`${base()}${path}`,{...init,headers,credentials:'include',signal:controller.signal});
   } catch (e) {
-    if (controller.signal.aborted) throw new ApiError(0,`Il server TRAXION non ha risposto entro ${Math.round(timeoutMs/1000)} secondi. Riprova o verifica lo stato dei servizi.`,'API_TIMEOUT');
+    if (controller.signal.aborted) throw new ApiError(0,`Il server HyperCopy non ha risposto entro ${Math.round(timeoutMs/1000)} secondi. Riprova o verifica lo stato dei servizi.`,'API_TIMEOUT');
     throw e;
   } finally {
     window.clearTimeout(timer);
