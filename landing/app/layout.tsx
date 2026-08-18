@@ -1,10 +1,13 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import { TRAXION_CANONICAL_URL } from "./config";
+import { TRAXION_CANONICAL_URL, traxionAsset } from "./config";
 
 const canonicalIsConfigured = TRAXION_CANONICAL_URL.startsWith("https://");
 
 export const metadata: Metadata = {
+  metadataBase: canonicalIsConfigured
+    ? new URL(TRAXION_CANONICAL_URL)
+    : undefined,
   title: "TRAXION | Intelligenza ibrida. Esecuzione deterministica.",
   description:
     "TRAXION collega analisi umana, Capital Intelligence AI, Risk Engine ed esecuzione disciplinata su Hyperliquid.",
@@ -25,7 +28,7 @@ export const metadata: Metadata = {
     siteName: "TRAXION",
     images: [
       {
-        url: "/traxion-ai-copy-trading-logo.webp",
+        url: traxionAsset("/traxion-ai-copy-trading-logo.webp"),
         width: 1200,
         height: 400,
         alt: "TRAXION",
@@ -41,9 +44,9 @@ export const metadata: Metadata = {
     "referrer": "strict-origin-when-cross-origin",
   },
   icons: {
-    icon: "/traxion-tab-icon-v3.ico",
-    shortcut: "/traxion-tab-icon-v3.ico",
-    apple: "/traxion-touch-icon-v3.png",
+    icon: traxionAsset("/traxion-tab-icon-v3.ico"),
+    shortcut: traxionAsset("/traxion-tab-icon-v3.ico"),
+    apple: traxionAsset("/traxion-touch-icon-v3.png"),
   },
 };
 

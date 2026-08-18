@@ -96,6 +96,7 @@ jobs:
           cache-dependency-path: landing/package-lock.json
       - run: npm ci
       - run: npm test
+      - run: npm run build:pages
       - run: npm audit --audit-level=high
 
   secrets:

@@ -8,6 +8,7 @@ import {
   PRIVACY_POLICY_URL,
   TERMS_URL,
   TRAXION_APP_URL,
+  traxionAsset,
 } from "./config";
 
 const navItems = [
@@ -147,7 +148,7 @@ const faqs = [
 
 const whitepaperPages = Array.from(
   { length: 6 },
-  (_, index) => `/whitepaper/trx-wp-0${index + 1}.webp`,
+  (_, index) => traxionAsset(`/whitepaper/trx-wp-0${index + 1}.webp`),
 );
 
 function ExternalAppLink({ className, children }: { className?: string; children: React.ReactNode }) {
@@ -278,7 +279,7 @@ export default function Home() {
       <header className="site-header">
         <div className="shell header-inner">
           <a className="brand" href="#top" aria-label="TRAXION, torna all'inizio">
-            <img src="/traxion-ai-copy-trading-logo.webp" alt="TRAXION" width="2048" height="682" />
+            <img src={traxionAsset("/traxion-ai-copy-trading-logo.webp")} alt="TRAXION" width="2048" height="682" />
           </a>
 
           <nav className={menuOpen ? "nav open" : "nav"} aria-label="Navigazione principale">
@@ -309,7 +310,7 @@ export default function Home() {
           <div className="shell hero-layout">
             <div className="hero-copy">
               <div className="eyebrow-row"><span className="beta-badge">Beta</span><span>Hybrid trading intelligence</span></div>
-              <img className="hero-logo" src="/traxion-logo-completo.webp" alt="TRAXION — Hyperliquid AI Trading Agent" width="1672" height="941" />
+              <img className="hero-logo" src={traxionAsset("/traxion-logo-completo.webp")} alt="TRAXION — Hyperliquid AI Trading Agent" width="1672" height="941" />
               <h1>Intelligenza ibrida.<br />Esecuzione deterministica.</h1>
               <p className="hero-lead">
                 TRAXION collega analisti, segnali operativi, notizie e dati di mercato alla Capital Intelligence AI.
@@ -538,7 +539,7 @@ export default function Home() {
 
       <footer className="site-footer">
         <div className="shell footer-main">
-          <div className="footer-brand"><img src="/traxion-ai-copy-trading-logo.webp" alt="TRAXION" width="2048" height="682" /><p>Powered by DigitalEmpower</p></div>
+          <div className="footer-brand"><img src={traxionAsset("/traxion-ai-copy-trading-logo.webp")} alt="TRAXION" width="2048" height="682" /><p>Powered by DigitalEmpower</p></div>
           <div className="footer-links">
             <ExternalAppLink>Webapp TRAXION</ExternalAppLink>
             <a href={HYPERLIQUID_REFERRAL_URL} target="_blank" rel="sponsored noopener noreferrer">Hyperliquid — referral DIGITALEMPOWER</a>

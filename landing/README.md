@@ -16,6 +16,7 @@ Comandi:
 npm ci
 npm run dev
 npm test
+npm run build:pages
 ```
 
 `npm test` esegue la build, convalida l'artefatto e verifica i contenuti HTML
@@ -51,3 +52,7 @@ un sistema operativo può sempre acquisire il contenuto visibile sullo schermo.
 Questa cartella non modifica il backend, la webapp, il checkout o la
 configurazione Railway esistente. Il deployment della landing deve usare
 `landing/` come directory radice del progetto.
+
+Il workflow `.github/workflows/pages.yml` pubblica automaticamente la build
+statica su `https://lncoachmrc.github.io/hypercopy/` dopo ogni aggiornamento di
+`main` che coinvolge la landing.
