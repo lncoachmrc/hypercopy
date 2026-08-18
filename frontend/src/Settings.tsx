@@ -91,6 +91,10 @@ const BASIC_PROFILES:Record<Exclude<BasicProfile,'custom'>,BasicProfileConfig>={
   },
 };
 
+const PAUSED_STYLE={background:'#4b3a0d',borderColor:'#d7a928',color:'#ffd766',fontWeight:700,opacity:1} as const;
+const SHADOW_STYLE={background:'#eef2f8',borderColor:'#eef2f8',color:'#0a0d12',fontWeight:700,opacity:1} as const;
+const ACTIVE_STYLE={background:'#123d2b',borderColor:'#2fbd78',color:'#87efb7',fontWeight:700,opacity:1} as const;
+
 export default function Settings(){
   const {refresh}=useAuth();
   const [me,setMe]=useState<Me|null>(null);
@@ -216,11 +220,13 @@ export default function Settings(){
     }
   };
 
+  const visibleAgentName=me?.trading_account?.agent_name?.toLowerCase()==='hypercopy'?'TRAXION':(me?.trading_account?.agent_name||'TRAXION');
+
   return <>
     <div className="title">
       <div>
         <h1>Configurazione</h1>
-        <p>Il wallet con cui accedi a HyperCopy è anche il tuo account operativo Hyperliquid. Per autorizzare gli ordini usa soltanto un API Wallet Hyperliquid nominato <code>hypercopy</code>.</p>
+        <p>Il wallet con cui accedi a TRAXION è anche il tuo account operativo Hyperliquid. Per autorizzare gli ordini usa soltanto un API Wallet Hyperliquid dedicato a TRAXION.</p>
       </div>
     </div>
 
@@ -238,26 +244,26 @@ export default function Settings(){
             <dt>Wallet / account operativo</dt><dd>{me.trading_account.account_address}</dd>
             <dt>Rete account operativo</dt><dd>{me.trading_account.network.toUpperCase()}</dd>
             <dt>API Wallet / Agent</dt><dd>{me.trading_account.agent_address}</dd>
-            <dt>Nome Agent</dt><dd>{me.trading_account.agent_name||'hypercopy'}</dd>
+            <dt>Nome Agent</dt><dd>{visibleAgentName}</dd>
             <dt>Stato credenziale</dt><dd>{me.trading_account.credential_status}</dd>
             <dt>Scadenza</dt><dd>{me.trading_account.expires_at?new Date(me.trading_account.expires_at).toLocaleDateString():'—'}</dd>
           </dl>
-          <p className="muted">La private key del wallet principale non viene mai richiesta da HyperCopy.</p>
+          <p className="muted">La private key del wallet principale non viene mai richiesta da TRAXION.</p>
           <button className="danger" onClick={async()=>{await del('/trading-account');await load()}}>Scollega API Wallet</button>
         </>:<>
           <dl><dt>Wallet / account operativo</dt><dd>{me?.auth_wallet||'Caricamento…'}</dd></dl>
           <p className="muted">Questo indirizzo deriva dal wallet con cui hai effettuato l'accesso e non può essere sostituito con un altro account.</p>
           <label>API Wallet Address<input value={agent} onChange={e=>setAgent(e.target.value)} placeholder="0x…" autoComplete="off"/></label>
           <label>API Wallet Private Key<input type="password" autoComplete="off" value={key} onChange={e=>setKey(e.target.value)} placeholder="0x…"/></label>
-          <p className="muted">Inserisci l'indirizzo e la private key dello stesso API Wallet Hyperliquid. HyperCopy controllerà che la chiave generi esattamente quell'indirizzo e che l'Agent sia autorizzato sul tuo account.</p>
+          <p className="muted">Inserisci l'indirizzo e la private key dello stesso API Wallet Hyperliquid. TRAXION controllerà che la chiave generi esattamente quell'indirizzo e che l'Agent sia autorizzato sul tuo account.</p>
           <button className="primary" onClick={()=>void link()} disabled={!agent||!key}>Verifica e collega</button>
         </>}
 
         <hr/>
         <div className="actions">
-          <button onClick={async()=>{await post('/copy/pause');await load();await refresh()}} disabled={me?.copy_state==='PAUSED'}>Pausa</button>
-          <button className="primary" onClick={()=>void setShadow()} disabled={!me?.trading_account||me?.copy_state==='SHADOW'}>Modalità SHADOW</button>
-          <button onClick={()=>void activate()} disabled={!me?.trading_account||me?.copy_state==='ACTIVE'}>Attiva strategia {me?.follower_network?.toUpperCase()||''}</button>
+          <button style={me?.copy_state==='PAUSED'?PAUSED_STYLE:undefined} onClick={async()=>{await post('/copy/pause');await load();await refresh()}} disabled={me?.copy_state==='PAUSED'}>Pausa</button>
+          <button className={me?.copy_state==='SHADOW'?'primary':''} style={me?.copy_state==='SHADOW'?SHADOW_STYLE:undefined} onClick={()=>void setShadow()} disabled={!me?.trading_account||me?.copy_state==='SHADOW'}>Modalità SHADOW</button>
+          <button style={me?.copy_state==='ACTIVE'?ACTIVE_STYLE:undefined} onClick={()=>void activate()} disabled={!me?.trading_account||me?.copy_state==='ACTIVE'}>Attiva strategia</button>
           <button className="danger" onClick={async()=>{if(confirm('Generare ordini reduce-only per chiudere tutte le posizioni gestite?')){await post('/copy/close-positions',{confirmation:'CLOSE',reason:'User requested close all'});setMsg('Chiusure accodate.')}}}>Chiudi posizioni</button>
         </div>
         <p className="muted">SHADOW calcola target, sizing e controlli senza inviare ordini. “Attiva strategia” abilita l'esecuzione automatizzata sul tuo account operativo.</p>
@@ -326,7 +332,7 @@ function BasicRisk({risk,equity,profile,markets,setProfile,setMarkets,apply,open
   const preview=buildBasicRisk(risk,profile,markets,equity);
   return <div className="basic-risk">
     <div className="basic-section">
-      <div className="basic-section-title"><span>1</span><div><h3>Quanto vuoi seguire la strategia?</h3><p>HyperCopy traduce questa scelta in sizing, leva e limiti tecnici del Risk Engine.</p></div></div>
+      <div className="basic-section-title"><span>1</span><div><h3>Quanto vuoi seguire la strategia?</h3><p>TRAXION traduce questa scelta in sizing, leva e limiti tecnici del Risk Engine.</p></div></div>
       <div className="risk-choice-grid">
         {(Object.keys(BASIC_PROFILES) as Exclude<BasicProfile,'custom'>[]).map(key=>{
           const item=BASIC_PROFILES[key];
@@ -355,7 +361,7 @@ function BasicRisk({risk,equity,profile,markets,setProfile,setMarkets,apply,open
     </div>
 
     <div className="basic-summary">
-      <div className="basic-summary-head"><div><h3>Riepilogo</h3><p>Questi sono i principali limiti che HyperCopy applicherà alla strategia.</p></div>{equity!=null&&<span className="badge">Equity {usd(equity)}</span>}</div>
+      <div className="basic-summary-head"><div><h3>Riepilogo</h3><p>Questi sono i principali limiti che TRAXION applicherà alla strategia.</p></div>{equity!=null&&<span className="badge">Equity {usd(equity)}</span>}</div>
       <div className="basic-summary-grid">
         <SummaryItem label="Intensità strategia" value={`${Math.round(Number(preview.multiplier)*100)}%`}/>
         <SummaryItem label="Leva account" value={`Strategia fino a ${Number(preview.max_leverage)}×`}/>
