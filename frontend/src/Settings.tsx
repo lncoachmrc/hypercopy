@@ -1,5 +1,5 @@
 import {useEffect,useState} from 'react';
-import {del,get,post,put} from './api';
+import {ACTIVATION_TIMEOUT_MS,del,get,post,put} from './api';
 import {useAuth} from './auth';
 
 type Me={
@@ -202,6 +202,20 @@ export default function Settings(){
     setMsg('Modalità SHADOW attiva: target e controlli vengono calcolati ma non vengono inviati ordini.');
   };
 
+  const activate=async()=>{
+    const network=me?.follower_network?.toUpperCase()||'';
+    if(!confirm(`Attivare il trading automatizzato della strategia ibrida sulla rete ${network}?`))return;
+    setMsg(`Attivazione ${network} in corso…`);
+    try{
+      await post('/copy/resume',undefined,ACTIVATION_TIMEOUT_MS);
+      await load();
+      await refresh();
+      setMsg(`Strategia ${network} attiva.`);
+    }catch(e){
+      setMsg(e instanceof Error?e.message:'Errore attivazione');
+    }
+  };
+
   return <>
     <div className="title">
       <div>
@@ -243,7 +257,7 @@ export default function Settings(){
         <div className="actions">
           <button onClick={async()=>{await post('/copy/pause');await load();await refresh()}} disabled={me?.copy_state==='PAUSED'}>Pausa</button>
           <button className="primary" onClick={()=>void setShadow()} disabled={!me?.trading_account||me?.copy_state==='SHADOW'}>Modalità SHADOW</button>
-          <button onClick={async()=>{if(confirm(`Attivare il trading automatizzato della strategia ibrida sulla rete ${me?.follower_network?.toUpperCase()||''}?`)){await post('/copy/resume');await load();await refresh()}}} disabled={!me?.trading_account||me?.copy_state==='ACTIVE'}>Attiva strategia {me?.follower_network?.toUpperCase()||''}</button>
+          <button onClick={()=>void activate()} disabled={!me?.trading_account||me?.copy_state==='ACTIVE'}>Attiva strategia {me?.follower_network?.toUpperCase()||''}</button>
           <button className="danger" onClick={async()=>{if(confirm('Generare ordini reduce-only per chiudere tutte le posizioni gestite?')){await post('/copy/close-positions',{confirmation:'CLOSE',reason:'User requested close all'});setMsg('Chiusure accodate.')}}}>Chiudi posizioni</button>
         </div>
         <p className="muted">SHADOW calcola target, sizing e controlli senza inviare ordini. “Attiva strategia” abilita l'esecuzione automatizzata sul tuo account operativo.</p>
