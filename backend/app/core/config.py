@@ -23,8 +23,8 @@ class Settings(BaseSettings):
     REDIS_URL: str = 'redis://redis:6379/0'
 
     # Legacy single-network setting kept as a safe fallback during migration.
-    # New deployments should set MASTER and FOLLOWER explicitly. An account is
-    # identified by (network, address), not address alone.
+    # MASTER remains deployment-scoped. FOLLOWER is now the safe default used
+    # for existing/new users until each user explicitly selects a network.
     HYPERLIQUID_NETWORK: Network = 'testnet'
     HYPERLIQUID_MASTER_NETWORK: Network | None = None
     HYPERLIQUID_FOLLOWER_NETWORK: Network | None = None
@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     HL_SAFE_READ_RETRIES: int = 3
     HL_SAFE_READ_BACKOFF_SECONDS: float = 0.5
 
+    # Global mainnet execution gate. Per-user network selection never bypasses
+    # this flag or the independent PostgreSQL live_trading flag.
     ENABLE_LIVE_TRADING: bool = False
     DEFAULT_SHADOW_MODE: bool = True
 
@@ -119,12 +121,8 @@ class Settings(BaseSettings):
         if self.APP_ENV == 'production':
             if self.SESSION_SECRET == 'development-only-change-me' or len(self.SESSION_SECRET) < 32:
                 raise ValueError('SESSION_SECRET must be a strong production secret')
-            # KMS is required only when HyperCopy signs on mainnet. Merely
-            # observing a mainnet master is read-only and needs no master key.
-            if self.KEK_PROVIDER == 'env' and self.follower_network == 'mainnet':
-                raise ValueError('Mainnet follower execution requires an external KMS provider')
-        if self.ENABLE_LIVE_TRADING and self.follower_network != 'mainnet':
-            raise ValueError('ENABLE_LIVE_TRADING is only meaningful for mainnet follower execution')
+            if self.ENABLE_LIVE_TRADING and self.KEK_PROVIDER == 'env':
+                raise ValueError('Mainnet live execution requires an external KMS provider')
         if self.WATCHER_LEASE_RENEW_SECONDS >= self.WATCHER_LEASE_TTL_SECONDS:
             raise ValueError('watcher lease renew interval must be lower than TTL')
         if self.HL_MASTER_SNAPSHOT_TTL_SECONDS <= 0:
