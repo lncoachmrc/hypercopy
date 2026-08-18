@@ -134,10 +134,11 @@ async def reconcile_user(
     source_configs = master_configs or {}
     run = ReconciliationRun(user_id=user.id, before={}, after={})
     db.add(run); await db.flush()
+    jobs_created = 0
     try:
         account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
         if not account:
-            run.status = 'SKIPPED'; run.finished_at = datetime.now(UTC); await db.commit(); return {'status': 'SKIPPED'}
+            run.status = 'SKIPPED'; run.finished_at = datetime.now(UTC); await db.commit(); return {'status': 'SKIPPED', 'jobs_created': 0}
 
         snapshot = await hl.account_snapshot(account.account_address)
         real_state = snapshot.perp_state
@@ -324,6 +325,7 @@ async def reconcile_user(
                 correlation_id=uuid.uuid4().hex,
                 context=context,
             ))
+            jobs_created += 1
 
         db.add(EquitySnapshot(
             user_id=user.id,
@@ -336,10 +338,10 @@ async def reconcile_user(
             taken_at=datetime.now(UTC),
         ))
 
-        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs}; run.finished_at = datetime.now(UTC)
-        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs})
+        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created}; run.finished_at = datetime.now(UTC)
+        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created})
         await db.commit()
-        return {'status': 'OK', 'discrepancies': discrepancies, 'equity': str(equity), 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs}
+        return {'status': 'OK', 'discrepancies': discrepancies, 'equity': str(equity), 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created}
     except Exception as exc:
         run.status = 'FAILED'; run.error = f'{type(exc).__name__}: {exc}'; run.finished_at = datetime.now(UTC); await db.commit(); raise
 
