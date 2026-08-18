@@ -2,7 +2,7 @@
 
 ## Decisione architetturale
 
-La rete della strategia sorgente resta una proprietà del deployment (`HYPERLIQUID_MASTER_NETWORK`). La rete dell'account operativo diventa invece una proprietà persistente del singolo utente.
+La rete della strategia sorgente resta una proprietà del deployment (`HYPERLIQUID_MASTER_NETWORK`). La rete dell'account operativo è una proprietà persistente del singolo utente.
 
 Ogni utente dispone di:
 
@@ -12,25 +12,28 @@ Ogni utente dispone di:
 
 Il default è `testnet`.
 
-## Cambio rete
+## Cambio rete automatico
 
-Il cambio TESTNET ↔ MAINNET è consentito solo quando sono vere tutte le condizioni seguenti:
+Il toggle TESTNET ↔ MAINNET è gestito direttamente dalla pagina Configurazione. TRAXION calcola continuamente lo stato di readiness e sblocca il cambio quando sono vere tutte le condizioni operative seguenti:
 
 1. strategia in `PAUSED`;
-2. nessun API Wallet collegato;
-3. nessuna posizione TRAXION gestita aperta;
-4. nessun job `QUEUED`, `PROCESSING` o `RETRYING`;
-5. nessuna esecuzione `SUBMITTING` o `UNKNOWN`.
+2. nessuna posizione TRAXION gestita aperta;
+3. nessun job `QUEUED`, `PROCESSING` o `RETRYING` nell'epoch corrente;
+4. nessuna esecuzione `SUBMITTING` o `UNKNOWN` nell'epoch corrente.
 
-Al cambio rete TRAXION:
+Quando una o più condizioni non sono soddisfatte, il click sul toggle apre un popup con la checklist aggiornata. Il frontend aggiorna automaticamente lo stato e il toggle diventa disponibile appena i requisiti risultano completati.
 
+L'API Wallet della rete corrente non è un prerequisito manuale. Quando il cambio rete viene eseguito, TRAXION:
+
+- rimuove automaticamente il `TradingAccount` e la relativa credenziale della rete precedente;
 - mantiene lo storico immutabile di esecuzioni, fill e audit;
 - reinizializza il `PositionLedger`, perché rappresenta lo stato derivato dell'exchange corrente;
 - reinizializza il `RiskState`, perché peak equity, perdita giornaliera e distanza dalla liquidazione appartengono alla rete corrente;
 - apre una nuova `network_started_at` epoch;
-- limita dashboard, PnL, equity e diagnostica operativa all'epoch corrente.
+- limita dashboard, PnL, equity e diagnostica operativa all'epoch corrente;
+- mostra immediatamente la scheda per inserire `API Wallet Address` e `Private Key` della nuova rete.
 
-Dopo il cambio rete l'utente deve collegare un API/Agent Wallet autorizzato sulla rete selezionata.
+Prima del passaggio a MAINNET la UI presenta un avviso esplicito che la rete utilizza fondi reali. La strategia resta in `PAUSED` dopo lo switch finché il nuovo API Wallet non viene configurato e l'utente non sceglie di riattivarla.
 
 ## Routing runtime
 
@@ -43,9 +46,9 @@ L'execution worker mantiene adapter Hyperliquid separati per TESTNET e MAINNET e
 
 La riconciliazione periodica raggruppa gli utenti per rete e usa l'adapter corrispondente. Le API di activation, leverage e Control room seguono la stessa regola.
 
-## Gate MAINNET
+## Gate di esecuzione MAINNET
 
-La selezione `mainnet` non abilita da sola ordini con fondi reali.
+La selezione `mainnet` configura la rete dell'utente; l'autorizzazione a inviare ordini reali resta separata dal toggle.
 
 Per l'esecuzione MAINNET devono essere contemporaneamente soddisfatti:
 
@@ -53,16 +56,16 @@ Per l'esecuzione MAINNET devono essere contemporaneamente soddisfatti:
 2. API Wallet MAINNET verificato per il wallet operativo autenticato;
 3. `ENABLE_LIVE_TRADING=true` nel deployment;
 4. flag PostgreSQL `live_trading=true` abilitato esplicitamente da SUPERADMIN;
-5. credenziale conservata con provider KMS esterno fuori dallo sviluppo;
+5. in produzione, credenziale conservata con provider KMS esterno;
 6. account, entitlement e credenziale attivi;
 7. Risk Engine in stato normale e limiti rispettati;
 8. nessun global pause / emergency stop / altro blocco deterministico.
 
-La UI può quindi permettere all'utente di preparare la configurazione MAINNET senza trasformare il toggle in un'autorizzazione a fare trading reale.
+Lo staging può quindi verificare l'intero flusso di configurazione MAINNET senza richiedere KMS di produzione; l'invio di ordini reali resta comunque bloccato dai gate di esecuzione.
 
 ## Migrazione
 
-Alembic `0009_user_execution_network` introduce `execution_network` e `network_started_at`. Gli account esistenti partono da `testnet`, coerentemente con l'attuale ambiente di staging e con il default fail-safe.
+Alembic `0009_user_execution_network` introduce `execution_network` e `network_started_at`. Gli account esistenti partono da `testnet`; il backfill usa `users.created_at` come epoch iniziale per preservare lo storico TESTNET già esistente.
 
 ## Rollback
 
@@ -74,5 +77,5 @@ Il downgrade della migrazione rimuove le due colonne e ripristina il comportamen
 - nessun `ENABLE_LIVE_TRADING=true` come effetto di questa modifica;
 - nessuna abilitazione del flag DB `live_trading` come effetto di questa modifica;
 - verifica esplicita di migrazione e rollback;
-- verifica TESTNET completa prima della prova MAINNET shadow/read-only;
+- verifica del toggle TESTNET ↔ MAINNET, rimozione automatica della vecchia credenziale e nuova configurazione API Wallet in staging;
 - mainnet con ordini reali solo dopo i gate previsti dalla specifica principale e autorizzazione esplicita.
