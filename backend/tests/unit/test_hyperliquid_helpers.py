@@ -181,6 +181,8 @@ async def test_unified_account_uses_spot_usdc_for_equity(monkeypatch):
     assert snap.abstraction=='unifiedAccount'
     assert snap.account_value==Decimal('498.99')
     assert snap.free_margin==Decimal('498.99')
+    assert snap.collateral_balance==Decimal('498.99')
+    assert snap.unrealized_pnl==Decimal('0')
 
 
 @pytest.mark.asyncio
@@ -209,6 +211,8 @@ async def test_unified_account_includes_unrealized_pnl(monkeypatch):
     snap=await adapter.account_snapshot('0x0000000000000000000000000000000000000001')
     assert snap.account_value==Decimal('512.34')
     assert snap.free_margin==Decimal('457.34')
+    assert snap.collateral_balance==Decimal('500')
+    assert snap.unrealized_pnl==Decimal('12.34')
 
 
 @pytest.mark.asyncio
@@ -220,7 +224,9 @@ async def test_standard_account_keeps_perp_equity(monkeypatch):
         return {
             'marginSummary':{'accountValue':'321.50','totalMarginUsed':'21.50'},
             'withdrawable':'300',
-            'assetPositions':[],
+            'assetPositions':[
+                {'position':{'coin':'BTC','szi':'0.01','unrealizedPnl':'-3.50'}}
+            ],
         }
 
     async def abstraction(*_args, **_kwargs):
@@ -232,6 +238,8 @@ async def test_standard_account_keeps_perp_equity(monkeypatch):
     snap=await adapter.account_snapshot('0x0000000000000000000000000000000000000001')
     assert snap.account_value==Decimal('321.50')
     assert snap.free_margin==Decimal('300')
+    assert snap.collateral_balance==Decimal('325.00')
+    assert snap.unrealized_pnl==Decimal('-3.50')
     assert snap.spot_state is None
 
 
