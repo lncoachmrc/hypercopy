@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.adapters.hyperliquid import fill_event_id, signed_fill_delta
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.models.entities import CopyJob, MasterEvent, TradingAccount, User, UserState
+from app.models.entities import CopyJob, MasterEvent
 
 log = get_logger(__name__)
 
@@ -57,13 +57,21 @@ async def persist_master_fill_and_jobs(
     db.add(event)
     await db.flush()
 
-    eligible = (await db.execute(
-        select(User.id).join(TradingAccount, TradingAccount.user_id == User.id)
-        .where(User.state == UserState.ACTIVE)
-    )).scalars().all()
+    # The source event is shared, while the follower network is a user-level
+    # choice. Read id + network in one query to avoid an N+1 lookup during fanout.
+    eligible = (await db.execute(text("""
+        SELECT u.id, u.execution_network
+        FROM users AS u
+        JOIN trading_accounts AS ta ON ta.user_id = u.id
+        WHERE u.state = 'ACTIVE'
+    """))).all()
 
     jobs: list[CopyJob] = []
-    for user_id in eligible:
+    for user_id, raw_network in eligible:
+        follower_network = str(raw_network or settings.follower_network).lower()
+        if follower_network not in {'testnet', 'mainnet'}:
+            log.error('Skipping user with invalid execution network', extra={'user_id': str(user_id), 'network': follower_network})
+            continue
         job_id = uuid.uuid5(uuid.UUID('8f6f61ae-7239-5e86-a501-8c8d95e94f20'), f'{event.id}:{user_id}')
         context = {
             'master_position': str(position_after),
@@ -72,7 +80,7 @@ async def persist_master_fill_and_jobs(
             'mark_price': str(price),
             'master_event_id': str(event.id),
             'master_network': source_network or settings.master_network,
-            'follower_network': settings.follower_network,
+            'follower_network': follower_network,
         }
         if master_leverage is not None:
             context['master_leverage'] = int(master_leverage)
