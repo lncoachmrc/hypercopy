@@ -23,6 +23,7 @@ from app.models.entities import (
 from app.schemas.admin import AdminAction, AdminReconcile
 from app.services.audit import audit
 from app.services.metrics import system_snapshot
+from app.services.queue import repair_stream
 from app.services.reconcile import master_snapshot, reconcile_user
 
 router = APIRouter(prefix='/admin', tags=['admin'])
@@ -298,16 +299,42 @@ async def resume_user(user_id: uuid.UUID, body: AdminAction, actor: User = Depen
     limiter = _limiter()
     master_hl = HyperliquidAdapter(limiter, network=settings.master_network)
     follower_hl = HyperliquidAdapter(limiter, network=settings.follower_network)
+    target.copy_state = CopyState.ACTIVE
     try:
         mp, meq, master_mids = await master_snapshot(master_hl)
+        master_state = await master_hl.user_state(
+            settings.HYPERLIQUID_MASTER_ADDRESS,
+            priority=Priority.RECONCILE,
+        )
+        master_configs = position_configs(master_state)
         follower_mids = master_mids if settings.master_network == settings.follower_network else await follower_hl.mids()
-        await reconcile_user(db, follower_hl, target, master_positions=mp, master_equity=meq, mids=follower_mids, master_mids=master_mids)
+        result = await reconcile_user(
+            db,
+            follower_hl,
+            target,
+            master_positions=mp,
+            master_equity=meq,
+            mids=follower_mids,
+            master_mids=master_mids,
+            master_configs=master_configs,
+        )
+        published = await repair_stream(redis_client(), db)
     except Exception as exc:
-        raise HTTPException(503, 'Reconciliation must succeed before admin resume') from exc
-    target.copy_state = CopyState.ACTIVE
-    await audit(db, action='ADMIN_USER_RESUME', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'master_network': settings.master_network, 'follower_network': settings.follower_network})
+        await db.rollback()
+        raise HTTPException(503, f'Admin activation failed: {type(exc).__name__}: {exc}') from exc
+    await audit(db, action='ADMIN_USER_RESUME', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={
+        'master_network': settings.master_network,
+        'follower_network': settings.follower_network,
+        'reconciliation': result,
+        'stream_published': published,
+    })
     await db.commit()
-    return {'ok': True}
+    return {
+        'ok': True,
+        'copy_state': target.copy_state.value,
+        'stream_published': published,
+        'reconciliation': result,
+    }
 
 
 @router.post('/users/{user_id}/reconcile', dependencies=[Depends(require_csrf)])
