@@ -1,0 +1,5 @@
+.actions .state-button{font-weight:700;transition:background-color .16s ease,border-color .16s ease,color .16s ease,box-shadow .16s ease}
+.actions .state-button.active:disabled{opacity:1;cursor:default}
+.actions .state-button--pause.active{background:#f2c94c;border-color:#f2c94c;color:#171207;box-shadow:0 0 0 1px #f2c94c33 inset,0 0 18px #f2c94c1f}
+.actions .state-button--shadow.active{background:#eef2f8;border-color:#eef2f8;color:#0a0d12;box-shadow:0 0 0 1px #ffffff26 inset,0 0 18px #ffffff14}
+.actions .state-button--active.active{background:#74e2ae;border-color:#74e2ae;color:#06140d;box-shadow:0 0 0 1px #74e2ae33 inset,0 0 18px #74e2ae1f}
