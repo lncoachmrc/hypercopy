@@ -33,6 +33,16 @@ def _positions(state: dict) -> dict[str, Decimal]:
     return out
 
 
+def _reconciliation_basis(
+    copy_state: CopyState,
+    previous_target: Decimal | None,
+    real: Decimal,
+) -> Decimal:
+    if copy_state == CopyState.SHADOW:
+        return previous_target if previous_target is not None else Decimal(0)
+    return real
+
+
 def _is_liquidity_reject(reason: str | None) -> bool:
     text = (reason or '').lower()
     return any(marker in text for marker in _LIQUIDITY_REJECT_MARKERS)
@@ -211,7 +221,7 @@ async def reconcile_user(
             ledger = ledger_by_asset.get(asset)
             follower_mark = Decimal(str(follower_mids.get(asset, '0') or '0'))
             if not ledger:
-                ledger = PositionLedger(user_id=user.id, asset=asset, size=real, mark_price=follower_mark, managed=asset in master_positions, exchange_verified_at=datetime.now(UTC))
+                ledger = PositionLedger(user_id=user.id, asset=asset, size=real, target_size=Decimal(0), mark_price=follower_mark, managed=asset in master_positions, exchange_verified_at=datetime.now(UTC))
                 db.add(ledger); ledger_by_asset[asset] = ledger
             if asset in master_positions and master_positions.get(asset, Decimal(0)) != 0:
                 ledger.managed = True
@@ -263,7 +273,7 @@ async def reconcile_user(
                     desired_leverage = None
                     desired_is_cross = None
 
-            basis = previous_target if user.copy_state == CopyState.SHADOW else real
+            basis = _reconciliation_basis(user.copy_state, previous_target, real)
             drift_notional = abs(desired_target - basis) * follower_mark if follower_mark > 0 else Decimal(0)
             if drift_notional < min_notional and not leverage_mismatch:
                 continue
