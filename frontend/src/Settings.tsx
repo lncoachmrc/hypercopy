@@ -4,6 +4,8 @@ import {useAuth} from './auth';
 import './settings-state.css';
 
 type TradingNetwork='testnet'|'mainnet';
+type NetworkSwitchBlocker={code:'pause'|'positions'|'jobs'|'executions';message:string};
+type NetworkDialog={target:TradingNetwork;kind:'blocked'|'confirm-mainnet'}|null;
 type Me={
   auth_wallet:string;
   role:string;
@@ -12,6 +14,8 @@ type Me={
   master_network:string;
   follower_network:TradingNetwork;
   network_started_at:string;
+  network_switch_ready:boolean;
+  network_switch_blockers:NetworkSwitchBlocker[];
   trading_account:null|{
     account_address:string;
     network:string;
@@ -102,6 +106,7 @@ export default function Settings(){
   const [agent,setAgent]=useState('');
   const [key,setKey]=useState('');
   const [msg,setMsg]=useState('');
+  const [networkDialog,setNetworkDialog]=useState<NetworkDialog>(null);
   const [riskMode,setRiskMode]=useState<RiskMode>(()=>localStorage.getItem('hypercopy:risk-mode')==='pro'?'pro':'basic');
   const [basicProfile,setBasicProfile]=useState<BasicProfile>('custom');
   const [basicMarkets,setBasicMarkets]=useState<BasicMarkets>('custom');
@@ -119,28 +124,29 @@ export default function Settings(){
     setBasicMarkets(inferBasicMarkets(riskValue));
   };
 
-  useEffect(()=>{void load()},[]);
+  const refreshNetworkState=async()=>{
+    try{setMe(await get<Me>('/me'))}catch{/* session errors are handled by the normal app flow */}
+  };
+
+  useEffect(()=>{
+    void load();
+    const timer=setInterval(()=>void refreshNetworkState(),2500);
+    return()=>clearInterval(timer);
+  },[]);
+
+  useEffect(()=>{
+    if(networkDialog?.kind==='blocked'&&me?.network_switch_ready)setNetworkDialog(null);
+  },[me?.network_switch_ready,networkDialog?.kind]);
 
   const switchRiskMode=(mode:RiskMode)=>{
     setRiskMode(mode);
     localStorage.setItem('hypercopy:risk-mode',mode);
   };
 
-  const switchTradingNetwork=async(network:TradingNetwork)=>{
+  const performTradingNetworkSwitch=async(network:TradingNetwork)=>{
     if(!me||me.follower_network===network)return;
-    if(me.copy_state!=='PAUSED'){
-      setMsg('Per cambiare rete, metti prima la strategia in PAUSA.');
-      return;
-    }
-    if(me.trading_account){
-      setMsg('Per cambiare rete, scollega prima l’API Wallet della rete attuale.');
-      return;
-    }
     const label=network.toUpperCase();
-    const prompt=network==='mainnet'
-      ?'Passare a MAINNET? La MAINNET utilizza fondi reali. La selezione della rete non attiva la strategia: dovrai collegare un API Wallet autorizzato per MAINNET e l’esecuzione resterà soggetta ai gate di sicurezza TRAXION.'
-      :'Tornare a TESTNET? Dovrai collegare un API Wallet autorizzato per TESTNET prima di riattivare la strategia.';
-    if(!confirm(prompt))return;
+    setNetworkDialog(null);
     setMsg(`Passaggio a ${label} in corso…`);
     try{
       const updated=await put<Me>('/trading-network',{network});
@@ -149,10 +155,24 @@ export default function Settings(){
       setKey('');
       setEquity(null);
       await load();
-      setMsg(`Rete operativa ${label} selezionata. Collega l’API Wallet ${label} per continuare.`);
+      setMsg(`Rete ${label} selezionata. Configura ora l’API Wallet ${label}.`);
     }catch(e){
+      await refreshNetworkState();
       setMsg(e instanceof Error?e.message:'Cambio rete non riuscito');
     }
+  };
+
+  const requestTradingNetworkSwitch=(network:TradingNetwork)=>{
+    if(!me||me.follower_network===network)return;
+    if(!me.network_switch_ready){
+      setNetworkDialog({target:network,kind:'blocked'});
+      return;
+    }
+    if(network==='mainnet'){
+      setNetworkDialog({target:network,kind:'confirm-mainnet'});
+      return;
+    }
+    void performTradingNetworkSwitch(network);
   };
 
   const link=async()=>{
@@ -248,7 +268,7 @@ export default function Settings(){
     }
   };
 
-  const canChangeNetwork=Boolean(me&&me.copy_state==='PAUSED'&&!me.trading_account);
+  const canChangeNetwork=Boolean(me?.network_switch_ready);
 
   return <>
     <div className="title">
@@ -270,14 +290,14 @@ export default function Settings(){
         {me&&<div className={`network-selector ${me.follower_network==='mainnet'?'mainnet':''}`}>
           <div className="network-selector-copy">
             <strong>Rete operativa Hyperliquid</strong>
-            <span>Scegli dove TRAXION deve gestire il tuo account. TESTNET usa fondi di prova; MAINNET usa fondi reali.</span>
+            <span>Passa da TESTNET a MAINNET e viceversa direttamente da qui. TRAXION controlla automaticamente quando il cambio è sicuro.</span>
           </div>
-          <div className="network-toggle" role="group" aria-label="Rete operativa Hyperliquid">
-            <button className={me.follower_network==='testnet'?'active testnet':''} aria-pressed={me.follower_network==='testnet'} disabled={me.follower_network==='testnet'||!canChangeNetwork} onClick={()=>void switchTradingNetwork('testnet')}>TESTNET</button>
-            <button className={me.follower_network==='mainnet'?'active mainnet':''} aria-pressed={me.follower_network==='mainnet'} disabled={me.follower_network==='mainnet'||!canChangeNetwork} onClick={()=>void switchTradingNetwork('mainnet')}>MAINNET</button>
+          <div className={`network-toggle ${canChangeNetwork?'ready':'locked'}`} role="group" aria-label="Rete operativa Hyperliquid">
+            <button className={`${me.follower_network==='testnet'?'active testnet':''} ${me.follower_network!=='testnet'&&!canChangeNetwork?'locked':''}`} aria-pressed={me.follower_network==='testnet'} aria-disabled={me.follower_network!=='testnet'&&!canChangeNetwork} disabled={me.follower_network==='testnet'} onClick={()=>requestTradingNetworkSwitch('testnet')}>TESTNET</button>
+            <button className={`${me.follower_network==='mainnet'?'active mainnet':''} ${me.follower_network!=='mainnet'&&!canChangeNetwork?'locked':''}`} aria-pressed={me.follower_network==='mainnet'} aria-disabled={me.follower_network!=='mainnet'&&!canChangeNetwork} disabled={me.follower_network==='mainnet'} onClick={()=>requestTradingNetworkSwitch('mainnet')}>MAINNET</button>
           </div>
-          <p className="network-help">Per cambiare rete: PAUSA → chiudi eventuali posizioni gestite → scollega l’API Wallet → scegli la nuova rete → collega l’API Wallet autorizzato sulla nuova rete.</p>
-          {me.follower_network==='mainnet'&&<div className="network-mainnet-warning"><strong>MAINNET selezionata</strong><span>Gli ordini utilizzano fondi reali. La selezione della rete non abilita da sola l’esecuzione live: Risk Engine e gate MAINNET della piattaforma restano obbligatori.</span></div>}
+          <p className="network-help">Il toggle si sblocca automaticamente quando la strategia è in PAUSA, le posizioni gestite sono chiuse, la coda è vuota e non esistono esecuzioni SUBMITTING/UNKNOWN. Al cambio rete TRAXION rimuove automaticamente la vecchia credenziale e mostra i campi dell’API Wallet della nuova rete.</p>
+          {me.follower_network==='mainnet'&&<div className="network-mainnet-warning"><strong>MAINNET selezionata</strong><span>Questa rete utilizza fondi reali. Configura esclusivamente un API Wallet Hyperliquid dedicato e revocabile.</span></div>}
         </div>}
 
         {me?.trading_account?<>
@@ -289,14 +309,20 @@ export default function Settings(){
             <dt>Scadenza</dt><dd>{me.trading_account.expires_at?new Date(me.trading_account.expires_at).toLocaleDateString():'—'}</dd>
           </dl>
           <p className="muted">La private key del wallet principale non viene mai richiesta da TRAXION.</p>
-          <button className="danger" onClick={async()=>{await del('/trading-account');await load();setMsg('API Wallet scollegato. Ora puoi cambiare rete se la strategia è in PAUSA.')}}>Scollega API Wallet</button>
+          <button className="danger" onClick={async()=>{await del('/trading-account');await load();setMsg('API Wallet scollegato.')}}>Scollega API Wallet</button>
         </>:<>
-          <dl><dt>Wallet / account operativo</dt><dd>{me?.auth_wallet||'Caricamento…'}</dd></dl>
-          <p className="muted">Questo indirizzo deriva dal wallet con cui hai effettuato l'accesso e non può essere sostituito con un altro account.</p>
-          <label>API Wallet Address · {me?.follower_network?.toUpperCase()}<input value={agent} onChange={e=>setAgent(e.target.value)} placeholder="0x…" autoComplete="off"/></label>
-          <label>API Wallet Private Key · {me?.follower_network?.toUpperCase()}<input type="password" autoComplete="off" value={key} onChange={e=>setKey(e.target.value)} placeholder="0x…"/></label>
-          <p className="muted">Inserisci indirizzo e private key dello stesso API Wallet Hyperliquid autorizzato sulla rete {me?.follower_network?.toUpperCase()}. TRAXION verifica che la chiave generi esattamente quell'indirizzo e che l'Agent sia autorizzato sul tuo account.</p>
-          <button className="primary" onClick={()=>void link()} disabled={!agent||!key}>Verifica e collega</button>
+          <div className={`network-credential-card ${me?.follower_network==='mainnet'?'mainnet':''}`}>
+            <div className="network-credential-title">
+              <strong>Configura API Wallet {me?.follower_network?.toUpperCase()}</strong>
+              <span>{me?.follower_network==='mainnet'?'Credenziale operativa per fondi reali.':'Credenziale operativa per l’ambiente di prova.'}</span>
+            </div>
+            <dl><dt>Wallet / account operativo</dt><dd>{me?.auth_wallet||'Caricamento…'}</dd></dl>
+            <p className="muted">Questo indirizzo deriva dal wallet con cui hai effettuato l'accesso e non può essere sostituito con un altro account.</p>
+            <label>API Wallet Address · {me?.follower_network?.toUpperCase()}<input value={agent} onChange={e=>setAgent(e.target.value)} placeholder="0x…" autoComplete="off"/></label>
+            <label>API Wallet Private Key · {me?.follower_network?.toUpperCase()}<input type="password" autoComplete="off" value={key} onChange={e=>setKey(e.target.value)} placeholder="0x…"/></label>
+            <p className="muted">Inserisci indirizzo e private key dello stesso API Wallet Hyperliquid autorizzato sulla rete {me?.follower_network?.toUpperCase()}. TRAXION verifica che la chiave generi esattamente quell'indirizzo e che l'Agent sia autorizzato sul tuo account.</p>
+            <button className="primary" onClick={()=>void link()} disabled={!agent||!key}>Verifica e collega</button>
+          </div>
         </>}
 
         <hr/>
@@ -355,8 +381,55 @@ export default function Settings(){
         </>}
       </section>
     </div>
+    {networkDialog&&me&&<NetworkSwitchDialog
+      me={me}
+      target={networkDialog.target}
+      kind={networkDialog.kind}
+      close={()=>setNetworkDialog(null)}
+      refreshState={()=>void refreshNetworkState()}
+      confirm={()=>void performTradingNetworkSwitch(networkDialog.target)}
+    />}
     {msg&&<div className="toast">{msg}</div>}
   </>;
+}
+
+function NetworkSwitchDialog({me,target,kind,close,refreshState,confirm}:{
+  me:Me;
+  target:TradingNetwork;
+  kind:'blocked'|'confirm-mainnet';
+  close:()=>void;
+  refreshState:()=>void;
+  confirm:()=>void;
+}){
+  const blocked=new Set(me.network_switch_blockers.map(x=>x.code));
+  const targetLabel=target.toUpperCase();
+  const requirements:[NetworkSwitchBlocker['code'],string][]=[
+    ['pause','Strategia in PAUSA'],
+    ['positions','Tutte le posizioni TRAXION chiuse'],
+    ['jobs','Nessun job QUEUED / PROCESSING / RETRYING'],
+    ['executions','Nessuna esecuzione SUBMITTING / UNKNOWN'],
+  ];
+  if(kind==='confirm-mainnet')return <div className="network-modal-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget)close()}}>
+    <div className="network-modal mainnet" role="dialog" aria-modal="true" aria-labelledby="network-mainnet-title">
+      <span className="network-modal-kicker">MAINNET</span>
+      <h3 id="network-mainnet-title">Attenzione, stai per passare alla MAINNET</h3>
+      <p>La MAINNET utilizza fondi reali. TRAXION rimuoverà automaticamente la credenziale {me.follower_network.toUpperCase()} attuale e, completato lo switch, mostrerà subito i campi per inserire <b>API Wallet Address</b> e <b>Private Key</b> della MAINNET.</p>
+      <p className="muted">La strategia resterà in PAUSA dopo il cambio rete finché non configuri il nuovo API Wallet e scegli di riattivarla.</p>
+      <div className="network-modal-actions"><button onClick={close}>Annulla</button><button className="primary" onClick={confirm}>Passa a MAINNET</button></div>
+    </div>
+  </div>;
+  return <div className="network-modal-backdrop" onMouseDown={e=>{if(e.target===e.currentTarget)close()}}>
+    <div className="network-modal" role="dialog" aria-modal="true" aria-labelledby="network-blocked-title">
+      <span className="network-modal-kicker">Cambio rete → {targetLabel}</span>
+      <h3 id="network-blocked-title">Completa prima questi passaggi</h3>
+      <p>Il toggle si sbloccherà automaticamente appena TRAXION rileva tutte le condizioni completate.</p>
+      <div className="network-requirements">{requirements.map(([code,label])=>{
+        const pending=blocked.has(code);
+        return <div key={code} className={`network-requirement ${pending?'pending':'done'}`}><span>{pending?'!':'✓'}</span><strong>{label}</strong></div>;
+      })}</div>
+      <div className="network-modal-actions"><button onClick={close}>Chiudi</button><button className="primary" onClick={refreshState}>Aggiorna stato</button></div>
+    </div>
+  </div>;
 }
 
 function BasicRisk({risk,equity,profile,markets,setProfile,setMarkets,apply,openPro}:{
