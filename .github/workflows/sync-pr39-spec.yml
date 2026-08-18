@@ -1,3 +1,4 @@
+# Temporary PR39 SPEC synchronizer; remove before merge.
 name: Sync PR39 SPEC
 
 on:
@@ -94,5 +95,9 @@ Dashboard, PnL, equity, diagnostica operativa, job pendenti ed esecuzioni ambigu
           PY
           git add SPEC.md
           git diff --check
+          if git diff --cached --quiet; then
+            echo 'SPEC already synchronized.'
+            exit 0
+          fi
           git commit -m "Align SPEC with per-user Hyperliquid network switching"
           git push origin HEAD:feature/per-user-hyperliquid-network
