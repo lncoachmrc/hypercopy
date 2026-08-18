@@ -177,11 +177,13 @@ API_PROXY_UPSTREAM=http://api.railway.internal:8080
 
 1. Creare un progetto **TRAXION** nel Reown Dashboard.
 2. Copiare il Project ID e inserirlo come `REOWN_PROJECT_ID` esclusivamente nel service Railway `frontend` dell'ambiente corrispondente.
-3. In **Allowed Origins**, aggiungere l'origin HTTPS reale di production, con protocollo e hostname esatti e senza path.
-4. Aggiungere separatamente l'origin HTTPS reale di staging.
-5. Non riutilizzare placeholder `example.com`: questa repository non contiene un dominio TRAXION reale verificabile.
+3. In **Allowed Origins**, registrare per staging l'origin verificato il 18 agosto 2026: `https://frontend-staging-9498.up.railway.app`.
+4. L'ambiente Railway `production` non espone ancora un frontend/domain attivo. Prima del primo deploy production, ricavare l'origin HTTPS effettivo del frontend e aggiungerlo separatamente agli Allowed Origins; non riutilizzare automaticamente l'origin staging.
+5. Non riutilizzare placeholder `example.com` né inventare domini production.
 6. Verificare che l'URL aperto nel browser, l'Allowed Origin e `metadata.url` coincidano esattamente per origin; il frontend imposta `metadata.url = window.location.origin`.
 7. Ripetere la verifica per eventuali sottodomini distinti: ogni origin effettivamente usato deve essere autorizzato nel Dashboard Reown.
+
+Stato Railway verificato il 18 agosto 2026: il frontend staging è online su `https://frontend-staging-9498.up.railway.app`, mentre `REOWN_PROJECT_ID` non è ancora presente nelle sue variabili. Configurarlo prima dei test wallet mobile. L'ambiente `production` non ha ancora un frontend attivo e quindi non dispone di un origin production da autorizzare.
 
 Reown viene usato solo per connessione wallet e firma EVM. Challenge, verifica firma, sessione HttpOnly, CSRF e logout restano nel backend TRAXION. Non configurare Reown Authentication, SIWE/SIWX, email/social login, embedded wallet o smart account.
 
@@ -283,7 +285,7 @@ Consigliato prima della produzione:
 - `ENABLE_LIVE_TRADING=false`
 - Stripe test mode
 - shadow mode default
-- Reown Allowed Origin dello staging configurato
+- Reown Allowed Origin staging `https://frontend-staging-9498.up.railway.app` configurato
 - `REOWN_PROJECT_ID` impostato soltanto sul frontend
 - Safari iPhone: MetaMask e Rabby via AppKit/WalletConnect
 - Chrome Android: almeno un wallet EVM via AppKit/WalletConnect
