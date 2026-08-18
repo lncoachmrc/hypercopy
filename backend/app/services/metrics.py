@@ -36,6 +36,7 @@ async def pnl_history_for_user(db: AsyncSession, user_id, range_key: str = '1d')
     query = select(
         bucket.label('bucket'),
         func.min(Fill.ts).label('at'),
+        func.max(Fill.ts).label('last_at'),
         func.coalesce(func.sum(net_pnl), 0).label('net'),
     ).where(Fill.user_id == user_id)
     if start is not None:
@@ -93,6 +94,7 @@ async def pnl_history_for_user(db: AsyncSession, user_id, range_key: str = '1d')
         'pnl_pct': pnl_pct,
         'start_equity': start_equity,
         'current_equity': float(latest_equity.account_value) if latest_equity else None,
+        'last_realized_at': rows[-1].last_at.isoformat() if rows else None,
         'points': points,
         'source': 'realized_net',
     }
@@ -133,6 +135,12 @@ async def dashboard_for_user(db: AsyncSession, user_id) -> dict:
     positions = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user_id))).scalars().all()
     return {
         'equity': float(latest.account_value) if latest else None,
+        'collateral_balance': float(latest.collateral_balance) if latest else None,
+        'unrealized_pnl': float(latest.unrealized_pnl) if latest else None,
+        'free_margin': float(latest.free_margin) if latest else None,
+        'account_mode': latest.account_mode if latest else None,
+        'snapshot_at': latest.taken_at.isoformat() if latest else None,
+        'snapshot_age_seconds': max((datetime.now(UTC) - latest.taken_at).total_seconds(), 0) if latest else None,
         'pnl_absolute': pnl,
         'max_drawdown_pct': max_dd,
         'sharpe': sharpe,

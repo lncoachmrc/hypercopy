@@ -285,6 +285,9 @@ class EquitySnapshot(BaseUuid, Base):
     account_value: Mapped[Decimal] = mapped_column(D, nullable=False)
     free_margin: Mapped[Decimal] = mapped_column(D, default=Decimal(0))
     unmanaged_margin: Mapped[Decimal] = mapped_column(D, default=Decimal(0))
+    collateral_balance: Mapped[Decimal] = mapped_column(D, default=Decimal(0))
+    unrealized_pnl: Mapped[Decimal] = mapped_column(D, default=Decimal(0))
+    account_mode: Mapped[str] = mapped_column(String(32), default='unknown')
     __table_args__ = (UniqueConstraint('user_id', 'taken_at', name='uq_equity_user_taken'), Index('ix_equity_user_taken', 'user_id', 'taken_at'))
 
 

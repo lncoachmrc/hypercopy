@@ -325,7 +325,16 @@ async def reconcile_user(
                 context=context,
             ))
 
-        db.add(EquitySnapshot(user_id=user.id, account_value=equity, free_margin=free_margin, unmanaged_margin=unmanaged_margin, taken_at=datetime.now(UTC)))
+        db.add(EquitySnapshot(
+            user_id=user.id,
+            account_value=equity,
+            free_margin=free_margin,
+            unmanaged_margin=unmanaged_margin,
+            collateral_balance=snapshot.collateral_balance,
+            unrealized_pnl=snapshot.unrealized_pnl,
+            account_mode=account_mode,
+            taken_at=datetime.now(UTC),
+        ))
 
         run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs}; run.finished_at = datetime.now(UTC)
         await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs})
