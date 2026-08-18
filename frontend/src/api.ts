@@ -3,7 +3,7 @@ export type Session = { user: SessionUser; entitlements: Record<string,unknown>;
 
 const cfg = () => window.__HYPERCOPY_CONFIG__ ?? {};
 
-// Security/session invariant: deployed HyperCopy browser traffic must stay on
+// Security/session invariant: deployed TRAXION browser traffic must stay on
 // the frontend origin and reach the API through Nginx /api/v1. This prevents
 // stale absolute Railway URLs from reintroducing cross-site cookie problems.
 const isLocalDev = () => ['localhost','127.0.0.1','::1'].includes(location.hostname);
@@ -41,7 +41,7 @@ export async function api<T>(path:string, init:RequestInit={}, timeoutMs=API_TIM
   try {
     res=await fetch(`${base()}${path}`,{...init,headers,credentials:'include',signal:controller.signal});
   } catch (e) {
-    if (controller.signal.aborted) throw new ApiError(0,`Il server HyperCopy non ha risposto entro ${Math.round(timeoutMs/1000)} secondi. Riprova o verifica lo stato dei servizi.`,'API_TIMEOUT');
+    if (controller.signal.aborted) throw new ApiError(0,`Il server TRAXION non ha risposto entro ${Math.round(timeoutMs/1000)} secondi. Riprova o verifica lo stato dei servizi.`,'API_TIMEOUT');
     throw e;
   } finally {
     window.clearTimeout(timer);
