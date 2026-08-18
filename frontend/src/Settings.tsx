@@ -3,13 +3,15 @@ import {ACTIVATION_TIMEOUT_MS,del,get,post,put} from './api';
 import {useAuth} from './auth';
 import './settings-state.css';
 
+type TradingNetwork='testnet'|'mainnet';
 type Me={
   auth_wallet:string;
   role:string;
   copy_state:string;
   risk_state:string;
   master_network:string;
-  follower_network:string;
+  follower_network:TradingNetwork;
+  network_started_at:string;
   trading_account:null|{
     account_address:string;
     network:string;
@@ -124,12 +126,41 @@ export default function Settings(){
     localStorage.setItem('hypercopy:risk-mode',mode);
   };
 
+  const switchTradingNetwork=async(network:TradingNetwork)=>{
+    if(!me||me.follower_network===network)return;
+    if(me.copy_state!=='PAUSED'){
+      setMsg('Per cambiare rete, metti prima la strategia in PAUSA.');
+      return;
+    }
+    if(me.trading_account){
+      setMsg('Per cambiare rete, scollega prima l’API Wallet della rete attuale.');
+      return;
+    }
+    const label=network.toUpperCase();
+    const prompt=network==='mainnet'
+      ?'Passare a MAINNET? La MAINNET utilizza fondi reali. La selezione della rete non attiva la strategia: dovrai collegare un API Wallet autorizzato per MAINNET e l’esecuzione resterà soggetta ai gate di sicurezza TRAXION.'
+      :'Tornare a TESTNET? Dovrai collegare un API Wallet autorizzato per TESTNET prima di riattivare la strategia.';
+    if(!confirm(prompt))return;
+    setMsg(`Passaggio a ${label} in corso…`);
+    try{
+      const updated=await put<Me>('/trading-network',{network});
+      setMe(updated);
+      setAgent('');
+      setKey('');
+      setEquity(null);
+      await load();
+      setMsg(`Rete operativa ${label} selezionata. Collega l’API Wallet ${label} per continuare.`);
+    }catch(e){
+      setMsg(e instanceof Error?e.message:'Cambio rete non riuscito');
+    }
+  };
+
   const link=async()=>{
-    setMsg('Verifica API Wallet…');
+    setMsg(`Verifica API Wallet ${me?.follower_network?.toUpperCase()||''}…`);
     try{
       await post('/trading-account',{agent_address:agent,agent_private_key:key});
       setKey('');
-      setMsg('API Wallet verificato e chiave cifrata.');
+      setMsg(`API Wallet ${me?.follower_network?.toUpperCase()||''} verificato e chiave cifrata.`);
       await load();
     }catch(e){
       setMsg(e instanceof Error?e.message:'Errore');
@@ -205,7 +236,7 @@ export default function Settings(){
 
   const activate=async()=>{
     const network=me?.follower_network?.toUpperCase()||'';
-    if(!confirm(`Attivare il trading automatizzato della strategia ibrida sulla rete ${network}?`))return;
+    if(!confirm(`Attivare il trading automatizzato della strategia ibrida sulla rete ${network}?${network==='MAINNET'?' Verranno utilizzati fondi reali.':''}`))return;
     setMsg(`Attivazione ${network} in corso…`);
     try{
       await post('/copy/resume',undefined,ACTIVATION_TIMEOUT_MS);
@@ -216,6 +247,8 @@ export default function Settings(){
       setMsg(e instanceof Error?e.message:'Errore attivazione');
     }
   };
+
+  const canChangeNetwork=Boolean(me&&me.copy_state==='PAUSED'&&!me.trading_account);
 
   return <>
     <div className="title">
@@ -234,6 +267,19 @@ export default function Settings(){
           <dt>Modalità operativa</dt><dd>{me.copy_state}</dd>
         </dl>}
 
+        {me&&<div className={`network-selector ${me.follower_network==='mainnet'?'mainnet':''}`}>
+          <div className="network-selector-copy">
+            <strong>Rete operativa Hyperliquid</strong>
+            <span>Scegli dove TRAXION deve gestire il tuo account. TESTNET usa fondi di prova; MAINNET usa fondi reali.</span>
+          </div>
+          <div className="network-toggle" role="group" aria-label="Rete operativa Hyperliquid">
+            <button className={me.follower_network==='testnet'?'active testnet':''} aria-pressed={me.follower_network==='testnet'} disabled={me.follower_network==='testnet'||!canChangeNetwork} onClick={()=>void switchTradingNetwork('testnet')}>TESTNET</button>
+            <button className={me.follower_network==='mainnet'?'active mainnet':''} aria-pressed={me.follower_network==='mainnet'} disabled={me.follower_network==='mainnet'||!canChangeNetwork} onClick={()=>void switchTradingNetwork('mainnet')}>MAINNET</button>
+          </div>
+          <p className="network-help">Per cambiare rete: PAUSA → chiudi eventuali posizioni gestite → scollega l’API Wallet → scegli la nuova rete → collega l’API Wallet autorizzato sulla nuova rete.</p>
+          {me.follower_network==='mainnet'&&<div className="network-mainnet-warning"><strong>MAINNET selezionata</strong><span>Gli ordini utilizzano fondi reali. La selezione della rete non abilita da sola l’esecuzione live: Risk Engine e gate MAINNET della piattaforma restano obbligatori.</span></div>}
+        </div>}
+
         {me?.trading_account?<>
           <dl>
             <dt>Wallet / account operativo</dt><dd>{me.trading_account.account_address}</dd>
@@ -243,13 +289,13 @@ export default function Settings(){
             <dt>Scadenza</dt><dd>{me.trading_account.expires_at?new Date(me.trading_account.expires_at).toLocaleDateString():'—'}</dd>
           </dl>
           <p className="muted">La private key del wallet principale non viene mai richiesta da TRAXION.</p>
-          <button className="danger" onClick={async()=>{await del('/trading-account');await load()}}>Scollega API Wallet</button>
+          <button className="danger" onClick={async()=>{await del('/trading-account');await load();setMsg('API Wallet scollegato. Ora puoi cambiare rete se la strategia è in PAUSA.')}}>Scollega API Wallet</button>
         </>:<>
           <dl><dt>Wallet / account operativo</dt><dd>{me?.auth_wallet||'Caricamento…'}</dd></dl>
           <p className="muted">Questo indirizzo deriva dal wallet con cui hai effettuato l'accesso e non può essere sostituito con un altro account.</p>
-          <label>API Wallet Address<input value={agent} onChange={e=>setAgent(e.target.value)} placeholder="0x…" autoComplete="off"/></label>
-          <label>API Wallet Private Key<input type="password" autoComplete="off" value={key} onChange={e=>setKey(e.target.value)} placeholder="0x…"/></label>
-          <p className="muted">Inserisci l'indirizzo e la private key dello stesso API Wallet Hyperliquid. TRAXION controllerà che la chiave generi esattamente quell'indirizzo e che l'Agent sia autorizzato sul tuo account.</p>
+          <label>API Wallet Address · {me?.follower_network?.toUpperCase()}<input value={agent} onChange={e=>setAgent(e.target.value)} placeholder="0x…" autoComplete="off"/></label>
+          <label>API Wallet Private Key · {me?.follower_network?.toUpperCase()}<input type="password" autoComplete="off" value={key} onChange={e=>setKey(e.target.value)} placeholder="0x…"/></label>
+          <p className="muted">Inserisci indirizzo e private key dello stesso API Wallet Hyperliquid autorizzato sulla rete {me?.follower_network?.toUpperCase()}. TRAXION verifica che la chiave generi esattamente quell'indirizzo e che l'Agent sia autorizzato sul tuo account.</p>
           <button className="primary" onClick={()=>void link()} disabled={!agent||!key}>Verifica e collega</button>
         </>}
 
@@ -260,7 +306,7 @@ export default function Settings(){
           <button className={`state-button state-button--active ${me?.copy_state==='ACTIVE'?'active':''}`} aria-pressed={me?.copy_state==='ACTIVE'} onClick={()=>void activate()} disabled={!me?.trading_account||me?.copy_state==='ACTIVE'}>Attiva strategia</button>
           <button className="danger" onClick={async()=>{if(confirm('Generare ordini reduce-only per chiudere tutte le posizioni gestite?')){await post('/copy/close-positions',{confirmation:'CLOSE',reason:'User requested close all'});setMsg('Chiusure accodate.')}}}>Chiudi posizioni</button>
         </div>
-        <p className="muted">SHADOW calcola target, sizing e controlli senza inviare ordini. “Attiva strategia” abilita l'esecuzione automatizzata sul tuo account operativo.</p>
+        <p className="muted">SHADOW calcola target, sizing e controlli senza inviare ordini. “Attiva strategia” abilita l'esecuzione automatizzata sulla rete operativa selezionata.</p>
       </section>
 
       <section className="panel risk-panel">
