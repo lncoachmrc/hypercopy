@@ -10,6 +10,7 @@ Questa è la procedura operativa completa per portare il monorepo da `git clone`
 - Wallet master Hyperliquid: **serve solo l'indirizzo pubblico**.
 - Per ogni follower: account Hyperliquid + agent/API wallet nominato `hypercopy`.
 - Per mainnet production: KMS esterno. Questa repo implementa `aws_kms`; è l'unica dipendenza infrastrutturale esterna prevista per la custodia avanzata della KEK.
+- Progetto Reown AppKit per il collegamento dei wallet self-custodial. Il Project ID è pubblico e resta configurato per ambiente.
 
 ## 2. Branch / CI
 
@@ -69,21 +70,21 @@ REDIS_URL=${{Redis.REDIS_URL}}
 
 Non usare `DATABASE_PUBLIC_URL`, host/porta/password hardcoded o credenziali nel repository.
 
-Il flusso di rete è:
+Il browser usa sempre il dominio del frontend. Nginx inoltra `/api/v1` e WebSocket all'API via Railway Private Network, preservando cookie SameSite/HttpOnly e CSRF same-origin.
 
 ```text
 Internet
-  ├─ frontend
-  └─ api
+  └─ frontend (Nginx)
        └─ Railway Private Network
-          ├─ Postgres
-          └─ Redis
+          └─ api
+              ├─ Postgres
+              └─ Redis
 
 master-watcher ──private──> Postgres/Redis ──outbound──> Hyperliquid
 execution-worker ─private─> Postgres/Redis ──outbound──> Hyperliquid
 ```
 
-Frontend non necessita accesso alla private network: è statico e chiama l'API via HTTPS/WSS pubblico.
+L'API può mantenere un dominio pubblico per webhook/health operativi previsti dall'architettura, ma il browser TRAXION non deve usarlo per autenticazione o sessione.
 
 ## 7. Variabili comuni backend
 
@@ -159,31 +160,55 @@ Separare i principal:
 
 Le credenziali AWS necessarie al singolo service sono Railway Variables di quel service, non Shared Variables e non GitHub secrets.
 
-## 9. Variabili frontend
+## 9. Variabili frontend e Reown AppKit
 
-Sul service `frontend`:
+Sul solo service Railway `frontend` impostare:
 
 ```text
-API_BASE_URL=https://api.example.com/api/v1
-WS_URL=wss://api.example.com/api/v1/ws/events
+REOWN_PROJECT_ID=<Project ID del progetto TRAXION in Reown Dashboard>
+API_PROXY_UPSTREAM=http://api.railway.internal:8080
 ```
 
-Sono configurazioni pubbliche, generate a runtime in `/config.js`; non sono secret build-time.
+`REOWN_PROJECT_ID` è un identificatore frontend pubblico, non una chiave privata. Viene scritto a runtime in `/config.js`: può quindi essere diverso tra staging e production senza ricompilare il bundle. Se manca, la pagina login resta operativa e mostra un errore di configurazione controllato senza inizializzare AppKit.
+
+`API_BASE_URL` e `WS_URL` restano disponibili per lo sviluppo locale; in staging/production il browser usa `/api/v1` same-origin e Nginx inoltra il traffico all'upstream privato.
+
+### Reown Dashboard — checklist TRAXION
+
+1. Creare un progetto **TRAXION** nel Reown Dashboard.
+2. Copiare il Project ID e inserirlo come `REOWN_PROJECT_ID` esclusivamente nel service Railway `frontend` dell'ambiente corrispondente.
+3. In **Allowed Origins**, aggiungere l'origin HTTPS reale di production, con protocollo e hostname esatti e senza path.
+4. Aggiungere separatamente l'origin HTTPS reale di staging.
+5. Non riutilizzare placeholder `example.com`: questa repository non contiene un dominio TRAXION reale verificabile.
+6. Verificare che l'URL aperto nel browser, l'Allowed Origin e `metadata.url` coincidano esattamente per origin; il frontend imposta `metadata.url = window.location.origin`.
+7. Ripetere la verifica per eventuali sottodomini distinti: ogni origin effettivamente usato deve essere autorizzato nel Dashboard Reown.
+
+Reown viene usato solo per connessione wallet e firma EVM. Challenge, verifica firma, sessione HttpOnly, CSRF e logout restano nel backend TRAXION. Non configurare Reown Authentication, SIWE/SIWX, email/social login, embedded wallet o smart account.
+
+### CSP AppKit
+
+`frontend/nginx.conf` mantiene `script-src 'self'`, `frame-ancestors 'none'`, `object-src 'none'` e `base-uri 'self'` e aggiunge solo le origini necessarie al flusso wallet:
+
+| Origine | Direttiva | Funzione |
+|---|---|---|
+| `rpc.walletconnect.com/.org` | `connect-src` | RPC EVM usato da AppKit |
+| `relay.walletconnect.com/.org` | `connect-src` HTTPS/WSS | relay WalletConnect |
+| `api.web3modal.com/.org` | `connect-src`, `img-src` | catalogo e asset wallet AppKit |
+| `keys.walletconnect.com/.org` | `connect-src` | chiavi/Verify WalletConnect |
+| `verify.walletconnect.com/.org`, `secure.walletconnect.com/.org` | `frame-src` | WalletConnect Verify |
+| `fonts.reown.com` | `font-src` | font AppKit |
+| `cca-lite.coinbase.com`, `wss://www.walletlink.org` | `connect-src` | connettore Coinbase EOA |
+
+Analytics, notifiche, on-ramp e swap sono disabilitati e le relative origini non vengono autorizzate. In staging controllare la console CSP durante MetaMask, Rabby, WalletConnect e Coinbase; ogni nuova origine deve essere documentata qui con la sua funzione prima di entrare in production. Non aggiungere wildcard, `unsafe-eval` o `unsafe-inline` per risolvere errori CSP.
 
 ## 10. Domains
 
 Assegnare domini pubblici solo a:
 
-- `frontend`: `app.example.com`
-- `api`: `api.example.com`
+- `frontend`: dominio applicativo reale
+- `api`: dominio API reale, se richiesto per webhook/health esterni
 
-Usare la stessa registrable domain per garantire il comportamento SameSite previsto dalle sessioni. Configurare Stripe webhook verso:
-
-```text
-https://api.example.com/api/v1/webhooks/stripe
-```
-
-Non assegnare public domain a watcher, worker, Postgres o Redis.
+Usare la stessa registrable domain quando possibile. Il login browser resta comunque same-origin attraverso Nginx. Configurare Stripe webhook sull'endpoint API pubblico effettivo.
 
 ## 11. Migrazioni Alembic
 
@@ -258,6 +283,13 @@ Consigliato prima della produzione:
 - `ENABLE_LIVE_TRADING=false`
 - Stripe test mode
 - shadow mode default
+- Reown Allowed Origin dello staging configurato
+- `REOWN_PROJECT_ID` impostato soltanto sul frontend
+- Safari iPhone: MetaMask e Rabby via AppKit/WalletConnect
+- Chrome Android: almeno un wallet EVM via AppKit/WalletConnect
+- Desktop: injected/EIP-6963 e WalletConnect
+- firma rifiutata, modal chiuso, cambio account e offline verificati
+- console browser senza violazioni CSP inattese
 
 Promuovere in production solo dopo P1/P2. Mainnet execute richiede P3.
 
@@ -319,10 +351,16 @@ Non fare downgrade distruttivo mentre vecchio/nuovo deployment possono coesister
 [ ] Root Directory impostate
 [ ] Config File assoluti impostati
 [ ] reference variables DB/Redis impostate
+[ ] REOWN_PROJECT_ID impostato soltanto sul frontend
+[ ] Reown Allowed Origins production/staging verificati
 [ ] domini solo frontend/api
 [ ] Stripe webhook firmato configurato
 [ ] KMS privilege separation configurata
 [ ] staging testnet deploy verde
+[ ] login Safari iPhone verificato con wallet self-custodial
+[ ] login Chrome Android verificato
+[ ] login desktop injected + WalletConnect verificato
+[ ] console CSP pulita durante il login wallet
 [ ] Alembic head = codice atteso
 [ ] /health/live e /health/ready verdi
 [ ] watcher lease presente
