@@ -13,8 +13,14 @@ rm -rf "${output_dir}"
 
 cd "${project_root}"
 GITHUB_PAGES=true \
-NEXT_PUBLIC_BASE_PATH=/hypercopy \
-NEXT_PUBLIC_TRAXION_CANONICAL_URL=https://lncoachmrc.github.io/hypercopy/ \
+NEXT_PUBLIC_TRAXION_CANONICAL_URL=https://traxion.lucianonovello.com/ \
   ./node_modules/.bin/next build
 
 test -f "${output_dir}/index.html"
+
+if grep -qE '(href|src)="/hypercopy/' "${output_dir}/index.html"; then
+  echo "The custom-domain build still contains the legacy /hypercopy asset prefix." >&2
+  exit 65
+fi
+
+grep -q 'https://traxion.lucianonovello.com/' "${output_dir}/index.html"
