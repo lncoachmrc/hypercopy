@@ -96,16 +96,17 @@ class Worker:
             master_state=await self.master_hl.user_state(settings.HYPERLIQUID_MASTER_ADDRESS)
             master_configs=position_configs(master_state)
             follower_mids=master_mids if settings.master_network == network else await follower_hl.mids()
-            await reconcile_user(
+            result=await reconcile_user(
                 db,follower_hl,user,
                 master_positions=mp,master_equity=me,mids=follower_mids,master_mids=master_mids,
                 master_configs=master_configs,
             )
-            await repair_stream(self.redis,db)
+            published=await repair_stream(self.redis,db)
+            return result,published
 
         timeout=max(min(settings.JOB_LEASE_SECONDS - 10, 90), 30)
         try:
-            await asyncio.wait_for(operation(), timeout=timeout)
+            result,published=await asyncio.wait_for(operation(), timeout=timeout)
         except asyncio.TimeoutError:
             return await _retry_admin_job(db, job.id, f'ADMIN_RECONCILE timed out after {timeout}s')
         except Exception as exc:
@@ -113,6 +114,12 @@ class Worker:
             return await _retry_admin_job(db, job.id, f'{type(exc).__name__}: {exc}')
 
         await db.refresh(job)
+        job.context={
+            **(job.context or {}),
+            'result': result,
+            'stream_published': published,
+            'completed_at': datetime.now(UTC).isoformat(),
+        }
         job.state=JobState.DONE
         job.last_error=None
         job.owner=None
