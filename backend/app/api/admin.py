@@ -18,7 +18,7 @@ from app.core.logging import get_logger
 from app.db.redis import redis_client
 from app.db.session import get_db
 from app.models.entities import (
-    AuditLog, CopyJob, CopyState, CredentialStatus, RiskHalt, RiskProfile,
+    AuditLog, CopyJob, CopyState, CredentialStatus, JobState, RiskHalt, RiskProfile,
     RiskState, Role, SigningCredential, SystemFlag, TradingAccount, User,
 )
 from app.schemas.admin import AdminAction, AdminReconcile
@@ -344,11 +344,37 @@ async def queue_reconcile(user_id: uuid.UUID, body: AdminReconcile, actor: User 
     target = await db.get(User, user_id)
     if not target:
         raise HTTPException(404, 'User not found')
+
+    existing = (await db.execute(
+        select(CopyJob).where(
+            CopyJob.user_id == target.id,
+            CopyJob.origin == 'ADMIN_RECONCILE',
+            CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),
+        ).order_by(CopyJob.created_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    if existing:
+        await audit(
+            db,
+            action='ADMIN_RECONCILE_REUSED',
+            actor_id=actor.id,
+            subject_id=target.id,
+            reason=body.reason,
+            after={'job_id': str(existing.id), 'state': existing.state.value},
+        )
+        await db.commit()
+        return {
+            'queued': True,
+            'job_id': str(existing.id),
+            'state': existing.state.value,
+            'stream_published': existing.enqueued_at is not None,
+            'reused': True,
+        }
+
     job = CopyJob(
         user_id=target.id,
         asset='__RECONCILE__',
         origin='ADMIN_RECONCILE',
-        state='QUEUED',
+        state=JobState.QUEUED,
         correlation_id=uuid.uuid4().hex,
         context={'reason': body.reason},
     )
@@ -383,7 +409,30 @@ async def queue_reconcile(user_id: uuid.UUID, body: AdminReconcile, actor: User 
         'job_id': str(job.id),
         'state': job.state.value,
         'stream_published': published,
+        'reused': False,
     }
+
+
+def _reconcile_job_payload(job: CopyJob) -> dict:
+    context = job.context or {}
+    return {
+        'job_id': str(job.id),
+        'state': job.state.value,
+        'last_error': job.last_error,
+        'attempt_count': job.attempt_count,
+        'next_attempt_at': job.next_attempt_at,
+        'result': context.get('result'),
+        'stream_published': int(context.get('stream_published') or 0),
+        'completed_at': context.get('completed_at'),
+    }
+
+
+@router.get('/users/{user_id}/reconcile/{job_id}')
+async def reconcile_status(user_id: uuid.UUID, job_id: uuid.UUID, actor: User = Depends(admin), db: AsyncSession = Depends(get_db)):
+    job = await db.get(CopyJob, job_id)
+    if not job or job.user_id != user_id or job.origin != 'ADMIN_RECONCILE':
+        raise HTTPException(404, 'Reconciliation job not found')
+    return _reconcile_job_payload(job)
 
 
 async def _flag(db: AsyncSession, slug: str, enabled: bool, actor: User, reason: str):
