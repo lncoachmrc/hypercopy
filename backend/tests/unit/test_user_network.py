@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+from app.api.user import _network_switch_blockers
 from app.core.config import settings
 from app.schemas.user import TradingNetworkIn
 from app.services.execution import live_trading_allowed
@@ -22,6 +23,26 @@ def test_trading_network_accepts_only_supported_networks():
     assert TradingNetworkIn(network='mainnet').network == 'mainnet'
     with pytest.raises(ValidationError):
         TradingNetworkIn(network='devnet')
+
+
+def test_network_toggle_unlocks_when_operational_state_is_clean():
+    assert _network_switch_blockers(
+        copy_state='PAUSED',
+        has_open_managed=False,
+        has_pending_jobs=False,
+        has_unresolved_execution=False,
+    ) == []
+
+
+def test_network_toggle_reports_only_real_operational_blockers():
+    blockers = _network_switch_blockers(
+        copy_state='ACTIVE',
+        has_open_managed=True,
+        has_pending_jobs=True,
+        has_unresolved_execution=True,
+    )
+    assert [item['code'] for item in blockers] == ['pause', 'positions', 'jobs', 'executions']
+    assert 'api_wallet' not in [item['code'] for item in blockers]
 
 
 @pytest.mark.asyncio
