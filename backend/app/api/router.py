@@ -6,8 +6,9 @@ from app.api.deps import api_rate_limit
 api_router = APIRouter(prefix='/api/v1')
 http_router = APIRouter(dependencies=[Depends(api_rate_limit)])
 http_router.include_router(auth.router)
-# The activation router must precede user.router because it intentionally
-# overrides the legacy /copy/resume handler during TESTNET validation.
+# The activation router precedes user.router because it is the hardened
+# implementation of /copy/resume: it preflights the selected user network,
+# reconciles before execution and preserves the independent MAINNET gates.
 http_router.include_router(activation.router)
 http_router.include_router(user.router)
 http_router.include_router(leverage.router)
