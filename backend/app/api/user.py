@@ -42,6 +42,44 @@ def _master_hl() -> HyperliquidAdapter:
     return HyperliquidAdapter(_limiter(), network=settings.master_network)
 
 
+def _network_switch_blockers(*, copy_state: str, has_open_managed: bool, has_pending_jobs: bool, has_unresolved_execution: bool) -> list[dict[str, str]]:
+    blockers: list[dict[str, str]] = []
+    if copy_state != CopyState.PAUSED.value:
+        blockers.append({'code': 'pause', 'message': 'Metti la strategia in PAUSA.'})
+    if has_open_managed:
+        blockers.append({'code': 'positions', 'message': 'Chiudi tutte le posizioni gestite da TRAXION.'})
+    if has_pending_jobs:
+        blockers.append({'code': 'jobs', 'message': 'Attendi che non ci siano job QUEUED, PROCESSING o RETRYING.'})
+    if has_unresolved_execution:
+        blockers.append({'code': 'executions', 'message': 'Attendi la risoluzione delle esecuzioni SUBMITTING o UNKNOWN.'})
+    return blockers
+
+
+async def _network_switch_status(db: AsyncSession, user: User, started_at: datetime) -> dict:
+    open_managed = (await db.execute(select(PositionLedger.id).where(
+        PositionLedger.user_id == user.id,
+        PositionLedger.managed.is_(True),
+        PositionLedger.size != 0,
+    ).limit(1))).scalar_one_or_none()
+    pending = (await db.execute(select(CopyJob.id).where(
+        CopyJob.user_id == user.id,
+        CopyJob.created_at >= started_at,
+        CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),
+    ).limit(1))).scalar_one_or_none()
+    unresolved = (await db.execute(select(Execution.id).where(
+        Execution.user_id == user.id,
+        Execution.created_at >= started_at,
+        Execution.state.in_([ExecutionState.SUBMITTING, ExecutionState.UNKNOWN]),
+    ).limit(1))).scalar_one_or_none()
+    blockers = _network_switch_blockers(
+        copy_state=user.copy_state.value,
+        has_open_managed=bool(open_managed),
+        has_pending_jobs=bool(pending),
+        has_unresolved_execution=bool(unresolved),
+    )
+    return {'ready': not blockers, 'blockers': blockers}
+
+
 async def _serialize_user(db: AsyncSession, user: User) -> dict:
     network_state = await user_network_state(db, user.id)
     account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
@@ -49,6 +87,7 @@ async def _serialize_user(db: AsyncSession, user: User) -> dict:
     if account:
         cred = (await db.execute(select(SigningCredential).where(SigningCredential.trading_account_id == account.id))).scalar_one_or_none()
     rs = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
+    switch_status = await _network_switch_status(db, user, network_state.started_at)
     return {
         'id': str(user.id), 'auth_wallet': user.auth_wallet, 'role': user.role.value, 'state': user.state.value,
         'copy_state': user.copy_state.value, 'manual_trade_policy': user.manual_trade_policy.value,
@@ -57,6 +96,8 @@ async def _serialize_user(db: AsyncSession, user: User) -> dict:
         'master_network': settings.master_network,
         'follower_network': network_state.network,
         'network_started_at': network_state.started_at,
+        'network_switch_ready': switch_status['ready'],
+        'network_switch_blockers': switch_status['blockers'],
         'trading_account': None if not account else {
             'account_address': account.account_address,
             'network': network_state.network,
@@ -80,34 +121,20 @@ async def trading_network(body: TradingNetworkIn, user: User = Depends(current_u
     network: Network = body.network
     if network == current.network:
         return await _serialize_user(db, user)
-    if user.copy_state != CopyState.PAUSED:
-        raise HTTPException(409, 'Metti in pausa la strategia prima di cambiare rete Hyperliquid')
 
-    account = (await db.execute(select(TradingAccount.id).where(TradingAccount.user_id == user.id).limit(1))).scalar_one_or_none()
+    status = await _network_switch_status(db, user, current.started_at)
+    if not status['ready']:
+        instructions = ' '.join(item['message'] for item in status['blockers'])
+        raise HTTPException(409, f'Rete non ancora pronta al cambio. {instructions}')
+
+    # The credential belongs to the old network. Once the operational state is
+    # clean, remove it automatically so the user can switch with a single action
+    # and immediately configure the API Wallet for the new network.
+    account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
+    removed_agent = bool(account)
     if account:
-        raise HTTPException(409, 'Scollega prima l’API Wallet della rete attuale')
-
-    pending = (await db.execute(select(CopyJob.id).where(
-        CopyJob.user_id == user.id,
-        CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),
-    ).limit(1))).scalar_one_or_none()
-    if pending:
-        raise HTTPException(409, 'Attendi che la coda operativa sia vuota prima di cambiare rete')
-
-    unresolved = (await db.execute(select(Execution.id).where(
-        Execution.user_id == user.id,
-        Execution.state.in_([ExecutionState.SUBMITTING, ExecutionState.UNKNOWN]),
-    ).limit(1))).scalar_one_or_none()
-    if unresolved:
-        raise HTTPException(409, 'Esiste ancora un’esecuzione non risolta; completa la riconciliazione prima di cambiare rete')
-
-    open_managed = (await db.execute(select(PositionLedger.id).where(
-        PositionLedger.user_id == user.id,
-        PositionLedger.managed.is_(True),
-        PositionLedger.size != 0,
-    ).limit(1))).scalar_one_or_none()
-    if open_managed:
-        raise HTTPException(409, 'Chiudi tutte le posizioni gestite prima di cambiare rete')
+        await db.delete(account)
+        await db.flush()
 
     # Position ledger and automatic risk-state peaks are network-scoped derived
     # state. Reset them at the network boundary while preserving immutable
@@ -124,7 +151,11 @@ async def trading_network(body: TradingNetworkIn, user: User = Depends(current_u
         actor_id=user.id,
         subject_id=user.id,
         before={'network': current.network, 'started_at': current.started_at.isoformat()},
-        after={'network': next_state.network, 'started_at': next_state.started_at.isoformat()},
+        after={
+            'network': next_state.network,
+            'started_at': next_state.started_at.isoformat(),
+            'previous_api_wallet_removed': removed_agent,
+        },
     )
     await db.commit()
     return await _serialize_user(db, user)
@@ -216,8 +247,8 @@ async def executions(user: User = Depends(current_user), db: AsyncSession = Depe
 @router.post('/trading-account', dependencies=[Depends(require_csrf)])
 async def link_trading_account(body: TradingAccountIn, request: Request, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     network = (await user_network_state(db, user.id)).network
-    if network == 'mainnet' and settings.APP_ENV != 'development' and settings.KEK_PROVIDER == 'env':
-        raise HTTPException(409, 'La configurazione MAINNET richiede il provider KMS esterno prima di salvare una credenziale operativa')
+    if network == 'mainnet' and settings.APP_ENV == 'production' and settings.KEK_PROVIDER == 'env':
+        raise HTTPException(409, 'La produzione MAINNET richiede il provider KMS esterno prima di salvare una credenziale operativa')
 
     account_address = normalize_address(user.auth_wallet)
     master_address = normalize_address(settings.HYPERLIQUID_MASTER_ADDRESS) if settings.HYPERLIQUID_MASTER_ADDRESS else ''
