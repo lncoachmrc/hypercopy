@@ -1,0 +1,59 @@
+name: Apply close positions patch on PR
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.head_ref == 'fix/close-positions-hyperliquid'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/close-positions-hyperliquid
+          fetch-depth: 0
+      - name: Apply targeted patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p=Path('backend/app/services/execution.py'); s=p.read_text()
+          s=s.replace(
+            "TERMINAL_EXEC = {ExecutionState.FILLED, ExecutionState.REJECTED, ExecutionState.CANCELED}\n\n\n",
+            """TERMINAL_EXEC = {ExecutionState.FILLED, ExecutionState.REJECTED, ExecutionState.CANCELED}\n\n\ndef _effective_master_mark(origin: str, master_mark: Decimal, follower_mark: Decimal, same_network: bool) -> Decimal:\n    if origin == 'CLOSE_ALL':\n        return follower_mark\n    if master_mark <= 0 and same_network:\n        return follower_mark\n    return master_mark\n\n\ndef _shadow_suppresses_exchange(copy_state: CopyState, origin: str) -> bool:\n    return copy_state == CopyState.SHADOW and origin != 'CLOSE_ALL'\n\n\n""",1)
+          s=s.replace(
+            """    if master_mark <= 0:\n        if settings.master_network == network:\n            master_mark = follower_mark\n        else:\n            return await _retry_or_dead(db, job, 'Master market price unavailable')\n""",
+            """    master_mark = _effective_master_mark(job.origin, master_mark, follower_mark, settings.master_network == network)\n    if master_mark <= 0:\n        return await _retry_or_dead(db, job, 'Master market price unavailable')\n""",1)
+          s=s.replace("    stale = equity.taken_at < datetime.now(UTC) - timedelta(seconds=settings.LEDGER_STALE_SECONDS)\n","    stale = False if job.origin == 'CLOSE_ALL' else equity.taken_at < datetime.now(UTC) - timedelta(seconds=settings.LEDGER_STALE_SECONDS)\n",1)
+          s=s.replace("    if user.copy_state == CopyState.SHADOW:\n","    if _shadow_suppresses_exchange(user.copy_state, job.origin):\n",1)
+          p.write_text(s)
+
+          p=Path('backend/app/api/user.py'); s=p.read_text()
+          s=s.replace("from app.services.networking import set_user_network, user_network_state\nfrom app.services.reconcile import master_snapshot, reconcile_user\n","from app.services.networking import set_user_network, user_network_state\nfrom app.services.queue import publish_job\nfrom app.services.reconcile import master_snapshot, reconcile_user\n",1)
+          start=s.index("@router.post('/copy/close-positions', dependencies=[Depends(require_csrf)])")
+          replacement="""@router.post('/copy/close-positions', dependencies=[Depends(require_csrf)])\nasync def close_positions(body: ClosePositionsIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):\n    network = (await user_network_state(db, user.id)).network\n    rows = (await db.execute(select(PositionLedger).where(\n        PositionLedger.user_id == user.id, PositionLedger.managed.is_(True), PositionLedger.size != 0\n    ))).scalars().all()\n    pending_assets = set((await db.execute(select(CopyJob.asset).where(\n        CopyJob.user_id == user.id, CopyJob.origin == 'CLOSE_ALL',\n        CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),\n    ))).scalars().all())\n    previous_copy_state = user.copy_state.value\n    user.copy_state = CopyState.PAUSED\n    jobs: list[CopyJob] = []\n    for row in rows:\n        if row.asset in pending_assets:\n            continue\n        mark = row.mark_price or Decimal(0)\n        job = CopyJob(\n            user_id=user.id, asset=row.asset, origin='CLOSE_ALL', state=JobState.QUEUED,\n            correlation_id=__import__('uuid').uuid4().hex,\n            context={\n                'master_position': '0', 'master_equity': '1',\n                'master_mark_price': str(mark), 'mark_price': str(mark),\n                'master_network': settings.master_network, 'follower_network': network,\n                'explicit_close': True,\n            },\n        )\n        db.add(job); jobs.append(job)\n    await db.flush()\n    deferred_enqueue = 0\n    redis = redis_client()\n    for job in jobs:\n        try:\n            await publish_job(redis, db, job)\n        except Exception:\n            job.enqueued_at = None\n            deferred_enqueue += 1\n    await audit(\n        db, action='CLOSE_POSITIONS_REQUESTED', actor_id=user.id, subject_id=user.id, reason=body.reason,\n        after={\n            'jobs': len(jobs), 'network': network, 'copy_state_before': previous_copy_state,\n            'copy_state_after': CopyState.PAUSED.value, 'deferred_enqueue': deferred_enqueue,\n        },\n    )\n    await db.commit()\n    return {'queued': len(jobs), 'paused': True, 'deferred_enqueue': deferred_enqueue}\n"""
+          s=s[:start]+replacement
+          p.write_text(s)
+
+          p=Path('frontend/src/Settings.tsx'); s=p.read_text()
+          anchor="  const canChangeNetwork=Boolean(me?.network_switch_ready);\n\n  return <>\n"
+          helper="""  const closeAll=async()=>{\n    if(!confirm('Chiudere tutte le posizioni TRAXION gestite? La strategia verrà messa automaticamente in PAUSA per evitare riaperture.'))return;\n    try{\n      const result=await post<{queued:number;paused:boolean;deferred_enqueue:number}>('/copy/close-positions',{confirmation:'CLOSE',reason:'User requested close all'});\n      await load(); await refresh();\n      setMsg(result.queued>0 ? `Strategia in PAUSA. ${result.queued} chiusure reduce-only accodate.` : 'Strategia in PAUSA. Nessuna posizione TRAXION gestita da chiudere.');\n    }catch(e){setMsg(e instanceof Error?e.message:'Chiusura posizioni non riuscita')}\n  };\n\n  const canChangeNetwork=Boolean(me?.network_switch_ready);\n\n  return <>\n"""
+          s=s.replace(anchor,helper,1)
+          old="          <button className=\"danger\" onClick={async()=>{if(confirm('Generare ordini reduce-only per chiudere tutte le posizioni gestite?')){await post('/copy/close-positions',{confirmation:'CLOSE',reason:'User requested close all'});setMsg('Chiusure accodate.')}}}>Chiudi posizioni</button>\n"
+          s=s.replace(old,"          <button className=\"danger\" onClick={()=>void closeAll()}>Chiudi posizioni</button>\n",1)
+          p.write_text(s)
+
+          Path('backend/tests/unit/test_close_all_execution.py').write_text("""from decimal import Decimal\n\nfrom app.models.entities import CopyState\nfrom app.services.execution import _effective_master_mark, _shadow_suppresses_exchange\n\n\ndef test_close_all_uses_follower_mark_across_networks():\n    assert _effective_master_mark('CLOSE_ALL', Decimal('0'), Decimal('123.45'), False) == Decimal('123.45')\n\n\ndef test_regular_cross_network_job_still_requires_master_mark():\n    assert _effective_master_mark('RECONCILE', Decimal('0'), Decimal('123.45'), False) == Decimal('0')\n\n\ndef test_close_all_is_not_suppressed_by_shadow_mode():\n    assert _shadow_suppresses_exchange(CopyState.SHADOW, 'CLOSE_ALL') is False\n    assert _shadow_suppresses_exchange(CopyState.SHADOW, 'RECONCILE') is True\n""")
+          PY
+      - name: Commit patch and remove temporary workflows
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -f .github/workflows/fix-close-positions.yml .github/workflows/apply-close-fix-on-pr.yml
+          git add backend/app/services/execution.py backend/app/api/user.py frontend/src/Settings.tsx backend/tests/unit/test_close_all_execution.py
+          git commit -m "Fix close-all execution on Hyperliquid"
+          git push origin HEAD:fix/close-positions-hyperliquid
