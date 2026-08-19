@@ -25,6 +25,7 @@ from app.services.entitlement import entitlement
 from app.services.execution import live_trading_allowed
 from app.services.metrics import dashboard_for_user
 from app.services.networking import set_user_network, user_network_state
+from app.services.queue import publish_job
 from app.services.reconcile import master_snapshot, reconcile_user
 
 router = APIRouter(tags=['user'])
@@ -384,11 +385,46 @@ async def resume(user: User = Depends(current_user), db: AsyncSession = Depends(
 @router.post('/copy/close-positions', dependencies=[Depends(require_csrf)])
 async def close_positions(body: ClosePositionsIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     network = (await user_network_state(db, user.id)).network
-    rows = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user.id, PositionLedger.managed.is_(True), PositionLedger.size != 0))).scalars().all()
-    count = 0
+    rows = (await db.execute(select(PositionLedger).where(
+        PositionLedger.user_id == user.id, PositionLedger.managed.is_(True), PositionLedger.size != 0
+    ))).scalars().all()
+    pending_assets = set((await db.execute(select(CopyJob.asset).where(
+        CopyJob.user_id == user.id, CopyJob.origin == 'CLOSE_ALL',
+        CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),
+    ))).scalars().all())
+    previous_copy_state = user.copy_state.value
+    user.copy_state = CopyState.PAUSED
+    jobs: list[CopyJob] = []
     for row in rows:
-        db.add(CopyJob(user_id=user.id, asset=row.asset, origin='CLOSE_ALL', state='QUEUED', correlation_id=__import__('uuid').uuid4().hex, context={
-            'master_position': '0', 'master_equity': '1', 'master_mark_price': '0', 'mark_price': '0',
-            'master_network': settings.master_network, 'follower_network': network,
-        })); count += 1
-    await audit(db, action='CLOSE_POSITIONS_REQUESTED', actor_id=user.id, subject_id=user.id, reason=body.reason, after={'jobs': count, 'network': network}); await db.commit(); return {'queued': count}
+        if row.asset in pending_assets:
+            continue
+        mark = row.mark_price or Decimal(0)
+        job = CopyJob(
+            user_id=user.id, asset=row.asset, origin='CLOSE_ALL', state=JobState.QUEUED,
+            correlation_id=__import__('uuid').uuid4().hex,
+            context={
+                'master_position': '0', 'master_equity': '1',
+                'master_mark_price': str(mark), 'mark_price': str(mark),
+                'master_network': settings.master_network, 'follower_network': network,
+                'explicit_close': True,
+            },
+        )
+        db.add(job); jobs.append(job)
+    await db.flush()
+    deferred_enqueue = 0
+    redis = redis_client()
+    for job in jobs:
+        try:
+            await publish_job(redis, db, job)
+        except Exception:
+            job.enqueued_at = None
+            deferred_enqueue += 1
+    await audit(
+        db, action='CLOSE_POSITIONS_REQUESTED', actor_id=user.id, subject_id=user.id, reason=body.reason,
+        after={
+            'jobs': len(jobs), 'network': network, 'copy_state_before': previous_copy_state,
+            'copy_state_after': CopyState.PAUSED.value, 'deferred_enqueue': deferred_enqueue,
+        },
+    )
+    await db.commit()
+    return {'queued': len(jobs), 'paused': True, 'deferred_enqueue': deferred_enqueue}
