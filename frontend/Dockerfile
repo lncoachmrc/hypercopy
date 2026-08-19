@@ -18,7 +18,7 @@ RUN printf '%s\n' \
   'case "$RAW_DNS_RESOLVER" in *:*) DNS_RESOLVER="[$RAW_DNS_RESOLVER]" ;; *) DNS_RESOLVER="$RAW_DNS_RESOLVER" ;; esac' \
   'export API_PROXY_UPSTREAM DNS_RESOLVER' \
   'envsubst '\''$PORT $API_PROXY_UPSTREAM $DNS_RESOLVER'\'' < /etc/nginx/nginx.conf.tpl > /etc/nginx/conf.d/default.conf' \
-  'envsubst '\''$API_BASE_URL $WS_URL'\'' < /usr/share/nginx/html/config.template.js > /usr/share/nginx/html/config.js' \
+  'envsubst '\''$API_BASE_URL $WS_URL $REOWN_PROJECT_ID'\'' < /usr/share/nginx/html/config.template.js > /usr/share/nginx/html/config.js' \
   'nginx -t' \
   'exec nginx -g "daemon off;"' \
   > /entrypoint.sh && chmod +x /entrypoint.sh
