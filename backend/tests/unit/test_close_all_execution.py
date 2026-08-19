@@ -1,4 +1,4 @@
-"""Regression coverage for explicit Hyperliquid close-all execution."""
+"""Regression coverage for explicit Hyperliquid close-all execution paths."""
 
 from decimal import Decimal
 
