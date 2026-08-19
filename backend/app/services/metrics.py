@@ -11,6 +11,7 @@ from app.models.entities import (
     JobState, MasterEvent, PositionLedger, ReconciliationRun,
     SigningCredential, WatcherLeaseModel, WorkerHeartbeat,
 )
+from app.services.networking import user_network_state
 
 
 PNL_RANGE_CONFIG = {
@@ -27,9 +28,11 @@ async def pnl_history_for_user(db: AsyncSession, user_id, range_key: str = '1d')
     if key not in PNL_RANGE_CONFIG:
         raise ValueError('Unsupported PnL range')
 
+    network_state = await user_network_state(db, user_id)
     now = datetime.now(UTC)
     delta, bucket_seconds = PNL_RANGE_CONFIG[key]
-    start = now - delta if delta else None
+    requested_start = now - delta if delta else network_state.started_at
+    start = max(requested_start, network_state.started_at)
 
     net_pnl = func.coalesce(Fill.closed_pnl, 0) - func.coalesce(Fill.fee, 0)
     bucket = func.floor(func.extract('epoch', Fill.ts) / bucket_seconds)
@@ -38,51 +41,51 @@ async def pnl_history_for_user(db: AsyncSession, user_id, range_key: str = '1d')
         func.min(Fill.ts).label('at'),
         func.max(Fill.ts).label('last_at'),
         func.coalesce(func.sum(net_pnl), 0).label('net'),
-    ).where(Fill.user_id == user_id)
-    if start is not None:
-        query = query.where(Fill.ts >= start)
-    query = query.group_by(bucket).order_by(bucket)
+    ).where(
+        Fill.user_id == user_id,
+        Fill.ts >= start,
+    ).group_by(bucket).order_by(bucket)
     rows = (await db.execute(query)).all()
 
     latest_equity = (await db.execute(
         select(EquitySnapshot)
-        .where(EquitySnapshot.user_id == user_id)
+        .where(
+            EquitySnapshot.user_id == user_id,
+            EquitySnapshot.taken_at >= network_state.started_at,
+        )
         .order_by(EquitySnapshot.taken_at.desc())
         .limit(1)
     )).scalar_one_or_none()
 
-    if start is None:
+    baseline = (await db.execute(
+        select(EquitySnapshot)
+        .where(
+            EquitySnapshot.user_id == user_id,
+            EquitySnapshot.taken_at >= network_state.started_at,
+            EquitySnapshot.taken_at <= start,
+        )
+        .order_by(EquitySnapshot.taken_at.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    if baseline is None:
         baseline = (await db.execute(
             select(EquitySnapshot)
-            .where(EquitySnapshot.user_id == user_id)
+            .where(
+                EquitySnapshot.user_id == user_id,
+                EquitySnapshot.taken_at >= start,
+            )
             .order_by(EquitySnapshot.taken_at.asc())
             .limit(1)
         )).scalar_one_or_none()
-        start_at = baseline.taken_at if baseline else (rows[0].at if rows else now)
-    else:
-        baseline = (await db.execute(
-            select(EquitySnapshot)
-            .where(EquitySnapshot.user_id == user_id, EquitySnapshot.taken_at <= start)
-            .order_by(EquitySnapshot.taken_at.desc())
-            .limit(1)
-        )).scalar_one_or_none()
-        if baseline is None:
-            baseline = (await db.execute(
-                select(EquitySnapshot)
-                .where(EquitySnapshot.user_id == user_id, EquitySnapshot.taken_at >= start)
-                .order_by(EquitySnapshot.taken_at.asc())
-                .limit(1)
-            )).scalar_one_or_none()
-        start_at = start
 
     total = 0.0
-    points = [{'at': start_at.isoformat(), 'value': 0.0, 'bucket_value': 0.0}]
+    points = [{'at': start.isoformat(), 'value': 0.0, 'bucket_value': 0.0}]
     for row in rows:
         bucket_value = float(row.net or 0)
         total += bucket_value
         points.append({'at': row.at.isoformat(), 'value': total, 'bucket_value': bucket_value})
 
-    if not points or points[-1]['at'] != now.isoformat():
+    if points[-1]['at'] != now.isoformat():
         points.append({'at': now.isoformat(), 'value': total, 'bucket_value': 0.0})
 
     start_equity = float(baseline.account_value) if baseline else None
@@ -90,6 +93,8 @@ async def pnl_history_for_user(db: AsyncSession, user_id, range_key: str = '1d')
 
     return {
         'range': key,
+        'network': network_state.network,
+        'network_started_at': network_state.started_at.isoformat(),
         'pnl_absolute': total,
         'pnl_pct': pnl_pct,
         'start_equity': start_equity,
@@ -101,14 +106,21 @@ async def pnl_history_for_user(db: AsyncSession, user_id, range_key: str = '1d')
 
 
 async def dashboard_for_user(db: AsyncSession, user_id) -> dict:
-    since = datetime.now(UTC)-timedelta(days=90)
-    latest = (await db.execute(select(EquitySnapshot).where(EquitySnapshot.user_id == user_id).order_by(EquitySnapshot.taken_at.desc()).limit(1))).scalar_one_or_none()
-    points = (await db.execute(select(EquitySnapshot).where(EquitySnapshot.user_id == user_id, EquitySnapshot.taken_at >= since).order_by(EquitySnapshot.taken_at))).scalars().all()
+    network_state = await user_network_state(db, user_id)
+    since = max(datetime.now(UTC)-timedelta(days=90), network_state.started_at)
+    latest = (await db.execute(select(EquitySnapshot).where(
+        EquitySnapshot.user_id == user_id,
+        EquitySnapshot.taken_at >= network_state.started_at,
+    ).order_by(EquitySnapshot.taken_at.desc()).limit(1))).scalar_one_or_none()
+    points = (await db.execute(select(EquitySnapshot).where(
+        EquitySnapshot.user_id == user_id,
+        EquitySnapshot.taken_at >= since,
+    ).order_by(EquitySnapshot.taken_at))).scalars().all()
     values = [float(p.account_value) for p in points]
 
     # Equity deltas include deposits, withdrawals and account-mode migrations,
-    # so they are not trading PnL. Until funding/unrealized PnL attribution is
-    # modelled explicitly, show net realized PnL from HyperCopy fills only.
+    # so they are not trading PnL. Show realized net PnL only for the current
+    # Hyperliquid network epoch selected by the user.
     realized = (await db.execute(
         select(func.coalesce(func.sum(func.coalesce(Fill.closed_pnl, 0) - func.coalesce(Fill.fee, 0)), 0))
         .where(Fill.user_id == user_id, Fill.ts >= since)
@@ -134,6 +146,8 @@ async def dashboard_for_user(db: AsyncSession, user_id) -> dict:
             sharpe = mean/math.sqrt(var)*math.sqrt(365.25)
     positions = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user_id))).scalars().all()
     return {
+        'network': network_state.network,
+        'network_started_at': network_state.started_at.isoformat(),
         'equity': float(latest.account_value) if latest else None,
         'collateral_balance': float(latest.collateral_balance) if latest else None,
         'unrealized_pnl': float(latest.unrealized_pnl) if latest else None,

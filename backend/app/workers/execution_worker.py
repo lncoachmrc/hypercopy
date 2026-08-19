@@ -9,7 +9,7 @@ from sqlalchemy import text
 
 from app.adapters.hyperliquid import HyperliquidAdapter, position_configs
 from app.adapters.ratelimit import Budget, WeightedRateLimiter
-from app.core.config import settings
+from app.core.config import Network, settings
 from app.core.logging import configure_logging, get_logger
 from app.db.lease import replica_identity
 from app.db.redis import redis_client
@@ -18,6 +18,7 @@ from app.db.schema import assert_schema
 from app.models.entities import CopyJob, JobState, User, WorkerHeartbeat
 from app.services.execution import claim_job, process_job, release_stale_jobs
 from app.services.credentials import monitor_credential_expiry
+from app.services.networking import user_network_state
 from app.services.queue import ensure_group, repair_stream
 from app.services.reconcile import master_snapshot, reconcile_active_users, reconcile_user
 
@@ -33,7 +34,7 @@ def _job_matches_current_networks(job: CopyJob) -> bool:
     ctx = job.context or {}
     return (
         ctx.get('master_network') == settings.master_network
-        and ctx.get('follower_network') == settings.follower_network
+        and ctx.get('follower_network') in {'testnet', 'mainnet'}
     )
 
 
@@ -62,8 +63,15 @@ class Worker:
         self.redis = redis_client()
         self.limiter = WeightedRateLimiter(self.redis, Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN))
         self.master_hl = HyperliquidAdapter(self.limiter, network=settings.master_network)
-        self.follower_hl = HyperliquidAdapter(self.limiter, network=settings.follower_network)
+        self.followers: dict[Network, HyperliquidAdapter] = {}
         self.current_job = None
+
+    def follower_hl(self, network: Network) -> HyperliquidAdapter:
+        adapter = self.followers.get(network)
+        if adapter is None:
+            adapter = HyperliquidAdapter(self.limiter, network=network)
+            self.followers[network] = adapter
+        return adapter
 
     async def heartbeat(self):
         async with SessionLocal() as db:
@@ -80,29 +88,38 @@ class Worker:
             job.locked_until=None
             await db.commit()
             return JobState.DEAD.value
+        network=(await user_network_state(db,user.id)).network
+        follower_hl=self.follower_hl(network)
 
         async def operation():
             mp,me,master_mids=await master_snapshot(self.master_hl)
             master_state=await self.master_hl.user_state(settings.HYPERLIQUID_MASTER_ADDRESS)
             master_configs=position_configs(master_state)
-            follower_mids=master_mids if settings.master_network == settings.follower_network else await self.follower_hl.mids()
-            await reconcile_user(
-                db,self.follower_hl,user,
+            follower_mids=master_mids if settings.master_network == network else await follower_hl.mids()
+            result=await reconcile_user(
+                db,follower_hl,user,
                 master_positions=mp,master_equity=me,mids=follower_mids,master_mids=master_mids,
                 master_configs=master_configs,
             )
-            await repair_stream(self.redis,db)
+            published=await repair_stream(self.redis,db)
+            return result,published
 
         timeout=max(min(settings.JOB_LEASE_SECONDS - 10, 90), 30)
         try:
-            await asyncio.wait_for(operation(), timeout=timeout)
+            result,published=await asyncio.wait_for(operation(), timeout=timeout)
         except asyncio.TimeoutError:
             return await _retry_admin_job(db, job.id, f'ADMIN_RECONCILE timed out after {timeout}s')
         except Exception as exc:
-            log.warning('Admin reconcile failed', extra={'job_id': str(job.id)}, exc_info=True)
+            log.warning('Admin reconcile failed', extra={'job_id': str(job.id), 'network': network}, exc_info=True)
             return await _retry_admin_job(db, job.id, f'{type(exc).__name__}: {exc}')
 
         await db.refresh(job)
+        job.context={
+            **(job.context or {}),
+            'result': result,
+            'stream_published': published,
+            'completed_at': datetime.now(UTC).isoformat(),
+        }
         job.state=JobState.DONE
         job.last_error=None
         job.owner=None
@@ -134,7 +151,8 @@ class Worker:
                 if job.origin=='ADMIN_RECONCILE':
                     result=await self._run_admin_reconcile(db,job)
                 else:
-                    result=await process_job(db,self.follower_hl,job)
+                    network=(await user_network_state(db,job.user_id)).network
+                    result=await process_job(db,self.follower_hl(network),job)
             finally:
                 self.current_job=None
                 try: await self.heartbeat()
@@ -184,13 +202,24 @@ class Worker:
             if not acquired: return
             try:
                 async with SessionLocal() as db:
-                    await reconcile_active_users(db,self.follower_hl,master_hl=self.master_hl)
+                    raw_networks=(await db.execute(text("""
+                        SELECT DISTINCT u.execution_network
+                        FROM users AS u
+                        JOIN trading_accounts AS ta ON ta.user_id = u.id
+                        WHERE u.state = 'ACTIVE'
+                          AND u.copy_state IN ('ACTIVE','SHADOW','PAUSED')
+                    """))).scalars().all()
+                    networks=[n for n in raw_networks if n in {'testnet','mainnet'}]
+                    for network in networks:
+                        await reconcile_active_users(
+                            db,self.follower_hl(network),master_hl=self.master_hl,
+                        )
             finally:
                 await conn.execute(text("SELECT pg_advisory_unlock(hashtext('hypercopy:reconciler'))")); await conn.commit()
 
     async def run(self):
         async with SessionLocal() as db: await assert_schema(db)
-        log.info('Execution worker networks', extra={'master_network': settings.master_network, 'follower_network': settings.follower_network})
+        log.info('Execution worker networks', extra={'master_network': settings.master_network, 'follower_network_mode': 'per-user'})
         consume=asyncio.create_task(self.consume()); maintenance=asyncio.create_task(self.maintenance())
         await stop.wait()
         maintenance.cancel()

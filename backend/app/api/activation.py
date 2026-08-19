@@ -15,6 +15,8 @@ from app.db.redis import redis_client
 from app.db.session import get_db
 from app.models.entities import CopyJob, CopyState, JobState, RiskHalt, RiskState, TradingAccount, User
 from app.services.audit import audit
+from app.services.execution import live_trading_allowed
+from app.services.networking import user_network_state
 from app.services.queue import repair_stream
 from app.services.reconcile import reconcile_user
 
@@ -41,16 +43,15 @@ async def resume_copy_immediate(
     user: User = Depends(current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Activate TESTNET strategy execution and create current multi-asset jobs immediately.
+    """Activate strategy execution on the user's selected Hyperliquid network.
 
-    This route intentionally precedes the legacy /copy/resume route. It is
-    restricted to TESTNET while the cross-network MAINNET->TESTNET pipeline is
-    being validated. Activation preflights both exchanges, refuses to start
-    with old pending jobs, and rolls back to PAUSED if the initial ACTIVE
-    reconciliation cannot be completed.
+    Activation preflights the source and selected follower network, refuses to
+    start with old pending jobs, preserves the independent mainnet live-trading
+    gates, and rolls back to PAUSED if the initial ACTIVE reconciliation fails.
     """
-    if settings.follower_network != 'testnet':
-        raise HTTPException(409, 'Immediate activation handler is currently restricted to TESTNET')
+    network = (await user_network_state(db, user.id)).network
+    if not await live_trading_allowed(db, network):
+        raise HTTPException(409, 'Mainnet live-trading gate is closed')
 
     rs = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
     if rs and rs.state != RiskHalt.NORMAL:
@@ -71,7 +72,7 @@ async def resume_copy_immediate(
 
     limiter = _limiter()
     master_hl = HyperliquidAdapter(limiter, network=settings.master_network)
-    follower_hl = HyperliquidAdapter(limiter, network=settings.follower_network)
+    follower_hl = HyperliquidAdapter(limiter, network=network)
 
     try:
         source_snapshot = await master_hl.account_snapshot(
@@ -81,7 +82,7 @@ async def resume_copy_immediate(
         master_positions = _positions(source_snapshot.perp_state)
         master_configs = position_configs(source_snapshot.perp_state)
         master_mids = await master_hl.mids()
-        follower_mids = master_mids if settings.master_network == settings.follower_network else await follower_hl.mids()
+        follower_mids = master_mids if settings.master_network == network else await follower_hl.mids()
     except Exception as exc:
         raise HTTPException(503, f'Strategy activation preflight failed: {type(exc).__name__}: {exc}') from exc
 
@@ -94,7 +95,7 @@ async def resume_copy_immediate(
         subject_id=user.id,
         after={
             'master_network': settings.master_network,
-            'follower_network': settings.follower_network,
+            'follower_network': network,
             'master_positions': len([x for x in master_positions.values() if x != 0]),
         },
     )
@@ -119,7 +120,7 @@ async def resume_copy_immediate(
             subject_id=user.id,
             after={
                 'master_network': settings.master_network,
-                'follower_network': settings.follower_network,
+                'follower_network': network,
                 'reconciliation': result,
                 'stream_published': published,
             },
@@ -128,6 +129,7 @@ async def resume_copy_immediate(
         return {
             'ok': True,
             'copy_state': user.copy_state.value,
+            'network': network,
             'master_positions': len([x for x in master_positions.values() if x != 0]),
             'stream_published': published,
             'reconciliation': result,
@@ -150,6 +152,7 @@ async def resume_copy_immediate(
             actor_id=user.id,
             subject_id=user.id,
             reason=f'{type(exc).__name__}: {exc}',
+            after={'follower_network': network},
         )
         await db.commit()
         raise HTTPException(503, f'Strategy activation failed and the account was paused: {type(exc).__name__}: {exc}') from exc

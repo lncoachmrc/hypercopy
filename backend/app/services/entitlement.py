@@ -8,12 +8,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.entities import EquitySnapshot, Plan, Subscription, User
+from app.services.networking import user_network_state
 
 ACTIVE = {'active', 'trialing'}
 LEGACY_PLAN_MAP = {'basic': 'starter', 'pro': 'plus', 'enterprise': 'pro_10k'}
 
 
 async def entitlement(db: AsyncSession, user: User) -> dict:
+    network_state = await user_network_state(db, user.id)
     sub = (await db.execute(select(Subscription).where(Subscription.user_id == user.id))).scalar_one_or_none()
     plan = await db.get(Plan, sub.plan_slug) if sub else None
     now = datetime.now(UTC)
@@ -25,7 +27,7 @@ async def entitlement(db: AsyncSession, user: User) -> dict:
     limits = dict(plan.limits if plan else {})
     operator_override = (
         settings.APP_ENV != 'production'
-        and settings.follower_network == 'testnet'
+        and network_state.network == 'testnet'
         and user.role.value == 'SUPERADMIN'
     )
 
@@ -36,7 +38,10 @@ async def entitlement(db: AsyncSession, user: User) -> dict:
 
     latest_equity = (await db.execute(
         select(EquitySnapshot)
-        .where(EquitySnapshot.user_id == user.id)
+        .where(
+            EquitySnapshot.user_id == user.id,
+            EquitySnapshot.taken_at >= network_state.started_at,
+        )
         .order_by(EquitySnapshot.taken_at.desc())
         .limit(1)
     )).scalar_one_or_none()
@@ -57,6 +62,7 @@ async def entitlement(db: AsyncSession, user: User) -> dict:
         'commercial_plan': commercial_plan,
         'period_end': sub.period_end.isoformat() if sub and sub.period_end else None,
         'limits': limits,
+        'network': network_state.network,
         'portfolio_equity': float(portfolio_equity) if portfolio_equity is not None else None,
         'portfolio_limit_usd': float(max_equity) if max_equity is not None else None,
         'portfolio_limit_exceeded': portfolio_limit_exceeded,
