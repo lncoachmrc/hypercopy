@@ -384,12 +384,14 @@ async def resume(user: User = Depends(current_user), db: AsyncSession = Depends(
 
 @router.post('/copy/close-positions', dependencies=[Depends(require_csrf)])
 async def close_positions(body: ClosePositionsIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    network = (await user_network_state(db, user.id)).network
+    network_state = await user_network_state(db, user.id)
+    network = network_state.network
     rows = (await db.execute(select(PositionLedger).where(
         PositionLedger.user_id == user.id, PositionLedger.managed.is_(True), PositionLedger.size != 0
     ))).scalars().all()
     pending_assets = set((await db.execute(select(CopyJob.asset).where(
         CopyJob.user_id == user.id, CopyJob.origin == 'CLOSE_ALL',
+        CopyJob.created_at >= network_state.started_at,
         CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),
     ))).scalars().all())
     previous_copy_state = user.copy_state.value
@@ -411,6 +413,11 @@ async def close_positions(body: ClosePositionsIn, user: User = Depends(current_u
         )
         db.add(job); jobs.append(job)
     await db.flush()
+    # Commit the PAUSED state and durable PostgreSQL jobs before publishing any
+    # Redis stream message. Otherwise a fast worker can consume the message
+    # before the job row is visible and acknowledge it as missing.
+    await db.commit()
+
     deferred_enqueue = 0
     redis = redis_client()
     for job in jobs:
@@ -419,6 +426,7 @@ async def close_positions(body: ClosePositionsIn, user: User = Depends(current_u
         except Exception:
             job.enqueued_at = None
             deferred_enqueue += 1
+
     await audit(
         db, action='CLOSE_POSITIONS_REQUESTED', actor_id=user.id, subject_id=user.id, reason=body.reason,
         after={
