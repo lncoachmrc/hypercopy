@@ -1,3 +1,5 @@
+"""Regression coverage for explicit Hyperliquid close-all execution."""
+
 from decimal import Decimal
 
 from app.models.entities import CopyState
