@@ -268,6 +268,15 @@ export default function Settings(){
     }
   };
 
+  const closeAll=async()=>{
+    if(!confirm('Chiudere tutte le posizioni TRAXION gestite? La strategia verrà messa automaticamente in PAUSA per evitare riaperture.'))return;
+    try{
+      const result=await post<{queued:number;paused:boolean;deferred_enqueue:number}>('/copy/close-positions',{confirmation:'CLOSE',reason:'User requested close all'});
+      await load(); await refresh();
+      setMsg(result.queued>0 ? `Strategia in PAUSA. ${result.queued} chiusure reduce-only accodate.` : 'Strategia in PAUSA. Nessuna posizione TRAXION gestita da chiudere.');
+    }catch(e){setMsg(e instanceof Error?e.message:'Chiusura posizioni non riuscita')}
+  };
+
   const canChangeNetwork=Boolean(me?.network_switch_ready);
 
   return <>
@@ -330,7 +339,7 @@ export default function Settings(){
           <button className={`state-button state-button--pause ${me?.copy_state==='PAUSED'?'active':''}`} aria-pressed={me?.copy_state==='PAUSED'} onClick={async()=>{await post('/copy/pause');await load();await refresh()}} disabled={me?.copy_state==='PAUSED'}>Pausa</button>
           <button className={`state-button state-button--shadow ${me?.copy_state==='SHADOW'?'active':''}`} aria-pressed={me?.copy_state==='SHADOW'} onClick={()=>void setShadow()} disabled={!me?.trading_account||me?.copy_state==='SHADOW'}>Modalità SHADOW</button>
           <button className={`state-button state-button--active ${me?.copy_state==='ACTIVE'?'active':''}`} aria-pressed={me?.copy_state==='ACTIVE'} onClick={()=>void activate()} disabled={!me?.trading_account||me?.copy_state==='ACTIVE'}>Attiva strategia</button>
-          <button className="danger" onClick={async()=>{if(confirm('Generare ordini reduce-only per chiudere tutte le posizioni gestite?')){await post('/copy/close-positions',{confirmation:'CLOSE',reason:'User requested close all'});setMsg('Chiusure accodate.')}}}>Chiudi posizioni</button>
+          <button className="danger" onClick={()=>void closeAll()}>Chiudi posizioni</button>
         </div>
         <p className="muted">SHADOW calcola target, sizing e controlli senza inviare ordini. “Attiva strategia” abilita l'esecuzione automatizzata sulla rete operativa selezionata.</p>
       </section>
