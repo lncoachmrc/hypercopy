@@ -1,0 +1,44 @@
+name: Harden close-all publication
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.head_ref == 'fix/close-positions-hyperliquid'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/close-positions-hyperliquid
+          fetch-depth: 0
+      - name: Patch durable-before-Redis close queue flow
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('backend/app/api/user.py')
+          s=p.read_text()
+          s=s.replace(
+            "    network = (await user_network_state(db, user.id)).network\n    rows = (await db.execute(select(PositionLedger).where(\n",
+            "    network_state = await user_network_state(db, user.id)\n    network = network_state.network\n    rows = (await db.execute(select(PositionLedger).where(\n",1)
+          s=s.replace(
+            "        CopyJob.user_id == user.id, CopyJob.origin == 'CLOSE_ALL',\n        CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),\n",
+            "        CopyJob.user_id == user.id, CopyJob.origin == 'CLOSE_ALL',\n        CopyJob.created_at >= network_state.started_at,\n        CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),\n",1)
+          old="""    await db.flush()\n    deferred_enqueue = 0\n    redis = redis_client()\n    for job in jobs:\n        try:\n            await publish_job(redis, db, job)\n        except Exception:\n            job.enqueued_at = None\n            deferred_enqueue += 1\n    await audit(\n        db, action='CLOSE_POSITIONS_REQUESTED', actor_id=user.id, subject_id=user.id, reason=body.reason,\n        after={\n            'jobs': len(jobs), 'network': network, 'copy_state_before': previous_copy_state,\n            'copy_state_after': CopyState.PAUSED.value, 'deferred_enqueue': deferred_enqueue,\n        },\n    )\n    await db.commit()\n"""
+          new="""    await db.flush()\n    # Commit the PAUSED state and durable PostgreSQL jobs before publishing any\n    # Redis stream message. Otherwise a fast worker can consume the message\n    # before the job row is visible and acknowledge it as missing.\n    await db.commit()\n\n    deferred_enqueue = 0\n    redis = redis_client()\n    for job in jobs:\n        try:\n            await publish_job(redis, db, job)\n        except Exception:\n            job.enqueued_at = None\n            deferred_enqueue += 1\n\n    await audit(\n        db, action='CLOSE_POSITIONS_REQUESTED', actor_id=user.id, subject_id=user.id, reason=body.reason,\n        after={\n            'jobs': len(jobs), 'network': network, 'copy_state_before': previous_copy_state,\n            'copy_state_after': CopyState.PAUSED.value, 'deferred_enqueue': deferred_enqueue,\n        },\n    )\n    await db.commit()\n"""
+          if old not in s:
+              raise SystemExit('publication block not found')
+          p.write_text(s.replace(old,new,1))
+          PY
+      - name: Remove workflow and commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/fix-close-publish-race.yml
+          git add backend/app/api/user.py
+          git commit -m "Harden close-all durable queue handoff"
+          git push origin HEAD:fix/close-positions-hyperliquid
