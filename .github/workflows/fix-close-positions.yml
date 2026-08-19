@@ -1,0 +1,111 @@
+name: Apply close positions fix
+
+on:
+  push:
+    branches:
+      - fix/close-positions-hyperliquid
+    paths:
+      - .github/workflows/fix-close-positions.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/close-positions-hyperliquid
+          fetch-depth: 0
+      - name: Patch CLOSE_ALL execution and API flow
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          execution = Path('backend/app/services/execution.py')
+          text = execution.read_text()
+
+          anchor = "TERMINAL_EXEC = {ExecutionState.FILLED, ExecutionState.REJECTED, ExecutionState.CANCELED}\n\n\n"
+          helper = """TERMINAL_EXEC = {ExecutionState.FILLED, ExecutionState.REJECTED, ExecutionState.CANCELED}\n\n\ndef _effective_master_mark(origin: str, master_mark: Decimal, follower_mark: Decimal, same_network: bool) -> Decimal:\n    # CLOSE_ALL is an explicit follower-side flatten operation. It must never\n    # depend on the source strategy market price, especially when master and\n    # follower run on different Hyperliquid networks.\n    if origin == 'CLOSE_ALL':\n        return follower_mark\n    if master_mark <= 0 and same_network:\n        return follower_mark\n    return master_mark\n\n\ndef _shadow_suppresses_exchange(copy_state: CopyState, origin: str) -> bool:\n    # Explicit risk-reducing CLOSE_ALL requests are real close orders even if\n    # the account was in SHADOW when the request was created.\n    return copy_state == CopyState.SHADOW and origin != 'CLOSE_ALL'\n\n\n"""
+          if anchor not in text:
+              raise SystemExit('execution helper anchor not found')
+          text = text.replace(anchor, helper, 1)
+
+          old = """    if master_mark <= 0:\n        if settings.master_network == network:\n            master_mark = follower_mark\n        else:\n            return await _retry_or_dead(db, job, 'Master market price unavailable')\n"""
+          new = """    master_mark = _effective_master_mark(\n        job.origin, master_mark, follower_mark, settings.master_network == network\n    )\n    if master_mark <= 0:\n        return await _retry_or_dead(db, job, 'Master market price unavailable')\n"""
+          if old not in text:
+              raise SystemExit('master mark block not found')
+          text = text.replace(old, new, 1)
+
+          old = "    stale = equity.taken_at < datetime.now(UTC) - timedelta(seconds=settings.LEDGER_STALE_SECONDS)\n"
+          new = "    stale = False if job.origin == 'CLOSE_ALL' else equity.taken_at < datetime.now(UTC) - timedelta(seconds=settings.LEDGER_STALE_SECONDS)\n"
+          if old not in text:
+              raise SystemExit('stale block not found')
+          text = text.replace(old, new, 1)
+
+          old = "    if user.copy_state == CopyState.SHADOW:\n"
+          new = "    if _shadow_suppresses_exchange(user.copy_state, job.origin):\n"
+          if old not in text:
+              raise SystemExit('shadow block not found')
+          text = text.replace(old, new, 1)
+          execution.write_text(text)
+
+          user = Path('backend/app/api/user.py')
+          text = user.read_text()
+          old = "from app.services.networking import set_user_network, user_network_state\nfrom app.services.reconcile import master_snapshot, reconcile_user\n"
+          new = "from app.services.networking import set_user_network, user_network_state\nfrom app.services.queue import publish_job\nfrom app.services.reconcile import master_snapshot, reconcile_user\n"
+          if old not in text:
+              raise SystemExit('user import anchor not found')
+          text = text.replace(old, new, 1)
+
+          old = """@router.post('/copy/close-positions', dependencies=[Depends(require_csrf)])\nasync def close_positions(body: ClosePositionsIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):\n    network = (await user_network_state(db, user.id)).network\n    rows = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user.id, PositionLedger.managed.is_(True), PositionLedger.size != 0))).scalars().all()\n    count = 0\n    for row in rows:\n        db.add(CopyJob(user_id=user.id, asset=row.asset, origin='CLOSE_ALL', state='QUEUED', correlation_id=__import__('uuid').uuid4().hex, context={\n            'master_position': '0', 'master_equity': '1', 'master_mark_price': '0', 'mark_price': '0',\n            'master_network': settings.master_network, 'follower_network': network,\n        })); count += 1\n    await audit(db, action='CLOSE_POSITIONS_REQUESTED', actor_id=user.id, subject_id=user.id, reason=body.reason, after={'jobs': count, 'network': network}); await db.commit(); return {'queued': count}\n"""
+          new = """@router.post('/copy/close-positions', dependencies=[Depends(require_csrf)])\nasync def close_positions(body: ClosePositionsIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):\n    network = (await user_network_state(db, user.id)).network\n    rows = (await db.execute(select(PositionLedger).where(\n        PositionLedger.user_id == user.id, PositionLedger.managed.is_(True), PositionLedger.size != 0\n    ))).scalars().all()\n    pending_assets = set((await db.execute(select(CopyJob.asset).where(\n        CopyJob.user_id == user.id,\n        CopyJob.origin == 'CLOSE_ALL',\n        CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),\n    ))).scalars().all())\n\n    previous_copy_state = user.copy_state.value\n    # An explicit close-all must also stop reconciliation from immediately\n    # reopening the strategy positions after they are flattened.\n    user.copy_state = CopyState.PAUSED\n\n    jobs: list[CopyJob] = []\n    for row in rows:\n        if row.asset in pending_assets:\n            continue\n        mark = row.mark_price or Decimal(0)\n        job = CopyJob(\n            user_id=user.id, asset=row.asset, origin='CLOSE_ALL', state=JobState.QUEUED,\n            correlation_id=__import__('uuid').uuid4().hex,\n            context={\n                'master_position': '0', 'master_equity': '1',\n                # CLOSE_ALL is follower-side. Carry the follower mark when known\n                # so cross-network users never depend on the master market price.\n                'master_mark_price': str(mark), 'mark_price': str(mark),\n                'master_network': settings.master_network, 'follower_network': network,\n                'explicit_close': True,\n            },\n        )\n        db.add(job)\n        jobs.append(job)\n\n    await db.flush()\n    deferred_enqueue = 0\n    redis = redis_client()\n    for job in jobs:\n        try:\n            await publish_job(redis, db, job)\n        except Exception:\n            # PostgreSQL remains the durable queue. The execution worker's\n            # repair_stream maintenance will publish any deferred job later.\n            job.enqueued_at = None\n            deferred_enqueue += 1\n\n    await audit(\n        db, action='CLOSE_POSITIONS_REQUESTED', actor_id=user.id, subject_id=user.id, reason=body.reason,\n        after={\n            'jobs': len(jobs), 'network': network,\n            'copy_state_before': previous_copy_state, 'copy_state_after': CopyState.PAUSED.value,\n            'deferred_enqueue': deferred_enqueue,\n        },\n    )\n    await db.commit()\n    return {'queued': len(jobs), 'paused': True, 'deferred_enqueue': deferred_enqueue}\n"""
+          if old not in text:
+              raise SystemExit('close_positions block not found')
+          text = text.replace(old, new, 1)
+          user.write_text(text)
+
+          settings = Path('frontend/src/Settings.tsx')
+          text = settings.read_text()
+          anchor = """  const canChangeNetwork=Boolean(me?.network_switch_ready);\n\n  return <>\n"""
+          helper = """  const closeAll=async()=>{\n    if(!confirm('Chiudere tutte le posizioni TRAXION gestite? La strategia verrà messa automaticamente in PAUSA per evitare riaperture.'))return;\n    try{\n      const result=await post<{queued:number;paused:boolean;deferred_enqueue:number}>('/copy/close-positions',{confirmation:'CLOSE',reason:'User requested close all'});\n      await load();\n      await refresh();\n      setMsg(result.queued>0\n        ? `Strategia in PAUSA. ${result.queued} chiusur${result.queued===1?'a':'e'} reduce-only accodat${result.queued===1?'a':'e'}.`\n        : 'Strategia in PAUSA. Nessuna posizione TRAXION gestita da chiudere.');\n    }catch(e){\n      setMsg(e instanceof Error?e.message:'Chiusura posizioni non riuscita');\n    }\n  };\n\n  const canChangeNetwork=Boolean(me?.network_switch_ready);\n\n  return <>\n"""
+          if anchor not in text:
+              raise SystemExit('Settings closeAll anchor not found')
+          text = text.replace(anchor, helper, 1)
+          old = """          <button className=\"danger\" onClick={async()=>{if(confirm('Generare ordini reduce-only per chiudere tutte le posizioni gestite?')){await post('/copy/close-positions',{confirmation:'CLOSE',reason:'User requested close all'});setMsg('Chiusure accodate.')}}}>Chiudi posizioni</button>\n"""
+          new = """          <button className=\"danger\" onClick={()=>void closeAll()}>Chiudi posizioni</button>\n"""
+          if old not in text:
+              raise SystemExit('Settings close button not found')
+          text = text.replace(old, new, 1)
+          settings.write_text(text)
+          PY
+
+          cat > backend/tests/unit/test_close_all_execution.py <<'PY'
+          from decimal import Decimal
+
+          from app.models.entities import CopyState
+          from app.services.execution import _effective_master_mark, _shadow_suppresses_exchange
+
+
+def test_close_all_uses_follower_mark_across_networks():
+    assert _effective_master_mark('CLOSE_ALL', Decimal('0'), Decimal('123.45'), False) == Decimal('123.45')
+
+
+def test_regular_cross_network_job_still_requires_master_mark():
+    assert _effective_master_mark('RECONCILE', Decimal('0'), Decimal('123.45'), False) == Decimal('0')
+
+
+def test_close_all_is_not_suppressed_by_shadow_mode():
+    assert _shadow_suppresses_exchange(CopyState.SHADOW, 'CLOSE_ALL') is False
+    assert _shadow_suppresses_exchange(CopyState.SHADOW, 'RECONCILE') is True
+          PY
+
+      - name: Remove one-shot workflow and push patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/fix-close-positions.yml
+          git add backend/app/services/execution.py backend/app/api/user.py frontend/src/Settings.tsx backend/tests/unit/test_close_all_execution.py
+          git commit -m "Fix close-all execution on Hyperliquid"
+          git push origin HEAD:fix/close-positions-hyperliquid
