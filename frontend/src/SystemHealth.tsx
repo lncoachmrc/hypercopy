@@ -1,0 +1,110 @@
+type RateLimitSnapshot={
+  status?:string;
+  window_seconds?:number;
+  total_budget?:number;
+  reserve?:number;
+  used?:number;
+  used_pct?:number;
+  lane_limits?:Record<string,number>;
+  lane_reconcile?:number;
+  lane_diagnostic?:number;
+  lane_metadata?:number;
+  lane_master_state?:number;
+  lane_order?:number;
+};
+
+type SystemHealthProps={
+  sys:null|{
+    rate_limit:RateLimitSnapshot;
+    flags:Record<string,boolean>;
+    live_trading_env_enabled?:boolean;
+  };
+};
+
+type GateTone='ok'|'warn'|'danger'|'neutral';
+
+const LANES=[
+  {key:'order',label:'Ordini',usage:'lane_order',description:'Invio e verifica delle azioni exchange.'},
+  {key:'master_state',label:'Master state',usage:'lane_master_state',description:'Equity, posizioni e leva della strategia sorgente.'},
+  {key:'reconcile',label:'Reconciliation',usage:'lane_reconcile',description:'Verifica e riallineamento degli account utenti.'},
+  {key:'metadata',label:'Metadata',usage:'lane_metadata',description:'Specifiche asset e metadati Hyperliquid.'},
+  {key:'diagnostic',label:'Diagnostica',usage:'lane_diagnostic',description:'Letture amministrative on-demand.'},
+] as const;
+
+export default function SystemHealth({sys}:SystemHealthProps){
+  const rate=sys?.rate_limit||{};
+  const flags=sys?.flags||{};
+  const masterCheckpoint=flagByPrefix(flags,'master_checkpoint:');
+  const aiIntelligence=flagByPrefix(flags,'ai:master_strategy_intelligence');
+  const rateAvailable=typeof rate.total_budget==='number'&&typeof rate.used==='number';
+  const globalPct=rateAvailable?percentage(rate.used||0,rate.total_budget||0):null;
+
+  return <section className="panel">
+    <div className="panelhead">
+      <div>
+        <h2>Salute sistema</h2>
+        <p className="muted">Gate operativi e consumo del budget Hyperliquid. Questi indicatori sono visibili solo agli amministratori.</p>
+      </div>
+      {rateAvailable?<HealthBadge tone={rateTone(globalPct)}>{`${rate.used} / ${rate.total_budget} · ${formatPct(globalPct)}`}</HealthBadge>:<HealthBadge tone="warn">Budget non disponibile</HealthBadge>}
+    </div>
+
+    <div className="stats">
+      <HealthCard label="Live trading" value={flags.live_trading?'ON':'OFF'} tone={flags.live_trading?'ok':'neutral'} hint={`Gate ambiente: ${sys?.live_trading_env_enabled?'ON':'OFF'}`}/>
+      <HealthCard label="Global pause" value={flags.global_pause?'ATTIVA':'OK'} tone={flags.global_pause?'warn':'ok'} hint="Blocca l’esecuzione globale quando attiva."/>
+      <HealthCard label="Emergency stop" value={flags.emergency_stop?'ATTIVO':'OK'} tone={flags.emergency_stop?'danger':'ok'} hint="Stato di arresto di emergenza."/>
+      <HealthCard label="Master checkpoint" value={masterCheckpoint===true?'OK':masterCheckpoint===false?'KO':'—'} tone={masterCheckpoint===true?'ok':masterCheckpoint===false?'danger':'neutral'} hint="Conferma lo stato sorgente usato dai target."/>
+      <HealthCard label="AI intelligence" value={aiIntelligence===true?'OK':aiIntelligence===false?'KO':'—'} tone={aiIntelligence===true?'ok':aiIntelligence===false?'warn':'neutral'} hint="Stato dell’intelligence consultiva della strategia."/>
+    </div>
+
+    {rateAvailable?<>
+      <div className="panelhead" style={{marginTop:18}}>
+        <div><h3>Budget Hyperliquid</h3><p className="muted">Finestra {rate.window_seconds??60}s · riserva operativa {rate.reserve??'—'} weight.</p></div>
+      </div>
+      <table>
+        <thead><tr><th>Lane</th><th>Uso</th><th>Limite</th><th>Utilizzo</th><th>Stato</th><th>Funzione</th></tr></thead>
+        <tbody>{LANES.map(lane=>{
+          const used=numberField(rate,lane.usage);
+          const limit=rate.lane_limits?.[lane.key];
+          const pct=typeof limit==='number'?percentage(used,limit):null;
+          return <tr key={lane.key}>
+            <td><b>{lane.label}</b></td>
+            <td>{used}</td>
+            <td>{limit??'—'}</td>
+            <td className={pct!=null&&pct>=90?'down':pct!=null&&pct<75?'up':''}>{formatPct(pct)}</td>
+            <td><HealthBadge tone={rateTone(pct)}>{rateLabel(pct)}</HealthBadge></td>
+            <td className="muted">{lane.description}</td>
+          </tr>;
+        })}</tbody>
+      </table>
+    </>:<div className="alert error">Rate limiter non leggibile: {rate.status||'stato Redis non disponibile'}.</div>}
+
+    <details style={{marginTop:18}}>
+      <summary>Dettagli tecnici</summary>
+      <pre>{JSON.stringify({flags,rate_limit:rate},null,2)}</pre>
+    </details>
+  </section>;
+}
+
+function HealthCard({label,value,tone,hint}:{label:string;value:string;tone:GateTone;hint:string}){
+  return <div className="panel stat"><span>{label}</span><strong className={tone==='danger'?'down':tone==='ok'?'up':''}>{value}</strong><small className="muted">{hint}</small></div>;
+}
+
+function HealthBadge({tone,children}:{tone:GateTone;children:React.ReactNode}){
+  const cls=tone==='ok'?'badge live':tone==='danger'?'badge offline':'badge';
+  return <span className={cls}>{children}</span>;
+}
+
+function flagByPrefix(flags:Record<string,boolean>,prefix:string){
+  const entry=Object.entries(flags).find(([key])=>key.startsWith(prefix));
+  return entry?.[1];
+}
+
+function numberField(rate:RateLimitSnapshot,key:keyof RateLimitSnapshot){
+  const value=rate[key];
+  return typeof value==='number'?value:0;
+}
+
+function percentage(used:number,limit:number){return limit>0?used/limit*100:null}
+function formatPct(value:number|null){return value==null?'—':`${value.toFixed(1)}%`}
+function rateTone(value:number|null):GateTone{return value==null?'neutral':value>=90?'danger':value>=75?'warn':'ok'}
+function rateLabel(value:number|null){return value==null?'N/D':value>=90?'SATURO':value>=75?'ALTO':'OK'}
