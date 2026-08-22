@@ -1,3 +1,6 @@
+import {useEffect,useState} from 'react';
+import {get} from './api';
+
 type RateLimitSnapshot={
   status?:string;
   window_seconds?:number;
@@ -11,6 +14,24 @@ type RateLimitSnapshot={
   lane_metadata?:number;
   lane_master_state?:number;
   lane_order?:number;
+};
+
+type AdminHealth={
+  master_checkpoint:{
+    configured:boolean;
+    present:boolean;
+    enabled:boolean;
+    time_ms:number;
+    updated_at:string|null;
+    network:string;
+  };
+  ai_intelligence:{
+    status:string;
+    mode:string|null;
+    provider:string|null;
+    model:string|null;
+    updated_at:string|null;
+  };
 };
 
 type SystemHealthProps={
@@ -32,12 +53,26 @@ const LANES=[
 ] as const;
 
 export default function SystemHealth({sys}:SystemHealthProps){
+  const [health,setHealth]=useState<AdminHealth|null>(null);
   const rate=(sys?.rate_limit||{}) as RateLimitSnapshot;
   const flags=sys?.flags||{};
-  const masterCheckpoint=flagByPrefix(flags,'master_checkpoint:');
-  const aiIntelligence=flagByPrefix(flags,'ai:master_strategy_intelligence');
   const rateAvailable=typeof rate.total_budget==='number'&&typeof rate.used==='number';
   const globalPct=rateAvailable?percentage(rate.used||0,rate.total_budget||0):null;
+  const liveFlag=flags.live_trading===true;
+  const envGate=sys?.live_trading_env_enabled===true;
+  const liveTradingEffective=liveFlag&&envGate;
+  const checkpoint=health?.master_checkpoint;
+  const checkpointOk=Boolean(checkpoint?.configured&&checkpoint.present&&checkpoint.enabled&&checkpoint.time_ms>0);
+  const ai=health?.ai_intelligence;
+  const aiTone=aiStatusTone(ai?.status);
+
+  useEffect(()=>{
+    let alive=true;
+    const load=async()=>{try{const value=await get<AdminHealth>('/admin/health');if(alive)setHealth(value)}catch{/* /admin/system remains available even if this diagnostic read fails */}};
+    void load();
+    const timer=window.setInterval(()=>void load(),10000);
+    return()=>{alive=false;window.clearInterval(timer)};
+  },[]);
 
   return <section className="panel">
     <div className="panelhead">
@@ -49,11 +84,11 @@ export default function SystemHealth({sys}:SystemHealthProps){
     </div>
 
     <div className="stats">
-      <HealthCard label="Live trading" value={flags.live_trading?'ON':'OFF'} tone={flags.live_trading?'ok':'neutral'} hint={`Gate ambiente: ${sys?.live_trading_env_enabled?'ON':'OFF'}`}/>
+      <HealthCard label="Live trading" value={liveTradingEffective?'ON':'OFF'} tone={liveTradingEffective?'ok':liveFlag||envGate?'warn':'neutral'} hint={`Effettivo MAINNET · flag DB ${liveFlag?'ON':'OFF'} · gate ambiente ${envGate?'ON':'OFF'}`}/>
       <HealthCard label="Global pause" value={flags.global_pause?'ATTIVA':'OK'} tone={flags.global_pause?'warn':'ok'} hint="Blocca l’esecuzione globale quando attiva."/>
       <HealthCard label="Emergency stop" value={flags.emergency_stop?'ATTIVO':'OK'} tone={flags.emergency_stop?'danger':'ok'} hint="Stato di arresto di emergenza."/>
-      <HealthCard label="Master checkpoint" value={masterCheckpoint===true?'OK':masterCheckpoint===false?'KO':'—'} tone={masterCheckpoint===true?'ok':masterCheckpoint===false?'danger':'neutral'} hint="Conferma lo stato sorgente usato dai target."/>
-      <HealthCard label="AI intelligence" value={aiIntelligence===true?'OK':aiIntelligence===false?'KO':'—'} tone={aiIntelligence===true?'ok':aiIntelligence===false?'warn':'neutral'} hint="Stato dell’intelligence consultiva della strategia."/>
+      <HealthCard label="Master checkpoint" value={!checkpoint?'—':checkpointOk?'OK':'KO'} tone={!checkpoint?'neutral':checkpointOk?'ok':'danger'} hint={checkpointHint(checkpoint)}/>
+      <HealthCard label="AI intelligence" value={ai?.status?ai.status.toUpperCase():'—'} tone={aiTone} hint={aiHint(ai)}/>
     </div>
 
     {rateAvailable?<>
@@ -80,7 +115,7 @@ export default function SystemHealth({sys}:SystemHealthProps){
 
     <details style={{marginTop:18}}>
       <summary>Dettagli tecnici</summary>
-      <pre>{JSON.stringify({flags,rate_limit:rate},null,2)}</pre>
+      <pre>{JSON.stringify({flags,rate_limit:rate,health},null,2)}</pre>
     </details>
   </section>;
 }
@@ -94,9 +129,26 @@ function HealthBadge({tone,children}:{tone:GateTone;children:React.ReactNode}){
   return <span className={cls}>{children}</span>;
 }
 
-function flagByPrefix(flags:Record<string,boolean>,prefix:string){
-  const entry=Object.entries(flags).find(([key])=>key.startsWith(prefix));
-  return entry?.[1];
+function checkpointHint(checkpoint:AdminHealth['master_checkpoint']|undefined){
+  if(!checkpoint)return 'Lettura checkpoint in corso.';
+  if(!checkpoint.configured)return 'Sorgente master non configurata.';
+  if(!checkpoint.present||!checkpoint.enabled||checkpoint.time_ms<=0)return `Nessun checkpoint valido per la sorgente ${checkpoint.network.toUpperCase()} corrente.`;
+  return `Ultimo evento checkpoint: ${new Date(checkpoint.time_ms).toLocaleString()}.`;
+}
+
+function aiHint(ai:AdminHealth['ai_intelligence']|undefined){
+  if(!ai)return 'Lettura stato runtime AI in corso.';
+  const runtime=[ai.provider,ai.model].filter(Boolean).join(' · ');
+  const updated=ai.updated_at?` · aggiornato ${new Date(ai.updated_at).toLocaleString()}`:'';
+  return `${runtime||ai.mode||'runtime AI'}${updated}`;
+}
+
+function aiStatusTone(status:string|undefined):GateTone{
+  if(status==='ok')return'ok';
+  if(status==='degraded')return'warn';
+  if(status==='disabled')return'neutral';
+  if(status==='pending')return'neutral';
+  return status?'warn':'neutral';
 }
 
 function numberField(rate:RateLimitSnapshot,key:keyof RateLimitSnapshot){
