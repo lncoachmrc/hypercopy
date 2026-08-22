@@ -15,7 +15,7 @@ type RateLimitSnapshot={
 
 type SystemHealthProps={
   sys:null|{
-    rate_limit:RateLimitSnapshot;
+    rate_limit:Record<string,unknown>;
     flags:Record<string,boolean>;
     live_trading_env_enabled?:boolean;
   };
@@ -32,7 +32,7 @@ const LANES=[
 ] as const;
 
 export default function SystemHealth({sys}:SystemHealthProps){
-  const rate=sys?.rate_limit||{};
+  const rate=(sys?.rate_limit||{}) as RateLimitSnapshot;
   const flags=sys?.flags||{};
   const masterCheckpoint=flagByPrefix(flags,'master_checkpoint:');
   const aiIntelligence=flagByPrefix(flags,'ai:master_strategy_intelligence');
