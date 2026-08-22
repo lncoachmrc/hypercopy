@@ -4,8 +4,9 @@ import asyncio
 import signal
 import uuid
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from app.adapters.hyperliquid import HyperliquidAdapter, position_configs
 from app.adapters.ratelimit import Budget, WeightedRateLimiter
@@ -15,7 +16,7 @@ from app.db.lease import replica_identity
 from app.db.redis import redis_client
 from app.db.session import SessionLocal, engine
 from app.db.schema import assert_schema
-from app.models.entities import CopyJob, JobState, User, WorkerHeartbeat
+from app.models.entities import CopyJob, EquitySnapshot, JobState, PositionLedger, TradingAccount, User, WorkerHeartbeat
 from app.services.execution import claim_job, process_job, release_stale_jobs
 from app.services.credentials import monitor_credential_expiry
 from app.services.networking import user_network_state
@@ -36,6 +37,16 @@ def _job_matches_current_networks(job: CopyJob) -> bool:
         ctx.get('master_network') == settings.master_network
         and ctx.get('follower_network') in {'testnet', 'mainnet'}
     )
+
+
+def _position_sizes(state: dict) -> dict[str, Decimal]:
+    out: dict[str, Decimal] = {}
+    for row in state.get('assetPositions', []):
+        position = row.get('position', row)
+        asset = str(position.get('coin') or '')
+        if asset:
+            out[asset] = Decimal(str(position.get('szi', '0') or '0'))
+    return out
 
 
 async def _retry_admin_job(db, job_id: uuid.UUID, reason: str) -> str:
@@ -196,6 +207,91 @@ class Worker:
             except Exception: log.warning('Worker maintenance failed',exc_info=True)
             await asyncio.sleep(settings.RECONCILE_INTERVAL_SECONDS)
 
+    async def _refresh_follower_observability(self, db, network: Network) -> int:
+        """Refresh follower account truth without creating trading jobs.
+
+        This path is deliberately independent of the strategy-source snapshot.
+        It keeps TESTNET/MAINNET account observability fresh when the master
+        network is temporarily unavailable, while preserving existing targets
+        and never submitting or queuing an order.
+        """
+        follower_hl=self.follower_hl(network)
+        try:
+            mids=await follower_hl.mids()
+        except Exception:
+            mids={}
+            log.warning('Follower mids unavailable during observability refresh', extra={'network': network}, exc_info=True)
+
+        users=(await db.execute(select(User).join(TradingAccount,TradingAccount.user_id==User.id))).scalars().all()
+        refreshed=0
+        for user in users:
+            network_state=await user_network_state(db,user.id)
+            if network_state.network != network:
+                continue
+            account=(await db.execute(select(TradingAccount).where(TradingAccount.user_id==user.id))).scalar_one_or_none()
+            if not account:
+                continue
+            try:
+                snapshot=await follower_hl.account_snapshot(account.account_address)
+                real_state=snapshot.perp_state
+                real_positions=_position_sizes(real_state)
+                follower_configs=position_configs(real_state)
+                ledger_rows=(await db.execute(select(PositionLedger).where(PositionLedger.user_id==user.id))).scalars().all()
+                ledger_by_asset={row.asset:row for row in ledger_rows}
+                now=datetime.now(UTC)
+
+                for asset in set(real_positions)|set(ledger_by_asset):
+                    real=real_positions.get(asset,Decimal(0))
+                    mark_raw=mids.get(asset)
+                    mark=Decimal(str(mark_raw or '0'))
+                    ledger=ledger_by_asset.get(asset)
+                    if ledger is None:
+                        ledger=PositionLedger(
+                            user_id=user.id,asset=asset,size=real,target_size=Decimal(0),
+                            mark_price=mark,managed=False,exchange_verified_at=now,
+                        )
+                        db.add(ledger)
+                        ledger_by_asset[asset]=ledger
+                    ledger.size=real
+                    if mark > 0:
+                        ledger.mark_price=mark
+                    ledger.exchange_verified_at=now
+                    cfg=follower_configs.get(asset)
+                    ledger.follower_leverage=cfg.leverage if real != 0 and cfg else None
+                    ledger.follower_is_cross=cfg.is_cross if real != 0 and cfg else None
+
+                unmanaged_margin=Decimal(0)
+                for row in real_state.get('assetPositions',[]):
+                    position=row.get('position',row)
+                    asset=str(position.get('coin') or '')
+                    ledger=ledger_by_asset.get(asset)
+                    if ledger is not None and not ledger.managed:
+                        try:
+                            unmanaged_margin += abs(Decimal(str(position.get('marginUsed','0') or '0')))
+                        except Exception:
+                            pass
+
+                db.add(EquitySnapshot(
+                    user_id=user.id,
+                    account_value=snapshot.account_value,
+                    free_margin=snapshot.free_margin,
+                    unmanaged_margin=unmanaged_margin,
+                    collateral_balance=snapshot.collateral_balance,
+                    unrealized_pnl=snapshot.unrealized_pnl,
+                    account_mode=snapshot.abstraction,
+                    taken_at=now,
+                ))
+                await db.commit()
+                refreshed += 1
+            except Exception:
+                await db.rollback()
+                log.warning(
+                    'Follower observability refresh failed',
+                    extra={'user_id':str(user.id),'network':network},
+                    exc_info=True,
+                )
+        return refreshed
+
     async def run_reconcile_if_leader(self):
         async with engine.connect() as conn:
             acquired=bool((await conn.execute(text("SELECT pg_try_advisory_lock(hashtext('hypercopy:reconciler'))"))).scalar_one())
@@ -211,9 +307,22 @@ class Worker:
                     """))).scalars().all()
                     networks=[n for n in raw_networks if n in {'testnet','mainnet'}]
                     for network in networks:
-                        await reconcile_active_users(
-                            db,self.follower_hl(network),master_hl=self.master_hl,
-                        )
+                        try:
+                            await reconcile_active_users(
+                                db,self.follower_hl(network),master_hl=self.master_hl,
+                            )
+                        except Exception:
+                            await db.rollback()
+                            log.warning(
+                                'Full reconciliation failed; refreshing follower observability only',
+                                extra={'master_network':settings.master_network,'follower_network':network},
+                                exc_info=True,
+                            )
+                            refreshed=await self._refresh_follower_observability(db,network)
+                            log.info(
+                                'Follower observability refresh completed',
+                                extra={'follower_network':network,'users_refreshed':refreshed},
+                            )
             finally:
                 await conn.execute(text("SELECT pg_advisory_unlock(hashtext('hypercopy:reconciler'))")); await conn.commit()
 
