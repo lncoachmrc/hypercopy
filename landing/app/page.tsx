@@ -428,7 +428,7 @@ export default function Home() {
 
               <ActivationStep number="02" title="Crea il profilo Hyperliquid">
                 <p>Apri Hyperliquid e collega lo stesso wallet che userai successivamente per accedere a TRAXION.</p>
-                <a className="inline-link" href={HYPERLIQUID_REFERRAL_URL} target="_blank" rel="sponsored noopener noreferrer">Apri Hyperliquid con referral DIGITALEMPOWER <span>↗</span></a>
+                <a className="inline-link" href={HYPERLIQUID_REFERRAL_URL} target="_blank" rel="sponsored noopener noreferrer">Apri un account Hyperliquid qui <span>↗</span></a>
                 <small>Disclosure: il link contiene il referral code <code>DIGITALEMPOWER</code>.</small>
               </ActivationStep>
 
