@@ -28,13 +28,6 @@ async def publish_job(redis: Redis, db: AsyncSession, job: CopyJob) -> None:
 
 
 def stale_enqueue_cutoff(now: datetime | None = None) -> datetime:
-    """Jobs older than this are safe to republish to Redis.
-
-    PostgreSQL owns job state and ``claim_job`` is idempotent under row locking,
-    so republishing a durable QUEUED/RETRYING job cannot execute it twice. This
-    recovers messages stranded in a Redis consumer pending list when a Railway
-    worker is replaced between XREADGROUP delivery and PostgreSQL claim/ack.
-    """
     current = now or datetime.now(UTC)
     return current - timedelta(seconds=max(settings.JOB_LEASE_SECONDS, 30))
 
@@ -45,11 +38,6 @@ def strategy_job_expiry_cutoff(now: datetime | None = None) -> datetime:
 
 
 def strategy_job_expired(job: CopyJob, now: datetime | None = None) -> bool:
-    """Point-in-time strategy jobs must never execute long after their signal.
-
-    EVENT and RECONCILE jobs are superseded by current reconciliation truth.
-    CLOSE_ALL and administrative jobs intentionally do not use this expiry.
-    """
     if job.origin not in STRATEGY_ORIGINS:
         return False
     created_at = job.created_at
@@ -58,7 +46,7 @@ def strategy_job_expired(job: CopyJob, now: datetime | None = None) -> bool:
     return created_at <= strategy_job_expiry_cutoff(now)
 
 
-def _expire_job(job: CopyJob) -> None:
+def expire_strategy_job(job: CopyJob) -> None:
     job.state = JobState.SKIPPED
     job.last_error = f'Stale strategy job expired after {settings.STRATEGY_JOB_MAX_AGE_SECONDS}s; current reconciliation supersedes it'
     job.owner = None
@@ -78,7 +66,7 @@ async def expire_stale_strategy_jobs(db: AsyncSession, now: datetime | None = No
         ).order_by(CopyJob.created_at).limit(limit).with_for_update(skip_locked=True)
     )).scalars().all()
     for job in rows:
-        _expire_job(job)
+        expire_strategy_job(job)
     if rows:
         await db.flush()
     return len(rows)
