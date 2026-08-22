@@ -95,6 +95,10 @@ class Settings(BaseSettings):
     WATCHER_LEASE_RENEW_SECONDS: int = 5
     JOB_LEASE_SECONDS: int = 120
     MAX_JOB_RETRIES: int = 5
+    # EVENT/RECONCILE jobs are point-in-time strategy intents. After this age
+    # they must be rebuilt from current exchange truth instead of executed late.
+    # CLOSE_ALL and administrative jobs are deliberately exempt.
+    STRATEGY_JOB_MAX_AGE_SECONDS: int = 600
     STREAM_NAME: str = 'hypercopy:copy_jobs'
     STREAM_GROUP: str = 'execution-workers'
     REALTIME_CHANNEL_PREFIX: str = 'hypercopy:events'
@@ -135,6 +139,8 @@ class Settings(BaseSettings):
             raise ValueError('HL_SAFE_READ_RETRIES must be between 1 and 5')
         if self.HL_SAFE_READ_BACKOFF_SECONDS < 0:
             raise ValueError('HL_SAFE_READ_BACKOFF_SECONDS cannot be negative')
+        if self.STRATEGY_JOB_MAX_AGE_SECONDS <= 0:
+            raise ValueError('STRATEGY_JOB_MAX_AGE_SECONDS must be positive')
         return self
 
     @property
