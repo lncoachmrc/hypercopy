@@ -65,6 +65,7 @@ export default function SystemHealth({sys}:SystemHealthProps){
   const checkpointOk=Boolean(checkpoint?.configured&&checkpoint.present&&checkpoint.enabled&&checkpoint.time_ms>0);
   const ai=health?.ai_intelligence;
   const aiTone=aiStatusTone(ai?.status);
+  const aiMode=ai?.mode?.toUpperCase()||'—';
 
   useEffect(()=>{
     let alive=true;
@@ -89,6 +90,7 @@ export default function SystemHealth({sys}:SystemHealthProps){
       <HealthCard label="Emergency stop" value={flags.emergency_stop?'ATTIVO':'OK'} tone={flags.emergency_stop?'danger':'ok'} hint="Stato di arresto di emergenza."/>
       <HealthCard label="Master checkpoint" value={!checkpoint?'—':checkpointOk?'OK':'KO'} tone={!checkpoint?'neutral':checkpointOk?'ok':'danger'} hint={checkpointHint(checkpoint)}/>
       <HealthCard label="AI intelligence" value={ai?.status?ai.status.toUpperCase():'—'} tone={aiTone} hint={aiHint(ai)}/>
+      <HealthCard label="Modalità AI" value={aiMode} tone="neutral" hint="Analisi consultiva: l’AI non invia ordini direttamente. Risk Engine e controlli deterministici restano autoritativi."/>
     </div>
 
     {rateAvailable?<>
