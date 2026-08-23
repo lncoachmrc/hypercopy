@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import "./pricing-layout.css";
+import "./master-performance.css";
+import MasterPerformancePortal from "./MasterPerformancePortal";
 import { TRAXION_CANONICAL_URL, traxionAsset } from "./config";
 
 const canonicalIsConfigured = TRAXION_CANONICAL_URL.startsWith("https://");
@@ -58,7 +60,10 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="it">
-      <body>{children}</body>
+      <body>
+        {children}
+        <MasterPerformancePortal />
+      </body>
     </html>
   );
 }
