@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,6 +21,63 @@ PNL_RANGE_CONFIG = {
     '90d': (timedelta(days=90), 6 * 60 * 60),
     'all': (None, 24 * 60 * 60),
 }
+SHARPE_WINDOW_DAYS = 90
+SHARPE_MIN_OBSERVATIONS = 20
+
+
+def _first_full_utc_day(start: datetime) -> date:
+    normalized = start.astimezone(UTC)
+    midnight = datetime(normalized.year, normalized.month, normalized.day, tzinfo=UTC)
+    if normalized > midnight:
+        midnight += timedelta(days=1)
+    return midnight.date()
+
+
+def _completed_daily_realized_returns(
+    equity_points: list[tuple[datetime, float]],
+    realized_by_day: dict[date, float],
+    *,
+    started_at: datetime,
+    now: datetime,
+) -> list[float]:
+    """Build full UTC-day strategy returns without treating cash flows as PnL.
+
+    The numerator is realized closed PnL minus fees. The denominator is the
+    first observed account equity for that UTC day. Later deposits/withdrawals
+    can change the capital base but never become strategy return themselves.
+    Missing opening-equity days are skipped rather than guessed.
+    """
+    cutoff = max(now - timedelta(days=SHARPE_WINDOW_DAYS), started_at)
+    first_day = _first_full_utc_day(cutoff)
+    today = now.astimezone(UTC).date()
+    last_day = today - timedelta(days=1)
+    if first_day > last_day:
+        return []
+
+    openings: dict[date, float] = {}
+    for taken_at, account_value in equity_points:
+        day = taken_at.astimezone(UTC).date()
+        if first_day <= day <= last_day and day not in openings and account_value > 0:
+            openings[day] = account_value
+
+    returns: list[float] = []
+    day = first_day
+    while day <= last_day:
+        opening_equity = openings.get(day)
+        if opening_equity is not None and opening_equity > 0:
+            returns.append(realized_by_day.get(day, 0.0) / opening_equity)
+        day += timedelta(days=1)
+    return returns
+
+
+def _annualized_sharpe(returns: list[float]) -> tuple[float | None, str]:
+    if len(returns) < SHARPE_MIN_OBSERVATIONS:
+        return None, 'collecting'
+    mean = sum(returns) / len(returns)
+    variance = sum((value - mean) ** 2 for value in returns) / (len(returns) - 1)
+    if variance <= 0:
+        return None, 'zero_variance'
+    return mean / math.sqrt(variance) * math.sqrt(365.25), 'ready'
 
 
 async def pnl_history_for_user(db: AsyncSession, user_id, range_key: str = '1d') -> dict:
@@ -107,7 +164,8 @@ async def pnl_history_for_user(db: AsyncSession, user_id, range_key: str = '1d')
 
 async def dashboard_for_user(db: AsyncSession, user_id) -> dict:
     network_state = await user_network_state(db, user_id)
-    since = max(datetime.now(UTC)-timedelta(days=90), network_state.started_at)
+    now = datetime.now(UTC)
+    since = max(now - timedelta(days=SHARPE_WINDOW_DAYS), network_state.started_at)
     latest = (await db.execute(select(EquitySnapshot).where(
         EquitySnapshot.user_id == user_id,
         EquitySnapshot.taken_at >= network_state.started_at,
@@ -121,29 +179,39 @@ async def dashboard_for_user(db: AsyncSession, user_id) -> dict:
     # Equity deltas include deposits, withdrawals and account-mode migrations,
     # so they are not trading PnL. Show realized net PnL only for the current
     # Hyperliquid network epoch selected by the user.
+    net_pnl = func.coalesce(Fill.closed_pnl, 0) - func.coalesce(Fill.fee, 0)
     realized = (await db.execute(
-        select(func.coalesce(func.sum(func.coalesce(Fill.closed_pnl, 0) - func.coalesce(Fill.fee, 0)), 0))
+        select(func.coalesce(func.sum(net_pnl), 0))
         .where(Fill.user_id == user_id, Fill.ts >= since)
     )).scalar_one()
     pnl = float(realized or 0)
 
     peak = values[0] if values else 0.0
     max_dd = 0.0
-    for v in values:
-        peak = max(peak, v)
+    for value in values:
+        peak = max(peak, value)
         if peak > 0:
-            max_dd = max(max_dd, (peak-v)/peak*100)
-    daily = {}
-    for p in points:
-        daily[p.taken_at.date()] = float(p.account_value)
-    closes = list(daily.values())
-    returns = [(closes[i]/closes[i-1]-1) for i in range(1, len(closes)) if closes[i-1] > 0]
-    sharpe = None
-    if len(returns) >= 20:
-        mean = sum(returns)/len(returns)
-        var = sum((r-mean)**2 for r in returns)/(len(returns)-1)
-        if var > 0:
-            sharpe = mean/math.sqrt(var)*math.sqrt(365.25)
+            max_dd = max(max_dd, (peak - value) / peak * 100)
+
+    # Sharpe follows SPEC's daily-UTC approach but measures strategy PnL rather
+    # than raw equity deltas, so deposits/withdrawals are not mistaken for return.
+    today_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
+    day_bucket = func.date_trunc('day', func.timezone('UTC', Fill.ts))
+    daily_rows = (await db.execute(
+        select(day_bucket.label('day'), func.coalesce(func.sum(net_pnl), 0).label('net'))
+        .where(Fill.user_id == user_id, Fill.ts >= since, Fill.ts < today_start)
+        .group_by(day_bucket)
+        .order_by(day_bucket)
+    )).all()
+    realized_by_day = {row.day.date(): float(row.net or 0) for row in daily_rows}
+    daily_returns = _completed_daily_realized_returns(
+        [(point.taken_at, float(point.account_value)) for point in points],
+        realized_by_day,
+        started_at=network_state.started_at,
+        now=now,
+    )
+    sharpe, sharpe_status = _annualized_sharpe(daily_returns)
+
     positions = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user_id))).scalars().all()
     return {
         'network': network_state.network,
@@ -154,11 +222,15 @@ async def dashboard_for_user(db: AsyncSession, user_id) -> dict:
         'free_margin': float(latest.free_margin) if latest else None,
         'account_mode': latest.account_mode if latest else None,
         'snapshot_at': latest.taken_at.isoformat() if latest else None,
-        'snapshot_age_seconds': max((datetime.now(UTC) - latest.taken_at).total_seconds(), 0) if latest else None,
+        'snapshot_age_seconds': max((now - latest.taken_at).total_seconds(), 0) if latest else None,
         'pnl_absolute': pnl,
         'max_drawdown_pct': max_dd,
         'sharpe': sharpe,
-        'sharpe_observations': len(returns),
+        'sharpe_observations': len(daily_returns),
+        'sharpe_min_observations': SHARPE_MIN_OBSERVATIONS,
+        'sharpe_window_days': SHARPE_WINDOW_DAYS,
+        'sharpe_status': sharpe_status,
+        'sharpe_method': 'realized_net_daily_utc',
         'positions': len([p for p in positions if p.size != 0]),
     }
 
