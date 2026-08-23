@@ -58,16 +58,17 @@ async def test_wallet_login_refresh_rotation_logout_and_cross_site_guard():
             assert 0 < remaining <= settings.SESSION_REFRESH_TTL_SECONDS
             assert remaining > settings.SESSION_REFRESH_TTL_SECONDS - 120
 
-            # Refresh credentials are one-time: replaying the rotated-out token
-            # is rejected even while its original 24-hour window is open.
-            async with httpx.AsyncClient(transport=transport, base_url='http://traxion.test') as stale:
-                stale.cookies.set(settings.SESSION_REFRESH_COOKIE_NAME, first_refresh)
-                replay = await stale.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
-                assert replay.status_code == 401
+            # If the first refresh response had been lost, a retry carrying the
+            # predecessor must recover the exact same successor during grace.
+            async with httpx.AsyncClient(transport=transport, base_url='http://traxion.test') as delivery_retry:
+                delivery_retry.cookies.set(settings.SESSION_REFRESH_COOKIE_NAME, first_refresh)
+                recovered = await delivery_retry.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
+                assert recovered.status_code == 200
+                assert delivery_retry.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME) == second_refresh
 
-            # Model a copied refresh credential being rotated elsewhere. The
-            # original browser still has a valid access JWT carrying the same
-            # refresh-family id, so logout must revoke the attacker's successor.
+            # Model a copied refresh credential being rotated elsewhere. A
+            # second delivery retry of that same predecessor must recover the
+            # same third token rather than create a divergent branch.
             async with httpx.AsyncClient(transport=transport, base_url='http://traxion.test') as copied:
                 copied.cookies.set(settings.SESSION_REFRESH_COOKIE_NAME, second_refresh)
                 copied_rotation = await copied.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
@@ -75,6 +76,14 @@ async def test_wallet_login_refresh_rotation_logout_and_cross_site_guard():
                 third_refresh = copied.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME)
                 assert third_refresh and third_refresh != second_refresh
 
+                async with httpx.AsyncClient(transport=transport, base_url='http://traxion.test') as retry_again:
+                    retry_again.cookies.set(settings.SESSION_REFRESH_COOKIE_NAME, second_refresh)
+                    same_rotation = await retry_again.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
+                    assert same_rotation.status_code == 200
+                    assert retry_again.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME) == third_refresh
+
+                # The original browser still has a valid access JWT carrying
+                # the family id. Logout must revoke the successor held elsewhere.
                 session = await client.get(f'{AUTH}/session')
                 assert session.status_code == 200
                 csrf = session.json()['csrf_token']
