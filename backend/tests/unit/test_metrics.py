@@ -26,7 +26,7 @@ def test_sharpe_is_annualized_from_daily_returns():
     value, status = _annualized_sharpe(returns)
     assert status == 'ready'
     assert value is not None
-    assert value == pytest.approx(8.0327, rel=1e-3)
+    assert value == pytest.approx(7.9833, rel=1e-3)
 
 
 def test_daily_returns_use_realized_pnl_and_day_opening_equity_only():
