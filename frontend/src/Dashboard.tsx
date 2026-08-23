@@ -4,7 +4,8 @@ import {get,wsUrl} from './api';
 import {useAuth} from './auth';
 import './dashboard.css';
 
-type Dash={equity:number|null;collateral_balance:number|null;unrealized_pnl:number|null;free_margin:number|null;account_mode:string|null;snapshot_at:string|null;snapshot_age_seconds:number|null;pnl_absolute:number;max_drawdown_pct:number;sharpe:number|null;positions:number;user:{copy_state:string;risk_state:string}};
+type SharpeStatus='collecting'|'ready'|'zero_variance';
+type Dash={equity:number|null;collateral_balance:number|null;unrealized_pnl:number|null;free_margin:number|null;account_mode:string|null;snapshot_at:string|null;snapshot_age_seconds:number|null;pnl_absolute:number;max_drawdown_pct:number;sharpe:number|null;sharpe_observations:number;sharpe_min_observations:number;sharpe_window_days:number;sharpe_status:SharpeStatus;sharpe_method:'realized_net_daily_utc';positions:number;user:{copy_state:string;risk_state:string}};
 type Pos={asset:string;current_size:string;target_size:string;delta:string;mark_price:string;delta_notional:string;status:'READY'|'BELOW_MIN'|'UNAVAILABLE'|'ON_TARGET';reason:string|null;managed:boolean;master_leverage:number|null;master_is_cross:boolean|null;follower_leverage:number|null;follower_is_cross:boolean|null;exchange_verified_at:string|null};
 type LiveLev={asset:string;master_leverage:number|null;master_is_cross:boolean|null;follower_leverage:number|null;follower_is_cross:boolean|null};
 type Exec={id:string;asset:string;state:string;is_buy:boolean;requested_size:string;filled_size:string;avg_price:string|null;reduce_only:boolean;reject_reason:string|null;leverage:number|string|null;is_cross:boolean|null;created_at:string};
@@ -93,8 +94,14 @@ export default function Dashboard(){
       <Card label="PnL aperto" value={signedMoney(d?.unrealized_pnl)} tone={pnlTone(d?.unrealized_pnl)} hint="Varia con le posizioni aperte"/>
       <Card label={`PnL chiuso · ${range.toUpperCase()}`} value={signedMoney(pnl?.pnl_absolute)} tone={pnlTone(pnl?.pnl_absolute)} hint="PnL realizzato meno fee"/>
       <Card label="Margine disponibile" value={money(d?.free_margin)} hint="Disponibile per nuove operazioni"/>
-      <Card label="Max drawdown" value={d?`${d.max_drawdown_pct.toFixed(2)}%`:'—'}/>
-      <Card label="Sharpe" value={d?.sharpe==null?'—':d.sharpe.toFixed(2)}/>
+      <Card label="Max drawdown" value={d?`${d.max_drawdown_pct.toFixed(2)}%`:'—'} hint="Massimo calo dell’equity osservata"/>
+      <Card
+        label={`Sharpe · ${d?.sharpe_window_days??90}D`}
+        value={d?.sharpe==null?'—':d.sharpe.toFixed(2)}
+        tone={sharpeTone(d?.sharpe)}
+        hint={sharpeHint(d)}
+        help="Rendimento netto giornaliero diviso per la sua volatilità, annualizzato. Usa solo giorni UTC completi e PnL chiuso meno fee: depositi e prelievi non vengono conteggiati come rendimento."
+      />
     </div>
 
     <PnlChart data={pnl} range={range} setRange={setRange} error={pnlError}/>
@@ -176,8 +183,10 @@ function pnlAxis(v:number){
 }
 
 function TargetStatus({p}:{p:Pos}){if(p.status==='UNAVAILABLE')return <span className="badge" title={p.reason||''}>Non disponibile TESTNET</span>;if(p.status==='BELOW_MIN')return <span className="badge" title={p.reason||''}>Sotto minimo · ${Number(p.delta_notional).toFixed(2)}</span>;if(p.status==='READY')return <span className="badge live">Pronto · ${Number(p.delta_notional).toFixed(2)}</span>;return <span className="muted">Allineato</span>}
-function Card({label,value,tone='neutral',hint}:{label:string;value:string;tone?:CardTone;hint?:string}){const cls=tone==='positive'?'up':tone==='negative'?'down':'';return <div className="panel stat"><span>{label}</span><strong className={cls}>{value}</strong>{hint&&<small>{hint}</small>}</div>}
+function Card({label,value,tone='neutral',hint,help}:{label:string;value:string;tone?:CardTone;hint?:string;help?:string}){const cls=tone==='positive'?'up':tone==='negative'?'down':'';return <div className="panel stat"><span className="stat-label">{label}{help&&<span className="metric-help" title={help} role="img" aria-label={help}>i</span>}</span><strong className={cls}>{value}</strong>{hint&&<small>{hint}</small>}</div>}
 function pnlTone(v:number|null|undefined):CardTone{return v==null||v===0?'neutral':v>0?'positive':'negative'}
+function sharpeTone(v:number|null|undefined):CardTone{return v==null||v===0?'neutral':v<0?'negative':v>=1?'positive':'neutral'}
+function sharpeHint(d:Dash|null){if(!d)return'Caricamento metrica…';if(d.sharpe_status==='collecting')return`Dati in raccolta · ${d.sharpe_observations}/${d.sharpe_min_observations} giorni completi`;if(d.sharpe_status==='zero_variance')return`${d.sharpe_observations} giorni completi · volatilità nulla`;return`${d.sharpe_observations} giorni completi · PnL netto giornaliero`}
 function money(v:number|null|undefined){return v==null?'—':v.toLocaleString('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2})}
 function signedMoney(v:number|null|undefined){if(v==null)return'—';const abs=Math.abs(v).toLocaleString('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2});return `${v>0?'+':v<0?'-':''}${abs}`}
 function snapshotLabel(d:Dash|null){if(!d?.snapshot_at)return'Dati Hyperliquid non disponibili';const seconds=Math.max(Math.round(d.snapshot_age_seconds??0),0);if(seconds<90)return'Dati Hyperliquid aggiornati';return `Dati Hyperliquid di ${Math.max(Math.round(seconds/60),1)} min fa`}
