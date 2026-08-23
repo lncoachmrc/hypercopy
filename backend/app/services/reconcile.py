@@ -13,6 +13,7 @@ from app.adapters.ratelimit import Priority
 from app.core.config import settings
 from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, FollowerState, MasterExposure, compute_target
 from app.models.entities import CopyJob, CopyState, EquitySnapshot, Execution, ExecutionState, Fill, JobState, PositionLedger, ReconciliationRun, RiskHalt, RiskProfile, RiskState, TradingAccount, User, UserState
+from app.services.ai_mode import read_ai_execution_policy
 from app.services.audit import audit
 from app.services.networking import user_network_state
 
@@ -167,6 +168,8 @@ async def reconcile_user(
             risk_state = RiskState(user_id=user.id, peak_equity=equity, day_start_equity=equity, day_key=datetime.now(UTC).date().isoformat())
             db.add(risk_state)
         risk = (await db.execute(select(RiskProfile).where(RiskProfile.user_id == user.id))).scalar_one_or_none()
+        ai_policy = await read_ai_execution_policy(db)
+        ai_factor = ai_policy.factor
 
         distances = []
         for row in real_state.get('assetPositions', []):
@@ -246,13 +249,15 @@ async def reconcile_user(
 
             master_pos = master_positions.get(asset, Decimal(0))
             master_mark = Decimal(str(source_mids.get(asset, '0') or '0'))
+            base_target = Decimal(0)
             desired_target = Decimal(0)
             if master_pos != 0 and master_equity > 0 and master_mark > 0 and follower_mark > 0:
-                desired_target = compute_target(
+                base_target = compute_target(
                     MasterExposure(asset, master_pos, master_mark, master_equity),
                     FollowerState(str(user.id), equity, unmanaged_margin, real, multiplier),
                     follower_mark,
                 )
+                desired_target = base_target * ai_factor
             ledger.target_size = desired_target
 
             master_config = source_configs.get(asset)
@@ -318,6 +323,10 @@ async def reconcile_user(
                 'mark_price': str(master_mark),
                 'master_network': settings.master_network,
                 'follower_network': network,
+                'ai_mode': ai_policy.effective_mode,
+                'ai_execution_influence': ai_policy.effective,
+                'ai_execution_factor': str(ai_factor),
+                'ai_target_without_influence': str(base_target),
             }
             if master_config is not None:
                 context['master_leverage'] = master_config.leverage
@@ -348,10 +357,10 @@ async def reconcile_user(
             taken_at=datetime.now(UTC),
         ))
 
-        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'network': network, 'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created}; run.finished_at = datetime.now(UTC)
-        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'network': network, 'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created})
+        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'network': network, 'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created, 'ai_mode': ai_policy.effective_mode, 'ai_execution_factor': str(ai_factor)}; run.finished_at = datetime.now(UTC)
+        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'network': network, 'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created, 'ai_mode': ai_policy.effective_mode, 'ai_execution_factor': str(ai_factor)})
         await db.commit()
-        return {'status': 'OK', 'network': network, 'discrepancies': discrepancies, 'equity': str(equity), 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created}
+        return {'status': 'OK', 'network': network, 'discrepancies': discrepancies, 'equity': str(equity), 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created, 'ai_mode': ai_policy.effective_mode, 'ai_execution_factor': str(ai_factor)}
     except Exception as exc:
         run.status = 'FAILED'; run.error = f'{type(exc).__name__}: {exc}'; run.finished_at = datetime.now(UTC); await db.commit(); raise
 
