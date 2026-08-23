@@ -13,13 +13,17 @@ For least privilege, use **different external KMS IAM principals** per Railway s
 Wallet challenges are one-time, short lived, persisted in PostgreSQL for auditability and atomically consumed from Redis. A successful wallet signature creates two separate browser credentials:
 
 - a 60-minute access JWT stored only in an `HttpOnly; Secure; SameSite=Lax` cookie in production;
-- an opaque, one-time rotating refresh credential stored in a second `HttpOnly; Secure; SameSite=Lax` cookie with an absolute 24-hour lifetime from the original wallet signature.
+- an opaque rotating refresh credential stored in a second `HttpOnly; Secure; SameSite=Lax` cookie with an absolute 24-hour lifetime from the original wallet signature.
 
-Redis stores only an HMAC digest of the refresh credential, never the plaintext cookie value. Every successful refresh consumes the current Redis entry and creates a new opaque credential without extending the original 24-hour absolute expiration. After that boundary, after logout/revocation, or when the refresh credential is invalid, a new wallet signature is required.
+Redis uses HMAC digests of refresh credentials as lookup keys, never reusable plaintext token values. Normal rotation creates a deterministic HMAC-derived opaque successor and preserves the predecessor for at most 60 seconds only as a delivery-recovery handle. During that fixed grace interval, a retry can reproduce the exact same successor if an HTTP response was lost or another tab raced the rotation; it cannot create a divergent token branch, cannot extend the grace interval and cannot extend the original 24-hour absolute expiry. Successor state is stored before the predecessor is converted into its bounded grace record, so a failed replacement write leaves the existing credential usable instead of forcing another wallet signature.
+
+The access JWT carries a random session-family identifier and the absolute family expiry. Logout deny-lists that family until its original expiration, which invalidates both future refreshes and already-issued access JWTs belonging to other tabs in the same family. The current access JTI is also deny-listed and browser cookies are cleared.
 
 The refresh endpoint does not depend on an expired access JWT. It requires the HttpOnly refresh cookie and the custom `X-Requested-With: HyperCopy` header; SameSite=Lax plus the non-simple custom header prevents a cross-site form from silently rotating the session. Authenticated mutations continue to require the access-session CSRF token plus the same custom header.
 
-Roles are re-read from PostgreSQL rather than trusted from a client token hint. Refresh issuance also reloads the user from PostgreSQL before minting the replacement access JWT. The frontend retries an expired access request only after a successful refresh; if the 24-hour refresh window is no longer valid it clears local auth state and returns to login instead of leaving a stale authenticated shell visible.
+A refresh changes the shared CSRF cookie as well as the access cookie. The frontend therefore synchronizes fresh CSRF values between same-origin tabs through an in-memory `BroadcastChannel` when available, with no localStorage persistence. Browsers without that mechanism, or tabs that miss the broadcast, recover only an explicit CSRF mismatch by reading the authoritative `/auth/session` state and retrying the mutation once.
+
+Roles are re-read from PostgreSQL rather than trusted from a client token hint. Refresh issuance also reloads the user from PostgreSQL before minting the replacement access JWT. The frontend retries an expired access request only through the guarded refresh flow; if the 24-hour refresh window is no longer valid it clears local auth state and returns to login instead of leaving a stale authenticated shell visible.
 
 IP addresses are hashed for audit/rate-limiting signals but are deliberately not a hard session-binding key: mobile networks, CGNAT, VPNs and normal ISP renewals can legitimately change an IP during the same trusted browser session.
 
