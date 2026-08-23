@@ -4,11 +4,14 @@ import {BrowserRouter} from 'react-router-dom';
 import App from './App';
 import {AuthProvider} from './auth';
 import {initLanguage} from './i18n';
-import {initAutoTranslate} from './autoTranslate';
+import {initAutoTranslate,translateText} from './autoTranslate';
 import './styles.css';
 import './i18n.css';
 
 initLanguage();
+
+const nativeConfirm=window.confirm.bind(window);
+window.confirm=(message?:string)=>nativeConfirm(translateText(String(message??'')));
 
 ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><BrowserRouter><AuthProvider><App/></AuthProvider></BrowserRouter></React.StrictMode>);
 
