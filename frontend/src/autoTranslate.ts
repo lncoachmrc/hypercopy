@@ -1,0 +1,84 @@
+import {detectLanguage} from './i18n';
+import {FRONTEND_DICTIONARIES,type TranslationMap} from './translations';
+import {ADMIN_EN,ADMIN_ES} from './admin-translations';
+
+const SKIP_TAGS=new Set(['SCRIPT','STYLE','NOSCRIPT','TEXTAREA','CODE','PRE']);
+
+function activeDictionary():TranslationMap{
+  const language=detectLanguage();
+  if(language==='it')return {};
+  const base=FRONTEND_DICTIONARIES[language];
+  const admin=language==='en'?ADMIN_EN:ADMIN_ES;
+  return {...base,...admin};
+}
+
+function normalise(value:string){return value.replace(/\s+/g,' ').trim()}
+function escapeRegExp(value:string){return value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}
+function entries(){return Object.entries(activeDictionary()).sort((a,b)=>b[0].length-a[0].length)}
+
+export function translateText(value:string){
+  const dictionaryEntries=entries();
+  if(!dictionaryEntries.length)return value;
+  const compact=normalise(value);
+  const exact=dictionaryEntries.find(([source])=>normalise(source)===compact);
+  if(exact){
+    const prefix=value.match(/^\s*/)?.[0]||'';
+    const suffix=value.match(/\s*$/)?.[0]||'';
+    return `${prefix}${exact[1]}${suffix}`;
+  }
+  let output=value;
+  for(const [source,target] of dictionaryEntries){
+    output=output.replace(new RegExp(escapeRegExp(source),'g'),target);
+  }
+  return output;
+}
+
+function skipped(element:Element|null){
+  if(!element)return false;
+  return SKIP_TAGS.has(element.tagName)||Boolean(element.closest('[data-no-translate]'));
+}
+
+function translateAttributes(element:Element){
+  if(skipped(element))return;
+  ['placeholder','aria-label','alt','title'].forEach(attribute=>{
+    const value=element.getAttribute(attribute);
+    if(!value)return;
+    const next=translateText(value);
+    if(next!==value)element.setAttribute(attribute,next);
+  });
+}
+
+function translateNode(node:Node){
+  if(node.nodeType!==Node.TEXT_NODE||!node.textContent?.trim())return;
+  if(skipped(node.parentElement))return;
+  const next=translateText(node.textContent);
+  if(next!==node.textContent)node.textContent=next;
+}
+
+function translateTree(root:ParentNode){
+  if(root instanceof Element)translateAttributes(root);
+  root.querySelectorAll?.('[placeholder],[aria-label],[alt],[title]').forEach(translateAttributes);
+  const walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);
+  let node=walker.nextNode();
+  while(node){translateNode(node);node=walker.nextNode()}
+}
+
+export function initAutoTranslate(){
+  if(typeof window==='undefined'||detectLanguage()==='it')return ()=>{};
+  const run=()=>translateTree(document.body);
+  window.requestAnimationFrame(run);
+  const fast=window.setTimeout(run,200);
+  const late=window.setTimeout(run,900);
+  const observer=new MutationObserver(mutations=>{
+    for(const mutation of mutations){
+      if(mutation.type==='characterData'){translateNode(mutation.target);continue}
+      if(mutation.type==='attributes'&&mutation.target instanceof Element){translateAttributes(mutation.target);continue}
+      mutation.addedNodes.forEach(node=>{
+        if(node.nodeType===Node.TEXT_NODE)translateNode(node);
+        else if(node.nodeType===Node.ELEMENT_NODE)translateTree(node as Element);
+      });
+    }
+  });
+  observer.observe(document.body,{childList:true,subtree:true,characterData:true,attributes:true,attributeFilter:['placeholder','aria-label','alt','title']});
+  return ()=>{observer.disconnect();window.clearTimeout(fast);window.clearTimeout(late)};
+}
