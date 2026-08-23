@@ -37,7 +37,7 @@ class AiExecutionPolicy:
         }
 
 
-def _bounded_decimal(value, *, default: Decimal = Decimal(0)) -> Decimal:
+def _bounded_buffer(value, *, default: Decimal = Decimal(0)) -> Decimal:
     try:
         parsed = Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
@@ -45,30 +45,58 @@ def _bounded_decimal(value, *, default: Decimal = Decimal(0)) -> Decimal:
     return max(Decimal(0), min(parsed, MAX_AI_BUFFER_PCT))
 
 
-def derive_ai_execution_policy(state: dict | None, *, requested: bool) -> AiExecutionPolicy:
+def _bounded_factor(value, *, default: Decimal = Decimal(1)) -> Decimal:
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        parsed = default
+    return max(MIN_AI_EXECUTION_FACTOR, min(parsed, Decimal(1)))
+
+
+def derive_ai_execution_policy(
+    state: dict | None,
+    *,
+    requested: bool,
+    fallback_factor: Decimal = Decimal(1),
+) -> AiExecutionPolicy:
     state = state if isinstance(state, dict) else {}
     status = str(state.get('status') or 'pending').lower()
     analysis = state.get('analysis') if isinstance(state.get('analysis'), dict) else {}
     capital_policy = analysis.get('capital_policy') if isinstance(analysis.get('capital_policy'), dict) else {}
-    buffer_pct = _bounded_decimal(capital_policy.get('buffer_pct', 0))
+    buffer_pct = _bounded_buffer(capital_policy.get('buffer_pct', 0))
 
     fallback_reason = None
     effective = requested
     if requested and status != 'ok':
         effective = False
-        fallback_reason = f'AI intelligence status is {status}; execution influence falls back to SHADOW.'
+        fallback_reason = (
+            f'AI intelligence status is {status}; new AI influence is disabled and the last safe '
+            'capital-allocation factor remains frozen.'
+        )
     elif requested and not capital_policy:
         effective = False
-        fallback_reason = 'AI capital policy is unavailable; execution influence falls back to SHADOW.'
+        fallback_reason = (
+            'AI capital policy is unavailable; new AI influence is disabled and the last safe '
+            'capital-allocation factor remains frozen.'
+        )
 
-    factor = max(MIN_AI_EXECUTION_FACTOR, Decimal(1) - buffer_pct) if effective else Decimal(1)
+    if not requested:
+        factor = Decimal(1)
+        applied_buffer = Decimal(0)
+    elif effective:
+        factor = max(MIN_AI_EXECUTION_FACTOR, Decimal(1) - buffer_pct)
+        applied_buffer = Decimal(1) - factor
+    else:
+        factor = _bounded_factor(fallback_factor)
+        applied_buffer = Decimal(1) - factor
+
     return AiExecutionPolicy(
         requested_mode='on' if requested else 'shadow',
         effective_mode='on' if effective else 'shadow',
         requested=requested,
         effective=effective,
         factor=factor,
-        buffer_pct=buffer_pct if effective else Decimal(0),
+        buffer_pct=applied_buffer,
         status=status,
         fallback_reason=fallback_reason,
     )
@@ -78,7 +106,13 @@ async def read_ai_execution_policy(db: AsyncSession) -> AiExecutionPolicy:
     mode_row = await db.get(SystemFlag, AI_EXECUTION_FLAG_SLUG)
     intelligence_row = await db.get(SystemFlag, AI_FLAG_SLUG)
     state = (intelligence_row.value or {}) if intelligence_row else {}
-    return derive_ai_execution_policy(state, requested=bool(mode_row and mode_row.enabled))
+    mode_value = (mode_row.value or {}) if mode_row else {}
+    fallback_factor = _bounded_factor(mode_value.get('last_valid_factor', 1))
+    return derive_ai_execution_policy(
+        state,
+        requested=bool(mode_row and mode_row.enabled),
+        fallback_factor=fallback_factor,
+    )
 
 
 async def set_ai_execution_mode(db: AsyncSession, *, enabled: bool, reason: str) -> AiExecutionPolicy:
@@ -90,8 +124,11 @@ async def set_ai_execution_mode(db: AsyncSession, *, enabled: bool, reason: str)
 
     now = datetime.now(UTC)
     row = await db.get(SystemFlag, AI_EXECUTION_FLAG_SLUG)
+    previous = (row.value or {}) if row else {}
     value = {
         'requested_mode': 'on' if enabled else 'shadow',
+        'last_valid_factor': str(candidate.factor) if enabled else previous.get('last_valid_factor', '1'),
+        'last_valid_buffer_pct': str(candidate.buffer_pct) if enabled else previous.get('last_valid_buffer_pct', '0'),
         'updated_at': now.isoformat(),
     }
     if row is None:
