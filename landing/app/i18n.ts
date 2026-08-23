@@ -49,7 +49,8 @@ export function initLanguage():Language{
   if(typeof document!=="undefined")document.documentElement.lang=htmlLocaleByLanguage[language];
   if(typeof window!=="undefined"){
     const query=querySelection();
-    if(query&&query!=="auto")window.localStorage.setItem(STORAGE_KEY,language);
+    if(query==="auto")window.localStorage.removeItem(STORAGE_KEY);
+    else if(query)window.localStorage.setItem(STORAGE_KEY,language);
     if(query){
       const url=new URL(window.location.href);
       url.searchParams.delete("lang");
