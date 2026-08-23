@@ -470,11 +470,6 @@ export default function Home() {
           <div className="shell">
             <div className="pricing-heading">
               <div><p className="section-kicker">06 / Trial e piani</p><h2>Capacità proporzionata al portafoglio operativo.</h2></div>
-              <div className="period-toggle" role="group" aria-label="Periodicità dei prezzi">
-                <button className={period === "monthly" ? "active" : ""} type="button" onClick={() => setPeriod("monthly")}>Mensile</button>
-                <button className={period === "annual" ? "active" : ""} type="button" onClick={() => setPeriod("annual")}>Annuale</button>
-                <span>−50%</span>
-              </div>
             </div>
 
             <article className="trial-card">
@@ -482,6 +477,12 @@ export default function Home() {
               <div className="trial-facts"><span><strong>1.000 USD</strong>portafoglio massimo</span><span><strong>3</strong>posizioni massime</span><span><strong>500 USD</strong>massimo per trade</span><span><strong>1×</strong>intensità massima</span></div>
               <ExternalAppLink className="button">Avvia il trial</ExternalAppLink>
             </article>
+
+            <div className="period-toggle" role="group" aria-label="Periodicità dei prezzi">
+              <button className={period === "monthly" ? "active" : ""} type="button" onClick={() => setPeriod("monthly")}>Mensile</button>
+              <button className={period === "annual" ? "active" : ""} type="button" onClick={() => setPeriod("annual")}>Annuale</button>
+              <span>−50%</span>
+            </div>
 
             <div className="pricing-grid">
               {plans.map((plan) => {
