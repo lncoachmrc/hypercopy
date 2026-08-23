@@ -1,10 +1,23 @@
 "use client";
 
 import {useEffect,useRef,useState} from "react";
+import {createPortal} from "react-dom";
 import {initAutoTranslate} from "./autoTranslate";
-import {changeLanguage,detectLanguage,initLanguage,languageLabels,SUPPORTED_LANGUAGES,tr,type Language} from "./i18n";
+import {TRAXION_APP_URL} from "./config";
+import {changeLanguage,detectLanguage,initLanguage,languageLabels,SUPPORTED_LANGUAGES,tr,withLanguageQuery,type Language} from "./i18n";
 
 function GlobeIcon(){return <svg aria-hidden="true" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.4 2.5 3.6 5.5 3.6 9S14.4 18.5 12 21c-2.4-2.5-3.6-5.5-3.6-9S9.6 5.5 12 3Z"/></svg>}
+
+function localizeAppLinks(){
+  if(typeof window==="undefined")return;
+  const app=new URL(TRAXION_APP_URL,window.location.href);
+  document.querySelectorAll<HTMLAnchorElement>("a[href]").forEach(anchor=>{
+    try{
+      const target=new URL(anchor.href,window.location.href);
+      if(target.origin===app.origin&&target.pathname===app.pathname)anchor.href=withLanguageQuery(target.toString());
+    }catch{/* Ignore non-URL href values. */}
+  });
+}
 
 export function LanguageController(){
   useEffect(()=>{
@@ -16,9 +29,27 @@ export function LanguageController(){
       document.title="TRAXION | Inteligencia híbrida. Ejecución determinista.";
       document.querySelector('meta[name="description"]')?.setAttribute("content","TRAXION conecta análisis humano, Capital Intelligence AI, Risk Engine y ejecución disciplinada en Hyperliquid.");
     }
-    return initAutoTranslate();
+    localizeAppLinks();
+    const translateCleanup=initAutoTranslate();
+    const linksTimer=window.setTimeout(localizeAppLinks,500);
+    return()=>{translateCleanup();window.clearTimeout(linksTimer)};
   },[]);
   return null;
+}
+
+export function LanguageSelectorPortal(){
+  const [host,setHost]=useState<HTMLElement|null>(null);
+  useEffect(()=>{
+    const cta=document.querySelector<HTMLElement>(".header-cta");
+    const header=cta?.parentElement;
+    if(!header)return;
+    const node=document.createElement("div");
+    node.className="landing-language-host";
+    header.insertBefore(node,cta);
+    setHost(node);
+    return()=>node.remove();
+  },[]);
+  return host?createPortal(<LanguageSelector/>,host):null;
 }
 
 export default function LanguageSelector(){
