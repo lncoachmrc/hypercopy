@@ -23,6 +23,7 @@ PNL_RANGE_CONFIG = {
 }
 SHARPE_WINDOW_DAYS = 90
 SHARPE_MIN_OBSERVATIONS = 20
+SHARPE_OPENING_SNAPSHOT_MAX_DELAY_SECONDS = 5 * 60
 
 
 def _first_full_utc_day(start: datetime) -> date:
@@ -42,10 +43,11 @@ def _completed_daily_realized_returns(
 ) -> list[float]:
     """Build full UTC-day strategy returns without treating cash flows as PnL.
 
-    The numerator is realized closed PnL minus fees. The denominator is the
-    first observed account equity for that UTC day. Later deposits/withdrawals
-    can change the capital base but never become strategy return themselves.
-    Missing opening-equity days are skipped rather than guessed.
+    The numerator is realized closed PnL minus fees. The denominator is an
+    account-equity snapshot sufficiently near 00:00 UTC. Later deposits,
+    withdrawals or delayed snapshots never become strategy return themselves.
+    Days without a trustworthy opening-equity snapshot are skipped rather than
+    guessed.
     """
     cutoff = max(now - timedelta(days=SHARPE_WINDOW_DAYS), started_at)
     first_day = _first_full_utc_day(cutoff)
@@ -56,8 +58,16 @@ def _completed_daily_realized_returns(
 
     openings: dict[date, float] = {}
     for taken_at, account_value in equity_points:
-        day = taken_at.astimezone(UTC).date()
-        if first_day <= day <= last_day and day not in openings and account_value > 0:
+        taken_utc = taken_at.astimezone(UTC)
+        day = taken_utc.date()
+        day_start = datetime(day.year, day.month, day.day, tzinfo=UTC)
+        opening_delay = (taken_utc - day_start).total_seconds()
+        if (
+            first_day <= day <= last_day
+            and day not in openings
+            and account_value > 0
+            and 0 <= opening_delay <= SHARPE_OPENING_SNAPSHOT_MAX_DELAY_SECONDS
+        ):
             openings[day] = account_value
 
     returns: list[float] = []
