@@ -14,13 +14,15 @@ const base = () => {
 };
 let csrf = '';
 export const setCsrf = (value:string) => { csrf=value; };
+export const SESSION_EXPIRED_EVENT='traxion:session-expired';
 
 export class ApiError extends Error { constructor(public status:number,message:string,public code?:string){super(message);} }
 
 const API_TIMEOUT_MS = 15_000;
 export const ACTIVATION_TIMEOUT_MS = 60_000;
+let refreshFlight:Promise<boolean>|null=null;
 
-export async function api<T>(path:string, init:RequestInit={}, timeoutMs=API_TIMEOUT_MS):Promise<T>{
+function requestHeaders(init:RequestInit){
   const method=(init.method||'GET').toUpperCase();
   const headers=new Headers(init.headers);
   if (init.body) headers.set('Content-Type','application/json');
@@ -28,31 +30,86 @@ export async function api<T>(path:string, init:RequestInit={}, timeoutMs=API_TIM
     headers.set('X-Requested-With','HyperCopy');
     if (csrf) headers.set('X-CSRF-Token',csrf);
   }
+  return headers;
+}
 
-  const controller = new AbortController();
-  const timer = window.setTimeout(()=>controller.abort(), timeoutMs);
-  const externalSignal = init.signal;
-  if (externalSignal) {
-    if (externalSignal.aborted) controller.abort();
+async function request(path:string,init:RequestInit,timeoutMs:number):Promise<Response>{
+  const controller=new AbortController();
+  const timer=window.setTimeout(()=>controller.abort(),timeoutMs);
+  const externalSignal=init.signal;
+  if(externalSignal){
+    if(externalSignal.aborted)controller.abort();
     else externalSignal.addEventListener('abort',()=>controller.abort(),{once:true});
   }
-
-  let res:Response;
-  try {
-    res=await fetch(`${base()}${path}`,{...init,headers,credentials:'include',signal:controller.signal});
-  } catch (e) {
-    if (controller.signal.aborted) throw new ApiError(0,`Il server TRAXION non ha risposto entro ${Math.round(timeoutMs/1000)} secondi. Riprova o verifica lo stato dei servizi.`,'API_TIMEOUT');
+  try{
+    return await fetch(`${base()}${path}`,{...init,headers:requestHeaders(init),credentials:'include',signal:controller.signal});
+  }catch(e){
+    if(controller.signal.aborted)throw new ApiError(0,`Il server TRAXION non ha risposto entro ${Math.round(timeoutMs/1000)} secondi. Riprova o verifica lo stato dei servizi.`,'API_TIMEOUT');
     throw e;
-  } finally {
+  }finally{
     window.clearTimeout(timer);
   }
+}
 
-  if (!res.ok){
-    let message=`Request failed (${res.status})`, code='';
-    try { const body=await res.json(); message=body?.error?.message||body?.detail||message; code=body?.error?.code||''; } catch {}
-    throw new ApiError(res.status,String(message),code);
+async function errorFrom(res:Response):Promise<ApiError>{
+  let message=`Request failed (${res.status})`,code='';
+  try{const body=await res.json();message=body?.error?.message||body?.detail||message;code=body?.error?.code||'';}catch{}
+  return new ApiError(res.status,String(message),code);
+}
+
+async function syncSessionFromAnotherTab():Promise<boolean>{
+  // A second tab can lose the one-time refresh race after the first tab rotates
+  // the shared cookies. Give that Set-Cookie a brief chance to land, then read
+  // /auth/session to synchronize this tab's in-memory CSRF token.
+  await new Promise(resolve=>window.setTimeout(resolve,180));
+  try{
+    const res=await request('/auth/session',{method:'GET'},API_TIMEOUT_MS);
+    if(!res.ok)return false;
+    const session=await res.json() as Session;
+    setCsrf(session.csrf_token);
+    return true;
+  }catch{return false;}
+}
+
+async function renewSession():Promise<boolean>{
+  if(refreshFlight)return refreshFlight;
+  refreshFlight=(async()=>{
+    try{
+      const res=await request('/auth/refresh',{method:'POST'},API_TIMEOUT_MS);
+      if(res.ok){
+        const session=await res.json() as Session;
+        setCsrf(session.csrf_token);
+        return true;
+      }
+      return await syncSessionFromAnotherTab();
+    }catch{
+      return await syncSessionFromAnotherTab();
+    }
+  })();
+  try{return await refreshFlight;}finally{refreshFlight=null;}
+}
+
+function canRefresh(path:string){
+  return !['/auth/challenge','/auth/verify','/auth/refresh'].includes(path);
+}
+
+function announceExpiredSession(){
+  setCsrf('');
+  window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
+}
+
+export async function api<T>(path:string, init:RequestInit={}, timeoutMs=API_TIMEOUT_MS):Promise<T>{
+  let res=await request(path,init,timeoutMs);
+  if(res.status===401&&canRefresh(path)){
+    const renewed=await renewSession();
+    if(renewed){
+      res=await request(path,init,timeoutMs);
+    }
+    if(res.status===401)announceExpiredSession();
   }
-  if(res.status===204) return undefined as T;
+
+  if(!res.ok)throw await errorFrom(res);
+  if(res.status===204)return undefined as T;
   return res.json() as Promise<T>;
 }
 export const get=<T>(p:string)=>api<T>(p);
