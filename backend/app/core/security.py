@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -58,6 +59,23 @@ def create_session_token(user_id: str, address: str, role: str, csrf: str | None
 
 def decode_session_token(token: str) -> dict[str, Any]:
     return jwt.decode(token, settings.SESSION_SECRET, algorithms=[ALGORITHM])
+
+
+def create_refresh_token() -> str:
+    """Create a high-entropy opaque refresh credential.
+
+    The plaintext is sent only as an HttpOnly cookie. Redis stores only its
+    HMAC digest, so a Redis key listing does not reveal a reusable credential.
+    """
+    return secrets.token_urlsafe(48)
+
+
+def hash_refresh_token(token: str) -> str:
+    return hmac.new(
+        settings.SESSION_SECRET.encode(),
+        token.encode(),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def hash_ip(ip: str | None) -> str | None:
