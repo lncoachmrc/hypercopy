@@ -83,7 +83,8 @@ async def test_wallet_login_refresh_rotation_logout_and_cross_site_guard():
                     assert retry_again.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME) == third_refresh
 
                 # The original browser still has a valid access JWT carrying
-                # the family id. Logout must revoke the successor held elsewhere.
+                # the family id. Logout must revoke every access/refresh
+                # credential from that family, including those held elsewhere.
                 session = await client.get(f'{AUTH}/session')
                 assert session.status_code == 200
                 csrf = session.json()['csrf_token']
@@ -94,6 +95,9 @@ async def test_wallet_login_refresh_rotation_logout_and_cross_site_guard():
                 )
                 assert logged_out.status_code == 204
                 assert client.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME) is None
+
+                copied_access_after_logout = await copied.get(f'{AUTH}/session')
+                assert copied_access_after_logout.status_code == 401
 
                 copied.cookies.set(settings.SESSION_REFRESH_COOKIE_NAME, third_refresh)
                 after_logout = await copied.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
