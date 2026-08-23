@@ -23,8 +23,9 @@ def test_all_range_never_reaches_before_operational_start():
     assert bucket_seconds == 24 * 60 * 60
 
 
-def test_short_range_is_clamped_to_operational_start():
-    now = datetime(2026, 8, 18, 0, 0, tzinfo=UTC)
-    started_at = now - timedelta(hours=2)
-    start, _ = _range_start(now, started_at, '1d')
+@pytest.mark.parametrize('range_key', ['90d', '180d', '1y'])
+def test_long_term_ranges_are_clamped_to_operational_start(range_key: str):
+    now = datetime(2026, 8, 23, 14, 0, tzinfo=UTC)
+    started_at = now - timedelta(days=6)
+    start, _ = _range_start(now, started_at, range_key)
     assert start == started_at

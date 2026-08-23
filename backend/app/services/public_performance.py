@@ -10,10 +10,9 @@ from app.models.entities import SystemFlag
 
 
 PUBLIC_PERFORMANCE_RANGE_CONFIG = {
-    '1d': (timedelta(days=1), 5 * 60),
-    '7d': (timedelta(days=7), 30 * 60),
-    '30d': (timedelta(days=30), 2 * 60 * 60),
     '90d': (timedelta(days=90), 6 * 60 * 60),
+    '180d': (timedelta(days=180), 12 * 60 * 60),
+    '1y': (timedelta(days=365), 24 * 60 * 60),
     'all': (None, 24 * 60 * 60),
 }
 

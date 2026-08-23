@@ -15,7 +15,7 @@ router = APIRouter(tags=['public'])
 @router.get('/public/master-performance')
 async def master_performance(
     response: Response,
-    range: str = Query('all', pattern='^(1d|7d|30d|90d|all)$'),
+    range: str = Query('all', pattern='^(90d|180d|1y|all)$'),
     db: AsyncSession = Depends(get_db),
 ):
     if range not in PUBLIC_PERFORMANCE_RANGE_CONFIG:
