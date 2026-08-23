@@ -18,6 +18,12 @@ export const htmlLocaleByLanguage:Record<Language,string>={
   es:'es-ES',
 };
 
+const documentCopy:Record<Language,{title:string;description:string}>={
+  it:{title:'TRAXION | Trading ibrido su Hyperliquid con analisti + AI',description:'TRAXION: trading ibrido su Hyperliquid con analisti, sistemi AI, Risk Engine ed esecuzione automatizzata.'},
+  en:{title:'TRAXION | Hybrid trading on Hyperliquid with analysts + AI',description:'TRAXION: hybrid trading on Hyperliquid with analysts, AI systems, Risk Engine and automated execution.'},
+  es:{title:'TRAXION | Trading híbrido en Hyperliquid con analistas + IA',description:'TRAXION: trading híbrido en Hyperliquid con analistas, sistemas de IA, Risk Engine y ejecución automatizada.'},
+};
+
 export function normaliseLanguage(value?:string|null):Language|null{
   if(!value)return null;
   const code=value.toLowerCase().split('-')[0];
@@ -55,7 +61,11 @@ export function detectLanguage():Language{
 
 export function initLanguage():Language{
   const language=detectLanguage();
-  if(typeof document!=='undefined')document.documentElement.lang=htmlLocaleByLanguage[language];
+  if(typeof document!=='undefined'){
+    document.documentElement.lang=htmlLocaleByLanguage[language];
+    document.title=documentCopy[language].title;
+    document.querySelector('meta[name="description"]')?.setAttribute('content',documentCopy[language].description);
+  }
   if(typeof window!=='undefined'){
     const query=queryLanguage();
     if(query&&query!=='auto')window.localStorage.setItem(STORAGE_KEY,language);
