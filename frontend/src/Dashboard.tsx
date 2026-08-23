@@ -102,6 +102,13 @@ export default function Dashboard(){
         hint={sharpeHint(d)}
         help="Rendimento netto giornaliero diviso per la sua volatilità, annualizzato. Usa solo giorni UTC completi e PnL chiuso meno fee: depositi e prelievi non vengono conteggiati come rendimento."
       />
+      <Card
+        label={`Performance · ${range.toUpperCase()}`}
+        value={signedPercent(pnl?.pnl_pct)}
+        tone={pnlTone(pnl?.pnl_pct)}
+        hint={pnl?.start_equity==null?'Equity iniziale intervallo non disponibile':'PnL chiuso / equity iniziale intervallo'}
+        help="Performance percentuale dello stesso intervallo selezionato nel grafico. È calcolata come PnL chiuso netto diviso per l’equity iniziale dell’intervallo."
+      />
     </div>
 
     <PnlChart data={pnl} range={range} setRange={setRange} error={pnlError}/>
@@ -189,5 +196,6 @@ function sharpeTone(v:number|null|undefined):CardTone{return v==null||v===0?'neu
 function sharpeHint(d:Dash|null){if(!d)return'Caricamento metrica…';if(d.sharpe_status==='collecting')return`Dati in raccolta · ${d.sharpe_observations}/${d.sharpe_min_observations} giorni completi`;if(d.sharpe_status==='zero_variance')return`${d.sharpe_observations} giorni completi · volatilità nulla`;return`${d.sharpe_observations} giorni completi · PnL netto giornaliero`}
 function money(v:number|null|undefined){return v==null?'—':v.toLocaleString('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2})}
 function signedMoney(v:number|null|undefined){if(v==null)return'—';const abs=Math.abs(v).toLocaleString('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2});return `${v>0?'+':v<0?'-':''}${abs}`}
+function signedPercent(v:number|null|undefined){if(v==null)return'—';return `${v>0?'+':''}${v.toFixed(2)}%`}
 function snapshotLabel(d:Dash|null){if(!d?.snapshot_at)return'Dati Hyperliquid non disponibili';const seconds=Math.max(Math.round(d.snapshot_age_seconds??0),0);if(seconds<90)return'Dati Hyperliquid aggiornati';return `Dati Hyperliquid di ${Math.max(Math.round(seconds/60),1)} min fa`}
 function pnlActivityLabel(data:PnlHistory|null){if(!data)return'Caricamento delle chiusure…';if(!data.last_realized_at)return'Nessuna posizione chiusa nell’intervallo selezionato.';return `Ultima chiusura registrata: ${new Date(data.last_realized_at).toLocaleString()}. La linea resta stabile fino alla prossima chiusura.`}
