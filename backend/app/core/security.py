@@ -42,7 +42,15 @@ def verify_wallet_signature(address: str, message: str, signature: str) -> bool:
     return recovered.lower() == normalize_address(address)
 
 
-def create_session_token(user_id: str, address: str, role: str, csrf: str | None = None) -> tuple[str, str]:
+def create_session_token(
+    user_id: str,
+    address: str,
+    role: str,
+    csrf: str | None = None,
+    *,
+    session_id: str | None = None,
+    session_absolute_exp: int | None = None,
+) -> tuple[str, str]:
     now = datetime.now(UTC)
     csrf_token = csrf or secrets.token_urlsafe(32)
     payload: dict[str, Any] = {
@@ -54,6 +62,10 @@ def create_session_token(user_id: str, address: str, role: str, csrf: str | None
         'exp': int((now + timedelta(seconds=settings.SESSION_TTL_SECONDS)).timestamp()),
         'jti': secrets.token_urlsafe(18),
     }
+    if session_id:
+        payload['sid'] = session_id
+    if session_absolute_exp is not None:
+        payload['session_exp'] = int(session_absolute_exp)
     return jwt.encode(payload, settings.SESSION_SECRET, algorithm=ALGORITHM), csrf_token
 
 
