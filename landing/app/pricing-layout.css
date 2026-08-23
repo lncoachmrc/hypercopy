@@ -1,0 +1,43 @@
+.pricing-section .shell {
+  display: flex;
+  flex-direction: column;
+}
+
+.pricing-section .pricing-heading {
+  display: contents;
+}
+
+.pricing-section .pricing-heading > div:first-child {
+  order: 1;
+  margin-bottom: 48px;
+}
+
+.pricing-section .trial-card {
+  order: 2;
+}
+
+.pricing-section .period-toggle {
+  order: 3;
+  align-self: center;
+  width: max-content;
+  margin: 6px 0 28px;
+}
+
+.pricing-section .pricing-grid {
+  order: 4;
+}
+
+.pricing-section .pricing-footnote {
+  order: 5;
+}
+
+@media (max-width: 920px) {
+  .pricing-section .pricing-heading > div:first-child {
+    margin-bottom: 36px;
+  }
+
+  .pricing-section .period-toggle {
+    width: 100%;
+    margin: 4px 0 24px;
+  }
+}
