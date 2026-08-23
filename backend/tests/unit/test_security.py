@@ -7,6 +7,7 @@ from app.core.config import settings
 from app.core.security import (
     build_signin_message,
     create_refresh_token,
+    derive_refresh_successor,
     hash_refresh_token,
     normalize_address,
     verify_wallet_signature,
@@ -39,7 +40,17 @@ def test_refresh_tokens_are_opaque_unique_and_not_stored_as_plaintext_keys():
     assert len(digest)==64
 
 
+def test_refresh_successor_is_recoverable_but_not_plaintext_derived_storage():
+    current=create_refresh_token()
+    successor=derive_refresh_successor(current)
+    assert successor==derive_refresh_successor(current)
+    assert successor!=current
+    assert len(successor)>=40
+    assert hash_refresh_token(successor)!=successor
+
+
 def test_refresh_window_is_longer_than_access_session():
     assert settings.SESSION_TTL_SECONDS==3600
     assert settings.SESSION_REFRESH_TTL_SECONDS==86400
-    assert settings.SESSION_REFRESH_TTL_SECONDS>settings.SESSION_TTL_SECONDS
+    assert settings.SESSION_REFRESH_GRACE_SECONDS==60
+    assert settings.SESSION_REFRESH_TTL_SECONDS>settings.SESSION_TTL_SECONDS>settings.SESSION_REFRESH_GRACE_SECONDS
