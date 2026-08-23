@@ -29,6 +29,7 @@ from app.services.entitlement import entitlement
 
 router = APIRouter(prefix='/auth', tags=['auth'])
 _REFRESH_PREFIX = 'session:refresh:'
+_REFRESH_DENY_PREFIX = 'session:refresh-deny:'
 
 
 def _secure_cookie() -> bool:
@@ -37,6 +38,10 @@ def _secure_cookie() -> bool:
 
 def _refresh_key(token: str) -> str:
     return f'{_REFRESH_PREFIX}{hash_refresh_token(token)}'
+
+
+def _refresh_deny_key(session_id: str) -> str:
+    return f'{_REFRESH_DENY_PREFIX}{session_id}'
 
 
 def _session_out(user: User, entitlements: dict, csrf: str) -> SessionOut:
@@ -99,6 +104,9 @@ async def _issue_refresh_token(user: User, *, absolute_exp: int, session_id: str
     ttl = absolute_exp - now_ts
     if ttl <= 0:
         raise HTTPException(401, 'Refresh session expired')
+    redis = redis_client()
+    if await redis.exists(_refresh_deny_key(session_id)):
+        raise HTTPException(401, 'Refresh session revoked')
     token = create_refresh_token()
     payload = json.dumps({
         'sub': str(user.id),
@@ -106,7 +114,7 @@ async def _issue_refresh_token(user: User, *, absolute_exp: int, session_id: str
         'absolute_exp': absolute_exp,
         'session_id': session_id,
     })
-    await redis_client().setex(_refresh_key(token), ttl, payload)
+    await redis.setex(_refresh_key(token), ttl, payload)
     return token, ttl
 
 
@@ -161,12 +169,19 @@ async def verify(body: VerifyIn, request: Request, response: Response, db: Async
     await audit(db, action='AUTH_LOGIN', actor_id=user.id, subject_id=user.id, ip_hash=hash_ip(request.client.host if request.client else None))
     await db.commit()
 
-    token, csrf = create_session_token(str(user.id), user.auth_wallet, user.role.value)
     absolute_exp = int(datetime.now(UTC).timestamp()) + settings.SESSION_REFRESH_TTL_SECONDS
+    session_id = secrets.token_urlsafe(18)
+    token, csrf = create_session_token(
+        str(user.id),
+        user.auth_wallet,
+        user.role.value,
+        session_id=session_id,
+        session_absolute_exp=absolute_exp,
+    )
     refresh_token, refresh_ttl = await _issue_refresh_token(
         user,
         absolute_exp=absolute_exp,
-        session_id=secrets.token_urlsafe(18),
+        session_id=session_id,
     )
     _set_access_cookies(response, token, csrf)
     _set_refresh_cookie(response, refresh_token, refresh_ttl)
@@ -204,6 +219,9 @@ async def refresh(request: Request, response: Response, db: AsyncSession = Depen
     if absolute_exp <= now_ts:
         await redis.delete(key)
         raise HTTPException(401, 'Refresh session expired')
+    if await redis.exists(_refresh_deny_key(session_id)):
+        await redis.delete(key)
+        raise HTTPException(401, 'Refresh session revoked')
 
     user = await db.get(User, user_id)
     if not user or user.auth_wallet != wallet:
@@ -221,7 +239,13 @@ async def refresh(request: Request, response: Response, db: AsyncSession = Depen
         absolute_exp=absolute_exp,
         session_id=session_id,
     )
-    token, csrf = create_session_token(str(user.id), user.auth_wallet, user.role.value)
+    token, csrf = create_session_token(
+        str(user.id),
+        user.auth_wallet,
+        user.role.value,
+        session_id=session_id,
+        session_absolute_exp=absolute_exp,
+    )
     _set_access_cookies(response, token, csrf)
     _set_refresh_cookie(response, new_refresh, refresh_ttl)
     ent = await entitlement(db, user)
@@ -230,9 +254,17 @@ async def refresh(request: Request, response: Response, db: AsyncSession = Depen
 
 @router.post('/logout', status_code=204, dependencies=[Depends(require_csrf)])
 async def logout(request: Request, response: Response, claims: dict = Depends(session_claims)):
-    ttl = max(int(claims.get('exp', 0) - datetime.now(UTC).timestamp()), 1)
+    now_ts = int(datetime.now(UTC).timestamp())
+    access_ttl = max(int(claims.get('exp', 0)) - now_ts, 1)
     redis = redis_client()
-    await redis.setex(f"session:deny:{claims.get('jti','')}", ttl, '1')
+    await redis.setex(f"session:deny:{claims.get('jti','')}", access_ttl, '1')
+
+    session_id = str(claims.get('sid') or '')
+    session_exp = int(claims.get('session_exp') or 0)
+    if session_id:
+        family_ttl = max(session_exp - now_ts, 1) if session_exp else settings.SESSION_REFRESH_TTL_SECONDS
+        await redis.setex(_refresh_deny_key(session_id), family_ttl, '1')
+
     refresh_token = request.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME)
     if refresh_token:
         await redis.delete(_refresh_key(refresh_token))
