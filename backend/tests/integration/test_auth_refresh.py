@@ -12,6 +12,7 @@ from app.main import app
 
 
 pytestmark = pytest.mark.skipif(os.getenv('RUN_INTEGRATION') != '1', reason='integration tests disabled')
+AUTH = '/api/v1/auth'
 
 
 @pytest.mark.asyncio
@@ -21,12 +22,12 @@ async def test_wallet_login_refresh_rotation_and_logout_revocation():
     transport = httpx.ASGITransport(app=app)
 
     async with httpx.AsyncClient(transport=transport, base_url='http://traxion.test') as client:
-        challenge = await client.post('/auth/challenge', json={'address': address})
+        challenge = await client.post(f'{AUTH}/challenge', json={'address': address})
         assert challenge.status_code == 200
         message = challenge.json()['message']
         signature = Account.sign_message(encode_defunct(text=message), account.key).signature.hex()
 
-        verified = await client.post('/auth/verify', json={'address': address, 'signature': signature})
+        verified = await client.post(f'{AUTH}/verify', json={'address': address, 'signature': signature})
         assert verified.status_code == 200
         assert verified.json()['user']['auth_wallet'] == address
         first_refresh = client.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME)
@@ -38,7 +39,7 @@ async def test_wallet_login_refresh_rotation_and_logout_revocation():
         # family is still valid. Refresh must work without another wallet sign.
         client.cookies.delete(settings.SESSION_COOKIE_NAME)
         client.cookies.delete(settings.CSRF_COOKIE_NAME)
-        refreshed = await client.post('/auth/refresh', headers={'X-Requested-With': 'HyperCopy'})
+        refreshed = await client.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
         assert refreshed.status_code == 200
         second_refresh = client.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME)
         assert second_refresh and second_refresh != first_refresh
@@ -52,15 +53,15 @@ async def test_wallet_login_refresh_rotation_and_logout_revocation():
         # Refresh credentials are one-time: replaying the rotated-out token is rejected.
         async with httpx.AsyncClient(transport=transport, base_url='http://traxion.test') as stale:
             stale.cookies.set(settings.SESSION_REFRESH_COOKIE_NAME, first_refresh)
-            replay = await stale.post('/auth/refresh', headers={'X-Requested-With': 'HyperCopy'})
+            replay = await stale.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
             assert replay.status_code == 401
 
-        session = await client.get('/auth/session')
+        session = await client.get(f'{AUTH}/session')
         assert session.status_code == 200
         csrf = session.json()['csrf_token']
 
         logged_out = await client.post(
-            '/auth/logout',
+            f'{AUTH}/logout',
             headers={'X-Requested-With': 'HyperCopy', 'X-CSRF-Token': csrf},
         )
         assert logged_out.status_code == 204
@@ -68,7 +69,7 @@ async def test_wallet_login_refresh_rotation_and_logout_revocation():
 
         async with httpx.AsyncClient(transport=transport, base_url='http://traxion.test') as revoked:
             revoked.cookies.set(settings.SESSION_REFRESH_COOKIE_NAME, second_refresh)
-            after_logout = await revoked.post('/auth/refresh', headers={'X-Requested-With': 'HyperCopy'})
+            after_logout = await revoked.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
             assert after_logout.status_code == 401
 
 
@@ -79,11 +80,11 @@ async def test_refresh_rejects_cross_site_style_request_without_custom_header():
     transport = httpx.ASGITransport(app=app)
 
     async with httpx.AsyncClient(transport=transport, base_url='http://traxion.test') as client:
-        challenge = await client.post('/auth/challenge', json={'address': address})
+        challenge = await client.post(f'{AUTH}/challenge', json={'address': address})
         message = challenge.json()['message']
         signature = Account.sign_message(encode_defunct(text=message), account.key).signature.hex()
-        verified = await client.post('/auth/verify', json={'address': address, 'signature': signature})
+        verified = await client.post(f'{AUTH}/verify', json={'address': address, 'signature': signature})
         assert verified.status_code == 200
 
-        rejected = await client.post('/auth/refresh')
+        rejected = await client.post(f'{AUTH}/refresh')
         assert rejected.status_code == 403
