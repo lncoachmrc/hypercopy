@@ -1,6 +1,7 @@
 import {useCallback,useEffect,useState} from 'react';
 import {get,post} from './api';
 import {useAuth} from './auth';
+import './ai-status.css';
 
 type AiState={status:string;mode:string;requested_mode?:string;effective_mode?:string;execution_influence?:boolean;execution_influence_requested?:boolean;execution_factor?:string;execution_buffer_pct?:string;fallback_reason?:string|null;safety?:string;provider?:string;model?:string;preferred_model?:string;fallback_index?:number;updated_at?:string|null;analysis?:{summary?:string;confidence?:number;capital_policy?:{buffer_pct?:number;preferred_coverage_pct?:number;minimum_coverage_pct?:number;micro_position_policy?:string;rebalance_urgency?:string}};capital_efficiency?:{coverage_pct:number|null;executable_positions:number;managed_positions:number;below_min_positions:number}};
 type AiModeResponse={ok:boolean;mode:string;effective_mode:string;requested_mode:string;execution_influence:boolean;execution_factor:string;takes_effect:string};
