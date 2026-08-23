@@ -1,17 +1,25 @@
-import {detectLanguage} from "./i18n";
+import {detectLanguage,type Language} from "./i18n";
 import {LANDING_DICTIONARIES,type TranslationMap} from "./translations";
 import {DATE_EN,DATE_ES} from "./date-translations";
 
 const SKIP_TAGS=new Set(["SCRIPT","STYLE","NOSCRIPT","TEXTAREA","CODE","PRE"]);
+let cachedLanguage:Language|null=null;
+let cachedEntries:[string,string][]=[];
 
-function dictionary():TranslationMap{
-  const language=detectLanguage();
+function dictionary(language:Language):TranslationMap{
   if(language==="it")return {};
   return {...LANDING_DICTIONARIES[language],...(language==="en"?DATE_EN:DATE_ES)};
 }
 function normalise(value:string){return value.replace(/\s+/g," ").trim()}
 function escapeRegExp(value:string){return value.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}
-function entries(){return Object.entries(dictionary()).sort((a,b)=>b[0].length-a[0].length)}
+function entries(){
+  const language=detectLanguage();
+  if(cachedLanguage!==language){
+    cachedLanguage=language;
+    cachedEntries=Object.entries(dictionary(language)).sort((a,b)=>b[0].length-a[0].length);
+  }
+  return cachedEntries;
+}
 
 export function translateText(value:string){
   const all=entries();
