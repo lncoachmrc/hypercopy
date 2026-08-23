@@ -2,16 +2,21 @@
 
 Base path: `/api/v1`. Production OpenAPI UI is disabled; development exposes `/docs` and `/openapi.json`.
 
-Authentication uses a wallet-signed challenge and an HttpOnly session cookie. Every state-changing authenticated HTTP request requires both `X-Requested-With: HyperCopy` and the `X-CSRF-Token` returned by `/auth/verify` or `/auth/session`.
+Authentication uses a wallet-signed challenge, a short-lived HttpOnly access-session cookie, and an opaque rotating HttpOnly refresh cookie. The access JWT remains valid for 60 minutes; the refresh family has an absolute lifetime of 24 hours from the original wallet signature and never extends beyond that boundary. The browser renews the access session silently through `/auth/refresh`; a new wallet signature is required after the absolute refresh window expires, after logout/revocation, or when the refresh family is no longer valid.
+
+Refresh rotation is delivery-recoverable. The current refresh credential creates one deterministic successor; for at most 60 seconds the predecessor remains a bounded idempotency handle that can reproduce only that same already-created successor if an HTTP response is lost or another browser tab races the rotation. The grace interval is never extended by retries and cannot extend the 24-hour family lifetime. Redis keys contain HMAC digests of refresh credentials rather than reusable plaintext tokens.
+
+Every state-changing authenticated HTTP request requires both `X-Requested-With: HyperCopy` and the `X-CSRF-Token` returned by `/auth/verify`, `/auth/refresh`, or `/auth/session`. `/auth/refresh` can run after the access JWT has expired, so it requires the rotating HttpOnly refresh cookie plus `X-Requested-With: HyperCopy`; it does not depend on the expired access-session CSRF claim. The frontend broadcasts fresh CSRF values between same-origin tabs when supported and can recover an explicit CSRF mismatch by re-reading `/auth/session` before retrying the mutation once.
 
 ## Authentication
 
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/auth/challenge` | create one-time signing challenge |
-| POST | `/auth/verify` | verify wallet signature, create session |
-| GET | `/auth/session` | restore session + CSRF token |
-| POST | `/auth/logout` | revoke current session |
+| POST | `/auth/verify` | verify wallet signature, create 60-minute access session + 24-hour refresh family |
+| POST | `/auth/refresh` | rotate/recover refresh credential and issue a new access session without a wallet signature |
+| GET | `/auth/session` | restore session + authoritative CSRF token; frontend may silently refresh after a 401 |
+| POST | `/auth/logout` | revoke the complete session family, invalidate its access/refresh credentials, clear cookies |
 
 ## User / trading
 
