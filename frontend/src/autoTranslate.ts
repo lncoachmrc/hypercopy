@@ -1,11 +1,12 @@
-import {detectLanguage} from './i18n';
+import {detectLanguage,type Language} from './i18n';
 import {FRONTEND_DICTIONARIES,type TranslationMap} from './translations';
 import {ADMIN_EN,ADMIN_ES} from './admin-translations';
 
 const SKIP_TAGS=new Set(['SCRIPT','STYLE','NOSCRIPT','TEXTAREA','CODE','PRE']);
+let cachedLanguage:Language|null=null;
+let cachedEntries:[string,string][]=[];
 
-function activeDictionary():TranslationMap{
-  const language=detectLanguage();
+function activeDictionary(language:Language):TranslationMap{
   if(language==='it')return {};
   const base=FRONTEND_DICTIONARIES[language];
   const admin=language==='en'?ADMIN_EN:ADMIN_ES;
@@ -14,7 +15,14 @@ function activeDictionary():TranslationMap{
 
 function normalise(value:string){return value.replace(/\s+/g,' ').trim()}
 function escapeRegExp(value:string){return value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}
-function entries(){return Object.entries(activeDictionary()).sort((a,b)=>b[0].length-a[0].length)}
+function entries(){
+  const language=detectLanguage();
+  if(cachedLanguage!==language){
+    cachedLanguage=language;
+    cachedEntries=Object.entries(activeDictionary(language)).sort((a,b)=>b[0].length-a[0].length);
+  }
+  return cachedEntries;
+}
 
 export function translateText(value:string){
   const dictionaryEntries=entries();
@@ -27,9 +35,7 @@ export function translateText(value:string){
     return `${prefix}${exact[1]}${suffix}`;
   }
   let output=value;
-  for(const [source,target] of dictionaryEntries){
-    output=output.replace(new RegExp(escapeRegExp(source),'g'),target);
-  }
+  for(const [source,target] of dictionaryEntries)output=output.replace(new RegExp(escapeRegExp(source),'g'),target);
   return output;
 }
 
@@ -37,7 +43,6 @@ function skipped(element:Element|null){
   if(!element)return false;
   return SKIP_TAGS.has(element.tagName)||Boolean(element.closest('[data-no-translate]'));
 }
-
 function translateAttributes(element:Element){
   if(skipped(element))return;
   ['placeholder','aria-label','alt','title'].forEach(attribute=>{
@@ -47,14 +52,11 @@ function translateAttributes(element:Element){
     if(next!==value)element.setAttribute(attribute,next);
   });
 }
-
 function translateNode(node:Node){
-  if(node.nodeType!==Node.TEXT_NODE||!node.textContent?.trim())return;
-  if(skipped(node.parentElement))return;
+  if(node.nodeType!==Node.TEXT_NODE||!node.textContent?.trim()||skipped(node.parentElement))return;
   const next=translateText(node.textContent);
   if(next!==node.textContent)node.textContent=next;
 }
-
 function translateTree(root:ParentNode){
   if(root instanceof Element)translateAttributes(root);
   root.querySelectorAll?.('[placeholder],[aria-label],[alt],[title]').forEach(translateAttributes);
