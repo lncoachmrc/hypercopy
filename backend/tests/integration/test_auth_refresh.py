@@ -65,20 +65,29 @@ async def test_wallet_login_refresh_rotation_logout_and_cross_site_guard():
                 replay = await stale.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
                 assert replay.status_code == 401
 
-            session = await client.get(f'{AUTH}/session')
-            assert session.status_code == 200
-            csrf = session.json()['csrf_token']
+            # Model a copied refresh credential being rotated elsewhere. The
+            # original browser still has a valid access JWT carrying the same
+            # refresh-family id, so logout must revoke the attacker's successor.
+            async with httpx.AsyncClient(transport=transport, base_url='http://traxion.test') as copied:
+                copied.cookies.set(settings.SESSION_REFRESH_COOKIE_NAME, second_refresh)
+                copied_rotation = await copied.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
+                assert copied_rotation.status_code == 200
+                third_refresh = copied.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME)
+                assert third_refresh and third_refresh != second_refresh
 
-            logged_out = await client.post(
-                f'{AUTH}/logout',
-                headers={'X-Requested-With': 'HyperCopy', 'X-CSRF-Token': csrf},
-            )
-            assert logged_out.status_code == 204
-            assert client.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME) is None
+                session = await client.get(f'{AUTH}/session')
+                assert session.status_code == 200
+                csrf = session.json()['csrf_token']
 
-            async with httpx.AsyncClient(transport=transport, base_url='http://traxion.test') as revoked:
-                revoked.cookies.set(settings.SESSION_REFRESH_COOKIE_NAME, second_refresh)
-                after_logout = await revoked.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
+                logged_out = await client.post(
+                    f'{AUTH}/logout',
+                    headers={'X-Requested-With': 'HyperCopy', 'X-CSRF-Token': csrf},
+                )
+                assert logged_out.status_code == 204
+                assert client.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME) is None
+
+                copied.cookies.set(settings.SESSION_REFRESH_COOKIE_NAME, third_refresh)
+                after_logout = await copied.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
                 assert after_logout.status_code == 401
     finally:
         # These application singletons keep async connection pools. Dispose the
