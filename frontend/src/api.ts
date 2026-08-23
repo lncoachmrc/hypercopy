@@ -13,8 +13,24 @@ const base = () => {
   return '/api/v1';
 };
 let csrf = '';
-export const setCsrf = (value:string) => { csrf=value; };
 export const SESSION_EXPIRED_EVENT='traxion:session-expired';
+const authChannel=typeof BroadcastChannel!=='undefined'?new BroadcastChannel('traxion-auth-v1'):null;
+
+authChannel?.addEventListener('message',(event:MessageEvent<{type?:string;csrf?:string}>)=>{
+  if(event.data?.type==='csrf'&&typeof event.data.csrf==='string')csrf=event.data.csrf;
+  if(event.data?.type==='expired'){
+    csrf='';
+    window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
+  }
+});
+
+// CSRF is not an authentication credential, but keeping it only in memory and
+// broadcasting fresh values avoids localStorage persistence while synchronizing
+// tabs after another tab rotates the shared HttpOnly session cookies.
+export const setCsrf = (value:string) => {
+  csrf=value;
+  if(value)authChannel?.postMessage({type:'csrf',csrf:value});
+};
 
 export class ApiError extends Error { constructor(public status:number,message:string,public code?:string){super(message);} }
 
@@ -57,11 +73,19 @@ async function errorFrom(res:Response):Promise<ApiError>{
   return new ApiError(res.status,String(message),code);
 }
 
-async function syncSessionFromAnotherTab():Promise<boolean>{
-  // A second tab can lose the one-time refresh race after the first tab rotates
-  // the shared cookies. Give that Set-Cookie a brief chance to land, then read
-  // /auth/session to synchronize this tab's in-memory CSRF token.
-  await new Promise(resolve=>window.setTimeout(resolve,180));
+async function isCsrfFailure(res:Response):Promise<boolean>{
+  if(res.status!==403)return false;
+  try{
+    const body=await res.clone().json();
+    const message=String(body?.error?.message||body?.detail||'').toLowerCase();
+    return message.includes('csrf protection failed');
+  }catch{return false;}
+}
+
+async function syncSessionFromAnotherTab(delayMs=180):Promise<boolean>{
+  // Shared cookies may already have changed in another tab. Re-reading the
+  // current session synchronizes this tab's in-memory CSRF without any wallet UI.
+  if(delayMs>0)await new Promise(resolve=>window.setTimeout(resolve,delayMs));
   try{
     const res=await request('/auth/session',{method:'GET'},API_TIMEOUT_MS);
     if(!res.ok)return false;
@@ -71,20 +95,27 @@ async function syncSessionFromAnotherTab():Promise<boolean>{
   }catch{return false;}
 }
 
+async function tryRefreshOnce():Promise<boolean>{
+  const res=await request('/auth/refresh',{method:'POST'},API_TIMEOUT_MS);
+  if(!res.ok)return false;
+  const session=await res.json() as Session;
+  setCsrf(session.csrf_token);
+  return true;
+}
+
 async function renewSession():Promise<boolean>{
   if(refreshFlight)return refreshFlight;
   refreshFlight=(async()=>{
-    try{
-      const res=await request('/auth/refresh',{method:'POST'},API_TIMEOUT_MS);
-      if(res.ok){
-        const session=await res.json() as Session;
-        setCsrf(session.csrf_token);
-        return true;
-      }
-      return await syncSessionFromAnotherTab();
-    }catch{
-      return await syncSessionFromAnotherTab();
+    // A response may be lost after the server has already rotated the cookie.
+    // The backend keeps the predecessor as a bounded idempotency handle, so one
+    // immediate retry can recover the exact same successor without a signature.
+    for(let attempt=0;attempt<2;attempt+=1){
+      try{
+        if(await tryRefreshOnce())return true;
+      }catch{}
+      if(attempt===0)await new Promise(resolve=>window.setTimeout(resolve,180));
     }
+    return await syncSessionFromAnotherTab(0);
   })();
   try{return await refreshFlight;}finally{refreshFlight=null;}
 }
@@ -94,7 +125,8 @@ function canRefresh(path:string){
 }
 
 function announceExpiredSession(){
-  setCsrf('');
+  csrf='';
+  authChannel?.postMessage({type:'expired'});
   window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
 }
 
@@ -102,10 +134,16 @@ export async function api<T>(path:string, init:RequestInit={}, timeoutMs=API_TIM
   let res=await request(path,init,timeoutMs);
   if(res.status===401&&canRefresh(path)){
     const renewed=await renewSession();
-    if(renewed){
-      res=await request(path,init,timeoutMs);
-    }
+    if(renewed)res=await request(path,init,timeoutMs);
     if(res.status===401)announceExpiredSession();
+  }
+
+  // Another tab may have rotated both shared cookies while this tab retained an
+  // older CSRF value in memory. Recover only the explicit CSRF mismatch, then
+  // repeat the original mutation once with the authoritative current token.
+  if(await isCsrfFailure(res)){
+    const synced=await syncSessionFromAnotherTab(0);
+    if(synced)res=await request(path,init,timeoutMs);
   }
 
   if(!res.ok)throw await errorFrom(res);
