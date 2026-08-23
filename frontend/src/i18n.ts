@@ -68,7 +68,8 @@ export function initLanguage():Language{
   }
   if(typeof window!=='undefined'){
     const query=queryLanguage();
-    if(query&&query!=='auto')window.localStorage.setItem(STORAGE_KEY,language);
+    if(query==='auto')window.localStorage.removeItem(STORAGE_KEY);
+    else if(query)window.localStorage.setItem(STORAGE_KEY,language);
     if(query){
       const url=new URL(window.location.href);
       url.searchParams.delete('lang');
