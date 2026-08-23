@@ -1,0 +1,11 @@
+.pricing-section .period-toggle {
+  width: max-content;
+  margin: 6px auto 28px;
+}
+
+@media (max-width: 620px) {
+  .pricing-section .period-toggle {
+    width: 100%;
+    margin: 4px 0 24px;
+  }
+}
