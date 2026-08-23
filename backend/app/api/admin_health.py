@@ -8,6 +8,7 @@ from app.core.config import settings
 from app.db.session import get_db
 from app.models.entities import Role, SystemFlag, User
 from app.services.ai_intelligence import read_ai_intelligence
+from app.services.ai_mode import read_ai_execution_policy
 
 router = APIRouter(prefix='/admin', tags=['admin'])
 admin = require_role(Role.ADMIN, Role.SUPERADMIN)
@@ -26,6 +27,7 @@ async def health(user: User = Depends(admin), db: AsyncSession = Depends(get_db)
     checkpoint_row = await db.get(SystemFlag, checkpoint_slug) if checkpoint_slug else None
     checkpoint_value = (checkpoint_row.value or {}) if checkpoint_row else {}
     ai = await read_ai_intelligence(db)
+    ai_policy = await read_ai_execution_policy(db)
 
     return {
         'master_checkpoint': {
@@ -38,7 +40,11 @@ async def health(user: User = Depends(admin), db: AsyncSession = Depends(get_db)
         },
         'ai_intelligence': {
             'status': str(ai.get('status') or 'pending'),
-            'mode': ai.get('mode'),
+            'mode': ai_policy.effective_mode,
+            'requested_mode': ai_policy.requested_mode,
+            'execution_influence': ai_policy.effective,
+            'execution_factor': str(ai_policy.factor),
+            'fallback_reason': ai_policy.fallback_reason,
             'provider': ai.get('provider'),
             'model': ai.get('model'),
             'updated_at': ai.get('updated_at'),
