@@ -20,7 +20,13 @@ from app.services.metrics import system_snapshot
 configure_logging()
 log=get_logger(__name__)
 app=FastAPI(title='HyperCopy API',version=settings.APP_VERSION,docs_url='/docs' if settings.APP_ENV!='production' else None,redoc_url=None)
-app.add_middleware(CORSMiddleware,allow_origins=[settings.PUBLIC_APP_URL],allow_credentials=True,allow_methods=['GET','POST','PUT','DELETE','OPTIONS'],allow_headers=['Content-Type','X-CSRF-Token','X-Requested-With','X-Metrics-Token'])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[settings.PUBLIC_APP_URL, 'https://traxion.lucianonovello.com'],
+    allow_credentials=True,
+    allow_methods=['GET','POST','PUT','DELETE','OPTIONS'],
+    allow_headers=['Content-Type','X-CSRF-Token','X-Requested-With','X-Metrics-Token'],
+)
 app.include_router(health_router)
 app.include_router(api_router)
 
