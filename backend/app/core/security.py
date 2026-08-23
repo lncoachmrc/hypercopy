@@ -27,7 +27,7 @@ def build_signin_message(address: str, nonce: str, issued_at: datetime, expires_
     return (
         f'{settings.SIWE_DOMAIN} wants you to sign in with your Ethereum account:\n'
         f'{address}\n\n'
-        'Sign in to HyperCopy. This request will not submit a blockchain transaction.\n\n'
+        'Sign in to TRAXION. Authentication only: no blockchain transaction, no gas, and no permission to move funds.\n\n'
         f'URI: {settings.SIWE_URI}\n'
         'Version: 1\n'
         'Chain ID: 1\n'
