@@ -7,7 +7,7 @@ const API_BASE =
   process.env.NEXT_PUBLIC_TRAXION_API_URL ??
   "https://api-staging-025a.up.railway.app";
 
-const RANGE_OPTIONS = ["1d", "7d", "30d", "90d", "all"] as const;
+const RANGE_OPTIONS = ["1y", "180d", "90d", "all"] as const;
 type RangeKey = (typeof RANGE_OPTIONS)[number];
 
 type PerformancePoint = {
