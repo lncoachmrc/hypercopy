@@ -14,6 +14,17 @@ from app.main import app
 
 pytestmark = pytest.mark.skipif(os.getenv('RUN_INTEGRATION') != '1', reason='integration tests disabled')
 AUTH = '/api/v1/auth'
+COOKIE_DOMAIN = 'traxion.test'
+COOKIE_PATH = '/'
+
+
+def _set_refresh_cookie(client: httpx.AsyncClient, token: str) -> None:
+    client.cookies.set(
+        settings.SESSION_REFRESH_COOKIE_NAME,
+        token,
+        domain=COOKIE_DOMAIN,
+        path=COOKIE_PATH,
+    )
 
 
 @pytest.mark.asyncio
@@ -61,7 +72,7 @@ async def test_wallet_login_refresh_rotation_logout_and_cross_site_guard():
             # If the first refresh response had been lost, a retry carrying the
             # predecessor must recover the exact same successor during grace.
             async with httpx.AsyncClient(transport=transport, base_url='http://traxion.test') as delivery_retry:
-                delivery_retry.cookies.set(settings.SESSION_REFRESH_COOKIE_NAME, first_refresh)
+                _set_refresh_cookie(delivery_retry, first_refresh)
                 recovered = await delivery_retry.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
                 assert recovered.status_code == 200
                 assert delivery_retry.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME) == second_refresh
@@ -70,14 +81,14 @@ async def test_wallet_login_refresh_rotation_logout_and_cross_site_guard():
             # second delivery retry of that same predecessor must recover the
             # same third token rather than create a divergent branch.
             async with httpx.AsyncClient(transport=transport, base_url='http://traxion.test') as copied:
-                copied.cookies.set(settings.SESSION_REFRESH_COOKIE_NAME, second_refresh)
+                _set_refresh_cookie(copied, second_refresh)
                 copied_rotation = await copied.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
                 assert copied_rotation.status_code == 200
                 third_refresh = copied.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME)
                 assert third_refresh and third_refresh != second_refresh
 
                 async with httpx.AsyncClient(transport=transport, base_url='http://traxion.test') as retry_again:
-                    retry_again.cookies.set(settings.SESSION_REFRESH_COOKIE_NAME, second_refresh)
+                    _set_refresh_cookie(retry_again, second_refresh)
                     same_rotation = await retry_again.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
                     assert same_rotation.status_code == 200
                     assert retry_again.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME) == third_refresh
@@ -99,7 +110,7 @@ async def test_wallet_login_refresh_rotation_logout_and_cross_site_guard():
                 copied_access_after_logout = await copied.get(f'{AUTH}/session')
                 assert copied_access_after_logout.status_code == 401
 
-                copied.cookies.set(settings.SESSION_REFRESH_COOKIE_NAME, third_refresh)
+                _set_refresh_cookie(copied, third_refresh)
                 after_logout = await copied.post(f'{AUTH}/refresh', headers={'X-Requested-With': 'HyperCopy'})
                 assert after_logout.status_code == 401
     finally:
