@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import secrets
@@ -74,12 +75,23 @@ def decode_session_token(token: str) -> dict[str, Any]:
 
 
 def create_refresh_token() -> str:
-    """Create a high-entropy opaque refresh credential.
-
-    The plaintext is sent only as an HttpOnly cookie. Redis stores only its
-    HMAC digest, so a Redis key listing does not reveal a reusable credential.
-    """
+    """Create the first high-entropy opaque credential in a refresh family."""
     return secrets.token_urlsafe(48)
+
+
+def derive_refresh_successor(token: str) -> str:
+    """Derive the next opaque credential without storing its plaintext.
+
+    A retry carrying the previous credential can reproduce the exact same
+    successor during the bounded delivery-grace window. HMAC domain separation
+    keeps this independent from the digest used for Redis lookup keys.
+    """
+    digest = hmac.new(
+        settings.SESSION_SECRET.encode(),
+        f'traxion-refresh-successor-v1:{token}'.encode(),
+        hashlib.sha256,
+    ).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b'=').decode()
 
 
 def hash_refresh_token(token: str) -> str:
