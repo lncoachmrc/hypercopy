@@ -4,6 +4,7 @@ import pytest
 
 from app.services.metrics import (
     SHARPE_MIN_OBSERVATIONS,
+    SHARPE_OPENING_SNAPSHOT_MAX_DELAY_SECONDS,
     _annualized_sharpe,
     _completed_daily_realized_returns,
 )
@@ -57,6 +58,33 @@ def test_daily_returns_use_realized_pnl_and_day_opening_equity_only():
     assert len(returns) == 23
     assert returns[8] == pytest.approx(0.01)  # Jan 10: midday jump ignored.
     assert returns[11] == pytest.approx(0.005)  # Jan 13: higher opening capital.
+
+
+def test_daily_returns_skip_day_when_opening_snapshot_arrives_too_late():
+    started_at = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    now = datetime(2026, 1, 4, 12, 0, tzinfo=UTC)
+    jan1 = datetime(2026, 1, 1, tzinfo=UTC)
+    jan2 = datetime(2026, 1, 2, tzinfo=UTC)
+    points = [
+        (jan1 + timedelta(minutes=1), 1_000.0),
+        (
+            jan2 + timedelta(seconds=SHARPE_OPENING_SNAPSHOT_MAX_DELAY_SECONDS + 1),
+            1_010.0,
+        ),
+    ]
+    realized = {
+        jan1.date(): 10.0,
+        jan2.date(): 500.0,
+    }
+
+    returns = _completed_daily_realized_returns(
+        points,
+        realized,
+        started_at=started_at,
+        now=now,
+    )
+
+    assert returns == [pytest.approx(0.01)]
 
 
 def test_daily_returns_exclude_current_incomplete_utc_day():
