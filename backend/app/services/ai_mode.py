@@ -4,9 +4,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.entities import SystemFlag
+from app.models.entities import CopyJob, SystemFlag
 from app.services.ai_intelligence import AI_FLAG_SLUG
 
 AI_EXECUTION_FLAG_SLUG = 'ai:execution_influence'
@@ -53,6 +54,13 @@ def _bounded_factor(value, *, default: Decimal = Decimal(1)) -> Decimal:
     return max(MIN_AI_EXECUTION_FACTOR, min(parsed, Decimal(1)))
 
 
+def _factor_from_capital_policy(capital_policy: dict) -> Decimal | None:
+    if not capital_policy:
+        return None
+    buffer_pct = _bounded_buffer(capital_policy.get('buffer_pct', 0))
+    return max(MIN_AI_EXECUTION_FACTOR, Decimal(1) - buffer_pct)
+
+
 def derive_ai_execution_policy(
     state: dict | None,
     *,
@@ -63,7 +71,7 @@ def derive_ai_execution_policy(
     status = str(state.get('status') or 'pending').lower()
     analysis = state.get('analysis') if isinstance(state.get('analysis'), dict) else {}
     capital_policy = analysis.get('capital_policy') if isinstance(analysis.get('capital_policy'), dict) else {}
-    buffer_pct = _bounded_buffer(capital_policy.get('buffer_pct', 0))
+    latest_valid_factor = _factor_from_capital_policy(capital_policy)
 
     fallback_reason = None
     effective = requested
@@ -82,13 +90,16 @@ def derive_ai_execution_policy(
 
     if not requested:
         factor = Decimal(1)
-        applied_buffer = Decimal(0)
     elif effective:
-        factor = max(MIN_AI_EXECUTION_FACTOR, Decimal(1) - buffer_pct)
-        applied_buffer = Decimal(1) - factor
+        factor = latest_valid_factor or Decimal(1)
     else:
         factor = _bounded_factor(fallback_factor)
-        applied_buffer = Decimal(1) - factor
+        # A degraded intelligence row preserves the last successful analysis.
+        # Never let a stale persisted fallback increase exposure above that
+        # latest validated conservative factor.
+        if latest_valid_factor is not None:
+            factor = min(factor, latest_valid_factor)
+    applied_buffer = Decimal(1) - factor
 
     return AiExecutionPolicy(
         requested_mode='on' if requested else 'shadow',
@@ -102,17 +113,63 @@ def derive_ai_execution_policy(
     )
 
 
+def apply_ai_factor_to_job_context(context: dict | None) -> dict:
+    """Persist the conservative target into the execution inputs themselves.
+
+    Execution workers rebuild sizing from ``master_position`` rather than from
+    the reconciliation ledger target. Scaling that persisted source position
+    keeps reconciliation and execution on the exact same target while retaining
+    the original source position for auditability.
+    """
+    out = dict(context or {})
+    factor = _bounded_factor(out.get('ai_execution_factor', 1))
+    if factor >= Decimal(1):
+        return out
+    try:
+        master_position = Decimal(str(out.get('master_position', '0')))
+    except (InvalidOperation, TypeError, ValueError):
+        return out
+    if master_position == 0:
+        return out
+    out['source_master_position'] = str(master_position)
+    out['master_position'] = str(master_position * factor)
+    out['ai_execution_factor_applied'] = True
+    return out
+
+
+@event.listens_for(CopyJob, 'before_insert')
+def _apply_ai_factor_before_job_insert(_mapper, _connection, target: CopyJob) -> None:
+    if target.origin != 'RECONCILE':
+        return
+    target.context = apply_ai_factor_to_job_context(target.context)
+
+
 async def read_ai_execution_policy(db: AsyncSession) -> AiExecutionPolicy:
     mode_row = await db.get(SystemFlag, AI_EXECUTION_FLAG_SLUG)
     intelligence_row = await db.get(SystemFlag, AI_FLAG_SLUG)
     state = (intelligence_row.value or {}) if intelligence_row else {}
     mode_value = (mode_row.value or {}) if mode_row else {}
     fallback_factor = _bounded_factor(mode_value.get('last_valid_factor', 1))
-    return derive_ai_execution_policy(
+    policy = derive_ai_execution_policy(
         state,
         requested=bool(mode_row and mode_row.enabled),
         fallback_factor=fallback_factor,
     )
+
+    # Keep the persisted fallback aligned with every newly accepted healthy
+    # policy. Callers already own the surrounding transaction; flush only.
+    if mode_row and mode_row.enabled and policy.effective:
+        previous_factor = _bounded_factor(mode_value.get('last_valid_factor', 1))
+        previous_buffer = _bounded_buffer(mode_value.get('last_valid_buffer_pct', 0))
+        if previous_factor != policy.factor or previous_buffer != policy.buffer_pct:
+            mode_row.value = {
+                **mode_value,
+                'last_valid_factor': str(policy.factor),
+                'last_valid_buffer_pct': str(policy.buffer_pct),
+                'last_valid_updated_at': datetime.now(UTC).isoformat(),
+            }
+            await db.flush()
+    return policy
 
 
 async def set_ai_execution_mode(db: AsyncSession, *, enabled: bool, reason: str) -> AiExecutionPolicy:
