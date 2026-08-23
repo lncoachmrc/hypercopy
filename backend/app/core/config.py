@@ -55,8 +55,13 @@ class Settings(BaseSettings):
     DEFAULT_SHADOW_MODE: bool = True
 
     SESSION_SECRET: str = 'development-only-change-me'
+    # Short-lived access JWT. Browser renewal happens through the independent
+    # rotating HttpOnly refresh credential below, so wallet signatures are not
+    # requested every hour.
     SESSION_TTL_SECONDS: int = 3600
+    SESSION_REFRESH_TTL_SECONDS: int = 86_400
     SESSION_COOKIE_NAME: str = 'hc_session'
+    SESSION_REFRESH_COOKIE_NAME: str = 'hc_refresh'
     CSRF_COOKIE_NAME: str = 'hc_csrf'
     SIWE_DOMAIN: str = 'localhost'
     SIWE_URI: str = 'http://localhost:5173'
@@ -127,6 +132,10 @@ class Settings(BaseSettings):
                 raise ValueError('SESSION_SECRET must be a strong production secret')
             if self.ENABLE_LIVE_TRADING and self.KEK_PROVIDER == 'env':
                 raise ValueError('Mainnet live execution requires an external KMS provider')
+        if self.SESSION_TTL_SECONDS <= 0:
+            raise ValueError('SESSION_TTL_SECONDS must be positive')
+        if self.SESSION_REFRESH_TTL_SECONDS <= self.SESSION_TTL_SECONDS:
+            raise ValueError('SESSION_REFRESH_TTL_SECONDS must be greater than SESSION_TTL_SECONDS')
         if self.WATCHER_LEASE_RENEW_SECONDS >= self.WATCHER_LEASE_TTL_SECONDS:
             raise ValueError('watcher lease renew interval must be lower than TTL')
         if self.HL_MASTER_SNAPSHOT_TTL_SECONDS <= 0:
