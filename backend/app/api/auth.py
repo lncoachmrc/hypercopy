@@ -15,6 +15,7 @@ from app.core.security import (
     build_signin_message,
     create_refresh_token,
     create_session_token,
+    derive_refresh_successor,
     hash_ip,
     hash_refresh_token,
     normalize_address,
@@ -42,6 +43,15 @@ def _refresh_key(token: str) -> str:
 
 def _refresh_deny_key(session_id: str) -> str:
     return f'{_REFRESH_DENY_PREFIX}{session_id}'
+
+
+def _refresh_payload(user: User, *, absolute_exp: int, session_id: str) -> dict:
+    return {
+        'sub': str(user.id),
+        'wallet': user.auth_wallet,
+        'absolute_exp': absolute_exp,
+        'session_id': session_id,
+    }
 
 
 def _session_out(user: User, entitlements: dict, csrf: str) -> SessionOut:
@@ -99,7 +109,7 @@ def _clear_session_cookies(response: Response) -> None:
     response.delete_cookie(settings.SESSION_REFRESH_COOKIE_NAME, path='/', secure=secure, httponly=True, samesite='lax')
 
 
-async def _issue_refresh_token(user: User, *, absolute_exp: int, session_id: str) -> tuple[str, int]:
+async def _store_refresh_token(token: str, user: User, *, absolute_exp: int, session_id: str) -> int:
     now_ts = int(datetime.now(UTC).timestamp())
     ttl = absolute_exp - now_ts
     if ttl <= 0:
@@ -107,15 +117,74 @@ async def _issue_refresh_token(user: User, *, absolute_exp: int, session_id: str
     redis = redis_client()
     if await redis.exists(_refresh_deny_key(session_id)):
         raise HTTPException(401, 'Refresh session revoked')
+    await redis.setex(
+        _refresh_key(token),
+        ttl,
+        json.dumps(_refresh_payload(user, absolute_exp=absolute_exp, session_id=session_id)),
+    )
+    return ttl
+
+
+async def _issue_refresh_token(user: User, *, absolute_exp: int, session_id: str) -> tuple[str, int]:
     token = create_refresh_token()
-    payload = json.dumps({
-        'sub': str(user.id),
-        'wallet': user.auth_wallet,
-        'absolute_exp': absolute_exp,
-        'session_id': session_id,
-    })
-    await redis.setex(_refresh_key(token), ttl, payload)
+    ttl = await _store_refresh_token(token, user, absolute_exp=absolute_exp, session_id=session_id)
     return token, ttl
+
+
+async def _rotate_refresh_token(
+    current_token: str,
+    stored_payload: dict,
+    user: User,
+    *,
+    absolute_exp: int,
+    session_id: str,
+) -> tuple[str, int]:
+    """Rotate without making a lost response force a wallet signature.
+
+    The successor is deterministic under SESSION_SECRET, so the old credential
+    can reproduce exactly the same successor during a bounded grace interval.
+    Redis still stores only token digests as keys, never successor plaintext.
+    """
+    now_ts = int(datetime.now(UTC).timestamp())
+    ttl = absolute_exp - now_ts
+    if ttl <= 0:
+        raise HTTPException(401, 'Refresh session expired')
+
+    redis = redis_client()
+    if await redis.exists(_refresh_deny_key(session_id)):
+        raise HTTPException(401, 'Refresh session revoked')
+
+    successor = derive_refresh_successor(current_token)
+    successor_hash = hash_refresh_token(successor)
+    rotated_to = str(stored_payload.get('rotated_to') or '')
+
+    if rotated_to:
+        if rotated_to != successor_hash:
+            await redis.delete(_refresh_key(current_token))
+            raise HTTPException(401, 'Invalid refresh rotation state')
+        # A prior response may have been lost. The old handle is intentionally
+        # idempotent only until its original rotation_grace_exp; never extend it.
+        grace_exp = int(stored_payload.get('rotation_grace_exp') or 0)
+        if grace_exp <= now_ts:
+            await redis.delete(_refresh_key(current_token))
+            raise HTTPException(401, 'Refresh rotation grace expired')
+        if not await redis.exists(_refresh_key(successor)):
+            await _store_refresh_token(successor, user, absolute_exp=absolute_exp, session_id=session_id)
+        return successor, ttl
+
+    # Store the successor first. If this write fails, the old credential remains
+    # active. If a later step or HTTP delivery fails, the old credential becomes
+    # a short-lived idempotency handle that can recover the same successor.
+    await _store_refresh_token(successor, user, absolute_exp=absolute_exp, session_id=session_id)
+    grace_seconds = min(settings.SESSION_REFRESH_GRACE_SECONDS, ttl)
+    grace_exp = now_ts + grace_seconds
+    grace_payload = {
+        **_refresh_payload(user, absolute_exp=absolute_exp, session_id=session_id),
+        'rotated_to': successor_hash,
+        'rotation_grace_exp': grace_exp,
+    }
+    await redis.setex(_refresh_key(current_token), grace_seconds, json.dumps(grace_payload))
+    return successor, ttl
 
 
 @router.post('/challenge', response_model=ChallengeOut)
@@ -203,7 +272,7 @@ async def refresh(request: Request, response: Response, db: AsyncSession = Depen
     key = _refresh_key(refresh_token)
     stored = await redis.get(key)
     if not stored:
-        raise HTTPException(401, 'Refresh session expired or already rotated')
+        raise HTTPException(401, 'Refresh session expired')
 
     try:
         payload = json.loads(stored)
@@ -228,13 +297,9 @@ async def refresh(request: Request, response: Response, db: AsyncSession = Depen
         await redis.delete(key)
         raise HTTPException(401, 'Refresh session no longer valid')
 
-    # Consume once before issuing the replacement. Concurrent tabs are handled
-    # client-side by retrying the original API request after a short grace wait.
-    consumed = await redis.getdel(key)
-    if not consumed:
-        raise HTTPException(401, 'Refresh session expired or already rotated')
-
-    new_refresh, refresh_ttl = await _issue_refresh_token(
+    new_refresh, refresh_ttl = await _rotate_refresh_token(
+        refresh_token,
+        payload,
         user,
         absolute_exp=absolute_exp,
         session_id=session_id,
