@@ -1,5 +1,5 @@
 import {createContext,useCallback,useContext,useEffect,useMemo,useRef,useState,type ReactNode} from 'react';
-import {ApiError,get,post,setCsrf,type Session,type SessionUser} from './api';
+import {ApiError,get,post,SESSION_EXPIRED_EVENT,setCsrf,type Session,type SessionUser} from './api';
 
 type SignMessage=(message:string)=>Promise<string>;
 type Ctx={user:SessionUser|null;entitlements:Record<string,unknown>;loading:boolean;ready:boolean;error:string|null;signIn:(address:string,signMessage:SignMessage)=>Promise<void>;signOut:()=>Promise<void>;refresh:()=>Promise<void>;clearError:()=>void};
@@ -27,10 +27,16 @@ function authErrorMessage(error:unknown){
 export function AuthProvider({children}:{children:ReactNode}){
  const [user,setUser]=useState<SessionUser|null>(null),[entitlements,setEnt]=useState<Record<string,unknown>>({}),[loading,setLoading]=useState(true),[ready,setReady]=useState(false),[error,setError]=useState<string|null>(null);
  const signInFlight=useRef(false);
+ const clearSession=useCallback(()=>{setCsrf('');setUser(null);setEnt({});setError(null);},[]);
  const applySession=useCallback((session:Session)=>{setCsrf(session.csrf_token);setUser(session.user);setEnt(session.entitlements);},[]);
  const clearError=useCallback(()=>setError(null),[]);
- const refresh=useCallback(async()=>{setLoading(true);setError(null);try{const session=await get<Session>('/auth/session');applySession(session);}catch(e){setCsrf('');setUser(null);setEnt({});if(e instanceof ApiError&&e.status===401){setError(null);}else{setError(e instanceof Error?e.message:'Impossibile contattare TRAXION.');}}finally{setLoading(false);setReady(true);}},[applySession]);
- useEffect(()=>{void refresh();},[refresh]);
+ const refresh=useCallback(async()=>{setLoading(true);setError(null);try{const session=await get<Session>('/auth/session');applySession(session);}catch(e){clearSession();if(e instanceof ApiError&&e.status===401){setError(null);}else{setError(e instanceof Error?e.message:'Impossibile contattare TRAXION.');}}finally{setLoading(false);setReady(true);}},[applySession,clearSession]);
+ useEffect(()=>{
+  const expired=()=>clearSession();
+  window.addEventListener(SESSION_EXPIRED_EVENT,expired);
+  void refresh();
+  return()=>window.removeEventListener(SESSION_EXPIRED_EVENT,expired);
+ },[clearSession,refresh]);
  const signIn=useCallback(async(address:string,signMessage:SignMessage)=>{
   if(signInFlight.current)return;
   signInFlight.current=true;setError(null);setLoading(true);
@@ -41,7 +47,7 @@ export function AuthProvider({children}:{children:ReactNode}){
    applySession(session);
   }catch(e){const message=authErrorMessage(e);setError(message);throw new AuthFlowError(message);}finally{signInFlight.current=false;setLoading(false);}
  },[applySession]);
- const signOut=useCallback(async()=>{try{await post<void>('/auth/logout');}catch{}setCsrf('');setUser(null);setEnt({});},[]);
+ const signOut=useCallback(async()=>{try{await post<void>('/auth/logout');}catch{}clearSession();},[clearSession]);
  const value=useMemo(()=>({user,entitlements,loading,ready,error,signIn,signOut,refresh,clearError}),[user,entitlements,loading,ready,error,signIn,signOut,refresh,clearError]);
  return <Auth.Provider value={value}>{children}</Auth.Provider>;
 }

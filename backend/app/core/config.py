@@ -55,8 +55,17 @@ class Settings(BaseSettings):
     DEFAULT_SHADOW_MODE: bool = True
 
     SESSION_SECRET: str = 'development-only-change-me'
+    # Short-lived access JWT. Browser renewal happens through the independent
+    # rotating HttpOnly refresh credential below, so wallet signatures are not
+    # requested every hour.
     SESSION_TTL_SECONDS: int = 3600
+    SESSION_REFRESH_TTL_SECONDS: int = 86_400
+    # The previous refresh credential remains an idempotent delivery handle for
+    # this short interval. It can only reproduce its already-created successor;
+    # it cannot extend the absolute 24-hour session window.
+    SESSION_REFRESH_GRACE_SECONDS: int = 60
     SESSION_COOKIE_NAME: str = 'hc_session'
+    SESSION_REFRESH_COOKIE_NAME: str = 'hc_refresh'
     CSRF_COOKIE_NAME: str = 'hc_csrf'
     SIWE_DOMAIN: str = 'localhost'
     SIWE_URI: str = 'http://localhost:5173'
@@ -95,6 +104,10 @@ class Settings(BaseSettings):
     WATCHER_LEASE_RENEW_SECONDS: int = 5
     JOB_LEASE_SECONDS: int = 120
     MAX_JOB_RETRIES: int = 5
+    # EVENT/RECONCILE jobs are point-in-time strategy intents. After this age
+    # they must be rebuilt from current exchange truth instead of executed late.
+    # CLOSE_ALL and administrative jobs are deliberately exempt.
+    STRATEGY_JOB_MAX_AGE_SECONDS: int = 600
     STREAM_NAME: str = 'hypercopy:copy_jobs'
     STREAM_GROUP: str = 'execution-workers'
     REALTIME_CHANNEL_PREFIX: str = 'hypercopy:events'
@@ -123,6 +136,12 @@ class Settings(BaseSettings):
                 raise ValueError('SESSION_SECRET must be a strong production secret')
             if self.ENABLE_LIVE_TRADING and self.KEK_PROVIDER == 'env':
                 raise ValueError('Mainnet live execution requires an external KMS provider')
+        if self.SESSION_TTL_SECONDS <= 0:
+            raise ValueError('SESSION_TTL_SECONDS must be positive')
+        if self.SESSION_REFRESH_TTL_SECONDS <= self.SESSION_TTL_SECONDS:
+            raise ValueError('SESSION_REFRESH_TTL_SECONDS must be greater than SESSION_TTL_SECONDS')
+        if not 1 <= self.SESSION_REFRESH_GRACE_SECONDS < self.SESSION_TTL_SECONDS:
+            raise ValueError('SESSION_REFRESH_GRACE_SECONDS must be between 1 and SESSION_TTL_SECONDS')
         if self.WATCHER_LEASE_RENEW_SECONDS >= self.WATCHER_LEASE_TTL_SECONDS:
             raise ValueError('watcher lease renew interval must be lower than TTL')
         if self.HL_MASTER_SNAPSHOT_TTL_SECONDS <= 0:
@@ -135,6 +154,8 @@ class Settings(BaseSettings):
             raise ValueError('HL_SAFE_READ_RETRIES must be between 1 and 5')
         if self.HL_SAFE_READ_BACKOFF_SECONDS < 0:
             raise ValueError('HL_SAFE_READ_BACKOFF_SECONDS cannot be negative')
+        if self.STRATEGY_JOB_MAX_AGE_SECONDS <= 0:
+            raise ValueError('STRATEGY_JOB_MAX_AGE_SECONDS must be positive')
         return self
 
     @property

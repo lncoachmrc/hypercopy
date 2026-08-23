@@ -89,10 +89,14 @@ class Budget:
             Priority.METADATA: self.metadata,
         }[priority]
 
+    def lane_limits(self) -> dict[str, int]:
+        """Authoritative lane capacities exposed to admin observability."""
+        return {priority.name.lower(): self.allowance(priority) for priority in Priority}
+
     def validate(self) -> None:
         allocated = (
-            self.orders + self.reconcile + self.diagnostic + self.master_state
-            + self.metadata + self.reserve
+            self.orders + self.reconcile + self.diagnostic
+            + self.master_state + self.metadata + self.reserve
         )
         if allocated > self.total_per_minute:
             raise ValueError(
@@ -204,15 +208,17 @@ class WeightedRateLimiter:
                 )
             await asyncio.sleep(poll)
 
-    async def snapshot(self) -> dict[str, int | float]:
-        """For the admin control room: current global and per-lane usage."""
+    async def snapshot(self) -> dict[str, object]:
+        """Current usage plus authoritative capacities for the admin control room."""
         global_used = await self.used()
         lanes = {p.name: await self.used(p) for p in Priority}
         return {
             "window_seconds": WINDOW_SECONDS,
             "total_budget": self._budget.total_per_minute,
+            "reserve": self._budget.reserve,
             "used": global_used,
             "used_pct": round(global_used / self._budget.total_per_minute * 100, 1),
+            "lane_limits": self._budget.lane_limits(),
             **{f"lane_{name.lower()}": value for name, value in lanes.items()},
         }
 

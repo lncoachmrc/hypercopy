@@ -23,7 +23,11 @@ async def session_claims(request: Request) -> dict:
         claims = decode_session_token(token)
     except Exception as exc:
         raise HTTPException(401, 'Invalid or expired session') from exc
-    if await redis_client().exists(f"session:deny:{claims.get('jti','')}"):
+    redis = redis_client()
+    if await redis.exists(f"session:deny:{claims.get('jti','')}"):
+        raise HTTPException(401, 'Session revoked')
+    session_id = str(claims.get('sid') or '')
+    if session_id and await redis.exists(f'session:refresh-deny:{session_id}'):
         raise HTTPException(401, 'Session revoked')
     return claims
 

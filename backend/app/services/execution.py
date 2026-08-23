@@ -27,6 +27,18 @@ log = get_logger(__name__)
 TERMINAL_EXEC = {ExecutionState.FILLED, ExecutionState.REJECTED, ExecutionState.CANCELED}
 
 
+def _effective_master_mark(origin: str, master_mark: Decimal, follower_mark: Decimal, same_network: bool) -> Decimal:
+    if origin == 'CLOSE_ALL':
+        return follower_mark
+    if master_mark <= 0 and same_network:
+        return follower_mark
+    return master_mark
+
+
+def _shadow_suppresses_exchange(copy_state: CopyState, origin: str) -> bool:
+    return copy_state == CopyState.SHADOW and origin != 'CLOSE_ALL'
+
+
 def _blob(cred: SigningCredential) -> EncryptedCredential:
     return EncryptedCredential(
         cred.ciphertext_b64, cred.nonce_b64, cred.wrapped_dek_b64,
@@ -127,11 +139,9 @@ async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) ->
         return await _retry_or_dead(db, job, 'Follower market price unavailable')
     if follower_mark <= 0:
         return await _retry_or_dead(db, job, 'Follower market price unavailable')
+    master_mark = _effective_master_mark(job.origin, master_mark, follower_mark, settings.master_network == network)
     if master_mark <= 0:
-        if settings.master_network == network:
-            master_mark = follower_mark
-        else:
-            return await _retry_or_dead(db, job, 'Master market price unavailable')
+        return await _retry_or_dead(db, job, 'Master market price unavailable')
 
     spec = await hl.asset_spec(job.asset)
     master_leverage = None
@@ -170,7 +180,7 @@ async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) ->
     ledgers = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user.id, PositionLedger.managed.is_(True)))).scalars().all()
     total_exposure = sum((abs(x.size) * max(x.mark_price or Decimal(0), Decimal(0)) for x in ledgers), Decimal(0))
     asset_exposure = abs(current) * follower_mark
-    stale = equity.taken_at < datetime.now(UTC) - timedelta(seconds=settings.LEDGER_STALE_SECONDS)
+    stale = False if job.origin == 'CLOSE_ALL' else equity.taken_at < datetime.now(UTC) - timedelta(seconds=settings.LEDGER_STALE_SECONDS)
     allowed_asset = (not risk.allow_assets or job.asset in risk.allow_assets) and job.asset not in risk.block_assets
     global_pause = bool((await db.get(SystemFlag, 'global_pause')) and (await db.get(SystemFlag, 'global_pause')).enabled)
     emergency_stop = bool((await db.get(SystemFlag, 'emergency_stop')) and (await db.get(SystemFlag, 'emergency_stop')).enabled)
@@ -198,7 +208,7 @@ async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) ->
     )
     decision = evaluate(sizing, profile_ctx)
 
-    if user.copy_state == CopyState.SHADOW:
+    if _shadow_suppresses_exchange(user.copy_state, job.origin):
         await audit(db, action='SHADOW_TARGET', subject_id=user.id, reason='Shadow mode: no exchange order', correlation_id=job.correlation_id, after={
             'asset': job.asset, 'target': str(sizing.target_size), 'current': str(current), 'delta': str(sizing.delta),
             'master_network': settings.master_network, 'follower_network': network,

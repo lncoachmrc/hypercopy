@@ -10,6 +10,9 @@ from app.core.config import settings
 from app.models.entities import CopyJob, JobState
 
 
+STRATEGY_ORIGINS = {'EVENT', 'RECONCILE'}
+
+
 async def ensure_group(redis: Redis) -> None:
     try:
         await redis.xgroup_create(settings.STREAM_NAME, settings.STREAM_GROUP, id='0', mkstream=True)
@@ -25,19 +28,53 @@ async def publish_job(redis: Redis, db: AsyncSession, job: CopyJob) -> None:
 
 
 def stale_enqueue_cutoff(now: datetime | None = None) -> datetime:
-    """Jobs older than this are safe to republish to Redis.
-
-    PostgreSQL owns job state and ``claim_job`` is idempotent under row locking,
-    so republishing a durable QUEUED/RETRYING job cannot execute it twice. This
-    recovers messages stranded in a Redis consumer pending list when a Railway
-    worker is replaced between XREADGROUP delivery and PostgreSQL claim/ack.
-    """
     current = now or datetime.now(UTC)
     return current - timedelta(seconds=max(settings.JOB_LEASE_SECONDS, 30))
 
 
+def strategy_job_expiry_cutoff(now: datetime | None = None) -> datetime:
+    current = now or datetime.now(UTC)
+    return current - timedelta(seconds=settings.STRATEGY_JOB_MAX_AGE_SECONDS)
+
+
+def strategy_job_expired(job: CopyJob, now: datetime | None = None) -> bool:
+    if job.origin not in STRATEGY_ORIGINS:
+        return False
+    created_at = job.created_at
+    if created_at is None:
+        return False
+    return created_at <= strategy_job_expiry_cutoff(now)
+
+
+def expire_strategy_job(job: CopyJob) -> None:
+    job.state = JobState.SKIPPED
+    job.last_error = f'Stale strategy job expired after {settings.STRATEGY_JOB_MAX_AGE_SECONDS}s; current reconciliation supersedes it'
+    job.owner = None
+    job.locked_until = None
+    job.next_attempt_at = None
+    job.enqueued_at = None
+
+
+async def expire_stale_strategy_jobs(db: AsyncSession, now: datetime | None = None, limit: int = 500) -> int:
+    current = now or datetime.now(UTC)
+    cutoff = strategy_job_expiry_cutoff(current)
+    rows = (await db.execute(
+        select(CopyJob).where(
+            CopyJob.state.in_([JobState.QUEUED, JobState.RETRYING]),
+            CopyJob.origin.in_(STRATEGY_ORIGINS),
+            CopyJob.created_at <= cutoff,
+        ).order_by(CopyJob.created_at).limit(limit).with_for_update(skip_locked=True)
+    )).scalars().all()
+    for job in rows:
+        expire_strategy_job(job)
+    if rows:
+        await db.flush()
+    return len(rows)
+
+
 async def repair_stream(redis: Redis, db: AsyncSession, limit: int = 500) -> int:
     now = datetime.now(UTC)
+    await expire_stale_strategy_jobs(db, now=now, limit=limit)
     stale_before = stale_enqueue_cutoff(now)
     rows = (await db.execute(
         select(CopyJob).where(

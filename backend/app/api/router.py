@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 
-from app.api import activation, admin, ai, analytics, auth, billing, leverage, user, ws
+from app.api import activation, admin, admin_health, ai, analytics, auth, billing, leverage, user, ws
 from app.api.deps import api_rate_limit
 
 api_router = APIRouter(prefix='/api/v1')
@@ -16,6 +16,7 @@ http_router.include_router(analytics.router)
 http_router.include_router(ai.router)
 http_router.include_router(billing.router)
 http_router.include_router(admin.router)
+http_router.include_router(admin_health.router)
 api_router.include_router(http_router)
 # WebSocket dependencies use the WebSocket object rather than Request, so keep
 # the HTTP fixed-window dependency off this router. WS authentication/rate
