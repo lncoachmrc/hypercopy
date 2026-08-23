@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import secrets
+import uuid
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -9,7 +11,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import current_user, require_csrf, scoped_rate_limit, session_claims
 from app.core.config import settings
-from app.core.security import build_signin_message, create_session_token, hash_ip, normalize_address, verify_wallet_signature
+from app.core.security import (
+    build_signin_message,
+    create_refresh_token,
+    create_session_token,
+    hash_ip,
+    hash_refresh_token,
+    normalize_address,
+    verify_wallet_signature,
+)
 from app.db.redis import redis_client
 from app.db.session import get_db
 from app.models.entities import AuthNonce, CopyState, Plan, RiskProfile, RiskState, Role, Subscription, User
@@ -18,6 +28,86 @@ from app.services.audit import audit
 from app.services.entitlement import entitlement
 
 router = APIRouter(prefix='/auth', tags=['auth'])
+_REFRESH_PREFIX = 'session:refresh:'
+
+
+def _secure_cookie() -> bool:
+    return settings.APP_ENV != 'development'
+
+
+def _refresh_key(token: str) -> str:
+    return f'{_REFRESH_PREFIX}{hash_refresh_token(token)}'
+
+
+def _session_out(user: User, entitlements: dict, csrf: str) -> SessionOut:
+    return SessionOut(
+        user=SessionUser(
+            id=str(user.id),
+            auth_wallet=user.auth_wallet,
+            role=user.role.value,
+            state=user.state.value,
+            copy_state=user.copy_state.value,
+        ),
+        entitlements=entitlements,
+        csrf_token=csrf,
+    )
+
+
+def _set_access_cookies(response: Response, token: str, csrf: str) -> None:
+    secure = _secure_cookie()
+    response.set_cookie(
+        settings.SESSION_COOKIE_NAME,
+        token,
+        max_age=settings.SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=secure,
+        samesite='lax',
+        path='/',
+    )
+    response.set_cookie(
+        settings.CSRF_COOKIE_NAME,
+        csrf,
+        max_age=settings.SESSION_TTL_SECONDS,
+        httponly=False,
+        secure=secure,
+        samesite='lax',
+        path='/',
+    )
+
+
+def _set_refresh_cookie(response: Response, token: str, max_age: int) -> None:
+    response.set_cookie(
+        settings.SESSION_REFRESH_COOKIE_NAME,
+        token,
+        max_age=max_age,
+        httponly=True,
+        secure=_secure_cookie(),
+        samesite='lax',
+        path='/',
+    )
+
+
+def _clear_session_cookies(response: Response) -> None:
+    secure = _secure_cookie()
+    response.delete_cookie(settings.SESSION_COOKIE_NAME, path='/', secure=secure, httponly=True, samesite='lax')
+    response.delete_cookie(settings.CSRF_COOKIE_NAME, path='/', secure=secure, httponly=False, samesite='lax')
+    response.delete_cookie(settings.SESSION_REFRESH_COOKIE_NAME, path='/', secure=secure, httponly=True, samesite='lax')
+
+
+async def _issue_refresh_token(user: User, *, absolute_exp: int, session_id: str) -> tuple[str, int]:
+    now_ts = int(datetime.now(UTC).timestamp())
+    ttl = absolute_exp - now_ts
+    if ttl <= 0:
+        raise HTTPException(401, 'Refresh session expired')
+    token = create_refresh_token()
+    payload = json.dumps({
+        'sub': str(user.id),
+        'wallet': user.auth_wallet,
+        'absolute_exp': absolute_exp,
+        'session_id': session_id,
+    })
+    await redis_client().setex(_refresh_key(token), ttl, payload)
+    return token, ttl
 
 
 @router.post('/challenge', response_model=ChallengeOut)
@@ -72,25 +162,84 @@ async def verify(body: VerifyIn, request: Request, response: Response, db: Async
     await db.commit()
 
     token, csrf = create_session_token(str(user.id), user.auth_wallet, user.role.value)
-    secure = settings.APP_ENV != 'development'
-    # Browser traffic is same-origin through the frontend Nginx gateway, so Lax
-    # is sufficient and avoids dependence on third-party cookie policies.
-    response.set_cookie(settings.SESSION_COOKIE_NAME, token, max_age=settings.SESSION_TTL_SECONDS, httponly=True, secure=secure, samesite='lax', path='/')
-    response.set_cookie(settings.CSRF_COOKIE_NAME, csrf, max_age=settings.SESSION_TTL_SECONDS, httponly=False, secure=secure, samesite='lax', path='/')
+    absolute_exp = int(datetime.now(UTC).timestamp()) + settings.SESSION_REFRESH_TTL_SECONDS
+    refresh_token, refresh_ttl = await _issue_refresh_token(
+        user,
+        absolute_exp=absolute_exp,
+        session_id=secrets.token_urlsafe(18),
+    )
+    _set_access_cookies(response, token, csrf)
+    _set_refresh_cookie(response, refresh_token, refresh_ttl)
     ent = await entitlement(db, user)
-    return SessionOut(user=SessionUser(id=str(user.id), auth_wallet=user.auth_wallet, role=user.role.value, state=user.state.value, copy_state=user.copy_state.value), entitlements=ent, csrf_token=csrf)
+    return _session_out(user, ent, csrf)
+
+
+@router.post('/refresh', response_model=SessionOut)
+async def refresh(request: Request, response: Response, db: AsyncSession = Depends(get_db)):
+    await scoped_rate_limit(request, 'auth-refresh', 60, 300)
+    if request.headers.get('x-requested-with') != 'HyperCopy':
+        raise HTTPException(403, 'Refresh protection failed')
+
+    refresh_token = request.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME)
+    if not refresh_token:
+        raise HTTPException(401, 'Refresh session required')
+
+    redis = redis_client()
+    key = _refresh_key(refresh_token)
+    stored = await redis.get(key)
+    if not stored:
+        raise HTTPException(401, 'Refresh session expired or already rotated')
+
+    try:
+        payload = json.loads(stored)
+        user_id = uuid.UUID(str(payload['sub']))
+        absolute_exp = int(payload['absolute_exp'])
+        session_id = str(payload['session_id'])
+        wallet = normalize_address(str(payload['wallet']))
+    except Exception as exc:
+        await redis.delete(key)
+        raise HTTPException(401, 'Invalid refresh session') from exc
+
+    now_ts = int(datetime.now(UTC).timestamp())
+    if absolute_exp <= now_ts:
+        await redis.delete(key)
+        raise HTTPException(401, 'Refresh session expired')
+
+    user = await db.get(User, user_id)
+    if not user or user.auth_wallet != wallet:
+        await redis.delete(key)
+        raise HTTPException(401, 'Refresh session no longer valid')
+
+    # Consume once before issuing the replacement. Concurrent tabs are handled
+    # client-side by retrying the original API request after a short grace wait.
+    consumed = await redis.getdel(key)
+    if not consumed:
+        raise HTTPException(401, 'Refresh session expired or already rotated')
+
+    new_refresh, refresh_ttl = await _issue_refresh_token(
+        user,
+        absolute_exp=absolute_exp,
+        session_id=session_id,
+    )
+    token, csrf = create_session_token(str(user.id), user.auth_wallet, user.role.value)
+    _set_access_cookies(response, token, csrf)
+    _set_refresh_cookie(response, new_refresh, refresh_ttl)
+    ent = await entitlement(db, user)
+    return _session_out(user, ent, csrf)
 
 
 @router.post('/logout', status_code=204, dependencies=[Depends(require_csrf)])
-async def logout(response: Response, claims: dict = Depends(session_claims)):
+async def logout(request: Request, response: Response, claims: dict = Depends(session_claims)):
     ttl = max(int(claims.get('exp', 0) - datetime.now(UTC).timestamp()), 1)
-    await redis_client().setex(f"session:deny:{claims.get('jti','')}", ttl, '1')
-    secure = settings.APP_ENV != 'development'
-    response.delete_cookie(settings.SESSION_COOKIE_NAME, path='/', secure=secure, httponly=True, samesite='lax')
-    response.delete_cookie(settings.CSRF_COOKIE_NAME, path='/', secure=secure, httponly=False, samesite='lax')
+    redis = redis_client()
+    await redis.setex(f"session:deny:{claims.get('jti','')}", ttl, '1')
+    refresh_token = request.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME)
+    if refresh_token:
+        await redis.delete(_refresh_key(refresh_token))
+    _clear_session_cookies(response)
 
 
 @router.get('/session', response_model=SessionOut)
 async def session(user: User = Depends(current_user), claims: dict = Depends(session_claims), db: AsyncSession = Depends(get_db)):
     ent = await entitlement(db, user)
-    return SessionOut(user=SessionUser(id=str(user.id), auth_wallet=user.auth_wallet, role=user.role.value, state=user.state.value, copy_state=user.copy_state.value), entitlements=ent, csrf_token=str(claims['csrf']))
+    return _session_out(user, ent, str(claims['csrf']))
