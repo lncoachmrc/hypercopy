@@ -1,13 +1,15 @@
 type LanguageViewportSnapshot={
   top:boolean;
-  sectionId:string|null;
+  landmarkKey:string|null;
   progress:number;
   absoluteY:number;
   capturedAt:number;
 };
 
+type Landmark={key:string;element:HTMLElement};
+
 const VIEWPORT_STORAGE_KEY="traxion_language_viewport_v1";
-const MAX_SNAPSHOT_AGE_MS=15_000;
+const MAX_SNAPSHOT_AGE_MS=5*60_000;
 const TOP_THRESHOLD_PX=48;
 
 function clamp(value:number,min:number,max:number){
@@ -21,17 +23,40 @@ function viewportMarker(){
   return Math.min(window.innerHeight*.25,Math.max(24,headerHeight+16));
 }
 
-function landmarks(){
-  if(typeof document==="undefined")return [] as HTMLElement[];
-  const unique=new Map<string,HTMLElement>();
-  document.querySelectorAll<HTMLElement>("main section[id], #master-performance").forEach(element=>{
-    if(element.id&&element.getBoundingClientRect().height>0)unique.set(element.id,element);
+function landmarks():Landmark[]{
+  if(typeof document==="undefined")return [];
+
+  const result:Landmark[]=[];
+  const seen=new Set<HTMLElement>();
+  const mainSections=[...document.querySelectorAll<HTMLElement>("main section")];
+
+  mainSections.forEach((element,index)=>{
+    if(seen.has(element)||element.getBoundingClientRect().height<=0)return;
+    seen.add(element);
+    result.push({key:element.id?`id:${element.id}`:`main-section:${index}`,element});
   });
-  return [...unique.values()];
+
+  const master=document.getElementById("master-performance");
+  if(master&&!seen.has(master)&&master.getBoundingClientRect().height>0){
+    seen.add(master);
+    result.push({key:"id:master-performance",element:master});
+  }
+
+  const footer=document.querySelector<HTMLElement>("footer.site-footer");
+  if(footer&&footer.getBoundingClientRect().height>0){
+    result.push({key:"footer:site-footer",element:footer});
+  }
+
+  return result;
+}
+
+function resolveLandmark(key:string|null){
+  if(!key)return null;
+  return landmarks().find(item=>item.key===key)?.element??null;
 }
 
 function currentLandmark(marker:number){
-  return landmarks().find(element=>{
+  return landmarks().find(({element})=>{
     const rect=element.getBoundingClientRect();
     return rect.top<=marker&&rect.bottom>marker;
   })??null;
@@ -67,11 +92,11 @@ export function captureLanguageViewport(){
   const marker=viewportMarker();
   const top=window.scrollY<=TOP_THRESHOLD_PX;
   const landmark=top?null:currentLandmark(marker);
-  const rect=landmark?.getBoundingClientRect();
+  const rect=landmark?.element.getBoundingClientRect();
   const progress=rect&&rect.height>0?clamp((marker-rect.top)/rect.height,0,1):0;
   const snapshot:LanguageViewportSnapshot={
     top,
-    sectionId:landmark?.id??null,
+    landmarkKey:landmark?.key??null,
     progress,
     absoluteY:window.scrollY,
     capturedAt:Date.now(),
@@ -86,13 +111,11 @@ function targetScroll(snapshot:LanguageViewportSnapshot){
   if(snapshot.top)return 0;
 
   const marker=viewportMarker();
-  if(snapshot.sectionId){
-    const element=document.getElementById(snapshot.sectionId);
-    if(element){
-      const rect=element.getBoundingClientRect();
-      const absoluteTop=window.scrollY+rect.top;
-      return absoluteTop+rect.height*clamp(snapshot.progress,0,1)-marker;
-    }
+  const element=resolveLandmark(snapshot.landmarkKey);
+  if(element){
+    const rect=element.getBoundingClientRect();
+    const absoluteTop=window.scrollY+rect.top;
+    return absoluteTop+rect.height*clamp(snapshot.progress,0,1)-marker;
   }
   return snapshot.absoluteY;
 }
