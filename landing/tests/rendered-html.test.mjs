@@ -102,10 +102,28 @@ test("language switching always performs an authoritative navigation", async () 
   const selector = await readFile(new URL("../app/LanguageSelector.tsx", import.meta.url), "utf8");
 
   assert.match(i18n, /url\.searchParams\.set\(["']lang["'],selection\)/);
-  assert.match(i18n, /window\.location\.assign\(languageNavigationUrl\(selection,window\.location\.href\)\)/);
+  assert.match(i18n, /const viewportCaptured=captureLanguageViewport\(\)/);
+  assert.match(i18n, /languageNavigationUrl\(selection,window\.location\.href,!viewportCaptured\)/);
+  assert.match(i18n, /if\(!preserveHash\)url\.hash=""/);
   assert.match(i18n, /if\(query&&persisted\)/);
   assert.match(selector, /setSwitching\(true\)/);
   assert.match(selector, /if\(option===language\)return/);
+  assert.match(selector, /restoreLanguageViewport\(\)/);
+});
+
+test("language switching restores the same semantic viewport", async () => {
+  const viewport = await readFile(new URL("../app/language-scroll.ts", import.meta.url), "utf8");
+
+  assert.match(viewport, /main section\[id\], #master-performance/);
+  assert.match(viewport, /progress/);
+  assert.match(viewport, /sessionStorage\.setItem\(VIEWPORT_STORAGE_KEY/);
+  assert.match(viewport, /scrollRestoration="manual"/);
+  assert.match(viewport, /window\.scrollTo\(\{top:next,left:0,behavior:"auto"\}\)/);
+  assert.match(viewport, /window\.setTimeout\(restore,160\)/);
+  assert.match(viewport, /window\.setTimeout\(restore,520\)/);
+  assert.match(viewport, /window\.setTimeout\(\(\)=>\{[\s\S]*restore\(\);[\s\S]*finish\(\);[\s\S]*\},760\)/);
+  assert.match(viewport, /interactionEvents/);
+  assert.match(viewport, /cancelPending/);
 });
 
 test("master performance tooltip flips before the right edge", async () => {

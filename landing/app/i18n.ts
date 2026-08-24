@@ -1,3 +1,5 @@
+import {captureLanguageViewport} from "./language-scroll";
+
 export type Language="it"|"en"|"es";
 export type LanguageSelection=Language|"auto";
 
@@ -83,19 +85,21 @@ export function persistLanguageSelection(selection:LanguageSelection):boolean{
   return selection==="auto"?clearStoredLanguage():writeStoredLanguage(selection);
 }
 
-export function languageNavigationUrl(selection:LanguageSelection,currentHref:string){
+export function languageNavigationUrl(selection:LanguageSelection,currentHref:string,preserveHash=true){
   const url=new URL(currentHref);
-  // Always change the URL when the user changes language. Navigating back to the
-  // same clean path can be treated as a same-document navigation by browsers,
-  // especially when a hash is present, so React/i18n may never re-initialize.
+  // Always change the URL when the user changes language. A captured viewport is
+  // restored after reload, so suppress the old hash during navigation to prevent
+  // the browser from jumping to the section start before the layout has settled.
   url.searchParams.set("lang",selection);
+  if(!preserveHash)url.hash="";
   return `${url.pathname}${url.search}${url.hash}`;
 }
 
 export function changeLanguage(selection:LanguageSelection){
   if(typeof window==="undefined")return;
+  const viewportCaptured=captureLanguageViewport();
   persistLanguageSelection(selection);
-  window.location.assign(languageNavigationUrl(selection,window.location.href));
+  window.location.assign(languageNavigationUrl(selection,window.location.href,!viewportCaptured));
 }
 
 export function tr(it:string,en:string,es:string){

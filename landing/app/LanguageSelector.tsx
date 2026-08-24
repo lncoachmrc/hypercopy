@@ -5,6 +5,7 @@ import {createPortal} from "react-dom";
 import {initAutoTranslate} from "./autoTranslate";
 import {TRAXION_APP_URL} from "./config";
 import {changeLanguage,detectLanguage,initLanguage,languageLabels,SUPPORTED_LANGUAGES,tr,withLanguageQuery,type Language} from "./i18n";
+import {restoreLanguageViewport} from "./language-scroll";
 
 function GlobeIcon(){return <svg aria-hidden="true" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.4 2.5 3.6 5.5 3.6 9S14.4 18.5 12 21c-2.4-2.5-3.6-5.5-3.6-9S9.6 5.5 12 3Z"/></svg>}
 
@@ -31,8 +32,11 @@ export function LanguageController(){
     }
     localizeAppLinks();
     const translateCleanup=initAutoTranslate();
+    // Restore after translation has been scheduled. The restore helper retries while
+    // dynamic portals (performance chart, whitepaper assets) settle their layout.
+    const scrollCleanup=restoreLanguageViewport();
     const linksTimer=window.setTimeout(localizeAppLinks,500);
-    return()=>{translateCleanup();window.clearTimeout(linksTimer)};
+    return()=>{scrollCleanup();translateCleanup();window.clearTimeout(linksTimer)};
   },[]);
   return null;
 }
