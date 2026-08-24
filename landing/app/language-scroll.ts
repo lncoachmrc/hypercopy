@@ -3,7 +3,6 @@ type LanguageViewportSnapshot={
   sectionId:string|null;
   progress:number;
   absoluteY:number;
-  hash:string;
   capturedAt:number;
 };
 
@@ -32,21 +31,10 @@ function landmarks(){
 }
 
 function currentLandmark(marker:number){
-  const elements=landmarks();
-  if(!elements.length)return null;
-
-  const containing=elements.find(element=>{
+  return landmarks().find(element=>{
     const rect=element.getBoundingClientRect();
     return rect.top<=marker&&rect.bottom>marker;
-  });
-  if(containing)return containing;
-
-  return elements.reduce<HTMLElement|null>((best,element)=>{
-    if(!best)return element;
-    const bestDistance=Math.abs(best.getBoundingClientRect().top-marker);
-    const nextDistance=Math.abs(element.getBoundingClientRect().top-marker);
-    return nextDistance<bestDistance?element:best;
-  },null);
+  })??null;
 }
 
 function storeSnapshot(snapshot:LanguageViewportSnapshot){
@@ -86,7 +74,6 @@ export function captureLanguageViewport(){
     sectionId:landmark?.id??null,
     progress,
     absoluteY:window.scrollY,
-    hash:window.location.hash,
     capturedAt:Date.now(),
   };
 
@@ -116,13 +103,6 @@ function restoreOnce(snapshot:LanguageViewportSnapshot){
   if(Math.abs(window.scrollY-next)>1)window.scrollTo({top:next,left:0,behavior:"auto"});
 }
 
-function restoreHashWithoutScrolling(hash:string){
-  if(!hash)return;
-  const url=new URL(window.location.href);
-  url.hash=hash;
-  window.history.replaceState(window.history.state,"",`${url.pathname}${url.search}${url.hash}`);
-}
-
 export function restoreLanguageViewport(){
   if(typeof window==="undefined"||typeof document==="undefined")return()=>{};
   const snapshot=takeSnapshot();
@@ -132,20 +112,40 @@ export function restoreLanguageViewport(){
 
   let frame=0;
   const timers:number[]=[];
-  const restore=()=>restoreOnce(snapshot);
+  let cancelled=false;
+
+  const finish=()=>{
+    if("scrollRestoration" in window.history)window.history.scrollRestoration="auto";
+  };
+  const cancelPending=()=>{
+    if(cancelled)return;
+    cancelled=true;
+    window.cancelAnimationFrame(frame);
+    timers.forEach(timer=>window.clearTimeout(timer));
+    finish();
+  };
+  const restore=()=>{
+    if(!cancelled)restoreOnce(snapshot);
+  };
+
+  const interactionEvents:[keyof WindowEventMap,AddEventListenerOptions][]=[
+    ["wheel",{passive:true,once:true}],
+    ["touchstart",{passive:true,once:true}],
+    ["pointerdown",{passive:true,once:true}],
+    ["keydown",{once:true}],
+  ];
+  interactionEvents.forEach(([event,options])=>window.addEventListener(event,cancelPending,options));
 
   frame=window.requestAnimationFrame(restore);
   timers.push(window.setTimeout(restore,160));
   timers.push(window.setTimeout(restore,520));
   timers.push(window.setTimeout(()=>{
     restore();
-    restoreHashWithoutScrolling(snapshot.hash);
-    if("scrollRestoration" in window.history)window.history.scrollRestoration="auto";
-  },1000));
+    finish();
+  },760));
 
   return()=>{
-    window.cancelAnimationFrame(frame);
-    timers.forEach(timer=>window.clearTimeout(timer));
-    if("scrollRestoration" in window.history)window.history.scrollRestoration="auto";
+    cancelPending();
+    interactionEvents.forEach(([event,options])=>window.removeEventListener(event,cancelPending,options));
   };
 }
