@@ -5,6 +5,8 @@ import {DATE_EN,DATE_ES} from "./date-translations";
 const SKIP_TAGS=new Set(["SCRIPT","STYLE","NOSCRIPT","TEXTAREA","CODE","PRE"]);
 let cachedLanguage:Language|null=null;
 let cachedEntries:[string,string][]=[];
+const translatedText=new WeakMap<Node,string>();
+const translatedAttributes=new WeakMap<Element,Map<string,string>>();
 
 function dictionary(language:Language):TranslationMap{
   if(language==="it")return {};
@@ -38,17 +40,31 @@ export function translateText(value:string){
 function skipped(element:Element|null){return Boolean(element&&(SKIP_TAGS.has(element.tagName)||element.closest("[data-no-translate]")))}
 function translateAttributes(element:Element){
   if(skipped(element))return;
+  let lastValues=translatedAttributes.get(element);
+  if(!lastValues){lastValues=new Map<string,string>();translatedAttributes.set(element,lastValues);}
   ["placeholder","aria-label","alt","title"].forEach(attribute=>{
     const value=element.getAttribute(attribute);
-    if(!value)return;
+    if(!value||lastValues!.get(attribute)===value)return;
     const next=translateText(value);
-    if(next!==value)element.setAttribute(attribute,next);
+    if(next!==value){
+      lastValues!.set(attribute,next);
+      element.setAttribute(attribute,next);
+    }else{
+      lastValues!.delete(attribute);
+    }
   });
 }
 function translateNode(node:Node){
   if(node.nodeType!==Node.TEXT_NODE||!node.textContent?.trim()||skipped(node.parentElement))return;
-  const next=translateText(node.textContent);
-  if(next!==node.textContent)node.textContent=next;
+  const current=node.textContent;
+  if(translatedText.get(node)===current)return;
+  const next=translateText(current);
+  if(next!==current){
+    translatedText.set(node,next);
+    node.textContent=next;
+  }else{
+    translatedText.delete(node);
+  }
 }
 function translateTree(root:ParentNode){
   if(root instanceof Element)translateAttributes(root);
