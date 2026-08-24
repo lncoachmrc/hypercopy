@@ -36,14 +36,14 @@ function readStoredLanguage():string|null{
   try{return window.localStorage.getItem(STORAGE_KEY);}catch{return null;}
 }
 
-function writeStoredLanguage(value:Language){
-  if(typeof window==="undefined")return;
-  try{window.localStorage.setItem(STORAGE_KEY,value);}catch{/* Storage is optional. */}
+function writeStoredLanguage(value:Language):boolean{
+  if(typeof window==="undefined")return false;
+  try{window.localStorage.setItem(STORAGE_KEY,value);return true;}catch{return false;}
 }
 
-function clearStoredLanguage(){
-  if(typeof window==="undefined")return;
-  try{window.localStorage.removeItem(STORAGE_KEY);}catch{/* Storage is optional. */}
+function clearStoredLanguage():boolean{
+  if(typeof window==="undefined")return false;
+  try{window.localStorage.removeItem(STORAGE_KEY);return true;}catch{return false;}
 }
 
 export function getStoredLanguage():Language|null{
@@ -63,9 +63,14 @@ export function initLanguage():Language{
   if(typeof document!=="undefined")document.documentElement.lang=htmlLocaleByLanguage[language];
   if(typeof window!=="undefined"){
     const query=querySelection();
-    if(query==="auto")clearStoredLanguage();
-    else if(query)writeStoredLanguage(language);
-    if(query){
+    let persisted=true;
+    if(query==="auto")persisted=clearStoredLanguage();
+    else if(query)persisted=writeStoredLanguage(language);
+
+    // The query parameter is the authoritative hand-off between navigations.
+    // Remove it only after the preference has been persisted successfully.
+    // If storage is blocked, keeping ?lang= preserves the user's explicit choice.
+    if(query&&persisted){
       const url=new URL(window.location.href);
       url.searchParams.delete("lang");
       window.history.replaceState(window.history.state,"",`${url.pathname}${url.search}${url.hash}`);
@@ -74,17 +79,23 @@ export function initLanguage():Language{
   return language;
 }
 
-export function persistLanguageSelection(selection:LanguageSelection){
-  if(selection==="auto")clearStoredLanguage();
-  else writeStoredLanguage(selection);
+export function persistLanguageSelection(selection:LanguageSelection):boolean{
+  return selection==="auto"?clearStoredLanguage():writeStoredLanguage(selection);
+}
+
+export function languageNavigationUrl(selection:LanguageSelection,currentHref:string){
+  const url=new URL(currentHref);
+  // Always change the URL when the user changes language. Navigating back to the
+  // same clean path can be treated as a same-document navigation by browsers,
+  // especially when a hash is present, so React/i18n may never re-initialize.
+  url.searchParams.set("lang",selection);
+  return `${url.pathname}${url.search}${url.hash}`;
 }
 
 export function changeLanguage(selection:LanguageSelection){
   if(typeof window==="undefined")return;
   persistLanguageSelection(selection);
-  const url=new URL(window.location.href);
-  url.searchParams.delete("lang");
-  window.location.assign(`${url.pathname}${url.search}${url.hash}`);
+  window.location.assign(languageNavigationUrl(selection,window.location.href));
 }
 
 export function tr(it:string,en:string,es:string){
