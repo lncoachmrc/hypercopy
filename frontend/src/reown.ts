@@ -9,6 +9,8 @@ export const reownConfigured=reownProjectId.length>0;
 if(reownConfigured){
  createAppKit({
   adapters:[new EthersAdapter()],
+  // Ethereum Mainnet remains the preferred AppKit network, but authentication
+  // is message-signature based and must not depend on the wallet's active EVM chain.
   networks:[mainnet],
   defaultNetwork:mainnet,
   projectId:reownProjectId,
@@ -32,7 +34,7 @@ if(reownConfigured){
   enableWalletGuide:false,
   enableAuthLogger:false,
   enableEmbedded:false,
-  allowUnsupportedChain:false,
+  allowUnsupportedChain:true,
   defaultAccountTypes:{eip155:'eoa'},
   features:{
    email:false,

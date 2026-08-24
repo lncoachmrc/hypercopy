@@ -15,11 +15,6 @@ function numericErrorCode(error:unknown):number|undefined{
  return undefined;
 }
 function sameAddress(a:string|undefined,b:string|undefined){if(!a||!b)return false;try{return getAddress(a)===getAddress(b);}catch{return false;}}
-function isEthereumMainnet(chainId:unknown){
- if(typeof chainId==='number')return chainId===1;
- if(typeof chainId!=='string')return false;
- try{return BigInt(chainId)===1n;}catch{return false;}
-}
 function walletErrorMessage(error:unknown){
  if(error instanceof WalletFlowError||error instanceof AuthFlowError)return error.message;
  if(typeof navigator!=='undefined'&&!navigator.onLine)return 'Sei offline. Ripristina la connessione e riprova.';
@@ -49,10 +44,6 @@ function ConfiguredWalletLogin(){
  const assertStable=useCallback((expected:string)=>{
   if(!latestConnected.current||!sameAddress(latestAddress.current,expected))throw new WalletFlowError('L’indirizzo del wallet è cambiato. Riprova per generare una nuova richiesta.');
  },[]);
- const assertMainnet=useCallback(async(provider:Provider)=>{
-  const chainId=await provider.request<unknown>({method:'eth_chainId'});
-  if(!isEthereumMainnet(chainId))throw new WalletFlowError('Seleziona Ethereum Mainnet nel wallet e riprova. TRAXION non cambia rete automaticamente.');
- },[]);
 
  const authenticate=useCallback(async()=>{
   if(runningRef.current)return;
@@ -61,30 +52,31 @@ function ConfiguredWalletLogin(){
   try{
    await close();
    const expected=getAddress(address);
-   await assertMainnet(walletProvider);
    const accounts=await walletProvider.request<string[]>({method:'eth_accounts'});
    if(!accounts.some(account=>sameAddress(account,expected)))throw new WalletFlowError('Il wallet collegato non controlla l’indirizzo selezionato. Ricollegalo e riprova.');
-   const provider=new BrowserProvider(walletProvider,1);
+
+   // Authentication proves control of the selected EVM address through a
+   // message signature. It is intentionally independent from the wallet's
+   // currently selected EVM chain and from TRAXION's Hyperliquid network.
+   const provider=new BrowserProvider(walletProvider);
    const signer=await provider.getSigner(expected);
    if(!sameAddress(await signer.getAddress(),expected))throw new WalletFlowError('Il wallet collegato non controlla l’indirizzo selezionato. Ricollegalo e riprova.');
 
    await signIn(address,async message=>{
     assertStable(expected);
-    await assertMainnet(walletProvider);
     const before=await walletProvider.request<string[]>({method:'eth_accounts'});
     if(!before.some(account=>sameAddress(account,expected)))throw new WalletFlowError('L’indirizzo del wallet è cambiato. Riprova per generare una nuova richiesta.');
     setPhase('signing');
     let signature:string;
     try{signature=await signer.signMessage(message);}catch(e){throw new WalletFlowError(walletErrorMessage(e));}
     assertStable(expected);
-    await assertMainnet(walletProvider);
     const after=await walletProvider.request<string[]>({method:'eth_accounts'});
     if(!after.some(account=>sameAddress(account,expected))||!sameAddress(await signer.getAddress(),expected))throw new WalletFlowError('L’indirizzo del wallet è cambiato. Riprova per generare una nuova richiesta.');
     setPhase('verifying');
     return signature;
    });
   }catch(e){setLocalError(walletErrorMessage(e));}finally{runningRef.current=false;setPhase('idle');}
- },[address,assertMainnet,assertStable,clearError,close,isConnected,signIn,walletProvider]);
+ },[address,assertStable,clearError,close,isConnected,signIn,walletProvider]);
 
  useEffect(()=>{
   if(!intentRef.current||runningRef.current)return;
