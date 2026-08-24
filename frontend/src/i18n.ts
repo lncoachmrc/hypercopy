@@ -46,9 +46,23 @@ function queryLanguage():LanguageSelection|null{
   return normaliseLanguage(raw);
 }
 
-export function getStoredLanguage():Language|null{
+function readStoredLanguage():string|null{
   if(typeof window==='undefined')return null;
-  return normaliseLanguage(window.localStorage.getItem(STORAGE_KEY));
+  try{return window.localStorage.getItem(STORAGE_KEY);}catch{return null;}
+}
+
+function writeStoredLanguage(value:Language){
+  if(typeof window==='undefined')return;
+  try{window.localStorage.setItem(STORAGE_KEY,value);}catch{/* Storage is optional. */}
+}
+
+function clearStoredLanguage(){
+  if(typeof window==='undefined')return;
+  try{window.localStorage.removeItem(STORAGE_KEY);}catch{/* Storage is optional. */}
+}
+
+export function getStoredLanguage():Language|null{
+  return normaliseLanguage(readStoredLanguage());
 }
 
 export function detectLanguage():Language{
@@ -68,8 +82,8 @@ export function initLanguage():Language{
   }
   if(typeof window!=='undefined'){
     const query=queryLanguage();
-    if(query==='auto')window.localStorage.removeItem(STORAGE_KEY);
-    else if(query)window.localStorage.setItem(STORAGE_KEY,language);
+    if(query==='auto')clearStoredLanguage();
+    else if(query)writeStoredLanguage(language);
     if(query){
       const url=new URL(window.location.href);
       url.searchParams.delete('lang');
@@ -80,9 +94,8 @@ export function initLanguage():Language{
 }
 
 export function persistLanguageSelection(selection:LanguageSelection){
-  if(typeof window==='undefined')return;
-  if(selection==='auto')window.localStorage.removeItem(STORAGE_KEY);
-  else window.localStorage.setItem(STORAGE_KEY,selection);
+  if(selection==='auto')clearStoredLanguage();
+  else writeStoredLanguage(selection);
 }
 
 export function changeLanguage(selection:LanguageSelection){
