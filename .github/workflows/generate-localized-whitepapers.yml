@@ -1,0 +1,105 @@
+name: Generate localized whitepaper rasters
+
+on:
+  push:
+    branches:
+      - feature/traxion-i18n-it-en-es
+    paths:
+      - "landing/.whitepaper-tmp/**"
+      - ".github/workflows/generate-localized-whitepapers.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/traxion-i18n-it-en-es
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install raster dependencies
+        run: python -m pip install --disable-pip-version-check reportlab Pillow PyMuPDF
+
+      - name: Generate localized raster pages
+        run: python landing/.whitepaper-tmp/generate_whitepapers.py
+
+      - name: Remove duplicate landing translation keys
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("landing/app/translations.ts")
+          text = path.read_text(encoding="utf-8")
+          marker = "export const ES:TranslationMap="
+          en, es = text.split(marker, 1)
+
+          def keep_first(block: str) -> str:
+              pattern = re.compile(r'\s*"Accedi a TRAXION":"[^"]*",?')
+              matches = list(pattern.finditer(block))
+              if len(matches) != 2:
+                  raise SystemExit(f"Expected exactly two Accedi a TRAXION entries, found {len(matches)}")
+              duplicate = matches[1]
+              return block[:duplicate.start()] + block[duplicate.end():]
+
+          text = keep_first(en) + marker + keep_first(es)
+          path.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Remove temporary and placeholder files
+        run: |
+          rm -f landing/public/whitepaper/en/.gitkeep
+          rm -f landing/public/whitepaper/en/ASSETS_PENDING.txt
+          rm -f landing/public/whitepaper/en/README.txt
+          rm -f landing/public/whitepaper/es/.gitkeep
+          rm -f landing/public/whitepaper/es/README.txt
+          rm -f landing/public/whitepaper/LOCALIZED_ASSETS.md
+          rm -f landing/app/whitepaper-localization-note.txt
+          rm -rf landing/.whitepaper-tmp
+          rm -f .github/workflows/generate-localized-whitepapers.yml
+
+      - name: Verify localized assets
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from PIL import Image
+
+          root = Path("landing/public/whitepaper")
+          for language in ("en", "es"):
+              pages = sorted((root / language).glob(f"trx-wp-{language}-*.webp"))
+              if len(pages) != 6:
+                  raise SystemExit(f"Expected 6 {language} pages, got {len(pages)}")
+              for page in pages:
+                  with Image.open(page) as image:
+                      if image.size != (1547, 2002):
+                          raise SystemExit(f"Unexpected size for {page}: {image.size}")
+          forbidden = [p for p in Path("landing/public").rglob("*") if p.suffix.lower() in {".pdf", ".docx", ".md"}]
+          if forbidden:
+              raise SystemExit(f"Source documents leaked into public assets: {forbidden}")
+          print("Localized whitepaper assets verified: 12 WebP pages.")
+          PY
+
+      - name: Verify GitHub Pages build
+        working-directory: landing
+        run: |
+          npm ci
+          npm test
+          npm run build:pages
+
+      - name: Commit generated assets
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --stat
+          git commit -m "Add English and Spanish whitepaper rasters"
+          git push origin HEAD:feature/traxion-i18n-it-en-es
