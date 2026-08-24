@@ -39,6 +39,7 @@ const TOP = 30;
 const BOTTOM = 48;
 const PLOT_W = VIEW_W - LEFT - RIGHT;
 const PLOT_H = VIEW_H - TOP - BOTTOM;
+const TOOLTIP_FLIP_RATIO = 0.82;
 
 function formatPct(value: number) {
   const sign = value > 0 ? "+" : "";
@@ -176,6 +177,9 @@ function PerformanceChart() {
   };
 
   const selected = chart && hoverIndex !== null ? chart.points[hoverIndex] : null;
+  const tooltipOnLeft = selected
+    ? (selected.x - LEFT) / PLOT_W >= TOOLTIP_FLIP_RATIO
+    : false;
 
   return (
     <section className="master-performance-section" aria-labelledby="master-performance-title">
@@ -269,7 +273,7 @@ function PerformanceChart() {
 
                 {selected && (
                   <div
-                    className="master-tooltip"
+                    className={`master-tooltip ${tooltipOnLeft ? "is-left" : "is-right"}`}
                     style={{
                       left: `${(selected.x / VIEW_W) * 100}%`,
                       top: `${(selected.y / VIEW_H) * 100}%`,
