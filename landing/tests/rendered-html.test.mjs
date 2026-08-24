@@ -108,6 +108,17 @@ test("language switching always performs an authoritative navigation", async () 
   assert.match(selector, /if\(option===language\)return/);
 });
 
+test("master performance tooltip flips before the right edge", async () => {
+  const chart = await readFile(new URL("../app/MasterPerformancePortal.tsx", import.meta.url), "utf8");
+  const css = await readFile(new URL("../app/master-performance.css", import.meta.url), "utf8");
+
+  assert.match(chart, /TOOLTIP_FLIP_RATIO\s*=\s*0\.82/);
+  assert.match(chart, /tooltipOnLeft/);
+  assert.match(chart, /master-tooltip \$\{tooltipOnLeft \? "is-left" : "is-right"\}/);
+  assert.match(css, /\.master-tooltip\.is-left\s*\{[\s\S]*translate\(calc\(-100% - 13px\), -50%\)/);
+  assert.match(css, /\.master-tooltip\.is-right\s*\{[\s\S]*translate\(13px, -50%\)/);
+});
+
 test("centralizes external product URLs", async () => {
   const config = await readFile(new URL("../app/config.ts", import.meta.url), "utf8");
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
