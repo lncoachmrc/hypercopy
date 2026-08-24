@@ -55,6 +55,7 @@ export function LanguageSelectorPortal(){
 export default function LanguageSelector(){
   const [open,setOpen]=useState(false);
   const [language,setLanguage]=useState<Language>("it");
+  const [switching,setSwitching]=useState(false);
   const ref=useRef<HTMLDivElement>(null);
   useEffect(()=>setLanguage(detectLanguage()),[]);
   useEffect(()=>{
@@ -66,12 +67,21 @@ export default function LanguageSelector(){
     return()=>{document.removeEventListener("pointerdown",outside);document.removeEventListener("keydown",key)};
   },[open]);
 
+  const selectLanguage=(option:Language)=>{
+    if(switching)return;
+    setOpen(false);
+    if(option===language)return;
+    setLanguage(option);
+    setSwitching(true);
+    changeLanguage(option);
+  };
+
   return <div className="landing-language-selector" ref={ref} data-no-translate>
-    <button type="button" className="landing-language-trigger" aria-haspopup="menu" aria-expanded={open} aria-label={tr("Seleziona lingua","Select language","Seleccionar idioma")} onClick={()=>setOpen(value=>!value)}>
+    <button type="button" className="landing-language-trigger" aria-haspopup="menu" aria-expanded={open} aria-busy={switching||undefined} aria-label={tr("Seleziona lingua","Select language","Seleccionar idioma")} onClick={()=>!switching&&setOpen(value=>!value)}>
       <GlobeIcon/><span>{language.toUpperCase()}</span><span aria-hidden="true">⌄</span>
     </button>
     {open&&<div className="landing-language-menu" role="menu" aria-label={tr("Lingue disponibili","Available languages","Idiomas disponibles")}>
-      {SUPPORTED_LANGUAGES.map(option=><button type="button" key={option} role="menuitemradio" aria-checked={option===language} className={option===language?"active":""} onClick={()=>changeLanguage(option)}>
+      {SUPPORTED_LANGUAGES.map(option=><button type="button" key={option} role="menuitemradio" aria-checked={option===language} className={option===language?"active":""} disabled={switching} onClick={()=>selectLanguage(option)}>
         <span>{option.toUpperCase()}</span><span>{languageLabels[option]}</span><span aria-hidden="true">{option===language?"✓":""}</span>
       </button>)}
     </div>}
