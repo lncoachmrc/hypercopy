@@ -156,14 +156,23 @@
 .master-tooltip {
   position: absolute;
   z-index: 4;
-  transform: translate(13px, -50%);
   min-width: 154px;
+  max-width: calc(100% - 24px);
+  box-sizing: border-box;
   pointer-events: none;
   padding: 12px 14px;
   border: 1px solid rgba(177,201,217,.22);
   border-radius: 10px;
   background: rgba(8,13,19,.97);
   box-shadow: 0 16px 40px rgba(0,0,0,.44);
+}
+
+.master-tooltip.is-right {
+  transform: translate(13px, -50%);
+}
+
+.master-tooltip.is-left {
+  transform: translate(calc(-100% - 13px), -50%);
 }
 
 .master-tooltip strong {
@@ -217,11 +226,13 @@
 @media (max-width: 620px) {
   .master-performance-section { padding: 66px 0 74px; }
   .master-performance-card-head { padding: 20px 18px 10px; }
-  .master-range-switch { width: 100%; display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; }
+  .master-range-switch { width: 100%; display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
   .master-range-switch button { min-width: 0; padding: 0 6px; }
   .master-chart-wrap { margin-left: -8px; margin-right: -6px; min-height: 300px; }
   .master-performance-svg { min-height: 270px; }
   .master-axis-label { font-size: 10px; }
-  .master-tooltip { min-width: 138px; transform: translate(-50%, -115%); }
+  .master-tooltip { min-width: 138px; }
+  .master-tooltip.is-right { transform: translate(10px, -115%); }
+  .master-tooltip.is-left { transform: translate(calc(-100% - 10px), -115%); }
   .master-performance-foot { margin: 0 18px; }
 }
