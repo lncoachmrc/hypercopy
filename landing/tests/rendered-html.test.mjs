@@ -104,6 +104,7 @@ test("language switching always performs an authoritative navigation", async () 
   assert.match(i18n, /url\.searchParams\.set\(["']lang["'],selection\)/);
   assert.match(i18n, /const viewportCaptured=captureLanguageViewport\(\)/);
   assert.match(i18n, /languageNavigationUrl\(selection,window\.location\.href,!viewportCaptured\)/);
+  assert.match(i18n, /if\(!preserveHash\)url\.hash=""/);
   assert.match(i18n, /if\(query&&persisted\)/);
   assert.match(selector, /setSwitching\(true\)/);
   assert.match(selector, /if\(option===language\)return/);
@@ -120,7 +121,9 @@ test("language switching restores the same semantic viewport", async () => {
   assert.match(viewport, /window\.scrollTo\(\{top:next,left:0,behavior:"auto"\}\)/);
   assert.match(viewport, /window\.setTimeout\(restore,160\)/);
   assert.match(viewport, /window\.setTimeout\(restore,520\)/);
-  assert.match(viewport, /restoreHashWithoutScrolling\(snapshot\.hash\)/);
+  assert.match(viewport, /window\.setTimeout\(\(\)=>\{[\s\S]*restore\(\);[\s\S]*finish\(\);[\s\S]*\},760\)/);
+  assert.match(viewport, /interactionEvents/);
+  assert.match(viewport, /cancelPending/);
 });
 
 test("master performance tooltip flips before the right edge", async () => {
