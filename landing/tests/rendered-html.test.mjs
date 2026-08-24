@@ -67,12 +67,25 @@ test("renders the verified TRAXION commercial experience", async () => {
   assert.doesNotMatch(html, /guadagn(?:o|i) garantiti|profitto garantito|senza rischio|l['’]AI prevede il mercato/i);
 });
 
-test("keeps the whitepaper source private and publishes only protected page rasters", async () => {
+test("keeps all localized whitepapers raster-only and complete", async () => {
   const publicFiles = await readdir(new URL("../public/", import.meta.url), { recursive: true });
   const lower = publicFiles.map((name) => String(name).toLowerCase());
 
-  assert.equal(lower.filter((name) => name.endsWith(".pdf") || name.endsWith(".docx")).length, 0);
+  assert.equal(
+    lower.filter((name) => name.endsWith(".pdf") || name.endsWith(".docx") || name.endsWith(".md")).length,
+    0,
+  );
   assert.equal(lower.filter((name) => /^whitepaper\/trx-wp-0[1-6]\.webp$/.test(name)).length, 6);
+  assert.equal(lower.filter((name) => /^whitepaper\/en\/trx-wp-en-0[1-6]\.webp$/.test(name)).length, 6);
+  assert.equal(lower.filter((name) => /^whitepaper\/es\/trx-wp-es-0[1-6]\.webp$/.test(name)).length, 6);
+
+  const localeResolver = await readFile(new URL("../app/whitepaper-locale.ts", import.meta.url), "utf8");
+  assert.match(localeResolver, /whitepaper\/en\/trx-wp-en-/);
+  assert.match(localeResolver, /whitepaper\/es\/trx-wp-es-/);
+  assert.match(localeResolver, /whitepaper\/trx-wp-/);
+
+  const localizer = await readFile(new URL("../app/WhitepaperAssetLocalizer.tsx", import.meta.url), "utf8");
+  assert.match(localizer, /localizedWhitepaperAsset\(detectLanguage\(\),page\)/);
 
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   const robots = await readFile(new URL("../public/robots.txt", import.meta.url), "utf8");

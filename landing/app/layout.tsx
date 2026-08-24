@@ -2,7 +2,10 @@ import type { Metadata } from "next";
 import "./globals.css";
 import "./pricing-layout.css";
 import "./master-performance.css";
+import "./i18n.css";
 import MasterPerformancePortal from "./MasterPerformancePortal";
+import { LanguageController, LanguageSelectorPortal } from "./LanguageSelector";
+import WhitepaperAssetLocalizer from "./WhitepaperAssetLocalizer";
 import { TRAXION_CANONICAL_URL, traxionAsset } from "./config";
 
 const canonicalIsConfigured = TRAXION_CANONICAL_URL.startsWith("https://");
@@ -61,7 +64,10 @@ export default function RootLayout({
   return (
     <html lang="it">
       <body>
+        <LanguageController />
+        <WhitepaperAssetLocalizer />
         {children}
+        <LanguageSelectorPortal />
         <MasterPerformancePortal />
       </body>
     </html>
