@@ -28,6 +28,8 @@ function landmarks():Landmark[]{
 
   const result:Landmark[]=[];
   const seen=new Set<HTMLElement>();
+  // Superset of the original "main section[id], #master-performance" capture:
+  // every main section now gets a stable structural key, including sections without ids.
   const mainSections=[...document.querySelectorAll<HTMLElement>("main section")];
 
   mainSections.forEach((element,index)=>{
