@@ -97,6 +97,17 @@ test("keeps all localized whitepapers raster-only and complete", async () => {
   assert.match(headers, /\/whitepaper\/\*[\s\S]*X-Robots-Tag:\s*noindex, nofollow, noarchive/);
 });
 
+test("language switching always performs an authoritative navigation", async () => {
+  const i18n = await readFile(new URL("../app/i18n.ts", import.meta.url), "utf8");
+  const selector = await readFile(new URL("../app/LanguageSelector.tsx", import.meta.url), "utf8");
+
+  assert.match(i18n, /url\.searchParams\.set\(["']lang["'],selection\)/);
+  assert.match(i18n, /window\.location\.assign\(languageNavigationUrl\(selection,window\.location\.href\)\)/);
+  assert.match(i18n, /if\(query&&persisted\)/);
+  assert.match(selector, /setSwitching\(true\)/);
+  assert.match(selector, /if\(option===language\)return/);
+});
+
 test("centralizes external product URLs", async () => {
   const config = await readFile(new URL("../app/config.ts", import.meta.url), "utf8");
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
