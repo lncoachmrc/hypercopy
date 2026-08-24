@@ -1,1 +1,0 @@
-The localized viewer resolves English and Spanish raster pages from language-specific whitepaper directories while keeping the original Italian pages as the default fallback.
