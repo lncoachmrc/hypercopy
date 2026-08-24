@@ -1,6 +1,7 @@
 import {detectLanguage,type Language} from './i18n';
 import {FRONTEND_DICTIONARIES,type TranslationMap} from './translations';
 import {ADMIN_EN,ADMIN_ES} from './admin-translations';
+import {AUTH_EN,AUTH_ES} from './auth-translations';
 
 const SKIP_TAGS=new Set(['SCRIPT','STYLE','NOSCRIPT','TEXTAREA','CODE','PRE']);
 let cachedLanguage:Language|null=null;
@@ -12,7 +13,8 @@ function activeDictionary(language:Language):TranslationMap{
   if(language==='it')return {};
   const base=FRONTEND_DICTIONARIES[language];
   const admin=language==='en'?ADMIN_EN:ADMIN_ES;
-  return {...base,...admin};
+  const auth=language==='en'?AUTH_EN:AUTH_ES;
+  return {...base,...admin,...auth};
 }
 
 function normalise(value:string){return value.replace(/\s+/g,' ').trim()}
