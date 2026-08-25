@@ -63,7 +63,7 @@ export default function AdminPlanDiscounts(){
     let confirmation:string|undefined;
     if(value===100){
       const label=PLANS.find(p=>p.slug===plan)?.label??plan;
-      if(!confirm(translateText(`Confermi lo sconto del 100% sul piano ${label} per ${user.wallet}? Il nuovo checkout del piano sarà gratuito.`)))return;
+      if(!confirm(translateText(`Confermi lo sconto del 100% sul piano ${label} per ${user.wallet}? Il piano potrà essere attivato direttamente senza Stripe.`)))return;
       confirmation='APPLY 100% DISCOUNT';
     }
     setBusy(key);
@@ -92,7 +92,7 @@ export default function AdminPlanDiscounts(){
     <div className="panelhead">
       <div>
         <h2>Sconti personali per wallet</h2>
-        <p className="muted">Condizioni commerciali applicate automaticamente ai nuovi checkout Stripe. Ogni piano può avere una percentuale diversa da 0 a 100%.</p>
+        <p className="muted">Condizioni commerciali personali per account. Gli sconti da 1 a 99% vengono applicati al checkout Stripe; con il 100% il piano può essere attivato direttamente senza Stripe.</p>
       </div>
       <div className="badge">{discountedTotal} utenti con sconto · {total} risultati</div>
     </div>
