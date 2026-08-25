@@ -29,6 +29,37 @@ async def my_plan_discounts(user: User = Depends(current_user), db: AsyncSession
     return {'discounts': await discounts_for_user(db, user.id)}
 
 
+@router.get('/admin/plan-discounts')
+async def admin_plan_discount_overview(
+    limit: int = 100,
+    actor: User = Depends(admin),
+    db: AsyncSession = Depends(get_db),
+):
+    users = (await db.execute(
+        select(User).order_by(User.created_at.desc()).limit(min(max(limit, 1), 200))
+    )).scalars().all()
+    user_ids = [user.id for user in users]
+    rows = [] if not user_ids else (await db.execute(
+        select(UserPlanDiscount).where(UserPlanDiscount.user_id.in_(user_ids))
+    )).scalars().all()
+    by_user: dict[uuid.UUID, dict[str, int]] = {}
+    for row in rows:
+        if row.plan_slug in DISCOUNTABLE_PLANS:
+            by_user.setdefault(row.user_id, {})[row.plan_slug] = int(row.percent_off)
+    return {
+        'users': [
+            {
+                'id': str(user.id),
+                'wallet': user.auth_wallet,
+                'role': user.role.value,
+                'discounts': by_user.get(user.id, {}),
+            }
+            for user in users
+        ],
+        'plans': list(DISCOUNTABLE_PLANS),
+    }
+
+
 @router.get('/admin/users/{user_id}/plan-discounts')
 async def admin_user_plan_discounts(
     user_id: uuid.UUID,
