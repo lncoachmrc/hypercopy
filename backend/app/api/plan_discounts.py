@@ -142,6 +142,7 @@ async def set_admin_user_plan_discount(
             ))
         action = 'ADMIN_PLAN_DISCOUNT_SET'
 
+    applies_to = 'direct_activation' if body.percent_off == 100 else 'new_checkout'
     await audit(
         db,
         action=action,
@@ -149,7 +150,7 @@ async def set_admin_user_plan_discount(
         subject_id=target.id,
         reason=body.reason,
         before={'plan': plan_slug, 'percent_off': previous},
-        after={'plan': plan_slug, 'percent_off': body.percent_off, 'applies_to': 'new_checkout'},
+        after={'plan': plan_slug, 'percent_off': body.percent_off, 'applies_to': applies_to},
     )
     await db.commit()
     return {
@@ -159,4 +160,5 @@ async def set_admin_user_plan_discount(
         'percent_off': body.percent_off,
         'discounts': await discounts_for_user(db, target.id),
         'applies_to_existing_subscription': False,
+        'activation_mode': 'direct' if body.percent_off == 100 else 'stripe_checkout',
     }
