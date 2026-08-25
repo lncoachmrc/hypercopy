@@ -29,6 +29,10 @@ export const DISCOUNT_EN:TranslationMap={
   'Attivazione piano non disponibile':'Plan activation unavailable',
   'Gratuito':'Complimentary',
   'Con sconto personale 100% il piano si attiva direttamente senza Stripe.':'With a 100% personal discount, the plan activates directly without Stripe.',
+  'Riconcilia ora':'Reconcile now',
+  'Riconciliare ora la strategia attiva':'Reconcile the active strategy now',
+  'Riconciliazione':'Reconciliation',
+  'riconciliata.':'reconciled.',
 };
 
 export const DISCOUNT_ES:TranslationMap={
@@ -60,4 +64,8 @@ export const DISCOUNT_ES:TranslationMap={
   'Attivazione piano non disponibile':'Activación del plan no disponible',
   'Gratuito':'Gratuito',
   'Con sconto personale 100% il piano si attiva direttamente senza Stripe.':'Con un descuento personal del 100%, el plan se activa directamente sin Stripe.',
+  'Riconcilia ora':'Reconciliar ahora',
+  'Riconciliare ora la strategia attiva':'Reconciliar ahora la estrategia activa',
+  'Riconciliazione':'Reconciliación',
+  'riconciliata.':'reconciliada.',
 };
