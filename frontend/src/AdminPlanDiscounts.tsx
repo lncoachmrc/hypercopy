@@ -1,5 +1,6 @@
 import {useEffect,useMemo,useState} from 'react';
 import {get,post} from './api';
+import {translateText} from './autoTranslate';
 
 type PlanSlug='starter'|'plus'|'pro_10k';
 type DiscountUser={id:string;wallet:string;role:string;discounts:Partial<Record<PlanSlug,number>>};
@@ -50,7 +51,8 @@ export default function AdminPlanDiscounts(){
     if(!Number.isInteger(value)||value<0||value>100){setError('Inserisci una percentuale intera da 0 a 100.');return}
     let confirmation:string|undefined;
     if(value===100){
-      if(!confirm(`Confermi lo sconto del 100% sul piano ${PLANS.find(p=>p.slug===plan)?.label} per ${user.wallet}? Il nuovo checkout del piano sarà gratuito.`))return;
+      const label=PLANS.find(p=>p.slug===plan)?.label??plan;
+      if(!confirm(translateText(`Confermi lo sconto del 100% sul piano ${label} per ${user.wallet}? Il nuovo checkout del piano sarà gratuito.`)))return;
       confirmation='APPLY 100% DISCOUNT';
     }
     setBusy(key);
