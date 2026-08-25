@@ -256,13 +256,15 @@ export default function Settings(){
 
   const activate=async()=>{
     const network=me?.follower_network?.toUpperCase()||'';
-    if(!confirm(`Attivare il trading automatizzato della strategia ibrida sulla rete ${network}?${network==='MAINNET'?' Verranno utilizzati fondi reali.':''}`))return;
-    setMsg(`Attivazione ${network} in corso…`);
+    const alreadyActive=me?.copy_state==='ACTIVE';
+    const action=alreadyActive?'Riconciliare ora la strategia attiva':'Attivare il trading automatizzato della strategia ibrida';
+    if(!confirm(`${action} sulla rete ${network}?${network==='MAINNET'?' Verranno utilizzati fondi reali.':''}`))return;
+    setMsg(alreadyActive?`Riconciliazione ${network} in corso…`:`Attivazione ${network} in corso…`);
     try{
       await post('/copy/resume',undefined,ACTIVATION_TIMEOUT_MS);
       await load();
       await refresh();
-      setMsg(`Strategia ${network} attiva.`);
+      setMsg(alreadyActive?`Strategia ${network} riconciliata.`:`Strategia ${network} attiva.`);
     }catch(e){
       setMsg(e instanceof Error?e.message:'Errore attivazione');
     }
@@ -338,7 +340,7 @@ export default function Settings(){
         <div className="actions">
           <button className={`state-button state-button--pause ${me?.copy_state==='PAUSED'?'active':''}`} aria-pressed={me?.copy_state==='PAUSED'} onClick={async()=>{await post('/copy/pause');await load();await refresh()}} disabled={me?.copy_state==='PAUSED'}>Pausa</button>
           <button className={`state-button state-button--shadow ${me?.copy_state==='SHADOW'?'active':''}`} aria-pressed={me?.copy_state==='SHADOW'} onClick={()=>void setShadow()} disabled={!me?.trading_account||me?.copy_state==='SHADOW'}>Modalità SHADOW</button>
-          <button className={`state-button state-button--active ${me?.copy_state==='ACTIVE'?'active':''}`} aria-pressed={me?.copy_state==='ACTIVE'} onClick={()=>void activate()} disabled={!me?.trading_account||me?.copy_state==='ACTIVE'}>Attiva strategia</button>
+          <button className={`state-button state-button--active ${me?.copy_state==='ACTIVE'?'active':''}`} aria-pressed={me?.copy_state==='ACTIVE'} onClick={()=>void activate()} disabled={!me?.trading_account}>{me?.copy_state==='ACTIVE'?'Riconcilia ora':'Attiva strategia'}</button>
           <button className="danger" onClick={()=>void closeAll()}>Chiudi posizioni</button>
         </div>
         <p className="muted">SHADOW calcola target, sizing e controlli senza inviare ordini. “Attiva strategia” abilita l'esecuzione automatizzata sulla rete operativa selezionata.</p>
