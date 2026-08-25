@@ -4,7 +4,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import current_user, require_csrf, require_role
@@ -31,13 +31,33 @@ async def my_plan_discounts(user: User = Depends(current_user), db: AsyncSession
 
 @router.get('/admin/plan-discounts')
 async def admin_plan_discount_overview(
-    limit: int = 100,
+    limit: int = 50,
+    offset: int = 0,
+    wallet: str | None = None,
     actor: User = Depends(admin),
     db: AsyncSession = Depends(get_db),
 ):
+    safe_limit = min(max(limit, 1), 100)
+    safe_offset = max(offset, 0)
+    wallet_query = (wallet or '').strip()
+
+    users_query = select(User)
+    total_query = select(func.count(User.id))
+    discounted_query = select(func.count(func.distinct(UserPlanDiscount.user_id))).join(
+        User, User.id == UserPlanDiscount.user_id
+    )
+    if wallet_query:
+        predicate = User.auth_wallet.ilike(f'%{wallet_query}%')
+        users_query = users_query.where(predicate)
+        total_query = total_query.where(predicate)
+        discounted_query = discounted_query.where(predicate)
+
+    total = int((await db.execute(total_query)).scalar_one())
+    discounted_total = int((await db.execute(discounted_query)).scalar_one())
     users = (await db.execute(
-        select(User).order_by(User.created_at.desc()).limit(min(max(limit, 1), 200))
+        users_query.order_by(User.created_at.desc()).offset(safe_offset).limit(safe_limit)
     )).scalars().all()
+
     user_ids = [user.id for user in users]
     rows = [] if not user_ids else (await db.execute(
         select(UserPlanDiscount).where(UserPlanDiscount.user_id.in_(user_ids))
@@ -57,6 +77,11 @@ async def admin_plan_discount_overview(
             for user in users
         ],
         'plans': list(DISCOUNTABLE_PLANS),
+        'total': total,
+        'discounted_total': discounted_total,
+        'offset': safe_offset,
+        'limit': safe_limit,
+        'wallet_query': wallet_query,
     }
 
 
