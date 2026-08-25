@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.entities import EquitySnapshot, Plan, Subscription, User
 from app.services.networking import user_network_state
+from app.services.plan_discounts import discount_percent_for
 
 ACTIVE = {'active', 'trialing'}
 LEGACY_PLAN_MAP = {'basic': 'starter', 'pro': 'plus', 'enterprise': 'pro_10k'}
@@ -23,6 +24,11 @@ async def entitlement(db: AsyncSession, user: User) -> dict:
     if sub and sub.status in ACTIVE:
         deadline = sub.period_end or sub.trial_end
         entitled = deadline is None or deadline > now
+    elif sub and sub.status == 'complimentary':
+        # Complimentary plans remain entitled only while the administrator keeps
+        # a 100% personal discount on that exact plan. Removing or reducing the
+        # discount immediately returns the account to the normal paid flow.
+        entitled = await discount_percent_for(db, user.id, sub.plan_slug) == 100
 
     limits = dict(plan.limits if plan else {})
     operator_override = (
