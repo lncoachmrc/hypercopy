@@ -1,12 +1,13 @@
-import {useEffect,useMemo,useState} from 'react';
+import {useEffect,useState} from 'react';
 import {get,post} from './api';
 import {translateText} from './autoTranslate';
 
 type PlanSlug='starter'|'plus'|'pro_10k';
 type DiscountUser={id:string;wallet:string;role:string;discounts:Partial<Record<PlanSlug,number>>};
-type Overview={users:DiscountUser[];plans:PlanSlug[]};
+type Overview={users:DiscountUser[];plans:PlanSlug[];total:number;discounted_total:number;offset:number;limit:number;wallet_query:string};
 type DiscountResult={ok:boolean;discounts:Partial<Record<PlanSlug,number>>;applies_to_existing_subscription:boolean};
 
+const PAGE_SIZE=50;
 const PLANS:{slug:PlanSlug;label:string}[]=[
   {slug:'starter',label:'Starter'},
   {slug:'plus',label:'Plus'},
@@ -18,30 +19,40 @@ export default function AdminPlanDiscounts(){
   const [users,setUsers]=useState<DiscountUser[]>([]);
   const [edits,setEdits]=useState<Record<string,string>>({});
   const [busy,setBusy]=useState('');
+  const [loading,setLoading]=useState(false);
   const [message,setMessage]=useState('');
   const [error,setError]=useState('');
+  const [total,setTotal]=useState(0);
+  const [discountedTotal,setDiscountedTotal]=useState(0);
+  const [offset,setOffset]=useState(0);
+  const [walletInput,setWalletInput]=useState('');
+  const [walletQuery,setWalletQuery]=useState('');
 
-  const load=async()=>{
-    const data=await get<Overview>('/admin/plan-discounts?limit=100');
-    setUsers(data.users);
-    setEdits(current=>{
-      const next={...current};
+  const load=async(nextOffset:number,nextQuery:string)=>{
+    setLoading(true);
+    setError('');
+    try{
+      const params=new URLSearchParams({limit:String(PAGE_SIZE),offset:String(Math.max(nextOffset,0))});
+      if(nextQuery)params.set('wallet',nextQuery);
+      const data=await get<Overview>(`/admin/plan-discounts?${params.toString()}`);
+      setUsers(data.users);
+      setTotal(data.total);
+      setDiscountedTotal(data.discounted_total);
+      setOffset(data.offset);
+      setWalletQuery(data.wallet_query);
+      const nextEdits:Record<string,string>={};
       for(const user of data.users){
-        for(const plan of PLANS){
-          const key=editKey(user.id,plan.slug);
-          if(!(key in next))next[key]=String(user.discounts[plan.slug]??0);
-        }
+        for(const plan of PLANS)nextEdits[editKey(user.id,plan.slug)]=String(user.discounts[plan.slug]??0);
       }
-      return next;
-    });
+      setEdits(nextEdits);
+    }catch(e){
+      setError(e instanceof Error?e.message:'Errore caricamento sconti');
+    }finally{
+      setLoading(false);
+    }
   };
 
-  useEffect(()=>{void load().catch(e=>setError(e instanceof Error?e.message:'Errore caricamento sconti'))},[]);
-
-  const usersWithDiscounts=useMemo(
-    ()=>users.filter(user=>PLANS.some(plan=>(user.discounts[plan.slug]??0)>0)).length,
-    [users],
-  );
+  useEffect(()=>{void load(0,'')},[]);
 
   const apply=async(user:DiscountUser,plan:PlanSlug,forcedValue?:number)=>{
     const key=editKey(user.id,plan);
@@ -57,15 +68,14 @@ export default function AdminPlanDiscounts(){
     }
     setBusy(key);
     try{
-      const result=await post<DiscountResult>(`/admin/users/${user.id}/plan-discounts/${plan}`,{
+      await post<DiscountResult>(`/admin/users/${user.id}/plan-discounts/${plan}`,{
         percent_off:value,
         reason:'Commercial discount configured from Control Room',
         confirmation,
       });
-      setUsers(current=>current.map(row=>row.id===user.id?{...row,discounts:result.discounts}:row));
-      setEdits(current=>({...current,[key]:String(value)}));
       const label=PLANS.find(p=>p.slug===plan)?.label??plan;
       setMessage(value===0?`Sconto ${label} rimosso per ${user.wallet}.`:`Sconto ${label} ${value}% applicato a ${user.wallet}.`);
+      await load(offset,walletQuery);
     }catch(e){
       setError(e instanceof Error?e.message:'Errore applicazione sconto');
     }finally{
@@ -73,14 +83,24 @@ export default function AdminPlanDiscounts(){
     }
   };
 
+  const start=total===0?0:offset+1;
+  const end=Math.min(offset+users.length,total);
+  const canPrev=offset>0&&!loading;
+  const canNext=offset+users.length<total&&!loading;
+
   return <section className="panel" style={{marginTop:18}}>
     <div className="panelhead">
       <div>
         <h2>Sconti personali per wallet</h2>
         <p className="muted">Condizioni commerciali applicate automaticamente ai nuovi checkout Stripe. Ogni piano può avere una percentuale diversa da 0 a 100%.</p>
       </div>
-      <div className="badge">{usersWithDiscounts} utenti con sconto</div>
+      <div className="badge">{discountedTotal} utenti con sconto · {total} risultati</div>
     </div>
+    <form onSubmit={e=>{e.preventDefault();const query=walletInput.trim();void load(0,query)}} style={{display:'flex',gap:8,alignItems:'center',flexWrap:'wrap',margin:'12px 0 16px'}}>
+      <input aria-label="Cerca wallet" placeholder="Cerca wallet" value={walletInput} onChange={e=>setWalletInput(e.target.value)} style={{minWidth:300,flex:'1 1 320px'}}/>
+      <button type="submit" disabled={loading}>Cerca</button>
+      {(walletQuery||walletInput)&&<button type="button" disabled={loading} onClick={()=>{setWalletInput('');void load(0,'')}}>Azzera</button>}
+    </form>
     {error&&<div className="alert error">{error}</div>}
     {message&&<div className="toast">{message}</div>}
     <div style={{overflowX:'auto'}}>
@@ -94,13 +114,20 @@ export default function AdminPlanDiscounts(){
                 <input aria-label={`Sconto ${plan.label} per ${user.wallet}`} type="number" min="0" max="100" step="1" inputMode="numeric" value={edits[key]??String(current)} onChange={e=>setEdits(values=>({...values,[key]:e.target.value}))} style={{width:76}}/>
                 <span>%</span>
               </div>
-              <button disabled={busy!==''} onClick={()=>void apply(user,plan.slug)}>{busy===key?'…':'Applica'}</button>
-              {current>0&&<button disabled={busy!==''} onClick={()=>{setEdits(values=>({...values,[key]:'0'}));void apply(user,plan.slug,0)}}>Rimuovi</button>}
+              <button disabled={busy!==''||loading} onClick={()=>void apply(user,plan.slug)}>{busy===key?'…':'Applica'}</button>
+              {current>0&&<button disabled={busy!==''||loading} onClick={()=>{setEdits(values=>({...values,[key]:'0'}));void apply(user,plan.slug,0)}}>Rimuovi</button>}
             </div>
             <div className="muted" style={{marginTop:6,fontSize:12}}>Attuale: {current}%</div>
           </td>})}
-        </tr>)}</tbody>
+        </tr>)}{!loading&&users.length===0&&<tr><td colSpan={4} className="muted">Nessun wallet trovato.</td></tr>}</tbody>
       </table>
+    </div>
+    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:12,flexWrap:'wrap',marginTop:14}}>
+      <span className="muted">Risultati {start}–{end} di {total}</span>
+      <div style={{display:'flex',gap:8}}>
+        <button disabled={!canPrev} onClick={()=>void load(Math.max(0,offset-PAGE_SIZE),walletQuery)}>Precedente</button>
+        <button disabled={!canNext} onClick={()=>void load(offset+PAGE_SIZE,walletQuery)}>Successiva</button>
+      </div>
     </div>
     <p className="muted" style={{marginTop:14}}>Lo sconto è associato all’account TRAXION e non richiede codici promozionali. Una sottoscrizione Stripe già attiva non viene modificata retroattivamente.</p>
   </section>;
