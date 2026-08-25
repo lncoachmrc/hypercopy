@@ -1,0 +1,33 @@
+import type {TranslationMap} from './translations';
+
+export const DISCOUNT_EN:TranslationMap={
+  'Sconti personali per wallet':'Personal discounts by wallet',
+  'Condizioni commerciali applicate automaticamente ai nuovi checkout Stripe. Ogni piano può avere una percentuale diversa da 0 a 100%.':'Commercial terms applied automatically to new Stripe checkouts. Each plan can have a different discount from 0 to 100%.',
+  'utenti con sconto':'users with discount',
+  'Sconto personale':'Personal discount',
+  'Applica':'Apply',
+  'Rimuovi':'Remove',
+  'Attuale:':'Current:',
+  'Lo sconto è associato all’account TRAXION e non richiede codici promozionali. Una sottoscrizione Stripe già attiva non viene modificata retroattivamente.':'The discount is linked to the TRAXION account and requires no promotion code. An already active Stripe subscription is not changed retroactively.',
+  'Inserisci una percentuale intera da 0 a 100.':'Enter a whole-number percentage from 0 to 100.',
+  'Confermi lo sconto del 100% sul piano':'Confirm the 100% discount on the',
+  'Il nuovo checkout del piano sarà gratuito.':'The new plan checkout will be free.',
+  'sconto applicato automaticamente al checkout':'discount applied automatically at checkout',
+  'Gli eventuali sconti personali sono associati al tuo account TRAXION e applicati server-side ai nuovi checkout.':'Any personal discounts are linked to your TRAXION account and applied server-side to new checkouts.',
+};
+
+export const DISCOUNT_ES:TranslationMap={
+  'Sconti personali per wallet':'Descuentos personales por wallet',
+  'Condizioni commerciali applicate automaticamente ai nuovi checkout Stripe. Ogni piano può avere una percentuale diversa da 0 a 100%.':'Condiciones comerciales aplicadas automáticamente a los nuevos checkouts de Stripe. Cada plan puede tener un descuento diferente del 0 al 100%.',
+  'utenti con sconto':'usuarios con descuento',
+  'Sconto personale':'Descuento personal',
+  'Applica':'Aplicar',
+  'Rimuovi':'Eliminar',
+  'Attuale:':'Actual:',
+  'Lo sconto è associato all’account TRAXION e non richiede codici promozionali. Una sottoscrizione Stripe già attiva non viene modificata retroattivamente.':'El descuento está asociado a la cuenta TRAXION y no requiere códigos promocionales. Una suscripción de Stripe ya activa no se modifica retroactivamente.',
+  'Inserisci una percentuale intera da 0 a 100.':'Introduce un porcentaje entero de 0 a 100.',
+  'Confermi lo sconto del 100% sul piano':'Confirma el descuento del 100% en el plan',
+  'Il nuovo checkout del piano sarà gratuito.':'El nuevo checkout del plan será gratuito.',
+  'sconto applicato automaticamente al checkout':'descuento aplicado automáticamente en el checkout',
+  'Gli eventuali sconti personali sono associati al tuo account TRAXION e applicati server-side ai nuovi checkout.':'Los descuentos personales están asociados a tu cuenta TRAXION y se aplican en el servidor a los nuevos checkouts.',
+};
