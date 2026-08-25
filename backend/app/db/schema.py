@@ -1,7 +1,7 @@
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-EXPECTED_REVISION='0009_user_execution_network'
+EXPECTED_REVISION='0010_user_plan_discounts'
 
 
 async def assert_schema(db:AsyncSession)->None:
