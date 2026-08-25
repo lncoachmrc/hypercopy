@@ -15,6 +15,7 @@ from app.core.config import settings
 from app.db.session import get_db
 from app.models.entities import Plan, StripeEvent, Subscription, User
 from app.services.entitlement import entitlement
+from app.services.plan_discounts import discount_percent_for
 
 router = APIRouter(tags=['billing'])
 
@@ -102,14 +103,16 @@ async def create_checkout(body: dict, user: User = Depends(current_user), db: As
     sub = (await db.execute(select(Subscription).where(Subscription.user_id == user.id))).scalar_one_or_none()
     if sub and sub.stripe_subscription_id and sub.status in {'active','trialing','past_due'}:
         raise HTTPException(409, 'An existing Stripe subscription must be managed through the billing portal')
+    personal_discount = await discount_percent_for(db, user.id, plan)
     url = await stripe_client.checkout(
         customer_id=sub.stripe_customer_id if sub else None,
         customer_email=user.email,
         user_id=str(user.id),
         plan=plan,
         billing_period=billing_period,
+        discount_percent=personal_discount,
     )
-    return {'url': url}
+    return {'url': url, 'personal_discount_pct': personal_discount}
 
 
 @router.post('/subscription/portal', dependencies=[Depends(require_csrf)])
