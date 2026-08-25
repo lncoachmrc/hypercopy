@@ -14,6 +14,7 @@ from app.api.deps import current_user, require_csrf
 from app.core.config import settings
 from app.db.session import get_db
 from app.models.entities import Plan, StripeEvent, Subscription, User
+from app.services.audit import audit
 from app.services.entitlement import entitlement
 from app.services.plan_discounts import discount_percent_for
 
@@ -90,6 +91,53 @@ async def subscription(user: User = Depends(current_user), db: AsyncSession = De
     return await entitlement(db, user)
 
 
+@router.post('/subscription/activate-complimentary', dependencies=[Depends(require_csrf)])
+async def activate_complimentary(body: dict, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    plan = str(body.get('plan', '')).lower().strip()
+    if plan not in OFFERED_PLANS:
+        raise HTTPException(422, 'Unknown plan')
+    if await discount_percent_for(db, user.id, plan) != 100:
+        raise HTTPException(409, 'A 100% personal discount is required for direct plan activation')
+    if not await db.get(Plan, plan):
+        raise HTTPException(409, 'Plan is not available in the entitlement catalog')
+
+    sub = (await db.execute(select(Subscription).where(Subscription.user_id == user.id))).scalar_one_or_none()
+    if sub and sub.stripe_subscription_id and sub.status in {'active', 'trialing', 'past_due'}:
+        raise HTTPException(409, 'An existing Stripe subscription must be managed through the billing portal')
+
+    before = {
+        'plan': sub.plan_slug if sub else None,
+        'status': sub.status if sub else 'none',
+    }
+    if sub is None:
+        sub = Subscription(
+            user_id=user.id,
+            plan_slug=plan,
+            status='complimentary',
+            period_end=None,
+            trial_end=None,
+        )
+        db.add(sub)
+    else:
+        sub.plan_slug = plan
+        sub.status = 'complimentary'
+        sub.period_end = None
+        sub.trial_end = None
+        sub.stripe_subscription_id = None
+
+    await audit(
+        db,
+        action='COMPLIMENTARY_PLAN_ACTIVATED',
+        actor_id=user.id,
+        subject_id=user.id,
+        reason='User activated a plan covered by a 100% personal discount',
+        before=before,
+        after={'plan': plan, 'status': 'complimentary', 'personal_discount_pct': 100},
+    )
+    await db.commit()
+    return await entitlement(db, user)
+
+
 @router.post('/subscription/checkout', dependencies=[Depends(require_csrf)])
 async def create_checkout(body: dict, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     plan = str(body.get('plan', '')).lower()
@@ -98,12 +146,14 @@ async def create_checkout(body: dict, user: User = Depends(current_user), db: As
         raise HTTPException(422, 'Unknown plan')
     if billing_period not in {'monthly', 'yearly'}:
         raise HTTPException(422, 'Unknown billing period')
-    if not stripe_client.plan_configured(plan, billing_period):
-        raise HTTPException(409, f'Stripe price is not configured yet for {plan}/{billing_period}')
     sub = (await db.execute(select(Subscription).where(Subscription.user_id == user.id))).scalar_one_or_none()
     if sub and sub.stripe_subscription_id and sub.status in {'active','trialing','past_due'}:
         raise HTTPException(409, 'An existing Stripe subscription must be managed through the billing portal')
     personal_discount = await discount_percent_for(db, user.id, plan)
+    if personal_discount == 100:
+        raise HTTPException(409, 'Use direct complimentary activation for a 100% discounted plan')
+    if not stripe_client.plan_configured(plan, billing_period):
+        raise HTTPException(409, f'Stripe price is not configured yet for {plan}/{billing_period}')
     url = await stripe_client.checkout(
         customer_id=sub.stripe_customer_id if sub else None,
         customer_email=user.email,
