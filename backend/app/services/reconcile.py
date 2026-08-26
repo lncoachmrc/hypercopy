@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.adapters.action_errors import ActionErrorClass, classify_action_error
 from app.adapters.hyperliquid import HyperliquidAdapter, PositionConfig, fill_event_id, position_configs
 from app.adapters.ratelimit import Priority
 from app.core.config import settings
@@ -20,13 +21,7 @@ from app.services.networking import user_network_state
 
 log = __import__('app.core.logging', fromlist=['get_logger']).get_logger(__name__)
 
-_LIQUIDITY_REJECT_MARKERS = (
-    'could not immediately match against any resting orders',
-    'no liquidity',
-    'marketordernoliquidityrejected',
-    'ioccancelrejected',
-)
-
+_LEDGER_DECIMAL_QUANTUM = Decimal('0.000000000001')
 _ACTIVE_AMBIGUITY_JOB_STATES = {JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING}
 _TERMINAL_AMBIGUITY_JOB_STATES = {JobState.DONE, JobState.SKIPPED, JobState.DEAD}
 
@@ -50,8 +45,12 @@ def _reconciliation_basis(
 
 
 def _is_liquidity_reject(reason: str | None) -> bool:
-    text = (reason or '').lower()
-    return any(marker in text for marker in _LIQUIDITY_REJECT_MARKERS)
+    return classify_action_error(reason).error_class is ActionErrorClass.LIQUIDITY
+
+
+def _persisted_ledger_decimal(value: Decimal) -> Decimal:
+    """Normalize to the Numeric(30, 12) precision used by PositionLedger."""
+    return value.quantize(_LEDGER_DECIMAL_QUANTUM, rounding=ROUND_HALF_UP)
 
 
 def _safe_ambiguity_reduction(real: Decimal, desired_target: Decimal) -> bool:
@@ -108,6 +107,9 @@ async def _terminal_action_rejection_blocks_unchanged_intent(
     are the target and local exchange basis that existed when the latest action
     rejection was persisted. A changed target or changed authoritative exchange
     position releases the fence and lets reconciliation create a fresh job/CLOID.
+    Comparisons use the ledger's persisted Numeric(30, 12) precision so harmless
+    extra Decimal digits from fresh exchange/sizing inputs do not reopen the same
+    terminal intent.
     """
 
     latest = (await db.execute(
@@ -126,7 +128,12 @@ async def _terminal_action_rejection_blocks_unchanged_intent(
         return False
     if str(metadata.get('network') or '') != str(network):
         return False
-    return previous_target == desired_target and previous_real == real
+    if previous_target is None:
+        return False
+    return (
+        _persisted_ledger_decimal(previous_target) == _persisted_ledger_decimal(desired_target)
+        and _persisted_ledger_decimal(previous_real) == _persisted_ledger_decimal(real)
+    )
 
 
 async def _sync_missing_fills(db: AsyncSession, hl: HyperliquidAdapter, user: User, account_address: str, started_at: datetime) -> int:
