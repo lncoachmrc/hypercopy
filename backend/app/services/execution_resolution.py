@@ -14,6 +14,7 @@ from app.models.entities import (
     Execution,
     ExecutionState,
     JobState,
+    PositionLedger,
     SystemIncident,
     TradingAccount,
 )
@@ -37,6 +38,50 @@ def _position_size(state: dict, asset: str) -> Decimal:
         if str(position.get('coin') or '') == asset:
             return Decimal(str(position.get('szi', '0') or '0'))
     return Decimal(0)
+
+
+async def _sync_asset_ledger_from_exchange_state(
+    db: AsyncSession,
+    execution: Execution,
+    state: dict,
+    *,
+    verified_at: datetime,
+    mark_price: Decimal | None = None,
+) -> Decimal:
+    """Persist authoritative follower position before removing an ambiguity fence."""
+
+    exchange_position = _position_size(state, execution.asset)
+    ledger = (
+        await db.execute(
+            select(PositionLedger)
+            .where(
+                PositionLedger.user_id == execution.user_id,
+                PositionLedger.asset == execution.asset,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if ledger is None:
+        ledger = PositionLedger(
+            user_id=execution.user_id,
+            asset=execution.asset,
+            size=exchange_position,
+            target_size=exchange_position,
+            mark_price=mark_price or Decimal(0),
+            managed=True,
+            last_execution_id=execution.id,
+            exchange_verified_at=verified_at,
+        )
+        db.add(ledger)
+    else:
+        ledger.size = exchange_position
+        ledger.managed = True
+        ledger.last_execution_id = execution.id
+        ledger.exchange_verified_at = verified_at
+        if mark_price is not None:
+            ledger.mark_price = mark_price
+    await db.flush()
+    return exchange_position
 
 
 def _matching_fill_summary(fills: list[dict], oid: str | None) -> tuple[Decimal, Decimal | None, int]:
@@ -204,29 +249,56 @@ async def resolve_ambiguous_executions(
                 execution = await db.get(Execution, execution_id)
                 if not execution or execution.state not in {ExecutionState.SUBMITTING, ExecutionState.UNKNOWN}:
                     continue
-                prior_hf001 = dict((execution.response or {}).get('hf001') or {})
-                prior_incident_id = prior_hf001.get('incident_id')
-                await _persist_outcome(db, execution, resolved)
-                if prior_hf001:
-                    execution.response = {**(execution.response or {}), 'hf001': prior_hf001}
-                await _resolve_incident(db, prior_incident_id)
-                await audit(
-                    db,
-                    action='AMBIGUOUS_EXECUTION_RESOLVED',
-                    subject_id=execution.user_id,
-                    correlation_id=job.correlation_id,
-                    after={
-                        'execution_id': str(execution.id),
-                        'job_id': str(job.id),
-                        'asset': execution.asset,
-                        'state': execution.state.value,
-                        'exchange_oid': execution.exchange_oid,
-                        'network': hl.network,
-                    },
-                )
-                await db.commit()
-                result['resolved'] += 1
-                continue
+
+                # A recovered fill removes the execution fence. Before that can
+                # happen, persist an authoritative follower snapshot under the
+                # same per-user ledger lock. If the snapshot is unavailable,
+                # keep UNKNOWN so network switching remains safely blocked.
+                if resolved.state == 'FILLED':
+                    try:
+                        snapshot = await hl.account_snapshot(account.account_address)
+                    except Exception:
+                        resolved = OrderOutcome(
+                            'UNKNOWN',
+                            resolved.oid,
+                            resolved.filled_size,
+                            resolved.avg_price,
+                            'Recovered fill is terminal but follower position snapshot is unavailable',
+                            resolved.raw,
+                        )
+                    else:
+                        await _sync_asset_ledger_from_exchange_state(
+                            db,
+                            execution,
+                            snapshot.perp_state,
+                            verified_at=datetime.now(UTC),
+                            mark_price=resolved.avg_price,
+                        )
+
+                if resolved.state != 'UNKNOWN':
+                    prior_hf001 = dict((execution.response or {}).get('hf001') or {})
+                    prior_incident_id = prior_hf001.get('incident_id')
+                    await _persist_outcome(db, execution, resolved)
+                    if prior_hf001:
+                        execution.response = {**(execution.response or {}), 'hf001': prior_hf001}
+                    await _resolve_incident(db, prior_incident_id)
+                    await audit(
+                        db,
+                        action='AMBIGUOUS_EXECUTION_RESOLVED',
+                        subject_id=execution.user_id,
+                        correlation_id=job.correlation_id,
+                        after={
+                            'execution_id': str(execution.id),
+                            'job_id': str(job.id),
+                            'asset': execution.asset,
+                            'state': execution.state.value,
+                            'exchange_oid': execution.exchange_oid,
+                            'network': hl.network,
+                        },
+                    )
+                    await db.commit()
+                    result['resolved'] += 1
+                    continue
 
             age_seconds = max((datetime.now(UTC) - execution.created_at).total_seconds(), 0)
             if age_seconds < UNKNOWN_EXECUTION_SLA_SECONDS:
@@ -259,7 +331,6 @@ async def resolve_ambiguous_executions(
                 fills = await _recent_fills(hl, account.account_address, execution)
             evidence_oid = resolved.oid or execution.exchange_oid
             fill_size, avg_price, matched_count = _matching_fill_summary(fills, evidence_oid)
-            exchange_position = _position_size(snapshot.perp_state, execution.asset)
 
             execution = await db.get(Execution, execution_id)
             job = await db.get(CopyJob, execution.copy_job_id) if execution else None
@@ -272,6 +343,14 @@ async def resolve_ambiguous_executions(
                 await db.rollback()
                 continue
 
+            exchange_verified_at = datetime.now(UTC)
+            exchange_position = await _sync_asset_ledger_from_exchange_state(
+                db,
+                execution,
+                snapshot.perp_state,
+                verified_at=exchange_verified_at,
+                mark_price=avg_price,
+            )
             quarantined_at = datetime.now(UTC)
             prior_state = execution.state.value
             prior_response = dict(execution.response or {})
@@ -284,7 +363,7 @@ async def resolve_ambiguous_executions(
                     'job_state': job.state.value,
                     'order_status_reason': resolved.reason,
                     'exchange_position': str(exchange_position),
-                    'exchange_verified_at': quarantined_at.isoformat(),
+                    'exchange_verified_at': exchange_verified_at.isoformat(),
                     'recent_fill_count': len(fills),
                     'matched_fill_count': matched_count,
                     'matched_fill_size': str(fill_size),

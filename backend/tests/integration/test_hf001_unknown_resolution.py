@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete, text
+from sqlalchemy import delete, select, text
 
 from app.core.config import settings
 from app.db.position_ledger_lock import position_ledger_lock_engine
@@ -19,6 +19,7 @@ from app.models.entities import (
     Execution,
     ExecutionState,
     JobState,
+    PositionLedger,
     SystemIncident,
     TradingAccount,
     User,
@@ -95,8 +96,11 @@ class FilledHL(AmbiguousHL):
             {'oid': 123, 'sz': '0.3', 'px': '110'},
         ]
 
+
+class SnapshotUnavailableHL(FilledHL):
     async def account_snapshot(self, account: str):
-        raise AssertionError('Terminal CLOID resolution should not need position quarantine')
+        self.snapshot_calls += 1
+        raise RuntimeError('snapshot unavailable')
 
 
 async def _seed_ambiguous_execution(*, job_state: JobState, age_seconds: int):
@@ -185,6 +189,7 @@ async def _cleanup(user_id: uuid.UUID):
                 ])
             )
         )
+        await db.execute(delete(PositionLedger).where(PositionLedger.user_id == user_id))
         await db.execute(delete(Execution).where(Execution.user_id == user_id))
         await db.execute(delete(CopyJob).where(CopyJob.user_id == user_id))
         await db.execute(delete(TradingAccount).where(TradingAccount.user_id == user_id))
@@ -218,12 +223,24 @@ async def test_dead_unknown_is_quarantined_after_sla_without_blind_resubmit():
         async with SessionLocal() as db:
             execution = await db.get(Execution, execution_id)
             job = await db.get(CopyJob, job_id)
+            ledger = (
+                await db.execute(
+                    select(PositionLedger).where(
+                        PositionLedger.user_id == user_id,
+                        PositionLedger.asset == 'BTC',
+                    )
+                )
+            ).scalar_one()
             assert execution is not None and job is not None
             assert job.state == JobState.DEAD
             assert execution.state == ExecutionState.QUARANTINED
             assert execution.resolved_at is not None
             assert execution.response['hf001']['resolution'] == 'QUARANTINED'
             assert execution.response['hf001']['exchange_position'] == '0.7'
+            assert ledger.size == Decimal('0.7')
+            assert ledger.managed is True
+            assert ledger.last_execution_id == execution_id
+            assert ledger.exchange_verified_at is not None
     finally:
         await _cleanup(user_id)
 
@@ -256,12 +273,12 @@ async def test_aged_unknown_with_live_job_alerts_but_keeps_fence():
 
 
 @pytest.mark.asyncio
-async def test_resolver_recovers_actual_fill_from_cloid_and_fill_history():
+async def test_resolver_recovers_actual_fill_and_syncs_authoritative_position():
     user_id, _, execution_id = await _seed_ambiguous_execution(
         job_state=JobState.DEAD,
         age_seconds=60,
     )
-    hl = FilledHL()
+    hl = FilledHL(position='0.4')
 
     try:
         async with SessionLocal() as db:
@@ -271,14 +288,62 @@ async def test_resolver_recovers_actual_fill_from_cloid_and_fill_history():
         assert result['quarantined'] == 0
         assert hl.place_ioc_calls == 0
         assert hl.fill_calls == 1
+        assert hl.snapshot_calls == 1
 
         async with SessionLocal() as db:
             execution = await db.get(Execution, execution_id)
+            ledger = (
+                await db.execute(
+                    select(PositionLedger).where(
+                        PositionLedger.user_id == user_id,
+                        PositionLedger.asset == 'BTC',
+                    )
+                )
+            ).scalar_one()
             assert execution is not None
             assert execution.state == ExecutionState.FILLED
             assert execution.exchange_oid == '123'
             assert execution.filled_size == Decimal('0.4')
             assert execution.avg_price == Decimal('107.5')
             assert execution.resolved_at is not None
+            assert ledger.size == Decimal('0.4')
+            assert ledger.managed is True
+            assert ledger.last_execution_id == execution_id
+            assert ledger.exchange_verified_at is not None
+    finally:
+        await _cleanup(user_id)
+
+
+@pytest.mark.asyncio
+async def test_recovered_fill_keeps_unknown_fence_when_snapshot_is_unavailable():
+    user_id, _, execution_id = await _seed_ambiguous_execution(
+        job_state=JobState.DEAD,
+        age_seconds=60,
+    )
+    hl = SnapshotUnavailableHL(position='0.4')
+
+    try:
+        async with SessionLocal() as db:
+            result = await resolve_ambiguous_executions(db, hl, user_id=user_id)
+
+        assert result['resolved'] == 0
+        assert result['quarantined'] == 0
+        assert hl.fill_calls == 1
+        assert hl.snapshot_calls == 1
+
+        async with SessionLocal() as db:
+            execution = await db.get(Execution, execution_id)
+            ledger = (
+                await db.execute(
+                    select(PositionLedger).where(
+                        PositionLedger.user_id == user_id,
+                        PositionLedger.asset == 'BTC',
+                    )
+                )
+            ).scalar_one_or_none()
+            assert execution is not None
+            assert execution.state == ExecutionState.UNKNOWN
+            assert execution.resolved_at is None
+            assert ledger is None
     finally:
         await _cleanup(user_id)
