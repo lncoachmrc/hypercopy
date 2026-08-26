@@ -5,6 +5,7 @@ from app.adapters.action_errors import (
     ActionRetryPolicy,
     classify_action_error,
 )
+from app.adapters.hyperliquid import parse_order_response
 
 
 @pytest.mark.parametrize(
@@ -19,7 +20,6 @@ from app.adapters.action_errors import (
         ("Order could not immediately match against any resting orders.", ActionErrorClass.LIQUIDITY),
         ("No liquidity available for market order.", ActionErrorClass.LIQUIDITY),
         ("iocCancelRejected", ActionErrorClass.LIQUIDITY),
-        ("Too many cumulative requests sent (500 > 100)", ActionErrorClass.TRANSIENT),
         ("positionIncreaseAtOpenInterestCapRejected", ActionErrorClass.TRANSIENT),
         ("oracleRejected", ActionErrorClass.TRANSIENT),
     ],
@@ -28,9 +28,52 @@ def test_documented_action_errors_have_explicit_semantic_class(reason, expected)
     assert classify_action_error(reason).error_class is expected
 
 
+@pytest.mark.parametrize(
+    ("error", "expected", "retry_policy"),
+    [
+        (
+            "Order could not immediately match against any resting orders.",
+            ActionErrorClass.LIQUIDITY,
+            ActionRetryPolicy.RECONCILE,
+        ),
+        (
+            "No liquidity available for market order.",
+            ActionErrorClass.LIQUIDITY,
+            ActionRetryPolicy.RECONCILE,
+        ),
+        (
+            "Position increase at open interest cap.",
+            ActionErrorClass.TRANSIENT,
+            ActionRetryPolicy.RECONCILE,
+        ),
+        (
+            "Insufficient margin to place order.",
+            ActionErrorClass.TERMINAL,
+            ActionRetryPolicy.NONE,
+        ),
+        (
+            "Reduce only order would increase position.",
+            ActionErrorClass.TERMINAL,
+            ActionRetryPolicy.NONE,
+        ),
+    ],
+)
+def test_production_parser_output_flows_into_taxonomy(error, expected, retry_policy):
+    fixture = {
+        "status": "ok",
+        "response": {"type": "order", "data": {"statuses": [{"error": error}]}},
+    }
+    outcome = parse_order_response(fixture)
+    assert outcome.state == "REJECTED"
+    assert outcome.reason == error
+    decision = classify_action_error(outcome.reason)
+    assert decision.error_class is expected
+    assert decision.retry_policy is retry_policy
+
+
 def test_only_semantically_recoverable_rejections_delegate_retry_to_reconciliation():
     assert classify_action_error("Order could not immediately match against any resting orders.").retry_policy is ActionRetryPolicy.RECONCILE
-    assert classify_action_error("Too many cumulative requests sent").retry_policy is ActionRetryPolicy.RECONCILE
+    assert classify_action_error("Oracle issue.").retry_policy is ActionRetryPolicy.RECONCILE
     assert classify_action_error("Insufficient margin to place order.").retry_policy is ActionRetryPolicy.NONE
 
 
@@ -40,9 +83,15 @@ def test_unknown_rejection_is_conservative_and_never_directly_retried():
     assert decision.retry_policy is ActionRetryPolicy.NONE
 
 
-def test_transport_ambiguity_is_not_disguised_as_retryable_action_error():
-    # Transport exceptions are handled by execution.py as UNKNOWN. If a similar
-    # string reaches this explicit-rejection classifier, it remains conservative.
-    decision = classify_action_error("connection reset after submit")
-    assert decision.error_class is ActionErrorClass.UNCLASSIFIED
-    assert decision.retry_policy is ActionRetryPolicy.NONE
+def test_transport_and_nonce_failures_stay_out_of_explicit_order_taxonomy():
+    # Signed-action HTTP/transport ambiguity remains Execution.UNKNOWN and nonce
+    # coordination has its own HF-003 policy. Neither is safe to reinterpret as
+    # an explicit no-effect order rejection here.
+    for reason in (
+        "connection reset after submit",
+        "429 Too Many Requests",
+        "invalid nonce",
+    ):
+        decision = classify_action_error(reason)
+        assert decision.error_class is ActionErrorClass.UNCLASSIFIED
+        assert decision.retry_policy is ActionRetryPolicy.NONE
