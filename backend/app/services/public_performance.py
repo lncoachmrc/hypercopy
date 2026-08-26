@@ -52,7 +52,8 @@ async def public_master_performance(db: AsyncSession, range_key: str = 'all') ->
 
     now = datetime.now(UTC)
     network = settings.master_network
-    operational_started_at = PUBLIC_PERFORMANCE_RESET_AT
+    checkpoint_started_at = checkpoint.created_at.astimezone(UTC)
+    operational_started_at = max(checkpoint_started_at, PUBLIC_PERFORMANCE_RESET_AT)
     start, bucket_seconds = _range_start(now, operational_started_at, key)
 
     baseline = (await db.execute(
