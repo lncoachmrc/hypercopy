@@ -22,9 +22,9 @@ class Settings(BaseSettings):
     DATABASE_URL: str = 'postgresql+asyncpg://hypercopy:hypercopy@postgres:5432/hypercopy'
     REDIS_URL: str = 'redis://redis:6379/0'
 
-    # Legacy single-network setting kept as a safe fallback during migration.
-    # MASTER remains deployment-scoped. FOLLOWER is now the safe default used
-    # for existing/new users until each user explicitly selects a network.
+    # Legacy single-network setting is follower-side only. The strategy source
+    # is deployment-scoped and defaults independently to MAINNET, so changing a
+    # user's TESTNET/MAINNET selection can never move the master source.
     HYPERLIQUID_NETWORK: Network = 'testnet'
     HYPERLIQUID_MASTER_NETWORK: Network | None = None
     HYPERLIQUID_FOLLOWER_NETWORK: Network | None = None
@@ -168,7 +168,7 @@ class Settings(BaseSettings):
 
     @property
     def master_network(self) -> Network:
-        return self.HYPERLIQUID_MASTER_NETWORK or self.HYPERLIQUID_NETWORK
+        return self.HYPERLIQUID_MASTER_NETWORK or 'mainnet'
 
     @property
     def follower_network(self) -> Network:
@@ -202,7 +202,7 @@ class Settings(BaseSettings):
 
     @property
     def hyperliquid_ws_url(self) -> str:
-        return self.hyperliquid_follower_ws_url
+        return self.hyperliquid_follower_api_url.replace('https://', 'wss://') + '/ws'
 
 
 @lru_cache(maxsize=1)
