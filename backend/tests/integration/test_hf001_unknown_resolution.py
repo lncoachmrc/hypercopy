@@ -11,6 +11,7 @@ import pytest_asyncio
 from sqlalchemy import delete, text
 
 from app.core.config import settings
+from app.db.position_ledger_lock import position_ledger_lock_engine
 from app.db.session import SessionLocal, engine
 from app.models.entities import (
     CopyJob,
@@ -35,9 +36,14 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _dispose_pool_after_test():
+async def _dispose_pools_after_test():
     yield
+    # pytest-asyncio may give each test its own event loop. Both asyncpg pools
+    # used by this regression must be drained before that loop is closed;
+    # otherwise the next test can inherit a pooled connection owned by the old
+    # loop and stall while acquiring the advisory-lock connection.
     await engine.dispose()
+    await position_ledger_lock_engine.dispose()
 
 
 class AmbiguousHL:
