@@ -16,10 +16,11 @@ PUBLIC_PERFORMANCE_RANGE_CONFIG = {
     'all': (None, 24 * 60 * 60),
 }
 
-# Public landing performance restarts from the production MAINNET activation.
-# Historical master events remain untouched for audit/internal use; this cutoff
-# only changes the public performance series consumed by the landing page.
-PUBLIC_PERFORMANCE_RESET_AT = datetime(2026, 8, 26, 6, 51, 12, tzinfo=UTC)
+# Public landing performance uses one shared reference point regardless of the
+# source network. Historical master events remain untouched for audit/internal
+# use; only the public landing series is clamped to this baseline.
+# 2026-08-26 08:00 CEST = 2026-08-26 06:00 UTC.
+PUBLIC_PERFORMANCE_RESET_AT = datetime(2026, 8, 26, 6, 0, 0, tzinfo=UTC)
 
 
 def _checkpoint_slug() -> str:
@@ -52,11 +53,7 @@ async def public_master_performance(db: AsyncSession, range_key: str = 'all') ->
     now = datetime.now(UTC)
     network = settings.master_network
     checkpoint_started_at = checkpoint.created_at.astimezone(UTC)
-    operational_started_at = (
-        max(checkpoint_started_at, PUBLIC_PERFORMANCE_RESET_AT)
-        if network == 'mainnet'
-        else checkpoint_started_at
-    )
+    operational_started_at = max(checkpoint_started_at, PUBLIC_PERFORMANCE_RESET_AT)
     start, bucket_seconds = _range_start(now, operational_started_at, key)
 
     baseline = (await db.execute(
