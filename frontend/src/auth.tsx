@@ -40,12 +40,20 @@ export function AuthProvider({children}:{children:ReactNode}){
  const signIn=useCallback(async(address:string,signMessage:SignMessage)=>{
   if(signInFlight.current)return;
   signInFlight.current=true;setError(null);setLoading(true);
+  let walletCallbackActive=false;
   try{
    const challenge=await post<{message:string}>('/auth/challenge',{address});
+   walletCallbackActive=true;
    const signature=await signMessage(challenge.message);
+   walletCallbackActive=false;
    const session=await post<Session>('/auth/verify',{address,signature});
    applySession(session);
-  }catch(e){const message=authErrorMessage(e);setError(message);throw new AuthFlowError(message);}finally{signInFlight.current=false;setLoading(false);}
+  }catch(e){
+   // Provider/signature failures belong to WalletLogin so it can disconnect a
+   // stale Reown/AppKit session. Only API/SIWE failures are normalized here.
+   if(walletCallbackActive)throw e;
+   const message=authErrorMessage(e);setError(message);throw new AuthFlowError(message);
+  }finally{signInFlight.current=false;setLoading(false);}
  },[applySession]);
  const signOut=useCallback(async()=>{try{await post<void>('/auth/logout');}catch{}clearSession();},[clearSession]);
  const value=useMemo(()=>({user,entitlements,loading,ready,error,signIn,signOut,refresh,clearError}),[user,entitlements,loading,ready,error,signIn,signOut,refresh,clearError]);
