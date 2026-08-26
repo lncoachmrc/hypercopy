@@ -12,6 +12,7 @@ from app.adapters.hyperliquid import HyperliquidAdapter, OrderOutcome, determini
 from app.core.config import Network, settings
 from app.core.crypto import EncryptedCredential, crypto
 from app.core.logging import get_logger
+from app.db.position_ledger_lock import position_ledger_lock
 from app.engine.risk import RiskAction, RiskContext, evaluate
 from app.engine.sizing import FollowerState, MasterExposure, SizingResult, plan, round_size
 from app.models.entities import (
@@ -97,6 +98,44 @@ async def live_trading_allowed(db: AsyncSession, network: Network) -> bool:
 
 
 async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) -> str:
+    expected_owner = job.owner
+    async with position_ledger_lock(job.user_id):
+        claimed_job = await _renew_job_lease_after_lock(db, job.id, expected_owner)
+        if claimed_job is None:
+            return JobState.RETRYING.value
+        return await _process_job_locked(db, hl, claimed_job)
+
+
+async def _renew_job_lease_after_lock(
+    db: AsyncSession,
+    job_id: uuid.UUID,
+    expected_owner: str | None,
+) -> CopyJob | None:
+    """Confirm ownership after a lock wait and renew the full processing lease."""
+
+    job = (
+        await db.execute(
+            select(CopyJob)
+            .where(CopyJob.id == job_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if (
+        job is None
+        or expected_owner is None
+        or job.state != JobState.PROCESSING
+        or job.owner != expected_owner
+    ):
+        await db.rollback()
+        return None
+
+    job.locked_until = datetime.now(UTC) + timedelta(seconds=settings.JOB_LEASE_SECONDS)
+    await db.commit()
+    return job
+
+
+async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) -> str:
     user = await db.get(User, job.user_id)
     if not user:
         return await _finish(db, job, JobState.DEAD, 'User no longer exists')

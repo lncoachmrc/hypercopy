@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.adapters.hyperliquid import HyperliquidAdapter, PositionConfig, fill_event_id, position_configs
 from app.adapters.ratelimit import Priority
 from app.core.config import settings
+from app.db.position_ledger_lock import position_ledger_lock
 from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, FollowerState, MasterExposure, compute_target
 from app.models.entities import CopyJob, CopyState, EquitySnapshot, Execution, ExecutionState, Fill, JobState, PositionLedger, ReconciliationRun, RiskHalt, RiskProfile, RiskState, TradingAccount, User, UserState
 from app.services.ai_mode import read_ai_execution_policy
@@ -122,6 +123,32 @@ async def master_snapshot(hl: HyperliquidAdapter) -> tuple[dict[str, Decimal], D
 
 
 async def reconcile_user(
+    db: AsyncSession,
+    hl: HyperliquidAdapter,
+    user: User,
+    *,
+    master_positions: dict[str, Decimal],
+    master_equity: Decimal,
+    mids: dict[str, str],
+    master_mids: dict[str, str] | None = None,
+    master_configs: dict[str, PositionConfig] | None = None,
+    create_jobs: bool = True,
+) -> dict:
+    async with position_ledger_lock(user.id):
+        return await _reconcile_user_locked(
+            db,
+            hl,
+            user,
+            master_positions=master_positions,
+            master_equity=master_equity,
+            mids=mids,
+            master_mids=master_mids,
+            master_configs=master_configs,
+            create_jobs=create_jobs,
+        )
+
+
+async def _reconcile_user_locked(
     db: AsyncSession,
     hl: HyperliquidAdapter,
     user: User,

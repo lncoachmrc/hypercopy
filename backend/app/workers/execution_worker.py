@@ -13,6 +13,7 @@ from app.adapters.ratelimit import Budget, WeightedRateLimiter
 from app.core.config import Network, settings
 from app.core.logging import configure_logging, get_logger
 from app.db.lease import replica_identity
+from app.db.position_ledger_lock import position_ledger_lock
 from app.db.redis import redis_client
 from app.db.session import SessionLocal, engine
 from app.db.schema import assert_schema
@@ -225,64 +226,66 @@ class Worker:
         users=(await db.execute(select(User).join(TradingAccount,TradingAccount.user_id==User.id))).scalars().all()
         refreshed=0
         for user in users:
-            network_state=await user_network_state(db,user.id)
-            if network_state.network != network:
-                continue
-            account=(await db.execute(select(TradingAccount).where(TradingAccount.user_id==user.id))).scalar_one_or_none()
-            if not account:
-                continue
             try:
-                snapshot=await follower_hl.account_snapshot(account.account_address)
-                real_state=snapshot.perp_state
-                real_positions=_position_sizes(real_state)
-                follower_configs=position_configs(real_state)
-                ledger_rows=(await db.execute(select(PositionLedger).where(PositionLedger.user_id==user.id))).scalars().all()
-                ledger_by_asset={row.asset:row for row in ledger_rows}
-                now=datetime.now(UTC)
+                async with position_ledger_lock(user.id):
+                    network_state=await user_network_state(db,user.id)
+                    if network_state.network != network:
+                        continue
+                    account=(await db.execute(select(TradingAccount).where(TradingAccount.user_id==user.id))).scalar_one_or_none()
+                    if not account:
+                        continue
 
-                for asset in set(real_positions)|set(ledger_by_asset):
-                    real=real_positions.get(asset,Decimal(0))
-                    mark_raw=mids.get(asset)
-                    mark=Decimal(str(mark_raw or '0'))
-                    ledger=ledger_by_asset.get(asset)
-                    if ledger is None:
-                        ledger=PositionLedger(
-                            user_id=user.id,asset=asset,size=real,target_size=Decimal(0),
-                            mark_price=mark,managed=False,exchange_verified_at=now,
-                        )
-                        db.add(ledger)
-                        ledger_by_asset[asset]=ledger
-                    ledger.size=real
-                    if mark > 0:
-                        ledger.mark_price=mark
-                    ledger.exchange_verified_at=now
-                    cfg=follower_configs.get(asset)
-                    ledger.follower_leverage=cfg.leverage if real != 0 and cfg else None
-                    ledger.follower_is_cross=cfg.is_cross if real != 0 and cfg else None
+                    snapshot=await follower_hl.account_snapshot(account.account_address)
+                    real_state=snapshot.perp_state
+                    real_positions=_position_sizes(real_state)
+                    follower_configs=position_configs(real_state)
+                    ledger_rows=(await db.execute(select(PositionLedger).where(PositionLedger.user_id==user.id))).scalars().all()
+                    ledger_by_asset={row.asset:row for row in ledger_rows}
+                    now=datetime.now(UTC)
 
-                unmanaged_margin=Decimal(0)
-                for row in real_state.get('assetPositions',[]):
-                    position=row.get('position',row)
-                    asset=str(position.get('coin') or '')
-                    ledger=ledger_by_asset.get(asset)
-                    if ledger is not None and not ledger.managed:
-                        try:
-                            unmanaged_margin += abs(Decimal(str(position.get('marginUsed','0') or '0')))
-                        except Exception:
-                            pass
+                    for asset in set(real_positions)|set(ledger_by_asset):
+                        real=real_positions.get(asset,Decimal(0))
+                        mark_raw=mids.get(asset)
+                        mark=Decimal(str(mark_raw or '0'))
+                        ledger=ledger_by_asset.get(asset)
+                        if ledger is None:
+                            ledger=PositionLedger(
+                                user_id=user.id,asset=asset,size=real,target_size=Decimal(0),
+                                mark_price=mark,managed=False,exchange_verified_at=now,
+                            )
+                            db.add(ledger)
+                            ledger_by_asset[asset]=ledger
+                        ledger.size=real
+                        if mark > 0:
+                            ledger.mark_price=mark
+                        ledger.exchange_verified_at=now
+                        cfg=follower_configs.get(asset)
+                        ledger.follower_leverage=cfg.leverage if real != 0 and cfg else None
+                        ledger.follower_is_cross=cfg.is_cross if real != 0 and cfg else None
 
-                db.add(EquitySnapshot(
-                    user_id=user.id,
-                    account_value=snapshot.account_value,
-                    free_margin=snapshot.free_margin,
-                    unmanaged_margin=unmanaged_margin,
-                    collateral_balance=snapshot.collateral_balance,
-                    unrealized_pnl=snapshot.unrealized_pnl,
-                    account_mode=snapshot.abstraction,
-                    taken_at=now,
-                ))
-                await db.commit()
-                refreshed += 1
+                    unmanaged_margin=Decimal(0)
+                    for row in real_state.get('assetPositions',[]):
+                        position=row.get('position',row)
+                        asset=str(position.get('coin') or '')
+                        ledger=ledger_by_asset.get(asset)
+                        if ledger is not None and not ledger.managed:
+                            try:
+                                unmanaged_margin += abs(Decimal(str(position.get('marginUsed','0') or '0')))
+                            except Exception:
+                                pass
+
+                    db.add(EquitySnapshot(
+                        user_id=user.id,
+                        account_value=snapshot.account_value,
+                        free_margin=snapshot.free_margin,
+                        unmanaged_margin=unmanaged_margin,
+                        collateral_balance=snapshot.collateral_balance,
+                        unrealized_pnl=snapshot.unrealized_pnl,
+                        account_mode=snapshot.abstraction,
+                        taken_at=now,
+                    ))
+                    await db.commit()
+                    refreshed += 1
             except Exception:
                 await db.rollback()
                 log.warning(
