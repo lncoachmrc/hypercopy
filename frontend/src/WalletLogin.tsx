@@ -1,6 +1,6 @@
 import {useCallback,useEffect,useRef,useState} from 'react';
 import {BrowserProvider,getAddress} from 'ethers';
-import {type Provider,useAppKit,useAppKitAccount,useAppKitProvider,useAppKitState} from '@reown/appkit/react';
+import {type Provider,useAppKit,useAppKitAccount,useAppKitProvider,useAppKitState,useDisconnect} from '@reown/appkit/react';
 import {AuthFlowError,useAuth} from './auth';
 import {reownConfigured} from './reown';
 
@@ -26,11 +26,18 @@ function walletErrorMessage(error:unknown){
  if(message.includes('disconnected')||message.includes('disconnect'))return 'Il wallet si è disconnesso. Collegalo di nuovo e riprova.';
  return 'Impossibile completare il collegamento al wallet. Riprova.';
 }
+function shouldResetWalletSession(error:unknown){
+ if(error instanceof AuthFlowError)return false;
+ if(numericErrorCode(error)===4001)return false;
+ if(error instanceof WalletFlowError&&error.message.toLowerCase().includes('richiesta annullata'))return false;
+ return true;
+}
 
 function MissingConfiguration(){return <><div className="alert error" role="alert">Configurazione wallet non disponibile. Imposta REOWN_PROJECT_ID nel servizio frontend.</div><button className="primary" disabled aria-disabled="true">Connetti wallet</button></>}
 
 function ConfiguredWalletLogin(){
  const {open,close}=useAppKit();
+ const {disconnect}=useDisconnect();
  const {address,isConnected,status}=useAppKitAccount({namespace:'eip155'});
  const {walletProvider}=useAppKitProvider<Provider>('eip155');
  const modalState=useAppKitState();
@@ -44,6 +51,11 @@ function ConfiguredWalletLogin(){
  const assertStable=useCallback((expected:string)=>{
   if(!latestConnected.current||!sameAddress(latestAddress.current,expected))throw new WalletFlowError('L’indirizzo del wallet è cambiato. Riprova per generare una nuova richiesta.');
  },[]);
+
+ const resetWalletSession=useCallback(async()=>{
+  intentRef.current=false;sawModalOpenRef.current=false;
+  try{await disconnect();}catch{}
+ },[disconnect]);
 
  const authenticate=useCallback(async()=>{
   if(runningRef.current)return;
@@ -75,8 +87,14 @@ function ConfiguredWalletLogin(){
     setPhase('verifying');
     return signature;
    });
-  }catch(e){setLocalError(walletErrorMessage(e));}finally{runningRef.current=false;setPhase('idle');}
- },[address,assertStable,clearError,close,isConnected,signIn,walletProvider]);
+  }catch(e){
+   const message=walletErrorMessage(e);
+   if(shouldResetWalletSession(e)){
+    await resetWalletSession();
+    setLocalError(message==='Impossibile completare il collegamento al wallet. Riprova.'?'La sessione wallet precedente non è più valida. Premi Connetti wallet e seleziona nuovamente il wallet.':message);
+   }else setLocalError(message);
+  }finally{runningRef.current=false;setPhase('idle');}
+ },[address,assertStable,clearError,close,isConnected,resetWalletSession,signIn,walletProvider]);
 
  useEffect(()=>{
   if(!intentRef.current||runningRef.current)return;
