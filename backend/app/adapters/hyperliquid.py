@@ -14,11 +14,11 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils.types import Cloid
 
-from app.adapters.ratelimit import Priority, WEIGHT_CHEAP_INFO, WEIGHT_EXCHANGE_ACTION, WEIGHT_STANDARD_INFO, WEIGHT_USER_FILLS_MAX, WeightedRateLimiter
 from app.core.config import Network, settings
 from app.core.logging import get_logger
 from app.db.signer_action_lock import signer_action_lock
 from app.engine.sizing import AssetSpec, round_price
+from app.adapters.ratelimit import Priority, WEIGHT_CHEAP_INFO, WEIGHT_EXCHANGE_ACTION, WEIGHT_STANDARD_INFO, WEIGHT_USER_FILLS_MAX, WeightedRateLimiter
 
 log = get_logger(__name__)
 
@@ -147,6 +147,11 @@ class HyperliquidAdapter:
         self.network: Network = network or settings.follower_network
         self.api_url = settings.hyperliquid_url_for(self.network)
         self.ws_url = self.api_url.replace('https://', 'wss://') + '/ws'
+        # Info normally performs spotMeta + meta HTTP requests in its constructor.
+        # Those eager calls bypass our shared limiter/retry path and can crash the
+        # worker before it starts when Hyperliquid briefly returns 502. Seed empty
+        # metadata because this adapter uses Info only for direct read methods;
+        # real perp metadata is fetched lazily by asset_spec through _read().
         self.info = Info(
             self.api_url,
             skip_ws=True,
@@ -281,6 +286,11 @@ class HyperliquidAdapter:
         )
 
     async def mids(self) -> dict[str, str]:
+        # allMids is shared market data used directly on the follower order hot
+        # path. It is not master account state. Charging it to MASTER_STATE let
+        # normal follower sizing consume the capacity reserved for verified
+        # master equity/positions/leverage. Keep it in the ORDER lane instead;
+        # reconciliation only calls it a handful of times per cycle.
         return await self._read(
             self.info.all_mids,
             weight=WEIGHT_CHEAP_INFO, priority=Priority.ORDER, timeout=10,
@@ -342,6 +352,12 @@ class HyperliquidAdapter:
         return self._specs[asset][1]
 
     def _exchange(self, local, account_address: str) -> Exchange:
+        """Build Exchange without SDK constructor network calls.
+
+        asset_spec() must run first so the real perp metadata is available for
+        name_to_asset signing. Supplying both meta objects prevents Exchange's
+        nested Info constructor from issuing its own eager spotMeta/meta reads.
+        """
         if self._perp_meta is None:
             raise RuntimeError('Perp metadata must be loaded before Exchange construction')
         return Exchange(
@@ -375,6 +391,8 @@ class HyperliquidAdapter:
             exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
             return exchange.update_leverage(leverage, asset, is_cross)
 
+        # Exchange actions are intentionally one-shot. Ambiguous results are
+        # resolved later by Cloid rather than blindly resubmitted.
         response = await self._signed_call(local.address, _submit_leverage)
         if not isinstance(response, dict) or response.get('status') not in (None, 'ok'):
             raise RuntimeError(f'Hyperliquid leverage update failed: {response}')
@@ -427,6 +445,8 @@ class HyperliquidAdapter:
         try:
             async with websockets.connect(
                 self.ws_url,
+                # Hyperliquid documents an application-level JSON heartbeat.
+                # Disable protocol ping frames and run that heartbeat ourselves.
                 ping_interval=None,
                 close_timeout=5,
             ) as ws:
@@ -438,6 +458,8 @@ class HyperliquidAdapter:
                 try:
                     while not stop_event.is_set():
                         try:
+                            # Periodically return control to observe SIGTERM while
+                            # the heartbeat task independently keeps the socket alive.
                             raw = await asyncio.wait_for(ws.recv(), timeout=5)
                         except TimeoutError:
                             continue
