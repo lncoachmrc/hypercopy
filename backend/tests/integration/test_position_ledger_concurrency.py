@@ -34,6 +34,7 @@ async def test_reconcile_and_fill_writes_serialize_without_lost_update():
 
     async with SessionLocal() as db:
         db.add(User(id=user_id, auth_wallet=wallet, copy_state=CopyState.ACTIVE))
+        await db.flush()
         db.add(
             PositionLedger(
                 user_id=user_id,
