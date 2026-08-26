@@ -89,6 +89,46 @@ async def _liquidity_backoff_seconds(db: AsyncSession, user_id, asset: str, star
     return max(int(remaining), 0)
 
 
+async def _terminal_action_rejection_blocks_unchanged_intent(
+    db: AsyncSession,
+    user_id,
+    asset: str,
+    started_at: datetime,
+    *,
+    network: str,
+    previous_target: Decimal | None,
+    previous_real: Decimal,
+    desired_target: Decimal,
+    real: Decimal,
+) -> bool:
+    """Honor retry_policy=NONE only while the rejected intent is unchanged.
+
+    The execution path writes the planned target into PositionLedger before the
+    durable SUBMITTING commit. Therefore `previous_target` and `previous_real`
+    are the target and local exchange basis that existed when the latest action
+    rejection was persisted. A changed target or changed authoritative exchange
+    position releases the fence and lets reconciliation create a fresh job/CLOID.
+    """
+
+    latest = (await db.execute(
+        select(CopyJob).where(
+            CopyJob.user_id == user_id,
+            CopyJob.asset == asset,
+            CopyJob.origin.in_(['EVENT', 'RECONCILE']),
+            CopyJob.created_at >= started_at,
+        ).order_by(CopyJob.created_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    if latest is None or latest.state != JobState.SKIPPED:
+        return False
+
+    metadata = (latest.context or {}).get('last_action_error') or {}
+    if metadata.get('retry_policy') != 'NONE':
+        return False
+    if str(metadata.get('network') or '') != str(network):
+        return False
+    return previous_target == desired_target and previous_real == real
+
+
 async def _sync_missing_fills(db: AsyncSession, hl: HyperliquidAdapter, user: User, account_address: str, started_at: datetime) -> int:
     missing = (await db.execute(
         select(Execution).where(
@@ -366,6 +406,19 @@ async def _reconcile_user_locked(
                 CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),
             ).limit(1))).scalar_one_or_none()
             if pending:
+                continue
+
+            if drift_notional >= min_notional and await _terminal_action_rejection_blocks_unchanged_intent(
+                db,
+                user.id,
+                asset,
+                network_state.started_at,
+                network=network,
+                previous_target=previous_target,
+                previous_real=before,
+                desired_target=desired_target,
+                real=real,
+            ):
                 continue
 
             increasing_exposure = (
