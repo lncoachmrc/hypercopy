@@ -22,10 +22,11 @@ class Settings(BaseSettings):
     DATABASE_URL: str = 'postgresql+asyncpg://hypercopy:hypercopy@postgres:5432/hypercopy'
     REDIS_URL: str = 'redis://redis:6379/0'
 
-    # Legacy single-network setting kept as a safe fallback during migration.
-    # MASTER remains deployment-scoped. FOLLOWER is now the safe default used
-    # for existing/new users until each user explicitly selects a network.
+    # Legacy single-network settings are follower-side only. The configured
+    # strategy master is an architectural MAINNET source and cannot be moved by
+    # user settings or a stale deployment-level network override.
     HYPERLIQUID_NETWORK: Network = 'testnet'
+    # Deprecated compatibility input. master_network intentionally ignores it.
     HYPERLIQUID_MASTER_NETWORK: Network | None = None
     HYPERLIQUID_FOLLOWER_NETWORK: Network | None = None
     HYPERLIQUID_MASTER_ADDRESS: str = ''
@@ -149,7 +150,7 @@ class Settings(BaseSettings):
         if self.HL_MASTER_SNAPSHOT_STALE_SECONDS < self.HL_MASTER_SNAPSHOT_TTL_SECONDS:
             raise ValueError('HL_MASTER_SNAPSHOT_STALE_SECONDS must be >= snapshot TTL')
         if not 0 < self.HL_WS_HEARTBEAT_SECONDS < 60:
-            raise ValueError('HL_WS_HEARTBEAT_SECONDS must be between 0 and 60 seconds')
+            raise ValueError('HL_WS_HEARTBEAT_SECONDS must be between 1 and 59 seconds')
         if not 1 <= self.HL_SAFE_READ_RETRIES <= 5:
             raise ValueError('HL_SAFE_READ_RETRIES must be between 1 and 5')
         if self.HL_SAFE_READ_BACKOFF_SECONDS < 0:
@@ -168,7 +169,10 @@ class Settings(BaseSettings):
 
     @property
     def master_network(self) -> Network:
-        return self.HYPERLIQUID_MASTER_NETWORK or self.HYPERLIQUID_NETWORK
+        # The strategy source is always the real Hyperliquid MAINNET wallet.
+        # HYPERLIQUID_MASTER_NETWORK is retained only so old deployments keep
+        # parsing cleanly; its value no longer controls runtime behavior.
+        return 'mainnet'
 
     @property
     def follower_network(self) -> Network:
