@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from decimal import Decimal
 
@@ -72,3 +73,46 @@ async def test_all_current_signed_adapter_actions_use_public_signer_lock(monkeyp
     )
     assert outcome.state == "FILLED"
     assert lock_entries == [expected_signer, expected_signer]
+
+
+@pytest.mark.asyncio
+async def test_signed_call_holds_lock_until_inflight_action_finishes_after_cancel(monkeypatch):
+    entered = asyncio.Event()
+    released = asyncio.Event()
+    call_started = asyncio.Event()
+    allow_finish = asyncio.Event()
+
+    @asynccontextmanager
+    async def fake_signer_lock(signer_address: str):
+        assert signer_address == "0x" + "11" * 20
+        entered.set()
+        try:
+            yield
+        finally:
+            released.set()
+
+    adapter = HyperliquidAdapter(None, network="testnet")
+
+    async def fake_call(func, *args):
+        call_started.set()
+        await allow_finish.wait()
+        return {"status": "ok"}
+
+    monkeypatch.setattr("app.adapters.hyperliquid.signer_action_lock", fake_signer_lock)
+    monkeypatch.setattr(adapter, "_call", fake_call)
+
+    task = asyncio.create_task(
+        adapter._signed_call("0x" + "11" * 20, lambda: {"status": "ok"})
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    await asyncio.wait_for(call_started.wait(), timeout=1)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not released.is_set()
+    assert not task.done()
+
+    allow_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+    assert released.is_set()
