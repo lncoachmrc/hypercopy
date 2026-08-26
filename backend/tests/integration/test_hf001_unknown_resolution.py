@@ -22,6 +22,7 @@ from app.models.entities import (
     SystemIncident,
     TradingAccount,
     User,
+    UserState,
 )
 from app.services.execution import _retry_or_dead
 from app.services.execution_resolution import (
@@ -112,7 +113,8 @@ async def _seed_ambiguous_execution(*, job_state: JobState, age_seconds: int):
             User(
                 id=user_id,
                 auth_wallet=wallet,
-                copy_state=CopyState.ACTIVE,
+                state=UserState.SUSPENDED,
+                copy_state=CopyState.PAUSED,
                 created_at=created_at - timedelta(hours=1),
             )
         )
@@ -168,6 +170,12 @@ async def _seed_ambiguous_execution(*, job_state: JobState, age_seconds: int):
 
 
 async def _cleanup(user_id: uuid.UUID):
+    """Remove mutable test rows while preserving append-only audit records.
+
+    The CI database is ephemeral. Audit rows intentionally keep their subject
+    user, so the suspended/paused test principal is left behind rather than
+    violating the production audit immutability trigger through ON DELETE SET NULL.
+    """
     async with SessionLocal() as db:
         await db.execute(
             delete(SystemIncident).where(
@@ -177,7 +185,9 @@ async def _cleanup(user_id: uuid.UUID):
                 ])
             )
         )
-        await db.execute(delete(User).where(User.id == user_id))
+        await db.execute(delete(Execution).where(Execution.user_id == user_id))
+        await db.execute(delete(CopyJob).where(CopyJob.user_id == user_id))
+        await db.execute(delete(TradingAccount).where(TradingAccount.user_id == user_id))
         await db.commit()
 
 
@@ -198,7 +208,7 @@ async def test_dead_unknown_is_quarantined_after_sla_without_blind_resubmit():
             assert await _retry_or_dead(db, job, 'Ambiguous execution', ambiguous=True) == JobState.DEAD.value
 
         async with SessionLocal() as db:
-            result = await resolve_ambiguous_executions(db, hl)
+            result = await resolve_ambiguous_executions(db, hl, user_id=user_id)
 
         assert result['quarantined'] == 1
         assert hl.place_ioc_calls == 0
@@ -228,7 +238,7 @@ async def test_aged_unknown_with_live_job_alerts_but_keeps_fence():
 
     try:
         async with SessionLocal() as db:
-            result = await resolve_ambiguous_executions(db, hl)
+            result = await resolve_ambiguous_executions(db, hl, user_id=user_id)
 
         assert result['aged'] == 1
         assert result['quarantined'] == 0
@@ -255,7 +265,7 @@ async def test_resolver_recovers_actual_fill_from_cloid_and_fill_history():
 
     try:
         async with SessionLocal() as db:
-            result = await resolve_ambiguous_executions(db, hl)
+            result = await resolve_ambiguous_executions(db, hl, user_id=user_id)
 
         assert result['resolved'] == 1
         assert result['quarantined'] == 0
