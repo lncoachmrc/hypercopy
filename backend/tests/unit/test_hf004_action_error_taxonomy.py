@@ -6,6 +6,7 @@ from app.adapters.action_errors import (
     classify_action_error,
 )
 from app.adapters.hyperliquid import parse_order_response
+from app.services.reconcile import _is_liquidity_reject, _persisted_ledger_decimal
 
 
 @pytest.mark.parametrize(
@@ -18,7 +19,9 @@ from app.adapters.hyperliquid import parse_order_response
         ("Invalid TP/SL price.", ActionErrorClass.TERMINAL),
         ("perpMaxPositionRejected", ActionErrorClass.TERMINAL),
         ("Order could not immediately match against any resting orders.", ActionErrorClass.LIQUIDITY),
+        ("Order could not immediately match.", ActionErrorClass.LIQUIDITY),
         ("No liquidity available for market order.", ActionErrorClass.LIQUIDITY),
+        ("IOC cancel", ActionErrorClass.LIQUIDITY),
         ("iocCancelRejected", ActionErrorClass.LIQUIDITY),
         ("positionIncreaseAtOpenInterestCapRejected", ActionErrorClass.TRANSIENT),
         ("oracleRejected", ActionErrorClass.TRANSIENT),
@@ -75,6 +78,22 @@ def test_only_semantically_recoverable_rejections_delegate_retry_to_reconciliati
     assert classify_action_error("Order could not immediately match against any resting orders.").retry_policy is ActionRetryPolicy.RECONCILE
     assert classify_action_error("Oracle issue.").retry_policy is ActionRetryPolicy.RECONCILE
     assert classify_action_error("Insufficient margin to place order.").retry_policy is ActionRetryPolicy.NONE
+
+
+def test_liquidity_backoff_predicate_reuses_the_same_taxonomy():
+    for reason in (
+        "IOC cancel",
+        "iocCancelRejected",
+        "Order could not immediately match.",
+        "No liquidity available for market order.",
+    ):
+        assert _is_liquidity_reject(reason)
+    assert not _is_liquidity_reject("Insufficient margin to place order.")
+
+
+def test_persisted_ledger_precision_matches_numeric_30_12():
+    assert _persisted_ledger_decimal(__import__("decimal").Decimal("1.00000000000049")) == __import__("decimal").Decimal("1.000000000000")
+    assert _persisted_ledger_decimal(__import__("decimal").Decimal("1.00000000000050")) == __import__("decimal").Decimal("1.000000000001")
 
 
 def test_unknown_rejection_is_conservative_and_never_directly_retried():
