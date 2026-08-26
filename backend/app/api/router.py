@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 
-from app.api import activation, admin, admin_health, ai, analytics, auth, billing, leverage, plan_discounts, public, user, ws
+from app.api import activation, admin, admin_health, ai, analytics, auth, billing, leverage, master_source, plan_discounts, public, user, ws
 from app.api.deps import api_rate_limit
 
 api_router = APIRouter(prefix='/api/v1')
@@ -18,6 +18,7 @@ http_router.include_router(billing.router)
 http_router.include_router(plan_discounts.router)
 http_router.include_router(admin.router)
 http_router.include_router(admin_health.router)
+http_router.include_router(master_source.router)
 http_router.include_router(public.router)
 api_router.include_router(http_router)
 # WebSocket dependencies use the WebSocket object rather than Request, so keep
