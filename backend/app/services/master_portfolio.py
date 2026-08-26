@@ -42,7 +42,12 @@ async def master_mainnet_portfolio(*, force_refresh: bool = False) -> list[Any]:
             'type': 'portfolio',
             'user': settings.HYPERLIQUID_MASTER_ADDRESS,
         }
-        data = await asyncio.to_thread(_mainnet_info.post, '/info', payload)
+        try:
+            data = await asyncio.to_thread(_mainnet_info.post, '/info', payload)
+        except Exception as exc:
+            raise RuntimeError(
+                f'Hyperliquid MAINNET master portfolio unavailable: {type(exc).__name__}: {exc}'
+            ) from exc
         if not isinstance(data, list):
             raise RuntimeError('Unexpected Hyperliquid portfolio response')
         _cache = (time.monotonic() + _CACHE_TTL_SECONDS, data)
