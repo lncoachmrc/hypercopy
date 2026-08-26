@@ -5,7 +5,8 @@ watchPatterns = [
   "/backend/app/api/**", "/backend/app/core/**", "/backend/app/db/**",
   "/backend/app/models/**", "/backend/app/schemas/**", "/backend/app/main.py",
   "/backend/app/services/audit.py", "/backend/app/services/entitlement.py",
-  "/backend/app/services/metrics.py", "/backend/app/adapters/stripe_client.py",
+  "/backend/app/services/metrics.py", "/backend/app/services/public_performance.py",
+  "/backend/app/adapters/stripe_client.py",
   "/backend/alembic/**", "/backend/requirements.txt", "/backend/Dockerfile",
   "/backend/railway.toml"
 ]
