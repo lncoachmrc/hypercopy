@@ -50,10 +50,14 @@ async def public_master_performance(db: AsyncSession, range_key: str = 'all') ->
         raise RuntimeError('Master performance checkpoint is unavailable')
 
     now = datetime.now(UTC)
-    checkpoint_started_at = checkpoint.created_at.astimezone(UTC)
-    operational_started_at = max(checkpoint_started_at, PUBLIC_PERFORMANCE_RESET_AT)
-    start, bucket_seconds = _range_start(now, operational_started_at, key)
     network = settings.master_network
+    checkpoint_started_at = checkpoint.created_at.astimezone(UTC)
+    operational_started_at = (
+        max(checkpoint_started_at, PUBLIC_PERFORMANCE_RESET_AT)
+        if network == 'mainnet'
+        else checkpoint_started_at
+    )
+    start, bucket_seconds = _range_start(now, operational_started_at, key)
 
     baseline = (await db.execute(
         text("""
