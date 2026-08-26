@@ -16,6 +16,7 @@ from hyperliquid.utils.types import Cloid
 
 from app.core.config import Network, settings
 from app.core.logging import get_logger
+from app.db.signer_action_lock import signer_action_lock
 from app.engine.sizing import AssetSpec, round_price
 from app.adapters.ratelimit import Priority, WEIGHT_CHEAP_INFO, WEIGHT_EXCHANGE_ACTION, WEIGHT_STANDARD_INFO, WEIGHT_USER_FILLS_MAX, WeightedRateLimiter
 
@@ -178,6 +179,30 @@ class HyperliquidAdapter:
             if any(token in msg for token in ('502', '503', '504', 'bad gateway', 'service unavailable', 'gateway timeout')):
                 await self._metric_incr('hl_5xx_count')
             raise
+
+    async def _signed_call(self, signer_address: str, func, *args):
+        """Run one signed SDK action under cross-process signer serialization.
+
+        `asyncio.to_thread()` cannot cancel an already running sync SDK call. If
+        the caller is cancelled during shutdown, keep the advisory lock until the
+        underlying call actually finishes, then propagate cancellation. This
+        prevents a replacement process from signing concurrently with an action
+        that is still in flight in the old process.
+        """
+
+        async with signer_action_lock(signer_address):
+            await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
+            call_task = asyncio.create_task(self._call(func, *args))
+            try:
+                return await asyncio.shield(call_task)
+            except asyncio.CancelledError:
+                try:
+                    await asyncio.shield(call_task)
+                except Exception:
+                    # The caller is still cancelled; the important invariant is
+                    # that the signer lock remained held until the SDK call ended.
+                    pass
+                raise
 
     async def _acquire(self, weight: int, priority: Priority, timeout: int | float) -> None:
         if self.limiter is None:
@@ -353,17 +378,22 @@ class HyperliquidAdapter:
         is_cross: bool,
     ) -> dict:
         """Set the follower market's leverage/margin mode using its API wallet."""
-        await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
         spec = await self.asset_spec(asset)
         leverage = max(1, min(int(leverage), spec.max_leverage))
         if spec.only_isolated:
             is_cross = False
         local = Account.from_key(private_key)
         exchange = self._exchange(local, account_address)
-        exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
+
+        def _submit_leverage():
+            # Calculate expiration only after the signer lock is held; otherwise
+            # lock contention could age expiresAfter before the action is sent.
+            exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
+            return exchange.update_leverage(leverage, asset, is_cross)
+
         # Exchange actions are intentionally one-shot. Ambiguous results are
         # resolved later by Cloid rather than blindly resubmitted.
-        response = await self._call(exchange.update_leverage, leverage, asset, is_cross)
+        response = await self._signed_call(local.address, _submit_leverage)
         if not isinstance(response, dict) or response.get('status') not in (None, 'ok'):
             raise RuntimeError(f'Hyperliquid leverage update failed: {response}')
         return response
@@ -384,22 +414,21 @@ class HyperliquidAdapter:
         self, *, account_address: str, private_key: str, asset: str, is_buy: bool,
         size: Decimal, mark_price: Decimal, slippage_bps: int, reduce_only: bool, cloid: str,
     ) -> OrderOutcome:
-        await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
         spec = await self.asset_spec(asset)
         slip = Decimal(slippage_bps) / Decimal(10_000)
         aggressive = mark_price * (Decimal(1) + slip if is_buy else Decimal(1) - slip)
         px = round_price(aggressive, spec.sz_decimals)
         local = Account.from_key(private_key)
         exchange = self._exchange(local, account_address)
-        exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
 
         def _submit():
+            exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
             return exchange.order(
                 asset, is_buy, float(size), float(px), {'limit': {'tif': 'Ioc'}},
                 reduce_only=reduce_only, cloid=Cloid.from_str(cloid),
             )
 
-        response = await self._call(_submit)
+        response = await self._signed_call(local.address, _submit)
         return parse_order_response(response)
 
     async def _heartbeat(self, ws, stop_event: asyncio.Event) -> None:
