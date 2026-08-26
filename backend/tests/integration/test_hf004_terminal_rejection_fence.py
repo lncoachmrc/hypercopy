@@ -141,6 +141,8 @@ async def _seed_terminal_rejection(
                         "asset": "BTC",
                         "network": "testnet",
                         "leg": "primary",
+                        "rejected_target": str(target),
+                        "rejected_real": str(position),
                     },
                 },
                 last_error="Price must be divisible by tick size.",
@@ -203,6 +205,42 @@ async def test_terminal_rejection_suppresses_only_unchanged_reconciliation_inten
             )
         ).scalars().all()
         assert len(queued) == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_rejection_ignores_mutable_ledger_refresh_when_real_changed():
+    user_id = await _seed_terminal_rejection(
+        position=Decimal("0.400"),
+        target=Decimal("1.000"),
+    )
+
+    # Simulate observability updating PositionLedger to the new exchange truth
+    # before normal reconciliation resumes after a master/read outage.
+    async with SessionLocal() as db:
+        ledger = (
+            await db.execute(
+                select(PositionLedger).where(
+                    PositionLedger.user_id == user_id,
+                    PositionLedger.asset == "BTC",
+                )
+            )
+        ).scalar_one()
+        ledger.size = Decimal("0.500")
+        await db.commit()
+
+    hl = ReconcileHL(Decimal("0.500"))
+    async with SessionLocal() as db:
+        user = await db.get(User, user_id)
+        result = await reconcile_user(
+            db,
+            hl,
+            user,
+            master_positions={"BTC": Decimal("1")},
+            master_equity=Decimal("100"),
+            mids={"BTC": "100"},
+            create_jobs=True,
+        )
+        assert result["jobs_created"] == 1
 
 
 @pytest.mark.asyncio
