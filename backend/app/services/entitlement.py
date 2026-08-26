@@ -15,7 +15,12 @@ ACTIVE = {'active', 'trialing'}
 LEGACY_PLAN_MAP = {'basic': 'starter', 'pro': 'plus', 'enterprise': 'pro_10k'}
 
 
-async def entitlement(db: AsyncSession, user: User) -> dict:
+async def entitlement(
+    db: AsyncSession,
+    user: User,
+    *,
+    portfolio_equity_override: Decimal | None = None,
+) -> dict:
     network_state = await user_network_state(db, user.id)
     sub = (await db.execute(select(Subscription).where(Subscription.user_id == user.id))).scalar_one_or_none()
     plan = await db.get(Plan, sub.plan_slug) if sub else None
@@ -42,16 +47,20 @@ async def entitlement(db: AsyncSession, user: User) -> dict:
     if operator_override:
         limits['max_positions'] = max(int(limits.get('max_positions', 0) or 0), 100)
 
-    latest_equity = (await db.execute(
-        select(EquitySnapshot)
-        .where(
-            EquitySnapshot.user_id == user.id,
-            EquitySnapshot.taken_at >= network_state.started_at,
-        )
-        .order_by(EquitySnapshot.taken_at.desc())
-        .limit(1)
-    )).scalar_one_or_none()
-    portfolio_equity = latest_equity.account_value if latest_equity else None
+    if portfolio_equity_override is not None:
+        portfolio_equity = Decimal(str(portfolio_equity_override))
+    else:
+        latest_equity = (await db.execute(
+            select(EquitySnapshot)
+            .where(
+                EquitySnapshot.user_id == user.id,
+                EquitySnapshot.taken_at >= network_state.started_at,
+            )
+            .order_by(EquitySnapshot.taken_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        portfolio_equity = latest_equity.account_value if latest_equity else None
+
     max_equity = limits.get('max_equity_usd')
     portfolio_limit_exceeded = False
     if max_equity is not None and portfolio_equity is not None and not operator_override:
