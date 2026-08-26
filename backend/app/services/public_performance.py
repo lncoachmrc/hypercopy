@@ -10,10 +10,10 @@ from app.services.master_portfolio import master_mainnet_portfolio
 
 
 PUBLIC_PERFORMANCE_RANGE_CONFIG = {
-    '90d': timedelta(days=90),
-    '180d': timedelta(days=180),
-    '1y': timedelta(days=365),
-    'all': None,
+    '90d': (timedelta(days=90), 6 * 60 * 60),
+    '180d': (timedelta(days=180), 12 * 60 * 60),
+    '1y': (timedelta(days=365), 24 * 60 * 60),
+    'all': (None, 24 * 60 * 60),
 }
 
 # One immutable public epoch for the real strategy source.
@@ -21,10 +21,14 @@ PUBLIC_PERFORMANCE_RANGE_CONFIG = {
 PUBLIC_PERFORMANCE_RESET_AT = datetime(2026, 8, 26, 6, 0, 0, tzinfo=UTC)
 
 
-def _range_start(now: datetime, range_key: str) -> datetime:
-    delta = PUBLIC_PERFORMANCE_RANGE_CONFIG[range_key]
-    requested = now - delta if delta else PUBLIC_PERFORMANCE_RESET_AT
-    return max(requested, PUBLIC_PERFORMANCE_RESET_AT)
+def _range_start(
+    now: datetime,
+    operational_started_at: datetime,
+    range_key: str,
+) -> tuple[datetime, int]:
+    delta, bucket_seconds = PUBLIC_PERFORMANCE_RANGE_CONFIG[range_key]
+    requested = now - delta if delta else operational_started_at
+    return max(requested, operational_started_at), bucket_seconds
 
 
 def _sections(portfolio: list[Any]) -> dict[str, dict]:
@@ -75,10 +79,14 @@ def _baseline(series: list[tuple[int, Decimal]], start_ms: int) -> tuple[int, De
     return series[0]
 
 
-def _pct(delta_pnl: Decimal, baseline_equity: Decimal | None) -> float:
-    if baseline_equity is None or baseline_equity <= 0:
+def _pct(delta_pnl: Decimal | float, baseline_equity: Decimal | float | None) -> float:
+    if baseline_equity is None:
         return 0.0
-    return float(delta_pnl / baseline_equity * Decimal(100))
+    pnl = Decimal(str(delta_pnl))
+    equity = Decimal(str(baseline_equity))
+    if equity <= 0:
+        return 0.0
+    return float(pnl / equity * Decimal(100))
 
 
 async def public_master_performance(_db: AsyncSession, range_key: str = 'all') -> dict:
@@ -87,7 +95,7 @@ async def public_master_performance(_db: AsyncSession, range_key: str = 'all') -
         raise ValueError('Unsupported performance range')
 
     now = datetime.now(UTC)
-    start = _range_start(now, key)
+    start, _bucket_seconds = _range_start(now, PUBLIC_PERFORMANCE_RESET_AT, key)
     start_ms = int(start.timestamp() * 1000)
 
     portfolio = await master_mainnet_portfolio()
