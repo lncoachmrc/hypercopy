@@ -69,19 +69,14 @@ async def resume_copy_immediate(
 ):
     """Activate strategy execution on the user's selected Hyperliquid network.
 
-    Activation preflights commercial entitlement, source and selected follower
-    network, refuses to start with old pending jobs, preserves the independent
-    mainnet live-trading gates, and rolls back to PAUSED if the initial ACTIVE
-    reconciliation fails.
+    Activation preflights fresh follower equity, commercial entitlement, source
+    and selected follower network, refuses to start with old pending jobs,
+    preserves the independent mainnet live-trading gates, and rolls back to
+    PAUSED if the initial ACTIVE reconciliation fails.
     """
     network = (await user_network_state(db, user.id)).network
     if not await live_trading_allowed(db, network):
         raise HTTPException(409, 'Mainnet live-trading gate is closed')
-
-    ent = await entitlement(db, user)
-    entitlement_error = _activation_entitlement_error(ent)
-    if entitlement_error:
-        raise HTTPException(409, entitlement_error)
 
     rs = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
     if rs and rs.state != RiskHalt.NORMAL:
@@ -109,12 +104,25 @@ async def resume_copy_immediate(
             settings.HYPERLIQUID_MASTER_ADDRESS,
             priority=Priority.RECONCILE,
         )
+        follower_snapshot = await follower_hl.account_snapshot(
+            account.account_address,
+            priority=Priority.RECONCILE,
+        )
         master_positions = _positions(source_snapshot.perp_state)
         master_configs = position_configs(source_snapshot.perp_state)
         master_mids = await master_hl.mids()
         follower_mids = master_mids if settings.master_network == network else await follower_hl.mids()
     except Exception as exc:
         raise HTTPException(503, f'Strategy activation preflight failed: {type(exc).__name__}: {exc}') from exc
+
+    ent = await entitlement(
+        db,
+        user,
+        portfolio_equity_override=follower_snapshot.account_value,
+    )
+    entitlement_error = _activation_entitlement_error(ent)
+    if entitlement_error:
+        raise HTTPException(409, entitlement_error)
 
     activation_started = datetime.now(UTC)
     user.copy_state = CopyState.ACTIVE
@@ -127,6 +135,7 @@ async def resume_copy_immediate(
             'master_network': settings.master_network,
             'follower_network': network,
             'master_positions': len([x for x in master_positions.values() if x != 0]),
+            'follower_equity': str(follower_snapshot.account_value),
             'entitlement_plan': ent.get('commercial_plan') or ent.get('plan'),
             'entitlement_status': ent.get('status'),
         },
