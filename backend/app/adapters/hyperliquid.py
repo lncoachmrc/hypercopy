@@ -14,10 +14,11 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils.types import Cloid
 
+from app.adapters.ratelimit import Priority, WEIGHT_CHEAP_INFO, WEIGHT_EXCHANGE_ACTION, WEIGHT_STANDARD_INFO, WEIGHT_USER_FILLS_MAX, WeightedRateLimiter
 from app.core.config import Network, settings
 from app.core.logging import get_logger
+from app.db.signer_action_lock import signer_action_lock
 from app.engine.sizing import AssetSpec, round_price
-from app.adapters.ratelimit import Priority, WEIGHT_CHEAP_INFO, WEIGHT_EXCHANGE_ACTION, WEIGHT_STANDARD_INFO, WEIGHT_USER_FILLS_MAX, WeightedRateLimiter
 
 log = get_logger(__name__)
 
@@ -361,9 +362,11 @@ class HyperliquidAdapter:
         local = Account.from_key(private_key)
         exchange = self._exchange(local, account_address)
         exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
-        # Exchange actions are intentionally one-shot. Ambiguous results are
-        # resolved later by Cloid rather than blindly resubmitted.
-        response = await self._call(exchange.update_leverage, leverage, asset, is_cross)
+        # Exchange actions are intentionally one-shot. The signer advisory lock
+        # spans SDK nonce generation/signing and the HTTP response so another
+        # TRAXION process cannot use this API wallet concurrently.
+        async with signer_action_lock(local.address):
+            response = await self._call(exchange.update_leverage, leverage, asset, is_cross)
         if not isinstance(response, dict) or response.get('status') not in (None, 'ok'):
             raise RuntimeError(f'Hyperliquid leverage update failed: {response}')
         return response
@@ -399,7 +402,11 @@ class HyperliquidAdapter:
                 reduce_only=reduce_only, cloid=Cloid.from_str(cloid),
             )
 
-        response = await self._call(_submit)
+        # Keep the distributed signer lock until the one-shot action returns.
+        # Ambiguous transport outcomes still resolve later by CLOID; they are
+        # never blind-resubmitted under a freshly generated nonce.
+        async with signer_action_lock(local.address):
+            response = await self._call(_submit)
         return parse_order_response(response)
 
     async def _heartbeat(self, ws, stop_event: asyncio.Event) -> None:
