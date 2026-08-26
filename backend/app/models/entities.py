@@ -64,6 +64,7 @@ class JobState(str, enum.Enum):
 class ExecutionState(str, enum.Enum):
     SUBMITTING = 'SUBMITTING'
     UNKNOWN = 'UNKNOWN'
+    QUARANTINED = 'QUARANTINED'
     FILLED = 'FILLED'
     REJECTED = 'REJECTED'
     CANCELED = 'CANCELED'

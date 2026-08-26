@@ -25,7 +25,12 @@ from app.services.entitlement import entitlement
 from app.services.networking import user_network_state
 
 log = get_logger(__name__)
-TERMINAL_EXEC = {ExecutionState.FILLED, ExecutionState.REJECTED, ExecutionState.CANCELED}
+TERMINAL_EXEC = {
+    ExecutionState.FILLED,
+    ExecutionState.REJECTED,
+    ExecutionState.CANCELED,
+    ExecutionState.QUARANTINED,
+}
 
 
 def _effective_master_mark(origin: str, master_mark: Decimal, follower_mark: Decimal, same_network: bool) -> Decimal:
@@ -38,6 +43,11 @@ def _effective_master_mark(origin: str, master_mark: Decimal, follower_mark: Dec
 
 def _shadow_suppresses_exchange(copy_state: CopyState, origin: str) -> bool:
     return copy_state == CopyState.SHADOW and origin != 'CLOSE_ALL'
+
+
+def _ambiguity_reduction_plan_safe(plan: SizingResult) -> bool:
+    """An ambiguity escape hatch may only reduce the current side, never reverse."""
+    return bool(plan.actionable and plan.reduce_only and plan.secondary is None and plan.order_size > 0)
 
 
 def _blob(cred: SigningCredential) -> EncryptedCredential:
@@ -258,6 +268,8 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
 
     leverage_sync_only = bool(ctx.get('leverage_sync_only'))
     if leverage_sync_only:
+        if ctx.get('ambiguity_safe_reduction'):
+            return await _finish(db, job, JobState.SKIPPED, 'Ambiguity-safe reduction cannot perform leverage-only actions')
         if user.copy_state != CopyState.ACTIVE or not allowed_asset or global_pause or emergency_stop:
             return await _finish(db, job, JobState.SKIPPED, 'Leverage synchronization blocked by copy/risk state')
         if not _credential_active(cred):
@@ -289,6 +301,26 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
     if decision.action in {RiskAction.DENY, RiskAction.SKIP}:
         await audit(db, action='COPY_JOB_BLOCKED', subject_id=user.id, reason=decision.reason, correlation_id=job.correlation_id, after={'asset': job.asset, 'target': str(sizing.target_size), 'current': str(current), 'network': network})
         return await _finish(db, job, JobState.SKIPPED, decision.reason or 'Not actionable')
+
+    if ctx.get('ambiguity_safe_reduction') and not _ambiguity_reduction_plan_safe(decision.plan):
+        reason = 'Ambiguity safety fence refused a non-reduce-only or reversal plan'
+        await audit(
+            db,
+            action='AMBIGUITY_REDUCTION_BLOCKED',
+            subject_id=user.id,
+            reason=reason,
+            correlation_id=job.correlation_id,
+            after={
+                'asset': job.asset,
+                'current': str(current),
+                'target': str(decision.plan.target_size),
+                'reduce_only': decision.plan.reduce_only,
+                'has_secondary': decision.plan.secondary is not None,
+                'network': network,
+            },
+        )
+        return await _finish(db, job, JobState.SKIPPED, reason)
+
     if not await live_trading_allowed(db, network):
         return await _finish(db, job, JobState.SKIPPED, 'Mainnet live-trading gate is closed')
     if not cred:
@@ -302,7 +334,7 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
 
     private_key = crypto.decrypt(_blob(cred), user_id=str(user.id), account_id=str(account.id))
     try:
-        if desired_leverage is not None and allowed_asset:
+        if desired_leverage is not None and allowed_asset and not ctx.get('ambiguity_safe_reduction'):
             try:
                 await hl.update_leverage(
                     account_address=account.account_address,
