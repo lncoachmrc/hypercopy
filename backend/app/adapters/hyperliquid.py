@@ -147,11 +147,6 @@ class HyperliquidAdapter:
         self.network: Network = network or settings.follower_network
         self.api_url = settings.hyperliquid_url_for(self.network)
         self.ws_url = self.api_url.replace('https://', 'wss://') + '/ws'
-        # Info normally performs spotMeta + meta HTTP requests in its constructor.
-        # Those eager calls bypass our shared limiter/retry path and can crash the
-        # worker before it starts when Hyperliquid briefly returns 502. Seed empty
-        # metadata because this adapter uses Info only for direct read methods;
-        # real perp metadata is fetched lazily by asset_spec through _read().
         self.info = Info(
             self.api_url,
             skip_ws=True,
@@ -179,6 +174,30 @@ class HyperliquidAdapter:
             if any(token in msg for token in ('502', '503', '504', 'bad gateway', 'service unavailable', 'gateway timeout')):
                 await self._metric_incr('hl_5xx_count')
             raise
+
+    async def _signed_call(self, signer_address: str, func, *args):
+        """Run one signed SDK action under cross-process signer serialization.
+
+        `asyncio.to_thread()` cannot cancel an already running sync SDK call. If
+        the caller is cancelled during shutdown, keep the advisory lock until the
+        underlying call actually finishes, then propagate cancellation. This
+        prevents a replacement process from signing concurrently with an action
+        that is still in flight in the old process.
+        """
+
+        async with signer_action_lock(signer_address):
+            await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
+            call_task = asyncio.create_task(self._call(func, *args))
+            try:
+                return await asyncio.shield(call_task)
+            except asyncio.CancelledError:
+                try:
+                    await asyncio.shield(call_task)
+                except Exception:
+                    # The caller is still cancelled; the important invariant is
+                    # that the signer lock remained held until the SDK call ended.
+                    pass
+                raise
 
     async def _acquire(self, weight: int, priority: Priority, timeout: int | float) -> None:
         if self.limiter is None:
@@ -262,11 +281,6 @@ class HyperliquidAdapter:
         )
 
     async def mids(self) -> dict[str, str]:
-        # allMids is shared market data used directly on the follower order hot
-        # path. It is not master account state. Charging it to MASTER_STATE let
-        # normal follower sizing consume the capacity reserved for verified
-        # master equity/positions/leverage. Keep it in the ORDER lane instead;
-        # reconciliation only calls it a handful of times per cycle.
         return await self._read(
             self.info.all_mids,
             weight=WEIGHT_CHEAP_INFO, priority=Priority.ORDER, timeout=10,
@@ -328,12 +342,6 @@ class HyperliquidAdapter:
         return self._specs[asset][1]
 
     def _exchange(self, local, account_address: str) -> Exchange:
-        """Build Exchange without SDK constructor network calls.
-
-        asset_spec() must run first so the real perp metadata is available for
-        name_to_asset signing. Supplying both meta objects prevents Exchange's
-        nested Info constructor from issuing its own eager spotMeta/meta reads.
-        """
         if self._perp_meta is None:
             raise RuntimeError('Perp metadata must be loaded before Exchange construction')
         return Exchange(
@@ -354,19 +362,20 @@ class HyperliquidAdapter:
         is_cross: bool,
     ) -> dict:
         """Set the follower market's leverage/margin mode using its API wallet."""
-        await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
         spec = await self.asset_spec(asset)
         leverage = max(1, min(int(leverage), spec.max_leverage))
         if spec.only_isolated:
             is_cross = False
         local = Account.from_key(private_key)
         exchange = self._exchange(local, account_address)
-        exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
-        # Exchange actions are intentionally one-shot. The signer advisory lock
-        # spans SDK nonce generation/signing and the HTTP response so another
-        # TRAXION process cannot use this API wallet concurrently.
-        async with signer_action_lock(local.address):
-            response = await self._call(exchange.update_leverage, leverage, asset, is_cross)
+
+        def _submit_leverage():
+            # Calculate expiration only after the signer lock is held; otherwise
+            # lock contention could age expiresAfter before the action is sent.
+            exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
+            return exchange.update_leverage(leverage, asset, is_cross)
+
+        response = await self._signed_call(local.address, _submit_leverage)
         if not isinstance(response, dict) or response.get('status') not in (None, 'ok'):
             raise RuntimeError(f'Hyperliquid leverage update failed: {response}')
         return response
@@ -387,26 +396,21 @@ class HyperliquidAdapter:
         self, *, account_address: str, private_key: str, asset: str, is_buy: bool,
         size: Decimal, mark_price: Decimal, slippage_bps: int, reduce_only: bool, cloid: str,
     ) -> OrderOutcome:
-        await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
         spec = await self.asset_spec(asset)
         slip = Decimal(slippage_bps) / Decimal(10_000)
         aggressive = mark_price * (Decimal(1) + slip if is_buy else Decimal(1) - slip)
         px = round_price(aggressive, spec.sz_decimals)
         local = Account.from_key(private_key)
         exchange = self._exchange(local, account_address)
-        exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
 
         def _submit():
+            exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
             return exchange.order(
                 asset, is_buy, float(size), float(px), {'limit': {'tif': 'Ioc'}},
                 reduce_only=reduce_only, cloid=Cloid.from_str(cloid),
             )
 
-        # Keep the distributed signer lock until the one-shot action returns.
-        # Ambiguous transport outcomes still resolve later by CLOID; they are
-        # never blind-resubmitted under a freshly generated nonce.
-        async with signer_action_lock(local.address):
-            response = await self._call(_submit)
+        response = await self._signed_call(local.address, _submit)
         return parse_order_response(response)
 
     async def _heartbeat(self, ws, stop_event: asyncio.Event) -> None:
@@ -423,8 +427,6 @@ class HyperliquidAdapter:
         try:
             async with websockets.connect(
                 self.ws_url,
-                # Hyperliquid documents an application-level JSON heartbeat.
-                # Disable protocol ping frames and run that heartbeat ourselves.
                 ping_interval=None,
                 close_timeout=5,
             ) as ws:
@@ -436,8 +438,6 @@ class HyperliquidAdapter:
                 try:
                     while not stop_event.is_set():
                         try:
-                            # Periodically return control to observe SIGTERM while
-                            # the heartbeat task independently keeps the socket alive.
                             raw = await asyncio.wait_for(ws.recv(), timeout=5)
                         except TimeoutError:
                             continue
