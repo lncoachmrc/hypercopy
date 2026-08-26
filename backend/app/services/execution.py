@@ -59,14 +59,15 @@ async def _finish_action_rejection(
     network: Network,
     outcome: OrderOutcome,
     leg: str,
+    rejected_target: Decimal,
+    rejected_real: Decimal,
 ) -> str:
     """Persist semantic rejection policy without ever blind-resubmitting a CLOID.
 
-    Known liquidity/transient rejections are terminal for this durable job. The
-    periodic reconciler may create a fresh job (and therefore a fresh CLOID)
-    from current exchange truth. Deterministic or unclassified rejections stay
-    terminal until a later strategy event/reconciliation independently changes
-    the desired state.
+    The rejected target and observed position are persisted as immutable evidence
+    for retry_policy=NONE. Reconciliation must compare future exchange truth to
+    these rejection-time values rather than to PositionLedger, which can change
+    independently through observability refreshes.
     """
 
     decision = classify_action_error(outcome.reason)
@@ -77,6 +78,8 @@ async def _finish_action_rejection(
         'asset': job.asset,
         'network': network,
         'leg': leg,
+        'rejected_target': str(rejected_target),
+        'rejected_real': str(rejected_real),
     }
     job.context = {**(job.context or {}), 'last_action_error': metadata}
     await audit(
@@ -369,9 +372,6 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
     if not cred:
         return await _finish(db, job, JobState.SKIPPED, 'Credential unavailable')
 
-    # Any opening/increasing order must have an explicit master leverage target.
-    # If the source snapshot was temporarily unavailable, wait for reconciliation
-    # instead of submitting at a stale follower leverage.
     if not sizing.reduce_only and master_pos != 0 and desired_leverage is None:
         return await _retry_or_dead(db, job, 'Master leverage unavailable; refusing to increase exposure')
 
@@ -399,7 +399,14 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
             if outcome.state == 'UNKNOWN':
                 return await _retry_or_dead(db, job, outcome.reason or 'Ambiguous execution', ambiguous=True)
             return await _finish_action_rejection(
-                db, job, user_id=user.id, network=network, outcome=outcome, leg='primary'
+                db,
+                job,
+                user_id=user.id,
+                network=network,
+                outcome=outcome,
+                leg='primary',
+                rejected_target=primary.target_size,
+                rejected_real=ledger.size,
             )
         await _apply_fill_to_ledger(db, ledger, primary, outcome)
         if primary.secondary:
@@ -408,7 +415,14 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
                 if outcome2.state == 'UNKNOWN':
                     return await _retry_or_dead(db, job, outcome2.reason or 'Ambiguous reversal open', ambiguous=True)
                 return await _finish_action_rejection(
-                    db, job, user_id=user.id, network=network, outcome=outcome2, leg='reversal_open'
+                    db,
+                    job,
+                    user_id=user.id,
+                    network=network,
+                    outcome=outcome2,
+                    leg='reversal_open',
+                    rejected_target=primary.secondary.target_size,
+                    rejected_real=ledger.size,
                 )
             await _apply_fill_to_ledger(db, ledger, primary.secondary, outcome2)
         await audit(db, action='COPY_JOB_EXECUTED', subject_id=user.id, correlation_id=job.correlation_id, after={
