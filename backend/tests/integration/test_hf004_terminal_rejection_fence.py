@@ -1,7 +1,8 @@
-"""PostgreSQL regression for HF-004 terminal rejection retry policy."""
+"""PostgreSQL regressions for HF-004 rejection retry policy."""
 
 import os
 import uuid
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -14,6 +15,8 @@ from app.db.session import SessionLocal, engine
 from app.models.entities import (
     CopyJob,
     CopyState,
+    Execution,
+    ExecutionState,
     JobState,
     PositionLedger,
     RiskProfile,
@@ -21,7 +24,7 @@ from app.models.entities import (
     User,
     UserState,
 )
-from app.services.reconcile import reconcile_user
+from app.services.reconcile import _liquidity_backoff_seconds, reconcile_user
 
 pytestmark = pytest.mark.skipif(
     os.getenv("RUN_INTEGRATION") != "1",
@@ -39,8 +42,8 @@ async def _dispose_pools_after_test():
 class ReconcileHL:
     network = "testnet"
 
-    def __init__(self):
-        self.position = Decimal("0.400")
+    def __init__(self, position: Decimal = Decimal("0.400")):
+        self.position = position
 
     async def account_snapshot(self, account: str):
         positions = []
@@ -68,7 +71,11 @@ class ReconcileHL:
         return []
 
 
-async def _seed_terminal_rejection():
+async def _seed_terminal_rejection(
+    *,
+    position: Decimal = Decimal("0.400"),
+    target: Decimal = Decimal("1.000"),
+):
     user_id = uuid.uuid4()
     wallet = "0x" + uuid.uuid4().hex + "00000000"
     agent = "0x" + uuid.uuid4().hex + "00000000"
@@ -109,8 +116,8 @@ async def _seed_terminal_rejection():
             PositionLedger(
                 user_id=user_id,
                 asset="BTC",
-                size=Decimal("0.400"),
-                target_size=Decimal("1.000"),
+                size=position,
+                target_size=target,
                 mark_price=Decimal("100"),
                 managed=True,
             )
@@ -123,7 +130,7 @@ async def _seed_terminal_rejection():
                 state=JobState.SKIPPED,
                 correlation_id=uuid.uuid4().hex,
                 context={
-                    "master_position": "1",
+                    "master_position": str(target),
                     "master_equity": "100",
                     "master_mark_price": "100",
                     "follower_network": "testnet",
@@ -200,3 +207,96 @@ async def test_terminal_rejection_suppresses_only_unchanged_reconciliation_inten
             )
         ).scalars().all()
         assert len(queued) == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_rejection_compares_target_and_real_at_persisted_precision():
+    user_id = await _seed_terminal_rejection(
+        position=Decimal("0.400000000000"),
+        target=Decimal("1.000000000000"),
+    )
+    hl = ReconcileHL(Decimal("0.40000000000049"))
+
+    # Sizing and exchange truth carry more than the ledger's 12 fractional
+    # digits, but both persist to the same Numeric(30, 12) values. The terminal
+    # NONE fence must therefore remain active rather than creating a new CLOID.
+    async with SessionLocal() as db:
+        user = await db.get(User, user_id)
+        result = await reconcile_user(
+            db,
+            hl,
+            user,
+            master_positions={"BTC": Decimal("1.00000000000049")},
+            master_equity=Decimal("100"),
+            mids={"BTC": "100"},
+            create_jobs=True,
+        )
+        assert result["jobs_created"] == 0
+
+    # A difference that survives Numeric(30, 12) persistence is material and
+    # must release the fence.
+    hl.position = Decimal("0.400000000002")
+    async with SessionLocal() as db:
+        user = await db.get(User, user_id)
+        result = await reconcile_user(
+            db,
+            hl,
+            user,
+            master_positions={"BTC": Decimal("1.00000000000049")},
+            master_equity=Decimal("100"),
+            mids={"BTC": "100"},
+            create_jobs=True,
+        )
+        assert result["jobs_created"] == 1
+
+
+@pytest.mark.asyncio
+async def test_liquidity_backoff_reuses_classifier_for_ioc_cancel_spelling():
+    user_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    now = datetime.now(UTC)
+
+    async with SessionLocal() as db:
+        db.add(
+            User(
+                id=user_id,
+                auth_wallet="0x" + uuid.uuid4().hex + "00000000",
+                state=UserState.ACTIVE,
+                copy_state=CopyState.ACTIVE,
+            )
+        )
+        db.add(
+            CopyJob(
+                id=job_id,
+                user_id=user_id,
+                asset="BTC",
+                origin="RECONCILE",
+                state=JobState.SKIPPED,
+                correlation_id=uuid.uuid4().hex,
+            )
+        )
+        await db.flush()
+        db.add(
+            Execution(
+                copy_job_id=job_id,
+                user_id=user_id,
+                cloid="0x" + uuid.uuid4().hex,
+                state=ExecutionState.REJECTED,
+                asset="BTC",
+                is_buy=True,
+                requested_size=Decimal("0.1"),
+                reduce_only=False,
+                limit_px=Decimal("100"),
+                reject_reason="IOC cancel",
+                resolved_at=now,
+            )
+        )
+        await db.commit()
+
+        wait_seconds = await _liquidity_backoff_seconds(
+            db,
+            user_id,
+            "BTC",
+            now - timedelta(minutes=1),
+        )
+        assert 1 <= wait_seconds <= 60
