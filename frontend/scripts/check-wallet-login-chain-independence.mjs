@@ -4,6 +4,7 @@ import {readFile} from 'node:fs/promises';
 const walletLogin=await readFile(new URL('../src/WalletLogin.tsx',import.meta.url),'utf8');
 const reown=await readFile(new URL('../src/reown.ts',import.meta.url),'utf8');
 const app=await readFile(new URL('../src/App.tsx',import.meta.url),'utf8');
+const auth=await readFile(new URL('../src/auth.tsx',import.meta.url),'utf8');
 
 assert.doesNotMatch(walletLogin,/eth_chainId/,'login must not depend on the active EVM chain');
 assert.doesNotMatch(walletLogin,/isEthereumMainnet/,'login must not restore a mainnet-only guard');
@@ -36,5 +37,8 @@ assert.match(walletLogin,/await disconnect\(\)/,'stale AppKit sessions must be d
 assert.match(walletLogin,/shouldResetWalletSession/,'wallet login must distinguish provider/session failures from auth failures');
 assert.match(app,/useDisconnect/,'application logout must clear the AppKit wallet session');
 assert.match(app,/try\{await disconnect\(\);\}catch\{\}await signOut\(\)/,'logout must disconnect AppKit before clearing the TRAXION session');
+assert.match(auth,/let walletCallbackActive=false/,'auth flow must track when the wallet signature callback is active');
+assert.match(auth,/walletCallbackActive=true;\s*const signature=await signMessage\(challenge\.message\);\s*walletCallbackActive=false;/s,'wallet callback boundary must cover only the signature-provider step');
+assert.match(auth,/if\(walletCallbackActive\)throw e;/,'wallet/provider failures must escape AuthProvider unchanged so WalletLogin can reset stale AppKit state');
 
 console.log('wallet login chain-independence and stale-session recovery checks passed');
