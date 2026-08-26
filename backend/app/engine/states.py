@@ -7,8 +7,20 @@ JOB_TRANSITIONS = {
     JobState.DONE: set(), JobState.SKIPPED: set(), JobState.DEAD: {JobState.QUEUED},
 }
 EXECUTION_TRANSITIONS = {
-    ExecutionState.SUBMITTING: {ExecutionState.UNKNOWN, ExecutionState.FILLED, ExecutionState.REJECTED, ExecutionState.CANCELED},
-    ExecutionState.UNKNOWN: {ExecutionState.FILLED, ExecutionState.REJECTED, ExecutionState.CANCELED},
+    ExecutionState.SUBMITTING: {
+        ExecutionState.UNKNOWN,
+        ExecutionState.QUARANTINED,
+        ExecutionState.FILLED,
+        ExecutionState.REJECTED,
+        ExecutionState.CANCELED,
+    },
+    ExecutionState.UNKNOWN: {
+        ExecutionState.QUARANTINED,
+        ExecutionState.FILLED,
+        ExecutionState.REJECTED,
+        ExecutionState.CANCELED,
+    },
+    ExecutionState.QUARANTINED: set(),
     ExecutionState.FILLED: set(), ExecutionState.REJECTED: set(), ExecutionState.CANCELED: set(),
 }
 

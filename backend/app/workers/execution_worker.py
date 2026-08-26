@@ -18,8 +18,9 @@ from app.db.redis import redis_client
 from app.db.session import SessionLocal, engine
 from app.db.schema import assert_schema
 from app.models.entities import CopyJob, EquitySnapshot, JobState, PositionLedger, TradingAccount, User, WorkerHeartbeat
-from app.services.execution import claim_job, process_job, release_stale_jobs
 from app.services.credentials import monitor_credential_expiry
+from app.services.execution import claim_job, process_job, release_stale_jobs
+from app.services.execution_resolution import resolve_ambiguous_executions
 from app.services.networking import user_network_state
 from app.services.queue import ensure_group, repair_stream
 from app.services.reconcile import master_snapshot, reconcile_active_users, reconcile_user
@@ -104,6 +105,7 @@ class Worker:
         follower_hl=self.follower_hl(network)
 
         async def operation():
+            await resolve_ambiguous_executions(db, follower_hl, user_id=user.id)
             mp,me,master_mids=await master_snapshot(self.master_hl)
             master_state=await self.master_hl.user_state(settings.HYPERLIQUID_MASTER_ADDRESS)
             master_configs=position_configs(master_state)
@@ -310,9 +312,25 @@ class Worker:
                     """))).scalars().all()
                     networks=[n for n in raw_networks if n in {'testnet','mainnet'}]
                     for network in networks:
+                        follower_hl=self.follower_hl(network)
+                        try:
+                            resolution=await resolve_ambiguous_executions(db,follower_hl)
+                            if resolution['resolved'] or resolution['quarantined'] or resolution['aged']:
+                                log.info(
+                                    'Ambiguous execution resolver completed',
+                                    extra={'follower_network':network,**resolution},
+                                )
+                        except Exception:
+                            await db.rollback()
+                            log.warning(
+                                'Ambiguous execution resolver failed; ambiguity fence remains active',
+                                extra={'follower_network':network},
+                                exc_info=True,
+                            )
+
                         try:
                             await reconcile_active_users(
-                                db,self.follower_hl(network),master_hl=self.master_hl,
+                                db,follower_hl,master_hl=self.master_hl,
                             )
                         except Exception:
                             await db.rollback()

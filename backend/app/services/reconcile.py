@@ -27,6 +27,9 @@ _LIQUIDITY_REJECT_MARKERS = (
     'ioccancelrejected',
 )
 
+_ACTIVE_AMBIGUITY_JOB_STATES = {JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING}
+_TERMINAL_AMBIGUITY_JOB_STATES = {JobState.DONE, JobState.SKIPPED, JobState.DEAD}
+
 
 def _positions(state: dict) -> dict[str, Decimal]:
     out: dict[str, Decimal] = {}
@@ -49,6 +52,13 @@ def _reconciliation_basis(
 def _is_liquidity_reject(reason: str | None) -> bool:
     text = (reason or '').lower()
     return any(marker in text for marker in _LIQUIDITY_REJECT_MARKERS)
+
+
+def _safe_ambiguity_reduction(real: Decimal, desired_target: Decimal) -> bool:
+    """Only a same-side reduction or full close is safe while outcome is unknown."""
+    if real == 0 or abs(desired_target) >= abs(real):
+        return False
+    return desired_target == 0 or real * desired_target > 0
 
 
 async def _liquidity_backoff_seconds(db: AsyncSession, user_id, asset: str, started_at: datetime) -> int:
@@ -243,13 +253,24 @@ async def _reconcile_user_locked(
                 except Exception:
                     pass
 
-        unresolved_assets = set((await db.execute(
-            select(Execution.asset).where(
+        unresolved_rows = (await db.execute(
+            select(Execution.asset, CopyJob.state)
+            .join(CopyJob, CopyJob.id == Execution.copy_job_id)
+            .where(
                 Execution.user_id == user.id,
                 Execution.created_at >= network_state.started_at,
                 Execution.state.in_([ExecutionState.SUBMITTING, ExecutionState.UNKNOWN]),
             )
-        )).scalars().all())
+        )).all()
+        live_ambiguity_assets = {
+            asset for asset, job_state in unresolved_rows
+            if job_state in _ACTIVE_AMBIGUITY_JOB_STATES
+        }
+        terminal_ambiguity_assets = {
+            asset for asset, job_state in unresolved_rows
+            if job_state in _TERMINAL_AMBIGUITY_JOB_STATES
+        }
+
         assets = set(master_positions) | set(real_positions) | set(ledger_by_asset)
         discrepancies = []
         liquidity_backoffs = []
@@ -294,7 +315,17 @@ async def _reconcile_user_locked(
             ledger.follower_leverage = follower_config.leverage if real != 0 and follower_config else None
             ledger.follower_is_cross = follower_config.is_cross if real != 0 and follower_config else None
 
-            if not create_jobs or user.copy_state == CopyState.PAUSED or asset in unresolved_assets:
+            if not create_jobs or user.copy_state == CopyState.PAUSED:
+                continue
+
+            has_live_ambiguity = asset in live_ambiguity_assets
+            has_terminal_ambiguity = asset in terminal_ambiguity_assets
+            ambiguity_safe_reduction = (
+                not has_live_ambiguity
+                and has_terminal_ambiguity
+                and _safe_ambiguity_reduction(real, desired_target)
+            )
+            if has_live_ambiguity or (has_terminal_ambiguity and not ambiguity_safe_reduction):
                 continue
 
             allowed_asset = bool(risk) and (not risk.allow_assets or asset in risk.allow_assets) and asset not in risk.block_assets
@@ -314,6 +345,10 @@ async def _reconcile_user_locked(
                 except Exception:
                     desired_leverage = None
                     desired_is_cross = None
+            if ambiguity_safe_reduction:
+                # A reduction does not require a leverage mutation. Avoid any
+                # unrelated exchange action while the older execution is still ambiguous.
+                leverage_mismatch = False
 
             basis = _reconciliation_basis(user.copy_state, previous_target, real)
             drift_notional = abs(desired_target - basis) * follower_mark if follower_mark > 0 else Decimal(0)
@@ -355,13 +390,19 @@ async def _reconcile_user_locked(
                 'ai_execution_factor': str(ai_factor),
                 'ai_target_without_influence': str(base_target),
             }
+            if ambiguity_safe_reduction:
+                context['ambiguity_safe_reduction'] = True
             if master_config is not None:
                 context['master_leverage'] = master_config.leverage
                 context['master_is_cross'] = master_config.is_cross
             if desired_leverage is not None:
                 context['desired_follower_leverage'] = desired_leverage
                 context['desired_follower_is_cross'] = desired_is_cross
-                context['leverage_sync_only'] = bool(leverage_mismatch and drift_notional < min_notional)
+                context['leverage_sync_only'] = bool(
+                    leverage_mismatch
+                    and drift_notional < min_notional
+                    and not ambiguity_safe_reduction
+                )
 
             db.add(CopyJob(
                 user_id=user.id,
