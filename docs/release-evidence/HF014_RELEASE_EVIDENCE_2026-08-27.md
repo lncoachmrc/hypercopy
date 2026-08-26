@@ -2,6 +2,8 @@
 
 Status: **PARTIAL / RELEASE GATE REMAINS BLOCKED**
 
+Pack revision: **1**
+
 This document is the versioned evidence index for the HF-014 release-process finding. A code path, runbook entry, or green unit test is not promoted to real-environment evidence unless the corresponding scenario was actually executed in the named environment.
 
 ## Evidence rules
