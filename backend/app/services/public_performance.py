@@ -16,6 +16,11 @@ PUBLIC_PERFORMANCE_RANGE_CONFIG = {
     'all': (None, 24 * 60 * 60),
 }
 
+# Public landing performance restarts from the production MAINNET activation.
+# Historical master events remain untouched for audit/internal use; this cutoff
+# only changes the public performance series consumed by the landing page.
+PUBLIC_PERFORMANCE_RESET_AT = datetime(2026, 8, 26, 6, 51, 12, tzinfo=UTC)
+
 
 def _checkpoint_slug() -> str:
     if not settings.HYPERLIQUID_MASTER_ADDRESS:
@@ -45,9 +50,14 @@ async def public_master_performance(db: AsyncSession, range_key: str = 'all') ->
         raise RuntimeError('Master performance checkpoint is unavailable')
 
     now = datetime.now(UTC)
-    operational_started_at = checkpoint.created_at.astimezone(UTC)
-    start, bucket_seconds = _range_start(now, operational_started_at, key)
     network = settings.master_network
+    checkpoint_started_at = checkpoint.created_at.astimezone(UTC)
+    operational_started_at = (
+        max(checkpoint_started_at, PUBLIC_PERFORMANCE_RESET_AT)
+        if network == 'mainnet'
+        else checkpoint_started_at
+    )
+    start, bucket_seconds = _range_start(now, operational_started_at, key)
 
     baseline = (await db.execute(
         text("""
