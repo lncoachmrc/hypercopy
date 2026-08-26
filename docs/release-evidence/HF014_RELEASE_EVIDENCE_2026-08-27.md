@@ -2,7 +2,7 @@
 
 Status: **PARTIAL / RELEASE GATE REMAINS BLOCKED**
 
-Pack revision: **1**
+Pack revision: **2**
 
 This document is the versioned evidence index for the HF-014 release-process finding. A code path, runbook entry, or green unit test is not promoted to real-environment evidence unless the corresponding scenario was actually executed in the named environment.
 
@@ -19,8 +19,8 @@ Every scenario must record:
 - command, test ID, workflow run, or other reproducible evidence;
 - final exchange state;
 - final local state;
-- verdict: `PASS`, `FAIL`, or `NON VERIFICABILE`;
-- reviewer and date.
+- verdict: `PASS`, `FAIL`, `PARTIAL`, or `NON VERIFICABILE`;
+- reviewer and review date for every completed `PASS` result.
 
 `PASS` is reserved for actually executed evidence. Simulator/fake-exchange evidence is labeled as such and does not certify Hyperliquid TESTNET or MAINNET behavior.
 
@@ -46,6 +46,8 @@ Every scenario must record:
 - Evidence: PR #86; final PR CI #431 and CodeQL #424; post-merge CI/CodeQL also green.
 - Final exchange state: simulated/fake adapter only.
 - Final local state: terminal recovery/quarantine and authoritative ledger synchronization covered.
+- Reviewer: automated CI evidence verified by the TRAXION technical remediation session.
+- Review date: 2026-08-27.
 - Verdict: **PASS — automated integration evidence; not a real TESTNET crash drill**.
 
 ### P0-LEDGER — concurrent PositionLedger serialization
@@ -58,6 +60,8 @@ Every scenario must record:
 - Evidence: PR #85; PostgreSQL integration suite.
 - Final exchange state: simulated.
 - Final local state: ledger incorporates the fill and subsequent sizing sees the correct value.
+- Reviewer: automated CI evidence verified by the TRAXION technical remediation session.
+- Review date: 2026-08-27.
 - Verdict: **PASS — PostgreSQL concurrency evidence**.
 
 ### P0-REDGREEN — negative-control proof
@@ -68,6 +72,10 @@ Every scenario must record:
 - Expected: the two dedicated P0 regressions fail for the intended reasons, then pass with production protections restored.
 - Observed: negative-control CI failed exactly the intended two P0 tests; final branch CI passed with the harness removed.
 - Evidence: PR #87 and `docs/release-evidence/P0_REGRESSION_2026-08-26.md`.
+- Final exchange state: simulated/not applicable.
+- Final local state: protected implementation restored; both P0 regressions green.
+- Reviewer: automated CI evidence verified by the TRAXION technical remediation session.
+- Review date: 2026-08-27.
 - Verdict: **PASS**.
 
 ### P1-PARTIAL-FILL — high-fidelity fake exchange lifecycle
@@ -80,51 +88,84 @@ Every scenario must record:
 - Test ID: `backend/tests/integration/test_hf007_partial_fill_lifecycle.py::test_partial_ioc_fill_updates_actual_size_then_reconciles_exact_residual`.
 - Final exchange state: fake adapter position `1.000 BTC`.
 - Final local state: two executions requested `[1.000, 0.600]`, filled `[0.400, 0.600]`, ledger `1.000`.
+- Reviewer: automated CI evidence verified by the TRAXION technical remediation session.
+- Review date: 2026-08-27.
 - Verdict: **PASS — high-fidelity fake exchange; real TESTNET partial fill remains unverified**.
 
-## HF-014 failure / environment matrix
+## SPEC.md mandatory 20-case TESTNET matrix
+
+This table mirrors the source-of-truth cases in `SPEC.md` §33. None of the rows may be omitted from a future HF-014 closure decision.
+
+| # | Mandatory case | Required assertion | Current evidence | Verdict |
+| ---: | --- | --- | --- | --- |
+| 1 | Open long | correct delta | no complete real TESTNET run in this pack | **NON VERIFICABILE** |
+| 2 | Increase long | correct delta | no complete real TESTNET run | **NON VERIFICABILE** |
+| 3 | Reduce long | correct delta + reduce-only | deterministic tests exist; no real TESTNET release run | **PARTIAL** |
+| 4 | Close long | correct delta + reduce-only | deterministic tests exist; no real TESTNET release run | **PARTIAL** |
+| 5 | Open short | correct inverted sign/delta | no complete real TESTNET run | **NON VERIFICABILE** |
+| 6 | Increase short | correct inverted sign/delta | no complete real TESTNET run | **NON VERIFICABILE** |
+| 7 | Reduce short | correct inverted sign + reduce-only | deterministic tests exist; no real TESTNET release run | **PARTIAL** |
+| 8 | Close short | correct inverted sign + reduce-only | deterministic tests exist; no real TESTNET release run | **PARTIAL** |
+| 9 | Reverse long→short | two executions, close `c` then open `o` | deterministic reversal logic exists; no real TESTNET release run | **PARTIAL** |
+| 10 | Reverse short→long | two executions, close `c` then open `o` | deterministic reversal logic exists; no real TESTNET release run | **PARTIAL** |
+| 11 | Partial fill | residual absorbed next cycle | high-fidelity fake exchange PASS; real TESTNET not forced | **PARTIAL** |
+| 12 | Rejected order | `REJECTED` reason; no retry if deterministic | current parser/unit evidence only; HF-004 remains open | **PARTIAL** |
+| 13 | Rate limit | shared bucket serializes, no unsafe bypass, order priority | limiter tests/design exist; real egress/address quota not proven | **PARTIAL** |
+| 14 | Duplicate event | one durable effect / deduplication | idempotency constraints exist; dedicated TESTNET release drill absent | **PARTIAL** |
+| 15 | Lost event | reconciler creates recovery job | reconciliation coverage exists; real stream-loss drill absent | **PARTIAL** |
+| 16 | WS reconnect | full reconciliation; no duplicate | reconnect/replay design exists; real stream drill absent | **NON VERIFICABILE** |
+| 17 | Worker crash mid-flight | durable `SUBMITTING` resolved by CLOID | HF-001 integration coverage; actual process-kill drill absent | **PARTIAL** |
+| 18 | Watcher crash | lease reacquired within 15 s | lease design exists; two-process/restart drill absent | **NON VERIFICABILE** |
+| 19 | Insufficient collateral | `REJECTED`, notification, no deterministic retry | parser/risk behavior exists; real TESTNET release run absent | **PARTIAL** |
+| 20 | Kill switch in flight | current in-flight job completes safely; following jobs denied | safety controls exist; in-flight TESTNET drill absent | **NON VERIFICABILE** |
+
+## Additional HF-014 failure / environment matrix
+
+The following scenarios extend the 20-case TESTNET matrix with the mandatory chaos and operational release evidence from `SPEC.md`, the audit, and the runbook.
 
 | Scenario | Required environment | Current evidence | Verdict |
 | --- | --- | --- | --- |
 | Hyperliquid adapter calls on real TESTNET | staging + dedicated test agent wallet | No complete evidence pack on this baseline | **NON VERIFICABILE** |
-| Open long / short | TESTNET | Not executed as part of this remediation | **NON VERIFICABILE** |
-| Increase / reduce / close | TESTNET | Unit/integration behavior exists; no current real TESTNET run | **NON VERIFICABILE** |
-| Reverse close→open | TESTNET | Deterministic sizing coverage exists; no current real TESTNET run | **NON VERIFICABILE** |
-| Partial fill | fake exchange + TESTNET | High-fidelity fake lifecycle PASS; real TESTNET partial-fill not forced | **PARTIAL** |
-| IOC no liquidity / rejected order | fake/fixture + TESTNET | Existing behavior/tests are not a complete release artifact | **NON VERIFICABILE** |
-| Min notional / precision edge | CI | Existing unit coverage; dedicated release evidence to be consolidated with HF-008/HF-015 | **PARTIAL** |
-| 429 / 5xx / timeout burst | isolated simulator/staging | No complete failure-injection run | **NON VERIFICABILE** |
-| Worker crash before submit | isolated worker + PostgreSQL | No process-kill run | **NON VERIFICABILE** |
-| Worker crash after durable submit / before ack | isolated worker + fake/testnet exchange | HF-001 state-machine coverage exists; no process-kill run | **PARTIAL** |
-| Worker crash after fill / before persist | isolated worker + fake/testnet exchange | No process-kill run | **NON VERIFICABILE** |
-| Worker crash after UNKNOWN / before resolver | isolated worker + PostgreSQL | Resolver regression exists; no process-kill run | **PARTIAL** |
-| Redis unavailable / flush and rebuild | isolated Redis + PostgreSQL | Durable DB fallback/rebuild design exists; no complete flush drill recorded | **NON VERIFICABILE** |
-| PostgreSQL unavailable during job | isolated staging | Runbook only | **NON VERIFICABILE** |
-| Slow PostgreSQL | isolated staging | No load/failure run | **NON VERIFICABILE** |
-| Master watcher split-brain / two processes | isolated staging + PostgreSQL | Fencing design exists; no completed two-process release drill | **NON VERIFICABILE** |
-| WS disconnect / reconnect / replay | staging/testnet stream | Reconnect/replay design exists; no current release run | **NON VERIFICABILE** |
-| Railway redeploy while jobs pending | staging | Not executed in this remediation | **NON VERIFICABILE** |
-| Rolling version overlap | staging | Not executed | **NON VERIFICABILE** |
-| Browser E2E / session reconnect | staging browsers/devices | Wallet-login regression is automated; full browser E2E not completed | **NON VERIFICABILE** |
-| PostgreSQL backup / PITR restore | isolated restored DB | Runbook documents procedure; restore drill not executed | **NON VERIFICABILE** |
-| Rollback deployment | staging | Procedure documented; drill not executed here | **NON VERIFICABILE** |
-| KMS rotation / rewrap | isolated KMS/staging | Code/runbook only | **NON VERIFICABILE** |
-| Mainnet shadow | production MAINNET read-only/shadow | Requires separate explicit mainnet authorization and observation period | **NON VERIFICABILE** |
-| Controlled canary | production MAINNET | Requires separate explicit authorization after all gates | **NON VERIFICABILE** |
+| IOC no liquidity / market no liquidity | fake/fixture + TESTNET | current behavior not yet consolidated as HF-004 release evidence | **NON VERIFICABILE** |
+| Min notional / precision edge | CI + TESTNET metadata | existing unit coverage; HF-008/HF-015 remain | **PARTIAL** |
+| 429 / 5xx / timeout burst | isolated simulator/staging | no complete failure-injection run | **NON VERIFICABILE** |
+| Worker crash before external submit | isolated worker + PostgreSQL | no process-kill run | **NON VERIFICABILE** |
+| Worker crash after durable submit / before ack | isolated worker + fake/testnet exchange | HF-001 state-machine coverage; no process-kill run | **PARTIAL** |
+| Worker crash after fill / before persist | isolated worker + fake/testnet exchange | no process-kill run | **NON VERIFICABILE** |
+| Worker crash after UNKNOWN / before resolver | isolated worker + PostgreSQL | resolver regression exists; no process-kill run | **PARTIAL** |
+| Redis unavailable / restart / flush and rebuild | isolated Redis + PostgreSQL | durable DB fallback/rebuild design exists; no complete flush drill recorded | **NON VERIFICABILE** |
+| PostgreSQL unavailable for 30 s during job processing | isolated staging | runbook only | **NON VERIFICABILE** |
+| Slow PostgreSQL | isolated staging | no load/failure run | **NON VERIFICABILE** |
+| Master watcher split-brain / two processes | isolated staging + PostgreSQL | fencing design exists; no completed two-process release drill | **NON VERIFICABILE** |
+| Hyperliquid WS disconnect/reconnect | staging/testnet stream | reconnect/replay design exists; no current release run | **NON VERIFICABILE** |
+| Duplicate event delivery under chaos | isolated staging/testnet | durable dedup design; no recorded chaos run | **NON VERIFICABILE** |
+| Injected network latency | isolated staging | no recorded failure run | **NON VERIFICABILE** |
+| Forced partial fill under chaos | TESTNET or high-fidelity simulator | high-fidelity fake lifecycle PASS; real forced event absent | **PARTIAL** |
+| Railway redeploy while jobs pending / under load | staging | not executed in this remediation | **NON VERIFICABILE** |
+| Rolling version overlap | staging | not executed | **NON VERIFICABILE** |
+| Browser E2E / session expiry and reconnect | staging browsers/devices | wallet-login regression automated; full browser E2E not completed | **NON VERIFICABILE** |
+| PostgreSQL backup / PITR restore | isolated restored DB | runbook documents procedure; restore drill not executed | **NON VERIFICABILE** |
+| Rollback deployment | staging | procedure documented; drill not executed here | **NON VERIFICABILE** |
+| KMS rotation / rewrap | isolated KMS/staging | code/runbook only | **NON VERIFICABILE** |
+| Mainnet shadow ≥ one week | production MAINNET read-only/shadow | requires separate explicit mainnet authorization and observation period | **NON VERIFICABILE** |
+| Controlled canary | production MAINNET | requires separate explicit authorization after all gates | **NON VERIFICABILE** |
 
 ## Exit criteria for HF-014
 
-HF-014 is not considered closed by merging this document. Closure requires a later evidence revision where all release-gating rows have executable evidence and the required rows are `PASS`, including at minimum:
+HF-014 is not considered closed by merging this document. Closure requires a later evidence revision in which:
 
-1. ambiguous crash/recovery drill;
-2. WS reconnect/replay;
-3. Redis loss/rebuild;
-4. PostgreSQL failure/recovery;
-5. real TESTNET trading matrix sufficient to validate adapter integration;
-6. nonce/topology policy verified before signer concurrency or scale-out;
-7. current staging deployment/health evidence for the candidate commit;
-8. backup/restore and rollback evidence before full production;
-9. mainnet shadow and controlled canary only after separate explicit authorization.
+1. **all 20 mandatory `SPEC.md` TESTNET rows above have explicit executed evidence and the required PASS verdicts**;
+2. ambiguous crash/recovery process-kill drill passes;
+3. WS reconnect/replay passes;
+4. Redis loss/rebuild passes;
+5. PostgreSQL failure/recovery passes;
+6. the real TESTNET adapter/trading matrix validates exchange integration;
+7. nonce/topology policy is verified before signer concurrency or scale-out;
+8. current staging deployment/health evidence exists for the candidate commit;
+9. backup/restore and rollback evidence exists before full production;
+10. mainnet shadow and controlled canary are performed only after separate explicit authorization.
+
+The unique chaos pass criterion remains: **zero duplicate orders and convergence to the correct state within two reconciliation cycles** for the covered trading scenarios.
 
 ## Safety statement
 
