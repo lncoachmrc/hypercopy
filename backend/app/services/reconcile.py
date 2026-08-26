@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.adapters.action_errors import ActionErrorClass, classify_action_error
 from app.adapters.hyperliquid import HyperliquidAdapter, PositionConfig, fill_event_id, position_configs
 from app.adapters.ratelimit import Priority
 from app.core.config import settings
@@ -20,13 +21,7 @@ from app.services.networking import user_network_state
 
 log = __import__('app.core.logging', fromlist=['get_logger']).get_logger(__name__)
 
-_LIQUIDITY_REJECT_MARKERS = (
-    'could not immediately match against any resting orders',
-    'no liquidity',
-    'marketordernoliquidityrejected',
-    'ioccancelrejected',
-)
-
+_LEDGER_DECIMAL_QUANTUM = Decimal('0.000000000001')
 _ACTIVE_AMBIGUITY_JOB_STATES = {JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING}
 _TERMINAL_AMBIGUITY_JOB_STATES = {JobState.DONE, JobState.SKIPPED, JobState.DEAD}
 
@@ -50,8 +45,12 @@ def _reconciliation_basis(
 
 
 def _is_liquidity_reject(reason: str | None) -> bool:
-    text = (reason or '').lower()
-    return any(marker in text for marker in _LIQUIDITY_REJECT_MARKERS)
+    return classify_action_error(reason).error_class is ActionErrorClass.LIQUIDITY
+
+
+def _persisted_ledger_decimal(value: Decimal) -> Decimal:
+    """Normalize to the Numeric(30, 12) precision used by PositionLedger."""
+    return value.quantize(_LEDGER_DECIMAL_QUANTUM, rounding=ROUND_HALF_UP)
 
 
 def _safe_ambiguity_reduction(real: Decimal, desired_target: Decimal) -> bool:
@@ -87,6 +86,55 @@ async def _liquidity_backoff_seconds(db: AsyncSession, user_id, asset: str, star
     delay_seconds = min(60 * (2 ** (consecutive - 1)), 600)
     remaining = (latest_at + timedelta(seconds=delay_seconds) - datetime.now(UTC)).total_seconds()
     return max(int(remaining), 0)
+
+
+async def _terminal_action_rejection_blocks_unchanged_intent(
+    db: AsyncSession,
+    user_id,
+    asset: str,
+    started_at: datetime,
+    *,
+    network: str,
+    desired_target: Decimal,
+    real: Decimal,
+) -> bool:
+    """Honor retry_policy=NONE only while rejection-time intent is unchanged.
+
+    Rejection-time target and observed exchange position are immutable evidence
+    stored in CopyJob.context.last_action_error by the execution path. This must
+    not depend on PositionLedger because observability refreshes can update that
+    mutable ledger before normal reconciliation resumes. Comparisons use the
+    ledger's persisted Numeric(30, 12) precision to avoid false changes caused
+    only by extra Decimal digits in fresh exchange/sizing inputs.
+    """
+
+    latest = (await db.execute(
+        select(CopyJob).where(
+            CopyJob.user_id == user_id,
+            CopyJob.asset == asset,
+            CopyJob.origin.in_(['EVENT', 'RECONCILE']),
+            CopyJob.created_at >= started_at,
+        ).order_by(CopyJob.created_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    if latest is None or latest.state != JobState.SKIPPED:
+        return False
+
+    metadata = (latest.context or {}).get('last_action_error') or {}
+    if metadata.get('retry_policy') != 'NONE':
+        return False
+    if str(metadata.get('network') or '') != str(network):
+        return False
+    if metadata.get('rejected_target') in (None, '') or metadata.get('rejected_real') in (None, ''):
+        return False
+    try:
+        rejected_target = Decimal(str(metadata['rejected_target']))
+        rejected_real = Decimal(str(metadata['rejected_real']))
+    except Exception:
+        return False
+    return (
+        _persisted_ledger_decimal(rejected_target) == _persisted_ledger_decimal(desired_target)
+        and _persisted_ledger_decimal(rejected_real) == _persisted_ledger_decimal(real)
+    )
 
 
 async def _sync_missing_fills(db: AsyncSession, hl: HyperliquidAdapter, user: User, account_address: str, started_at: datetime) -> int:
@@ -346,8 +394,6 @@ async def _reconcile_user_locked(
                     desired_leverage = None
                     desired_is_cross = None
             if ambiguity_safe_reduction:
-                # A reduction does not require a leverage mutation. Avoid any
-                # unrelated exchange action while the older execution is still ambiguous.
                 leverage_mismatch = False
 
             basis = _reconciliation_basis(user.copy_state, previous_target, real)
@@ -366,6 +412,17 @@ async def _reconcile_user_locked(
                 CopyJob.state.in_([JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]),
             ).limit(1))).scalar_one_or_none()
             if pending:
+                continue
+
+            if drift_notional >= min_notional and await _terminal_action_rejection_blocks_unchanged_intent(
+                db,
+                user.id,
+                asset,
+                network_state.started_at,
+                network=network,
+                desired_target=desired_target,
+                real=real,
+            ):
                 continue
 
             increasing_exposure = (
@@ -459,10 +516,7 @@ async def reconcile_active_users(
             continue
         await reconcile_user(
             db, hl, user,
-            master_positions=mp,
-            master_equity=me,
-            mids=follower_mids,
-            master_mids=source_mids,
+            master_positions=mp, master_equity=me, mids=follower_mids, master_mids=source_mids,
             master_configs=source_configs,
         )
         reconciled += 1

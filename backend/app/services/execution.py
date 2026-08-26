@@ -8,6 +8,7 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.adapters.action_errors import ActionRetryPolicy, classify_action_error
 from app.adapters.hyperliquid import HyperliquidAdapter, OrderOutcome, deterministic_cloid
 from app.core.config import Network, settings
 from app.core.crypto import EncryptedCredential, crypto
@@ -48,6 +49,51 @@ def _shadow_suppresses_exchange(copy_state: CopyState, origin: str) -> bool:
 def _ambiguity_reduction_plan_safe(plan: SizingResult) -> bool:
     """An ambiguity escape hatch may only reduce the current side, never reverse."""
     return bool(plan.actionable and plan.reduce_only and plan.secondary is None and plan.order_size > 0)
+
+
+async def _finish_action_rejection(
+    db: AsyncSession,
+    job: CopyJob,
+    *,
+    user_id: uuid.UUID,
+    network: Network,
+    outcome: OrderOutcome,
+    leg: str,
+    rejected_target: Decimal,
+    rejected_real: Decimal,
+) -> str:
+    """Persist semantic rejection policy without ever blind-resubmitting a CLOID.
+
+    The rejected target and observed position are persisted as immutable evidence
+    for retry_policy=NONE. Reconciliation must compare future exchange truth to
+    these rejection-time values rather than to PositionLedger, which can change
+    independently through observability refreshes.
+    """
+
+    decision = classify_action_error(outcome.reason)
+    metadata = {
+        'class': decision.error_class.value,
+        'retry_policy': decision.retry_policy.value,
+        'reason': outcome.reason,
+        'asset': job.asset,
+        'network': network,
+        'leg': leg,
+        'rejected_target': str(rejected_target),
+        'rejected_real': str(rejected_real),
+    }
+    job.context = {**(job.context or {}), 'last_action_error': metadata}
+    await audit(
+        db,
+        action='COPY_JOB_ACTION_REJECTED',
+        subject_id=user_id,
+        reason=outcome.reason or 'Order rejected',
+        correlation_id=job.correlation_id,
+        after=metadata,
+    )
+    reason = outcome.reason or 'Order rejected'
+    if decision.retry_policy is ActionRetryPolicy.RECONCILE:
+        reason = f'{reason} [retry policy: fresh reconciliation]'
+    return await _finish(db, job, JobState.SKIPPED, reason)
 
 
 def _blob(cred: SigningCredential) -> EncryptedCredential:
@@ -326,9 +372,6 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
     if not cred:
         return await _finish(db, job, JobState.SKIPPED, 'Credential unavailable')
 
-    # Any opening/increasing order must have an explicit master leverage target.
-    # If the source snapshot was temporarily unavailable, wait for reconciliation
-    # instead of submitting at a stale follower leverage.
     if not sizing.reduce_only and master_pos != 0 and desired_leverage is None:
         return await _retry_or_dead(db, job, 'Master leverage unavailable; refusing to increase exposure')
 
@@ -355,14 +398,32 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
         if outcome.state != 'FILLED':
             if outcome.state == 'UNKNOWN':
                 return await _retry_or_dead(db, job, outcome.reason or 'Ambiguous execution', ambiguous=True)
-            return await _finish(db, job, JobState.SKIPPED, outcome.reason or 'Order rejected')
+            return await _finish_action_rejection(
+                db,
+                job,
+                user_id=user.id,
+                network=network,
+                outcome=outcome,
+                leg='primary',
+                rejected_target=primary.target_size,
+                rejected_real=ledger.size,
+            )
         await _apply_fill_to_ledger(db, ledger, primary, outcome)
         if primary.secondary:
             outcome2 = await _execute_leg(db, hl, job, user.id, account.account_address, private_key, primary.secondary, follower_mark, risk.max_slippage_bps, 'o')
             if outcome2.state != 'FILLED':
                 if outcome2.state == 'UNKNOWN':
                     return await _retry_or_dead(db, job, outcome2.reason or 'Ambiguous reversal open', ambiguous=True)
-                return await _finish(db, job, JobState.SKIPPED, outcome2.reason or 'Reversal open rejected')
+                return await _finish_action_rejection(
+                    db,
+                    job,
+                    user_id=user.id,
+                    network=network,
+                    outcome=outcome2,
+                    leg='reversal_open',
+                    rejected_target=primary.secondary.target_size,
+                    rejected_real=ledger.size,
+                )
             await _apply_fill_to_ledger(db, ledger, primary.secondary, outcome2)
         await audit(db, action='COPY_JOB_EXECUTED', subject_id=user.id, correlation_id=job.correlation_id, after={
             'asset': job.asset, 'target': str(sizing.target_size), 'ledger_size': str(ledger.size),
