@@ -5,11 +5,11 @@ from enum import Enum
 
 
 class ActionErrorClass(str, Enum):
-    """Semantic class for an explicit Hyperliquid action rejection.
+    """Semantic class for an explicit Hyperliquid order rejection.
 
-    These classes describe responses where the exchange explicitly rejected or
-    canceled the action. Transport ambiguity is deliberately handled elsewhere
-    as ExecutionState.UNKNOWN and must never enter this classifier.
+    Transport ambiguity, HTTP failures and nonce ownership are deliberately
+    handled outside this classifier. A signed action with an indeterminate
+    transport result must remain UNKNOWN and be reconciled before replacement.
     """
 
     TERMINAL = "TERMINAL"
@@ -31,6 +31,7 @@ class ActionErrorDecision:
 
 _LIQUIDITY_TOKENS = (
     "order could not immediately match against any resting orders",
+    "order could not immediately match",
     "no liquidity available for market order",
     "ioccancel",
     "ioc cancel",
@@ -41,12 +42,6 @@ _LIQUIDITY_TOKENS = (
 )
 
 _TRANSIENT_TOKENS = (
-    "too many cumulative requests sent",
-    "rate limit",
-    "rate-limit",
-    "invalid nonce",
-    "nonce too low",
-    "nonce too old",
     "open interest is capped",
     "open interest cap",
     "openinterestcap",
