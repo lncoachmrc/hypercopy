@@ -156,8 +156,6 @@ async def test_terminal_rejection_suppresses_only_unchanged_reconciliation_inten
     user_id = await _seed_terminal_rejection()
     hl = ReconcileHL()
 
-    # Same target and same authoritative real position as the rejected intent:
-    # a deterministic NONE policy must suppress a fresh job/CLOID.
     async with SessionLocal() as db:
         user = await db.get(User, user_id)
         result = await reconcile_user(
@@ -181,8 +179,6 @@ async def test_terminal_rejection_suppresses_only_unchanged_reconciliation_inten
         ).scalars().all()
         assert queued == []
 
-    # If exchange truth changes, the old terminal rejection no longer describes
-    # the same intent. Reconciliation is allowed to create a fresh job/new CLOID.
     hl.position = Decimal("0.500")
     async with SessionLocal() as db:
         user = await db.get(User, user_id)
@@ -217,9 +213,6 @@ async def test_terminal_rejection_compares_target_and_real_at_persisted_precisio
     )
     hl = ReconcileHL(Decimal("0.40000000000049"))
 
-    # Sizing and exchange truth carry more than the ledger's 12 fractional
-    # digits, but both persist to the same Numeric(30, 12) values. The terminal
-    # NONE fence must therefore remain active rather than creating a new CLOID.
     async with SessionLocal() as db:
         user = await db.get(User, user_id)
         result = await reconcile_user(
@@ -233,8 +226,6 @@ async def test_terminal_rejection_compares_target_and_real_at_persisted_precisio
         )
         assert result["jobs_created"] == 0
 
-    # A difference that survives Numeric(30, 12) persistence is material and
-    # must release the fence.
     hl.position = Decimal("0.400000000002")
     async with SessionLocal() as db:
         user = await db.get(User, user_id)
@@ -265,6 +256,7 @@ async def test_liquidity_backoff_reuses_classifier_for_ioc_cancel_spelling():
                 copy_state=CopyState.ACTIVE,
             )
         )
+        await db.flush()
         db.add(
             CopyJob(
                 id=job_id,
