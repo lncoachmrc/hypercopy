@@ -95,21 +95,17 @@ async def _terminal_action_rejection_blocks_unchanged_intent(
     started_at: datetime,
     *,
     network: str,
-    previous_target: Decimal | None,
-    previous_real: Decimal,
     desired_target: Decimal,
     real: Decimal,
 ) -> bool:
-    """Honor retry_policy=NONE only while the rejected intent is unchanged.
+    """Honor retry_policy=NONE only while rejection-time intent is unchanged.
 
-    The execution path writes the planned target into PositionLedger before the
-    durable SUBMITTING commit. Therefore `previous_target` and `previous_real`
-    are the target and local exchange basis that existed when the latest action
-    rejection was persisted. A changed target or changed authoritative exchange
-    position releases the fence and lets reconciliation create a fresh job/CLOID.
-    Comparisons use the ledger's persisted Numeric(30, 12) precision so harmless
-    extra Decimal digits from fresh exchange/sizing inputs do not reopen the same
-    terminal intent.
+    Rejection-time target and observed exchange position are immutable evidence
+    stored in CopyJob.context.last_action_error by the execution path. This must
+    not depend on PositionLedger because observability refreshes can update that
+    mutable ledger before normal reconciliation resumes. Comparisons use the
+    ledger's persisted Numeric(30, 12) precision to avoid false changes caused
+    only by extra Decimal digits in fresh exchange/sizing inputs.
     """
 
     latest = (await db.execute(
@@ -128,11 +124,16 @@ async def _terminal_action_rejection_blocks_unchanged_intent(
         return False
     if str(metadata.get('network') or '') != str(network):
         return False
-    if previous_target is None:
+    if metadata.get('rejected_target') in (None, '') or metadata.get('rejected_real') in (None, ''):
+        return False
+    try:
+        rejected_target = Decimal(str(metadata['rejected_target']))
+        rejected_real = Decimal(str(metadata['rejected_real']))
+    except Exception:
         return False
     return (
-        _persisted_ledger_decimal(previous_target) == _persisted_ledger_decimal(desired_target)
-        and _persisted_ledger_decimal(previous_real) == _persisted_ledger_decimal(real)
+        _persisted_ledger_decimal(rejected_target) == _persisted_ledger_decimal(desired_target)
+        and _persisted_ledger_decimal(rejected_real) == _persisted_ledger_decimal(real)
     )
 
 
@@ -393,8 +394,6 @@ async def _reconcile_user_locked(
                     desired_leverage = None
                     desired_is_cross = None
             if ambiguity_safe_reduction:
-                # A reduction does not require a leverage mutation. Avoid any
-                # unrelated exchange action while the older execution is still ambiguous.
                 leverage_mismatch = False
 
             basis = _reconciliation_basis(user.copy_state, previous_target, real)
@@ -421,8 +420,6 @@ async def _reconcile_user_locked(
                 asset,
                 network_state.started_at,
                 network=network,
-                previous_target=previous_target,
-                previous_real=before,
                 desired_target=desired_target,
                 real=real,
             ):
@@ -519,10 +516,7 @@ async def reconcile_active_users(
             continue
         await reconcile_user(
             db, hl, user,
-            master_positions=mp,
-            master_equity=me,
-            mids=follower_mids,
-            master_mids=source_mids,
+            master_positions=mp, master_equity=me, mids=follower_mids, master_mids=source_mids,
             master_configs=source_configs,
         )
         reconciled += 1
