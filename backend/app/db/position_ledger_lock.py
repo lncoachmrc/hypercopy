@@ -18,8 +18,20 @@ from contextlib import asynccontextmanager
 from hashlib import blake2b
 
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.db.session import engine
+from app.core.config import settings
+
+# Advisory-lock waits must not consume the bounded connection pool used by API
+# requests and worker sessions.  A small, separate pool lets waiting lock calls
+# make bounded progress without allowing an unbounded database connection burst.
+position_ledger_lock_engine = create_async_engine(
+    settings.DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=2,
+    max_overflow=0,
+    pool_recycle=900,
+)
 
 
 def _lock_id(user_id: uuid.UUID | str) -> int:
@@ -36,7 +48,7 @@ async def position_ledger_lock(user_id: uuid.UUID | str) -> AsyncIterator[None]:
     or process; an in-process ``asyncio.Lock`` would not.
     """
 
-    async with engine.connect() as connection, connection.begin():
+    async with position_ledger_lock_engine.connect() as connection, connection.begin():
         await connection.execute(
             text("SELECT pg_advisory_xact_lock(:lock_id)"),
             {"lock_id": _lock_id(user_id)},
