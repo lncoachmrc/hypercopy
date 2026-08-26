@@ -190,8 +190,8 @@ function PerformanceChart() {
             <h2 id="master-performance-title">Andamento operativo del modello.</h2>
           </div>
           <p>
-            Performance percentuale del modello master di riferimento, calcolata esclusivamente
-            dall’avvio operativo di TRAXION. Nessun saldo o valore assoluto viene esposto.
+            Performance percentuale del wallet master MAINNET di riferimento, letta direttamente
+            dal portfolio Hyperliquid dal 26 agosto 2026. Nessun saldo o valore assoluto viene esposto.
           </p>
         </div>
 
@@ -293,7 +293,7 @@ function PerformanceChart() {
                 ? `Serie TRAXION attiva dal ${formatTooltipDate(payload.started_at)}`
                 : "Serie TRAXION dall’avvio operativo"}
             </span>
-            <span>Metodo: PnL chiuso meno fee, normalizzato in percentuale.</span>
+            <span>Metodo: PnL del portfolio Hyperliquid normalizzato sull’equity di partenza.</span>
           </div>
         </div>
       </div>
