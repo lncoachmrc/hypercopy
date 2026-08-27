@@ -12,7 +12,7 @@ import websockets
 from eth_account import Account
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
-from hyperliquid.utils.types import Cloid
+from hyperliquid.utils.types import Cloid, Meta
 
 from app.adapters.address_ratelimit import AddressActionTracker, is_exchange_rate_limit_error
 from app.core.config import Network, settings
@@ -187,7 +187,7 @@ class HyperliquidAdapter:
             spot_meta={'universe': [], 'tokens': []},
         )
         self._specs: dict[str, tuple[float, AssetSpec]] = {}
-        self._perp_meta: dict | None = None
+        self._perp_meta: Meta | None = None
         self._abstraction_cache: dict[str, tuple[float, str]] = {}
         self.address_limits = (
             AddressActionTracker(limiter._redis, self.network)

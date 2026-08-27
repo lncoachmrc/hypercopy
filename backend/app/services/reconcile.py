@@ -385,15 +385,20 @@ async def _reconcile_user_locked(
         risk_state.near_liquidation = bool(min_liq_distance is not None and min_liq_distance < Decimal('15'))
 
         if risk:
-            risk_state.peak_equity = max(risk_state.peak_equity or equity, equity)
-            dd = ((risk_state.peak_equity - equity) / risk_state.peak_equity * 100) if risk_state.peak_equity and risk_state.peak_equity > 0 else Decimal(0)
+            stored_peak_equity = risk_state.peak_equity
+            peak_equity = max(stored_peak_equity, equity) if stored_peak_equity is not None else equity
+            risk_state.peak_equity = peak_equity
+            dd = ((peak_equity - equity) / peak_equity * 100) if peak_equity > 0 else Decimal(0)
             if dd >= risk.max_drawdown_pct:
                 risk_state.state = RiskHalt.DRAWDOWN_HALT
                 risk_state.reason = f'Drawdown {dd:.2f}% >= {risk.max_drawdown_pct}%'
             today = datetime.now(UTC).date().isoformat()
             if risk_state.day_key != today:
                 risk_state.day_key, risk_state.day_start_equity = today, equity
-            daily_loss = ((risk_state.day_start_equity - equity) / risk_state.day_start_equity * 100) if risk_state.day_start_equity and risk_state.day_start_equity > 0 else Decimal(0)
+                day_start_equity = equity
+            else:
+                day_start_equity = risk_state.day_start_equity
+            daily_loss = ((day_start_equity - equity) / day_start_equity * 100) if day_start_equity is not None and day_start_equity > 0 else Decimal(0)
             if daily_loss >= risk.max_daily_loss_pct:
                 risk_state.state = RiskHalt.DAILY_LOSS_HALT
                 risk_state.reason = f'Daily loss {daily_loss:.2f}% >= {risk.max_daily_loss_pct}%'

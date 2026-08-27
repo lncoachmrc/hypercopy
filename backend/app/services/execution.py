@@ -299,8 +299,10 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
     asset_exposure = abs(current) * follower_mark
     stale = False if job.origin == 'CLOSE_ALL' else equity.taken_at < datetime.now(UTC) - timedelta(seconds=settings.LEDGER_STALE_SECONDS)
     allowed_asset = (not risk.allow_assets or job.asset in risk.allow_assets) and job.asset not in risk.block_assets
-    global_pause = bool((await db.get(SystemFlag, 'global_pause')) and (await db.get(SystemFlag, 'global_pause')).enabled)
-    emergency_stop = bool((await db.get(SystemFlag, 'emergency_stop')) and (await db.get(SystemFlag, 'emergency_stop')).enabled)
+    global_pause_flag = await db.get(SystemFlag, 'global_pause')
+    emergency_stop_flag = await db.get(SystemFlag, 'emergency_stop')
+    global_pause = bool(global_pause_flag and global_pause_flag.enabled)
+    emergency_stop = bool(emergency_stop_flag and emergency_stop_flag.enabled)
     profile_ctx = RiskContext(
         user_active=user.state == UserState.ACTIVE,
         entitlement_active=bool(ent['entitled']),
@@ -340,7 +342,7 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
             return await _finish(db, job, JobState.SKIPPED, 'Ambiguity-safe reduction cannot perform leverage-only actions')
         if user.copy_state != CopyState.ACTIVE or not allowed_asset or global_pause or emergency_stop:
             return await _finish(db, job, JobState.SKIPPED, 'Leverage synchronization blocked by copy/risk state')
-        if not _credential_active(cred):
+        if cred is None or not _credential_active(cred):
             return await _finish(db, job, JobState.SKIPPED, 'Trading credential is unavailable')
         if desired_leverage is None:
             return await _retry_or_dead(db, job, 'Master leverage unavailable')

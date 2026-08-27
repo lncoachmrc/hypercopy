@@ -1,0 +1,14 @@
+{
+  "include": [
+    "app/engine/sizing.py",
+    "app/engine/risk.py",
+    "app/services/execution.py",
+    "app/services/reconcile.py",
+    "app/adapters/hyperliquid.py",
+    "app/core/crypto.py",
+    "app/services/credentials.py"
+  ],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic",
+  "reportMissingTypeStubs": "none"
+}
