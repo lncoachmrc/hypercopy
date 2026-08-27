@@ -19,8 +19,8 @@ from cumulative traded volume at one request per 1 USDC traded. Subaccounts are
 accounted separately. A batch of `n` actions counts as `n` address requests.
 
 Once an address is rate-limited, Hyperliquid still permits one request every
-10 seconds. TRAXION mirrors that documented degraded cadence after a throttle
-has been observed.
+10 seconds. TRAXION mirrors that documented degraded cadence while authoritative
+`userRateLimit` evidence says the normal address budget is exhausted.
 
 The read-only `userRateLimit` info request exposes the exchange's current fields:
 
@@ -40,14 +40,21 @@ Instead:
 - every signed follower action attempt is counted in Redis by public follower
   account address and network;
 - an observed 429/rate-limit response records a per-address throttle event;
-- the affected address receives a Redis-backed 10-second backoff shared across
-  TRAXION processes;
-- other follower addresses are not delayed by that backoff;
+- any observed throttle installs a one-shot Redis-backed 10-second delay;
 - after a definite action-level `rate limited` rejection, TRAXION best-effort
   reads `userRateLimit` and persists the exchange snapshot for diagnostics;
-- after an HTTP/transport 429, TRAXION records the local backoff and propagates
-  the ambiguous failure immediately so the execution layer can persist
-  `UNKNOWN` without waiting for a second network request;
+- when that authoritative snapshot reports `nRequestsUsed >= nRequestsCap`, the
+  address enters sustained throttled mode;
+- in sustained mode, every TRAXION process competes for the same Redis atomic
+  `SET NX` 10-second slot, so no more than one subsequent action is released per
+  10-second interval;
+- when a later authoritative snapshot reports `nRequestsUsed < nRequestsCap`,
+  sustained mode and its reserved slot are cleared;
+- after an HTTP/transport 429, TRAXION does not assume the address itself is the
+  exhausted limiter: it records the one-shot delay and propagates the ambiguous
+  failure immediately so the execution layer can persist `UNKNOWN` without
+  waiting for a second network request;
+- other follower addresses are not delayed by the affected account's state;
 - an administrator can explicitly refresh the official snapshot through the
   read-only admin diagnostic endpoint;
 - aggregate action/throttle/backoff counters are exported through `/metrics`
@@ -69,9 +76,14 @@ limited is different: it is an observed no-effect rejection. It is classified as
 `TRANSIENT` and can be revisited only through a fresh reconciliation cycle, which
 creates a fresh job/CLOID after current exchange truth is read.
 
-The local backoff delays only a *subsequent* signed action for that same account.
-It is checked before acquiring the PostgreSQL signer lock, so a cooling account
-does not occupy the distributed signer critical section while waiting.
+Throttle tracking after an exchange response is best-effort. Redis or diagnostic
+failures cannot replace a known exchange rejection with an ambiguous result. In
+particular, a definite `REJECTED` response remains definite even if Redis is
+unavailable while TRAXION records the throttle evidence.
+
+The local cadence gate delays only subsequent signed actions for that same
+account. The atomic Redis slot prevents concurrent TRAXION processes from being
+released together after the first 10-second cooldown.
 
 ## Leverage-update suppression
 
@@ -94,8 +106,9 @@ Admin diagnostic:
 `GET /api/v1/admin/users/{user_id}/hyperliquid-rate-limit`
 
 It returns the follower network, public account address, the official
-`userRateLimit` fields and the local Redis accounting/backoff snapshot. It does
-not expose signing credentials.
+`userRateLimit` fields and the local Redis accounting/backoff snapshot. The local
+snapshot also reports whether sustained `throttled_mode` is active. It does not
+expose signing credentials.
 
 Aggregate metrics:
 
