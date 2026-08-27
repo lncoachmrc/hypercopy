@@ -129,21 +129,25 @@ async def record_master_leverage_missing(
     *,
     now: float | None = None,
 ) -> bool:
-    """Track one durable follower intent blocked by missing master leverage."""
+    """Track one durable follower intent blocked by missing master leverage.
+
+    Index membership is repaired on every call, including when the marker was
+    already created by an earlier attempt whose SADD failed. This keeps active
+    SLO telemetry recoverable after transient Redis partial failures.
+    """
 
     current = time.time() if now is None else now
-    created = await redis.set(
+    created = bool(await redis.set(
         _missing_key(user_id, asset),
         f'{current:.6f}',
         nx=True,
         ex=86_400,
-    )
-    if not created:
-        return False
+    ))
     await redis.sadd(_missing_index_key(), _missing_member(user_id, asset))
     await redis.expire(_missing_index_key(), 86_400)
-    await redis.incr(_metric_key('master_leverage_unavailable_count'))
-    return True
+    if created:
+        await redis.incr(_metric_key('master_leverage_unavailable_count'))
+    return created
 
 
 async def record_master_leverage_repaired(
@@ -151,9 +155,15 @@ async def record_master_leverage_repaired(
     user_id: object,
     asset: str,
     *,
+    evidence_created_at: float | None = None,
     now: float | None = None,
 ) -> float | None:
-    """Resolve a blocked intent only after reconciliation durably supersedes it."""
+    """Resolve a blocked intent only after a newer reconciliation supersedes it.
+
+    A queued RECONCILE created before the missing EVENT is not valid recovery
+    evidence even if it is republished later. Its creation timestamp must be at
+    or after the missing marker timestamp before telemetry can be closed.
+    """
 
     current = time.time() if now is None else now
     key = _missing_key(user_id, asset)
@@ -167,6 +177,9 @@ async def record_master_leverage_repaired(
     except (TypeError, ValueError):
         await redis.delete(key)
         await redis.srem(_missing_index_key(), member)
+        return None
+
+    if evidence_created_at is None or evidence_created_at < started_at:
         return None
 
     duration = max(current - started_at, 0.0)
