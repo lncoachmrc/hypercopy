@@ -6,7 +6,8 @@ traded volume, so TRAXION must not invent an authoritative client-side cap.
 
 This module therefore does three things only:
 - account locally for signed action attempts per follower account address;
-- impose the documented 10-second cool-down after an observed exchange throttle;
+- impose the documented one-action-per-10-seconds degraded cadence after a
+  definite address-quota rejection;
 - persist the latest authoritative ``userRateLimit`` snapshot for diagnostics.
 
 The public follower account address is used as the key. Private keys and Agent
@@ -16,6 +17,7 @@ Wallet secrets are never stored here.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -60,6 +62,7 @@ def is_exchange_rate_limit_error(exc: Exception) -> bool:
 class AddressRateLimitSnapshot:
     network: str
     address: str
+    throttled_mode: bool
     local_action_attempts: int
     local_throttle_count: int
     backoff_seconds_remaining: int
@@ -78,6 +81,7 @@ class AddressRateLimitSnapshot:
         return {
             "network": self.network,
             "address": self.address,
+            "throttled_mode": self.throttled_mode,
             "local_action_attempts": self.local_action_attempts,
             "local_throttle_count": self.local_throttle_count,
             "backoff_seconds_remaining": self.backoff_seconds_remaining,
@@ -104,17 +108,39 @@ class AddressActionTracker:
     def _state_key(self, address: str) -> str:
         return f"{_KEY_PREFIX}:{self._network}:{_normalize_address(address)}"
 
-    def _backoff_key(self, address: str) -> str:
-        return f"{self._state_key(address)}:backoff"
+    def _slot_key(self, address: str) -> str:
+        return f"{self._state_key(address)}:slot"
+
+    def _mode_key(self, address: str) -> str:
+        return f"{self._state_key(address)}:throttled"
 
     async def wait_if_backed_off(self, address: str) -> float:
-        """Honor an observed address throttle, including cross-process extensions."""
+        """Atomically reserve the next permitted action slot when throttled.
+
+        A definite address-quota rejection enables sustained throttled mode. In
+        that mode every process competes for the same Redis ``SET NX PX`` slot,
+        so at most one action can be released per 10-second interval. A transport
+        429, whose source may be IP-wide, installs only a one-shot 10-second delay.
+        """
 
         waited = 0.0
-        backoff_key = self._backoff_key(address)
+        slot_key = self._slot_key(address)
+        mode_key = self._mode_key(address)
+        slot_ms = ADDRESS_BACKOFF_SECONDS * 1000
+
         while True:
-            remaining_ms = int(await self._redis.pttl(backoff_key) or 0)
+            sustained = bool(await self._redis.exists(mode_key))
+            if sustained:
+                reserved = await self._redis.set(slot_key, "1", nx=True, px=slot_ms)
+                if reserved:
+                    return waited
+            remaining_ms = int(await self._redis.pttl(slot_key) or 0)
             if remaining_ms <= 0:
+                if sustained:
+                    # The slot may have expired between SET NX and PTTL. Retry
+                    # the atomic reservation rather than releasing all waiters.
+                    await asyncio.sleep(0)
+                    continue
                 return waited
             await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_backoff_wait_count")
             sleep_seconds = remaining_ms / 1000
@@ -128,16 +154,33 @@ class AddressActionTracker:
         await self._redis.hset(key, mapping={"last_action_at_ms": now_ms})
         await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_action_attempt_count")
 
-    async def mark_throttled(self, address: str) -> None:
+    async def mark_throttled(self, address: str, *, sustained: bool = True) -> None:
+        """Record a throttle and block the next action for 10 seconds.
+
+        ``sustained=True`` is reserved for a definite action-level address-quota
+        rejection. Ambiguous HTTP/transport throttles use a one-shot delay only.
+        """
+
         key = self._state_key(address)
         now_ms = int(time.time() * 1000)
-        await self._redis.set(self._backoff_key(address), "1", ex=ADDRESS_BACKOFF_SECONDS)
+        await self._redis.set(
+            self._slot_key(address),
+            "1",
+            px=ADDRESS_BACKOFF_SECONDS * 1000,
+        )
+        if sustained:
+            await self._redis.set(self._mode_key(address), "1")
         await self._redis.hincrby(key, "local_throttle_count", 1)
         await self._redis.hset(key, mapping={"last_throttled_at_ms": now_ms})
         await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_throttle_count")
 
     async def record_exchange_snapshot(self, address: str, payload: dict[str, Any]) -> None:
-        """Persist only documented userRateLimit fields plus observation time."""
+        """Persist documented userRateLimit fields and clear stale throttle mode.
+
+        ``nRequestsUsed < nRequestsCap`` is direct exchange evidence that normal
+        address capacity is available again. Only that authoritative condition
+        clears sustained throttled mode; local counters never guess the cap.
+        """
 
         def _numeric(name: str) -> str:
             value = payload.get(name)
@@ -146,6 +189,8 @@ class AddressActionTracker:
             return str(int(value))
 
         key = self._state_key(address)
+        used = payload.get("nRequestsUsed")
+        cap = payload.get("nRequestsCap")
         mapping = {
             "exchange_cum_volume": str(payload.get("cumVlm") or ""),
             "exchange_requests_used": _numeric("nRequestsUsed"),
@@ -154,11 +199,14 @@ class AddressActionTracker:
             "exchange_snapshot_at_ms": int(time.time() * 1000),
         }
         await self._redis.hset(key, mapping=mapping)
+        if used not in (None, "") and cap not in (None, "") and int(used) < int(cap):
+            await self._redis.delete(self._mode_key(address), self._slot_key(address))
 
     async def snapshot(self, address: str) -> AddressRateLimitSnapshot:
         normalized = _normalize_address(address)
         values = _decode_map(await self._redis.hgetall(self._state_key(normalized)))
-        ttl = int(await self._redis.ttl(self._backoff_key(normalized)) or 0)
+        remaining_ms = int(await self._redis.pttl(self._slot_key(normalized)) or 0)
+        throttled_mode = bool(await self._redis.exists(self._mode_key(normalized)))
 
         def _int(name: str) -> int | None:
             raw = values.get(name)
@@ -172,9 +220,10 @@ class AddressActionTracker:
         return AddressRateLimitSnapshot(
             network=self._network,
             address=normalized,
+            throttled_mode=throttled_mode,
             local_action_attempts=_int("local_action_attempts") or 0,
             local_throttle_count=_int("local_throttle_count") or 0,
-            backoff_seconds_remaining=max(ttl, 0),
+            backoff_seconds_remaining=max(math.ceil(remaining_ms / 1000), 0),
             last_action_at_ms=_int("last_action_at_ms"),
             last_throttled_at_ms=_int("last_throttled_at_ms"),
             exchange_cum_volume=values.get("exchange_cum_volume") or None,
