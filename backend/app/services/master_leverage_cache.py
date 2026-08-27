@@ -33,15 +33,11 @@ def _cache_key(asset: str) -> str:
 
 
 def _missing_index_key() -> str:
-    return f'{_MISSING_PREFIX}:index:{_master_namespace()}'
+    return f'{_MISSING_PREFIX}:active:{_master_namespace()}'
 
 
 def _missing_member(user_id: object, asset: str) -> str:
     return f'{user_id}|{asset}'
-
-
-def _missing_key(user_id: object, asset: str) -> str:
-    return f'{_MISSING_PREFIX}:{_master_namespace()}:{user_id}:{asset}'
 
 
 def _metric_key(name: str) -> str:
@@ -127,26 +123,26 @@ async def record_master_leverage_missing(
     user_id: object,
     asset: str,
     *,
-    now: float | None = None,
+    intent_created_at: float,
 ) -> bool:
-    """Track one durable follower intent blocked by missing master leverage.
+    """Track the newest durable intent actually fenced by missing leverage.
 
-    Index membership is repaired on every call, including when the marker was
-    already created by an earlier attempt whose SADD failed. This keeps active
-    SLO telemetry recoverable after transient Redis partial failures.
+    One sorted-set member is the complete active marker for a user/asset. Its
+    score is the creation time of the newest blocked job. ``ZADD GT`` updates
+    the score only when a newer intent is observed, so retries of the same job
+    cannot reset the SLO and an older worker cannot overwrite newer evidence.
+    There is deliberately no TTL: an unresolved safety condition remains
+    observable until an authoritative reconciliation explicitly repairs it.
     """
 
-    current = time.time() if now is None else now
-    created = bool(await redis.set(
-        _missing_key(user_id, asset),
-        f'{current:.6f}',
-        nx=True,
-        ex=86_400,
+    member = _missing_member(user_id, asset)
+    created = bool(await redis.zadd(
+        _missing_index_key(),
+        {member: float(intent_created_at)},
+        gt=True,
     ))
     if created:
         await redis.incr(_metric_key('master_leverage_unavailable_count'))
-    await redis.sadd(_missing_index_key(), _missing_member(user_id, asset))
-    await redis.expire(_missing_index_key(), 86_400)
     return created
 
 
@@ -158,33 +154,22 @@ async def record_master_leverage_repaired(
     evidence_created_at: float | None = None,
     now: float | None = None,
 ) -> float | None:
-    """Resolve a blocked intent only after a newer reconciliation supersedes it.
-
-    A queued RECONCILE created before the missing EVENT is not valid recovery
-    evidence even if it is republished later. Its creation timestamp must be at
-    or after the missing marker timestamp before telemetry can be closed.
-    """
+    """Resolve a blocked intent only after newer reconciliation evidence exists."""
 
     current = time.time() if now is None else now
-    key = _missing_key(user_id, asset)
     member = _missing_member(user_id, asset)
-    raw = await redis.get(key)
-    if not raw:
-        await redis.srem(_missing_index_key(), member)
+    raw_started = await redis.zscore(_missing_index_key(), member)
+    if raw_started is None:
         return None
-    try:
-        started_at = float(_decode(raw))
-    except (TypeError, ValueError):
-        await redis.delete(key)
-        await redis.srem(_missing_index_key(), member)
-        return None
+    started_at = float(raw_started)
 
     if evidence_created_at is None or evidence_created_at < started_at:
         return None
 
     duration = max(current - started_at, 0.0)
-    await redis.delete(key)
-    await redis.srem(_missing_index_key(), member)
+    removed = await redis.zrem(_missing_index_key(), member)
+    if not removed:
+        return None
     await redis.incr(_metric_key('master_leverage_recovery_count'))
     await redis.set(_metric_key('master_leverage_recovery_last_seconds'), f'{duration:.6f}')
 
@@ -235,24 +220,12 @@ async def master_leverage_metric_snapshot(
     active = 0
     max_age = 0.0
     active_breaches = 0
-    members = await redis.smembers(_missing_index_key())
-    for raw_member in members:
+    for raw_member, raw_score in await redis.zrange(_missing_index_key(), 0, -1, withscores=True):
         member = _decode(raw_member)
-        try:
-            user_id, asset = member.rsplit('|', 1)
-        except ValueError:
-            await redis.srem(_missing_index_key(), member)
+        if '|' not in member:
+            await redis.zrem(_missing_index_key(), member)
             continue
-        raw_started = await redis.get(_missing_key(user_id, asset))
-        if not raw_started:
-            await redis.srem(_missing_index_key(), member)
-            continue
-        try:
-            started_at = float(_decode(raw_started))
-        except (TypeError, ValueError):
-            await redis.delete(_missing_key(user_id, asset))
-            await redis.srem(_missing_index_key(), member)
-            continue
+        started_at = float(raw_score)
         age = max(current - started_at, 0.0)
         active += 1
         max_age = max(max_age, age)
