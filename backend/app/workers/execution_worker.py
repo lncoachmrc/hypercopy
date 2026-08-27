@@ -170,17 +170,21 @@ class Worker:
                     result=await process_job(db,self.follower_hl(network),job)
                     if result in {JobState.RETRYING.value, JobState.DEAD.value}:
                         await db.refresh(job)
-                        if (job.last_error or '').startswith('Master leverage unavailable') and job.created_at is not None:
+                        if (job.last_error or '').startswith('Master leverage unavailable'):
                             try:
+                                raw_order=(job.context or {}).get('master_intent_order')
+                                intent_order=int(Decimal(str(raw_order)))
+                                if intent_order <= 0 or Decimal(str(raw_order)) != Decimal(intent_order):
+                                    raise ValueError('missing or invalid stable master intent order')
                                 await record_master_leverage_missing(
                                     self.redis,
                                     job.user_id,
                                     job.asset,
-                                    intent_created_at=job.created_at.timestamp(),
+                                    intent_order=intent_order,
                                 )
                             except Exception:
                                 log.warning(
-                                    'Master leverage missing-intent metric update failed',
+                                    'Master leverage missing-intent metric update failed; execution remains fail-closed',
                                     extra={'job_id':str(job.id),'user_id':str(job.user_id),'asset':job.asset},
                                     exc_info=True,
                                 )
