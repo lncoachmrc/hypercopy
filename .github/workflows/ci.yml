@@ -60,6 +60,10 @@ jobs:
       # Critical correctness lint only; formatting/style can evolve without
       # weakening undefined-name/syntax/import safety in the release gate.
       - run: ruff check app tests --select E9,F63,F7,F82
+      # HF-010 gradual static typing gate. Keep the initial boundary aligned
+      # with the audit's financial/exchange/credential critical modules; expand
+      # coverage deliberately as adjacent modules become typed.
+      - run: pyright --project pyrightconfig.json
       - run: python -m compileall -q app
       - run: alembic upgrade head
       - run: pytest -q
