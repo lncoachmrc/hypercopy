@@ -203,10 +203,14 @@ async def test_quota_exhausted_mode_atomically_spaces_each_subsequent_action(mon
     monkeypatch.setattr("app.adapters.address_ratelimit.asyncio.sleep", sleep)
 
     first_wait = await tracker.wait_if_backed_off(throttled)
-    # The first waiter reserves a fresh 10-second slot before it is released.
+    await tracker.record_action_attempt(throttled)
+    # Accounting completes first; only then is the next 10-second slot reserved.
     assert await redis.pttl(tracker._slot_key(throttled)) == ADDRESS_BACKOFF_SECONDS * 1000
+
     second_wait = await tracker.wait_if_backed_off(throttled)
+    await tracker.record_action_attempt(throttled)
     not_waited = await tracker.wait_if_backed_off(other)
+    await tracker.record_action_attempt(other)
 
     assert first_wait == float(ADDRESS_BACKOFF_SECONDS)
     assert second_wait == float(ADDRESS_BACKOFF_SECONDS)
@@ -217,6 +221,57 @@ async def test_quota_exhausted_mode_atomically_spaces_each_subsequent_action(mon
         float(ADDRESS_BACKOFF_SECONDS),
     ]
     assert redis.counters["hypercopy:metrics:hl_address_backoff_wait_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_action_accounting_precedes_final_sustained_slot_reservation():
+    events: list[str] = []
+
+    class _OrderedRedis(_FakeRedis):
+        async def hincrby(self, key: str, field: str, amount: int):
+            events.append("hincrby")
+            return await super().hincrby(key, field, amount)
+
+        async def hset(self, key: str, mapping: dict[str, object]):
+            events.append("hset")
+            return await super().hset(key, mapping)
+
+        async def incr(self, key: str):
+            if key.endswith("hl_address_action_attempt_count"):
+                events.append("metric")
+            return await super().incr(key)
+
+        async def set(
+            self,
+            key: str,
+            value: str,
+            *,
+            ex: int | None = None,
+            px: int | None = None,
+            nx: bool = False,
+        ):
+            if nx and key.endswith(":slot"):
+                events.append("reserve")
+            return await super().set(key, value, ex=ex, px=px, nx=nx)
+
+    redis = _OrderedRedis()
+    tracker = AddressActionTracker(redis, "testnet")
+    address = "0x" + "12" * 20
+    await tracker.record_exchange_snapshot(
+        address,
+        {
+            "cumVlm": "100",
+            "nRequestsUsed": 10100,
+            "nRequestsCap": 10100,
+            "nRequestsSurplus": 0,
+        },
+    )
+    events.clear()
+
+    await tracker.record_action_attempt(address)
+
+    assert events == ["hincrby", "hset", "metric", "reserve"]
+    assert await redis.pttl(tracker._slot_key(address)) == ADDRESS_BACKOFF_SECONDS * 1000
 
 
 @pytest.mark.asyncio
