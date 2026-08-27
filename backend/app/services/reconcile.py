@@ -517,7 +517,7 @@ async def _reconcile_user_locked(
                     submitted_size = _risk_limited_submitted_size(
                         user_id=user.id,
                         asset=asset,
-                        master_pos=master_pos,
+                        master_pos=master_pos * ai_factor,
                         master_mark=master_mark,
                         master_equity=master_equity,
                         follower_equity=equity,
