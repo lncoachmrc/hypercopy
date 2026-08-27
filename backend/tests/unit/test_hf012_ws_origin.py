@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from starlette.exceptions import HTTPException
 
 from app.api.ws import events
 from app.core.config import settings
@@ -18,14 +19,10 @@ STAGING_ORIGIN = 'https://frontend-staging-9498.up.railway.app'
 class _RejectBeforeAuthWebSocket:
     def __init__(self, origin: str | None):
         self.headers = {} if origin is None else {'origin': origin}
-        self.closed_codes: list[int] = []
 
     @property
     def cookies(self):
         raise AssertionError('origin rejection must happen before cookie/session access')
-
-    async def close(self, code: int):
-        self.closed_codes.append(code)
 
 
 class _MissingSessionWebSocket:
@@ -79,12 +76,14 @@ def test_origin_normalization_is_exact_and_handles_default_ports():
         'https://traxion.lucianonovello.com.evil.example',
     ],
 )
-async def test_ws_events_rejects_untrusted_origin_before_auth(origin: str | None):
+async def test_ws_events_denies_untrusted_origin_handshake_before_auth(origin: str | None):
     ws = _RejectBeforeAuthWebSocket(origin)
 
-    await events(ws)  # type: ignore[arg-type]
+    with pytest.raises(HTTPException) as exc_info:
+        await events(ws)  # type: ignore[arg-type]
 
-    assert ws.closed_codes == [4403]
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == 'WebSocket origin not allowed'
 
 
 @pytest.mark.asyncio
