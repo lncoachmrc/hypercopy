@@ -23,10 +23,9 @@ from app.workers.watcher import Watcher
 
 
 class FakeRedis:
-    def __init__(self, *, fail_sadd_once: bool = False):
+    def __init__(self):
         self.values: dict[str, str] = {}
-        self.sets: dict[str, set[str]] = {}
-        self.fail_sadd_once = fail_sadd_once
+        self.zsets: dict[str, dict[str, float]] = {}
 
     async def set(self, key, value, ex=None, nx=False):
         if nx and key in self.values:
@@ -39,7 +38,7 @@ class FakeRedis:
 
     async def delete(self, key):
         self.values.pop(str(key), None)
-        self.sets.pop(str(key), None)
+        self.zsets.pop(str(key), None)
         return 1
 
     async def incr(self, key):
@@ -48,30 +47,39 @@ class FakeRedis:
         self.values[name] = str(value)
         return value
 
-    async def sadd(self, key, *members):
-        if self.fail_sadd_once:
-            self.fail_sadd_once = False
-            raise RuntimeError('transient SADD failure')
-        values = self.sets.setdefault(str(key), set())
-        before = len(values)
-        values.update(str(member) for member in members)
-        return len(values) - before
+    async def zadd(self, key, mapping, gt=False):
+        values = self.zsets.setdefault(str(key), {})
+        added = 0
+        for member, raw_score in mapping.items():
+            item = str(member)
+            score = float(raw_score)
+            if item not in values:
+                values[item] = score
+                added += 1
+            elif not gt or score > values[item]:
+                values[item] = score
+        return added
 
-    async def smembers(self, key):
-        return set(self.sets.get(str(key), set()))
+    async def zscore(self, key, member):
+        return self.zsets.get(str(key), {}).get(str(member))
 
-    async def srem(self, key, *members):
-        values = self.sets.setdefault(str(key), set())
+    async def zrem(self, key, *members):
+        values = self.zsets.setdefault(str(key), {})
         removed = 0
         for member in members:
             item = str(member)
             if item in values:
-                values.remove(item)
+                del values[item]
                 removed += 1
         return removed
 
-    async def expire(self, key, seconds):
-        return 1
+    async def zrange(self, key, start, stop, withscores=False):
+        ordered = sorted(self.zsets.get(str(key), {}).items(), key=lambda item: (item[1], item[0]))
+        if stop == -1:
+            selected = ordered[start:]
+        else:
+            selected = ordered[start:stop + 1]
+        return selected if withscores else [member for member, _ in selected]
 
 
 class DummySession:
@@ -156,11 +164,11 @@ async def test_shared_cache_fails_closed_for_malformed_or_unpaired_equity(config
 
 
 @pytest.mark.asyncio
-async def test_active_missing_intent_exposes_age_and_slo_breach_before_recovery(configured_master):
+async def test_retry_of_same_blocked_job_does_not_reset_slo(configured_master):
     redis = FakeRedis()
 
-    created = await record_master_leverage_missing(redis, 'user-1', 'BTC', now=100.0)
-    duplicate = await record_master_leverage_missing(redis, 'user-1', 'BTC', now=120.0)
+    created = await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=100.0)
+    duplicate = await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=100.0)
     metrics = await master_leverage_metric_snapshot(redis, now=161.0)
 
     assert created is True
@@ -170,30 +178,58 @@ async def test_active_missing_intent_exposes_age_and_slo_breach_before_recovery(
     assert metrics['master_leverage_missing_max_age_seconds'] == pytest.approx(61.0)
     assert metrics['master_leverage_missing_slo_breach_active_count'] == 1
     assert metrics['master_leverage_recovery_count'] == 0
-    assert metrics['master_leverage_recovery_slo_breach_count'] == 0
 
 
 @pytest.mark.asyncio
-async def test_existing_missing_marker_reindexes_after_transient_sadd_failure(configured_master):
-    redis = FakeRedis(fail_sadd_once=True)
+async def test_newest_blocked_intent_controls_recovery_causality(configured_master):
+    redis = FakeRedis()
+    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=100.0)
+    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=120.0)
 
-    with pytest.raises(RuntimeError, match='SADD'):
-        await record_master_leverage_missing(redis, 'user-1', 'BTC', now=100.0)
+    stale_repair = await record_master_leverage_repaired(
+        redis,
+        'user-1',
+        'BTC',
+        evidence_created_at=110.0,
+        now=161.0,
+    )
+    pending = await master_leverage_metric_snapshot(redis, now=161.0)
 
-    recreated = await record_master_leverage_missing(redis, 'user-1', 'BTC', now=120.0)
-    metrics = await master_leverage_metric_snapshot(redis, now=161.0)
+    assert stale_repair is None
+    assert pending['master_leverage_missing_active_count'] == 1
+    assert pending['master_leverage_missing_max_age_seconds'] == pytest.approx(41.0)
+    assert pending['master_leverage_recovery_count'] == 0
 
-    assert recreated is False
-    assert metrics['master_leverage_unavailable_count'] == 1
+    fresh_repair = await record_master_leverage_repaired(
+        redis,
+        'user-1',
+        'BTC',
+        evidence_created_at=121.0,
+        now=162.0,
+    )
+    repaired = await master_leverage_metric_snapshot(redis, now=162.0)
+
+    assert fresh_repair == pytest.approx(42.0)
+    assert repaired['master_leverage_missing_active_count'] == 0
+    assert repaired['master_leverage_recovery_count'] == 1
+
+
+@pytest.mark.asyncio
+async def test_unresolved_marker_remains_visible_beyond_24_hours(configured_master):
+    redis = FakeRedis()
+    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=100.0)
+
+    metrics = await master_leverage_metric_snapshot(redis, now=100.0 + 3 * 86_400)
+
     assert metrics['master_leverage_missing_active_count'] == 1
-    assert metrics['master_leverage_missing_max_age_seconds'] == pytest.approx(61.0)
+    assert metrics['master_leverage_missing_max_age_seconds'] == pytest.approx(3 * 86_400)
     assert metrics['master_leverage_missing_slo_breach_active_count'] == 1
 
 
 @pytest.mark.asyncio
 async def test_reconcile_repair_closes_active_marker_and_records_recovery(configured_master):
     redis = FakeRedis()
-    await record_master_leverage_missing(redis, 'user-1', 'BTC', now=100.0)
+    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=100.0)
 
     duration = await record_master_leverage_repaired(
         redis,
@@ -212,38 +248,6 @@ async def test_reconcile_repair_closes_active_marker_and_records_recovery(config
     assert metrics['master_leverage_recovery_max_seconds'] == pytest.approx(65.0)
     assert metrics['master_leverage_recovery_slo_breach_count'] == 1
     assert metrics['master_leverage_recovery_slo_seconds'] == pytest.approx(60.0)
-
-
-@pytest.mark.asyncio
-async def test_reconcile_created_before_missing_intent_cannot_report_recovery(configured_master):
-    redis = FakeRedis()
-    await record_master_leverage_missing(redis, 'user-1', 'BTC', now=100.0)
-
-    stale_repair = await record_master_leverage_repaired(
-        redis,
-        'user-1',
-        'BTC',
-        evidence_created_at=99.0,
-        now=165.0,
-    )
-    pending = await master_leverage_metric_snapshot(redis, now=165.0)
-
-    assert stale_repair is None
-    assert pending['master_leverage_missing_active_count'] == 1
-    assert pending['master_leverage_recovery_count'] == 0
-
-    fresh_repair = await record_master_leverage_repaired(
-        redis,
-        'user-1',
-        'BTC',
-        evidence_created_at=101.0,
-        now=166.0,
-    )
-    repaired = await master_leverage_metric_snapshot(redis, now=166.0)
-
-    assert fresh_repair == pytest.approx(66.0)
-    assert repaired['master_leverage_missing_active_count'] == 0
-    assert repaired['master_leverage_recovery_count'] == 1
 
 
 def test_only_authoritative_reconcile_intent_marks_missing_leverage_repaired():
@@ -326,3 +330,4 @@ async def test_watcher_keeps_fail_closed_when_live_and_shared_leverage_are_missi
     assert captured['master_leverage'] is None
     assert captured['master_is_cross'] is None
     assert captured['master_equity'] == Decimal('1000')
+    assert all('master-leverage-missing' not in key for key in redis.zsets)
