@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.entities import CopyJob, JobState
-from app.services.master_leverage_cache import record_master_leverage_repaired
+from app.services.master_leverage_cache import publish_master_leverage_repair
 
 
 STRATEGY_ORIGINS = {'EVENT', 'RECONCILE'}
@@ -125,20 +125,28 @@ async def repair_stream(redis: Redis, db: AsyncSession, limit: int = 500) -> int
     )).scalars().all()
     count = 0
     for job in rows:
-        await publish_job(redis, db, job)
         evidence_order = reconcile_job_repair_evidence(job)
-        if evidence_order is not None:
-            try:
-                await record_master_leverage_repaired(
-                    redis,
-                    job.user_id,
-                    job.asset,
-                    evidence_order=evidence_order,
-                )
-            except Exception:
-                # Recovery telemetry must never prevent a durable correction
-                # from reaching the execution stream.
-                pass
+        if evidence_order is None:
+            await publish_job(redis, db, job)
+        else:
+            # For an authoritative RECONCILE, publication and HF-006 recovery
+            # bookkeeping are one Redis transaction. If Redis fails before the
+            # script executes, neither happens and this durable DB job remains
+            # eligible for a later repair_stream retry. If the client loses the
+            # reply after execution, both already happened atomically; a later
+            # duplicate stream entry is harmless because job claim/state is
+            # durable and recovery accounting is marker-idempotent.
+            await publish_master_leverage_repair(
+                redis,
+                stream_name=settings.STREAM_NAME,
+                job_id=job.id,
+                user_id=job.user_id,
+                asset=job.asset,
+                evidence_order=evidence_order,
+                maxlen=100_000,
+            )
+            job.enqueued_at = datetime.now(UTC)
+            await db.flush()
         count += 1
     await db.commit()
     return count
