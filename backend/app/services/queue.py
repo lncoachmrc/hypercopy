@@ -109,20 +109,20 @@ async def replay_completed_hf006_repairs(
     *,
     limit: int = 500,
 ) -> int:
-    """Replay only HF-006 bookkeeping for DONE jobs completed via DB fallback.
+    """Replay bookkeeping for terminal fallback repairs without republishing.
 
-    A PostgreSQL-fallback worker may complete a corrective RECONCILE while Redis
-    is unavailable. Those jobs must never be republished after completion; only
-    their durable repair obligation is replayed once Redis is available again.
-    Successful Redis execution (including the no-active-marker case) is enough
-    to clear the obligation because the repair watermark has then been recorded.
+    A PostgreSQL-fallback worker may complete or safely skip an authoritative
+    corrective RECONCILE while Redis is unavailable. The equivalent stream path
+    records HF-006 repair accounting at publication time, before the eventual
+    execution result, so both DONE and SKIPPED terminal fallback jobs must
+    discharge the durable obligation when Redis returns. DEAD remains excluded.
     """
 
     rows = (
         await db.execute(
             select(CopyJob)
             .where(
-                CopyJob.state == JobState.DONE,
+                CopyJob.state.in_([JobState.DONE, JobState.SKIPPED]),
                 CopyJob.origin == 'RECONCILE',
                 CopyJob.context[_HF006_REPAIR_PENDING].as_boolean().is_(True),
             )
@@ -203,7 +203,7 @@ async def repair_stream(redis: Redis, db: AsyncSession, limit: int = 500) -> int
     await expire_stale_strategy_jobs(db, now=now, limit=limit)
 
     # First discharge durable bookkeeping obligations left by PostgreSQL
-    # fallback execution. This path never republishes a DONE order.
+    # fallback execution. This path never republishes a terminal repair job.
     await replay_completed_hf006_repairs(redis, db, limit=limit)
 
     stale_before = stale_enqueue_cutoff(now)
