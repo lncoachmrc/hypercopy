@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from app.engine.sizing import AssetSpec, FollowerState, MasterExposure, OrderIntent, plan
+from app.engine.sizing import AssetSpec, FollowerState, MasterExposure, OrderIntent, plan, round_price
 
 SPEC = AssetSpec('BTC', 5, 40)
 D = Decimal
@@ -97,3 +97,19 @@ def test_cross_network_uses_master_mark_for_ratio_and_follower_mark_for_units():
     assert r.target_size == D('0.1')
     assert r.order_size == D('0.10000')
     assert r.notional == D('5000.00000')
+
+
+def test_round_price_preserves_large_integer_allowed_by_hyperliquid():
+    assert round_price(D('123456'), sz_decimals=2) == D('123456')
+
+
+def test_round_price_prefers_nearest_valid_integer_over_coarser_sig_fig_rounding():
+    assert round_price(D('123456.7'), sz_decimals=2) == D('123457')
+
+
+def test_round_price_still_applies_five_significant_figures_to_decimal_price():
+    assert round_price(D('1234.56'), sz_decimals=2) == D('1234.6')
+
+
+def test_round_price_still_applies_perp_decimal_place_limit():
+    assert round_price(D('0.0012345'), sz_decimals=0) == D('0.001235')
