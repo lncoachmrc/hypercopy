@@ -51,6 +51,11 @@ _TRANSIENT_TOKENS = (
     "openinterestincrease",
     "oracle issue",
     "oraclerejected",
+    # Only an explicit exchange rejection reaches this classifier. HTTP 429 and
+    # transport-level throttles stay outside it and remain Execution.UNKNOWN.
+    "rate limited",
+    "user rate limit",
+    "address rate limit",
 )
 
 _TERMINAL_TOKENS = (
