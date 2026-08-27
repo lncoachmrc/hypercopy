@@ -238,13 +238,18 @@ class HyperliquidAdapter:
     async def _signed_call(self, account_address: str, signer_address: str, func, *args):
         """Run one signed SDK action under signer serialization and address cadence.
 
-        The shared IP budget and signer lock can both block. The per-address
-        throttle slot is therefore revalidated/reserved only after those steps,
-        immediately before the exchange call. A definite action-level throttle
-        installs the next one-shot slot before the signer lock is released, so a
-        queued process cannot slip through between rejection and backoff. The
-        slower authoritative diagnostic remains outside this critical section.
+        A lightweight pre-wait happens outside the signer lock. The authoritative
+        cadence reservation is then performed from the worker thread that is
+        about to invoke the synchronous SDK function, eliminating thread-pool
+        queue time between reservation and actual exchange invocation. The signer
+        lock remains held through reservation, signing, network I/O and result
+        classification. A definite action-level throttle installs the next
+        one-shot slot before signer unlock; slower `userRateLimit` diagnostics
+        remain outside this critical section.
         """
+
+        if self.address_limits is not None:
+            await self.address_limits.wait_for_existing_backoff(account_address)
 
         async def _mark_explicit_result(response: object) -> None:
             if self.address_limits is None:
@@ -252,14 +257,26 @@ class HyperliquidAdapter:
             if _explicit_rate_limit_reason(response) is not None:
                 await self.address_limits.mark_throttled(account_address)
 
+        loop = asyncio.get_running_loop()
+
+        async def _prepare_actual_submission() -> None:
+            if self.address_limits is None:
+                return
+            # This coroutine is scheduled by the worker thread immediately before
+            # the sync SDK call. It is therefore the final cross-process cadence
+            # gate; no executor queue can consume its 10-second reservation.
+            await self.address_limits.wait_if_backed_off(account_address)
+            await self.address_limits.record_action_attempt(account_address)
+
+        def _invoke_after_cadence():
+            if self.address_limits is not None:
+                preparation = asyncio.run_coroutine_threadsafe(_prepare_actual_submission(), loop)
+                preparation.result()
+            return func(*args)
+
         async with signer_action_lock(signer_address):
             await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
-            if self.address_limits is not None:
-                await self.address_limits.record_action_attempt(account_address)
-                # Final cadence gate: no potentially blocking lock/budget step may
-                # occur between this reservation and the signed exchange action.
-                await self.address_limits.wait_if_backed_off(account_address)
-            call_task = asyncio.create_task(self._call(func, *args))
+            call_task = asyncio.create_task(self._call(_invoke_after_cadence))
             try:
                 response = await asyncio.shield(call_task)
                 await _mark_explicit_result(response)
