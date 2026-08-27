@@ -16,6 +16,7 @@ from app.core.origins import browser_origins
 from app.db.redis import redis_client
 from app.adapters.ratelimit import Budget, WeightedRateLimiter
 from app.db.session import SessionLocal
+from app.services.master_leverage_cache import master_leverage_metric_snapshot
 from app.services.metrics import system_snapshot
 
 configure_logging()
@@ -93,5 +94,8 @@ async def metrics(request:Request):
         lines.append(f'hypercopy_hl_address_action_attempt_count {int(await rc.get("hypercopy:metrics:hl_address_action_attempt_count") or 0)}')
         lines.append(f'hypercopy_hl_address_throttle_count {int(await rc.get("hypercopy:metrics:hl_address_throttle_count") or 0)}')
         lines.append(f'hypercopy_hl_address_backoff_wait_count {int(await rc.get("hypercopy:metrics:hl_address_backoff_wait_count") or 0)}')
+        leverage_metrics=await master_leverage_metric_snapshot(rc)
+        for name,value in leverage_metrics.items():
+            lines.append(f'hypercopy_{name} {value}')
     except Exception: pass
     return PlainTextResponse('\n'.join(lines)+'\n',media_type='text/plain; version=0.0.4')
