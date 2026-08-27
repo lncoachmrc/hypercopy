@@ -119,7 +119,7 @@ Every scenario must record:
 - Final local state: deterministic rejection fencing now includes the durable `Execution.requested_size` and current risk-limited submitted-size preview, including AI scaling parity.
 - Reviewer: Codex final review + automated CI evidence verified by the TRAXION technical remediation session.
 - Review date: 2026-08-27.
-- Verdict: **PASS — automated PostgreSQL evidence; real TESTNET rejection/no-liquidity drill remains unverified**.
+- Verdict: **PASS — automated PostgreSQL evidence; real TESTNET terminal-rejection drill remains unverified**.
 
 ## SPEC.md mandatory 20-case TESTNET matrix
 
@@ -155,7 +155,7 @@ The following scenarios extend the 20-case TESTNET matrix with the mandatory cha
 | Scenario | Required environment | Current evidence | Verdict |
 | --- | --- | --- | --- |
 | Hyperliquid adapter calls on real TESTNET | staging + dedicated test agent wallet | No complete evidence pack on this baseline | **NON VERIFICABILE** |
-| IOC no liquidity / market no liquidity | fake/fixture + TESTNET | HF-004 deterministic rejection fence PASS in PostgreSQL CI; real TESTNET no-liquidity run absent | **PARTIAL** |
+| IOC no liquidity / market no liquidity | fake/fixture + TESTNET | production parser/taxonomy and liquidity-backoff predicate have unit coverage (`test_hf004_action_error_taxonomy.py`); no full fake lifecycle or real TESTNET no-liquidity run is recorded | **PARTIAL** |
 | Min notional / precision edge | CI + TESTNET metadata | HF-008 code finding closed; HF-015 remains; no complete TESTNET precision-edge run | **PARTIAL** |
 | 429 / 5xx / timeout burst | isolated simulator/staging | no complete failure-injection run | **NON VERIFICABILE** |
 | Worker crash before external submit | isolated worker + PostgreSQL | no process-kill run | **NON VERIFICABILE** |
