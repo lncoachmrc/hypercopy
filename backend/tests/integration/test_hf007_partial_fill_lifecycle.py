@@ -213,10 +213,11 @@ async def test_partial_ioc_fill_updates_actual_size_then_reconciles_exact_residu
             Decimal("100"),
             50,
             "o",
+            ledger.last_execution_id,
         )
         assert first.state == "FILLED"
         assert first.filled_size == Decimal("0.400")
-        await _apply_fill_to_ledger(db, ledger, primary, first)
+        await _apply_fill_to_ledger(db, ledger, job, "o", primary, first)
 
         await db.refresh(ledger)
         assert ledger.size == Decimal("0.400")
@@ -239,6 +240,7 @@ async def test_partial_ioc_fill_updates_actual_size_then_reconciles_exact_residu
             Decimal("100"),
             50,
             "o",
+            ledger.last_execution_id,
         )
         assert duplicate.filled_size == Decimal("0.400")
         assert len(hl.place_ioc_calls) == 1
@@ -278,13 +280,6 @@ async def test_partial_ioc_fill_updates_actual_size_then_reconciles_exact_residu
         assert ledger.size == Decimal("0.400")
         assert ledger.target_size == Decimal("1")
 
-        # This test calls the execution primitive directly. Model the real worker
-        # claim before doing so: production never executes a QUEUED job directly.
-        residual_job.state = JobState.PROCESSING
-        residual_job.owner = "hf007"
-        residual_job.attempt_count += 1
-        await db.flush()
-
         residual = _target_plan(ledger.size)
         assert residual.order_size == Decimal("0.600")
         second = await _execute_leg(
@@ -298,10 +293,11 @@ async def test_partial_ioc_fill_updates_actual_size_then_reconciles_exact_residu
             Decimal("100"),
             50,
             "o",
+            ledger.last_execution_id,
         )
         assert second.state == "FILLED"
         assert second.filled_size == Decimal("0.600")
-        await _apply_fill_to_ledger(db, ledger, residual, second)
+        await _apply_fill_to_ledger(db, ledger, residual_job, "o", residual, second)
         await db.refresh(ledger)
         assert ledger.size == Decimal("1.000")
         residual_job.state = JobState.DONE
