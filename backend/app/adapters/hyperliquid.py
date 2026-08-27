@@ -14,6 +14,7 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils.types import Cloid
 
+from app.adapters.address_ratelimit import AddressActionTracker, is_exchange_rate_limit_error
 from app.core.config import Network, settings
 from app.core.logging import get_logger
 from app.db.signer_action_lock import signer_action_lock
@@ -161,6 +162,11 @@ class HyperliquidAdapter:
         self._specs: dict[str, tuple[float, AssetSpec]] = {}
         self._perp_meta: dict | None = None
         self._abstraction_cache: dict[str, tuple[float, str]] = {}
+        self.address_limits = (
+            AddressActionTracker(limiter._redis, self.network)
+            if limiter is not None
+            else None
+        )
 
     async def _metric_incr(self, name: str) -> None:
         try:
@@ -180,29 +186,54 @@ class HyperliquidAdapter:
                 await self._metric_incr('hl_5xx_count')
             raise
 
-    async def _signed_call(self, signer_address: str, func, *args):
-        """Run one signed SDK action under cross-process signer serialization.
+    async def _record_exchange_address_throttle(self, account_address: str) -> None:
+        """Capture an authoritative userRateLimit snapshot after a signed throttle."""
+        if self.address_limits is None:
+            return
+        try:
+            snapshot = await self.user_rate_limit(account_address, priority=Priority.DIAGNOSTIC)
+            await self.address_limits.record_exchange_snapshot(account_address, snapshot)
+        except Exception:
+            # The throttle may be IP-wide, so the diagnostic read can itself fail.
+            # The local throttle/backoff evidence has already been persisted.
+            pass
 
-        `asyncio.to_thread()` cannot cancel an already running sync SDK call. If
-        the caller is cancelled during shutdown, keep the advisory lock until the
-        underlying call actually finishes, then propagate cancellation. This
-        prevents a replacement process from signing concurrently with an action
-        that is still in flight in the old process.
+    async def _signed_call(self, account_address: str, signer_address: str, func, *args):
+        """Run one signed SDK action under signer serialization and address backoff.
+
+        Address backoff happens before the signer lock, so a throttled user does
+        not occupy a database lock while cooling down. The action is still sent
+        only once; any transport ambiguity remains the caller's UNKNOWN path.
         """
 
-        async with signer_action_lock(signer_address):
-            await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
-            call_task = asyncio.create_task(self._call(func, *args))
-            try:
-                return await asyncio.shield(call_task)
-            except asyncio.CancelledError:
+        if self.address_limits is not None:
+            await self.address_limits.wait_if_backed_off(account_address)
+
+        exchange_throttled = False
+        try:
+            async with signer_action_lock(signer_address):
+                await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
+                if self.address_limits is not None:
+                    await self.address_limits.record_action_attempt(account_address)
+                call_task = asyncio.create_task(self._call(func, *args))
                 try:
-                    await asyncio.shield(call_task)
-                except Exception:
-                    # The caller is still cancelled; the important invariant is
-                    # that the signer lock remained held until the SDK call ended.
-                    pass
-                raise
+                    return await asyncio.shield(call_task)
+                except asyncio.CancelledError:
+                    try:
+                        await asyncio.shield(call_task)
+                    except Exception as exc:
+                        if self.address_limits is not None and is_exchange_rate_limit_error(exc):
+                            await self.address_limits.mark_throttled(account_address)
+                    raise
+                except Exception as exc:
+                    if self.address_limits is not None and is_exchange_rate_limit_error(exc):
+                        await self.address_limits.mark_throttled(account_address)
+                        exchange_throttled = True
+                    raise
+        except Exception:
+            if exchange_throttled:
+                await self._record_exchange_address_throttle(account_address)
+            raise
 
     async def _acquire(self, weight: int, priority: Priority, timeout: int | float) -> None:
         if self.limiter is None:
@@ -254,6 +285,26 @@ class HyperliquidAdapter:
         abstraction = str(value or 'default')
         self._abstraction_cache[key] = (time.monotonic() + 300, abstraction)
         return abstraction
+
+    async def user_rate_limit(self, address: str, *, priority: Priority = Priority.DIAGNOSTIC) -> dict:
+        """Read Hyperliquid's authoritative per-user action quota status."""
+        return await self._read(
+            self.info.post,
+            '/info',
+            {'type': 'userRateLimit', 'user': address},
+            weight=WEIGHT_STANDARD_INFO,
+            priority=priority,
+            timeout=15,
+        )
+
+    async def address_rate_limit_snapshot(self, address: str) -> dict[str, object]:
+        if self.address_limits is None:
+            return {
+                'network': self.network,
+                'address': address.lower(),
+                'tracking': 'disabled_without_shared_limiter',
+            }
+        return (await self.address_limits.snapshot(address)).as_dict()
 
     async def account_snapshot(self, address: str, *, priority: Priority = Priority.RECONCILE) -> AccountSnapshot:
         perp = await self.user_state(address, priority=priority)
@@ -393,7 +444,7 @@ class HyperliquidAdapter:
 
         # Exchange actions are intentionally one-shot. Ambiguous results are
         # resolved later by Cloid rather than blindly resubmitted.
-        response = await self._signed_call(local.address, _submit_leverage)
+        response = await self._signed_call(account_address, local.address, _submit_leverage)
         if not isinstance(response, dict) or response.get('status') not in (None, 'ok'):
             raise RuntimeError(f'Hyperliquid leverage update failed: {response}')
         return response
@@ -428,7 +479,7 @@ class HyperliquidAdapter:
                 reduce_only=reduce_only, cloid=Cloid.from_str(cloid),
             )
 
-        response = await self._signed_call(local.address, _submit)
+        response = await self._signed_call(account_address, local.address, _submit)
         return parse_order_response(response)
 
     async def _heartbeat(self, ws, stop_event: asyncio.Event) -> None:
