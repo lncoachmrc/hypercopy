@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import time
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -15,30 +14,79 @@ _CACHE_PREFIX = 'hypercopy:master-leverage-cache'
 _METRIC_PREFIX = 'hypercopy:metrics:'
 _MISSING_PREFIX = 'hypercopy:master-leverage-missing'
 _ATOMIC_MISSING_SCRIPT = """
-local started = redis.call('ZSCORE', KEYS[1], ARGV[1])
+-- HF006_REGISTER_MISSING
+local member = ARGV[1]
+local intent_order = tonumber(ARGV[2])
+if not intent_order then
+  return 0
+end
+local repaired = redis.call('ZSCORE', KEYS[3], member)
+if repaired and tonumber(repaired) >= intent_order then
+  return 0
+end
+local started = redis.call('ZSCORE', KEYS[1], member)
 local created = 0
 if not started then
-  redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+  local current
+  if ARGV[3] ~= '' then
+    current = tonumber(ARGV[3])
+  else
+    local redis_time = redis.call('TIME')
+    current = tonumber(redis_time[1]) + tonumber(redis_time[2]) / 1000000
+  end
+  redis.call('ZADD', KEYS[1], current, member)
+  redis.call('INCR', KEYS[4])
   created = 1
 end
-local latest = redis.call('ZSCORE', KEYS[2], ARGV[1])
-if not latest or tonumber(ARGV[2]) > tonumber(latest) then
-  redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
+local latest = redis.call('ZSCORE', KEYS[2], member)
+if not latest or intent_order > tonumber(latest) then
+  redis.call('ZADD', KEYS[2], intent_order, member)
 end
 return created
 """
 _ATOMIC_REPAIR_SCRIPT = """
-local started = redis.call('ZSCORE', KEYS[1], ARGV[1])
-local latest = redis.call('ZSCORE', KEYS[2], ARGV[1])
+-- HF006_RECORD_REPAIR
+local member = ARGV[1]
+local evidence_order = tonumber(ARGV[2])
+local slo_seconds = tonumber(ARGV[3])
+if not evidence_order or not slo_seconds then
+  return false
+end
+local previous_repair = redis.call('ZSCORE', KEYS[3], member)
+if not previous_repair or evidence_order > tonumber(previous_repair) then
+  redis.call('ZADD', KEYS[3], evidence_order, member)
+end
+local started = redis.call('ZSCORE', KEYS[1], member)
+local latest = redis.call('ZSCORE', KEYS[2], member)
 if not started or not latest then
   return false
 end
-if tonumber(ARGV[2]) < tonumber(latest) then
+if evidence_order < tonumber(latest) then
   return false
 end
-redis.call('ZREM', KEYS[1], ARGV[1])
-redis.call('ZREM', KEYS[2], ARGV[1])
-return started
+local current
+if ARGV[4] ~= '' then
+  current = tonumber(ARGV[4])
+else
+  local redis_time = redis.call('TIME')
+  current = tonumber(redis_time[1]) + tonumber(redis_time[2]) / 1000000
+end
+local duration = current - tonumber(started)
+if duration < 0 then
+  duration = 0
+end
+redis.call('ZREM', KEYS[1], member)
+redis.call('ZREM', KEYS[2], member)
+redis.call('INCR', KEYS[4])
+redis.call('SET', KEYS[5], string.format('%.6f', duration))
+local previous_max = tonumber(redis.call('GET', KEYS[6]) or '0')
+if duration > previous_max then
+  redis.call('SET', KEYS[6], string.format('%.6f', duration))
+end
+if duration > slo_seconds then
+  redis.call('INCR', KEYS[7])
+end
+return string.format('%.6f', duration)
 """
 
 
@@ -66,6 +114,14 @@ def _missing_latest_key() -> str:
     return f'{_MISSING_PREFIX}:latest:{_master_namespace()}'
 
 
+def _repair_latest_key() -> str:
+    return f'{_MISSING_PREFIX}:repair:{_master_namespace()}'
+
+
+def _causal_order_key() -> str:
+    return f'{_MISSING_PREFIX}:order:{_master_namespace()}'
+
+
 def _missing_member(user_id: object, asset: str) -> str:
     return f'{user_id}|{asset}'
 
@@ -78,6 +134,22 @@ def _decode(raw: object) -> str:
     return raw.decode() if isinstance(raw, bytes) else str(raw)
 
 
+async def _redis_now(redis: Redis) -> float:
+    raw = await redis.time()
+    if isinstance(raw, (tuple, list)) and len(raw) >= 2:
+        return float(raw[0]) + float(raw[1]) / 1_000_000
+    raise RuntimeError('Redis TIME returned an invalid payload')
+
+
+async def next_master_leverage_causal_order(redis: Redis) -> int:
+    """Allocate a master-namespace causal token from one shared Redis sequencer."""
+
+    value = int(await redis.incr(_causal_order_key()))
+    if value <= 0:
+        raise RuntimeError('Master leverage causal order must be positive')
+    return value
+
+
 async def cache_master_configs(
     redis: Redis,
     configs: dict[str, PositionConfig],
@@ -88,13 +160,14 @@ async def cache_master_configs(
     """Persist timestamp-correlated master config and equity for a short bridge.
 
     The cache is populated only from one verified Hyperliquid account snapshot.
-    Leverage and equity therefore share the same observation timestamp. Values
-    expire at the existing snapshot stale boundary and are never guessed.
+    Leverage and equity therefore share the same observation timestamp. Redis
+    TIME is the default clock so readers in other processes cannot disagree due
+    to host clock skew. Values expire at the existing snapshot stale boundary.
     """
 
     if master_equity <= 0:
         return
-    observed_at = time.time() if now is None else now
+    observed_at = await _redis_now(redis) if now is None else now
     ttl = max(1, int(math.ceil(settings.HL_MASTER_SNAPSHOT_STALE_SECONDS)))
     for asset, config in configs.items():
         payload = json.dumps(
@@ -115,7 +188,7 @@ async def cached_master_config(
     *,
     now: float | None = None,
 ) -> CachedMasterLeverage | None:
-    current = time.time() if now is None else now
+    current = await _redis_now(redis) if now is None else now
     try:
         raw = await redis.get(_cache_key(asset))
         if not raw:
@@ -153,30 +226,34 @@ async def record_master_leverage_missing(
     user_id: object,
     asset: str,
     *,
-    intent_created_at: float,
+    intent_order: int,
+    now: float | None = None,
 ) -> bool:
     """Track one continuous outage plus the newest blocked intent atomically.
 
-    ``outage_started_at`` stays fixed at the first blocked job for the current
-    outage, while ``latest_blocked_intent_at`` advances to the newest blocked
-    job. Retries therefore cannot reset the SLO, but stale reconciliation
-    evidence still cannot clear a newer blocked intent. Neither marker expires;
-    explicit authoritative repair is required.
+    ``outage_started_at`` uses Redis TIME and stays fixed at the first blocked
+    job for the continuous outage. ``latest_blocked_intent_order`` is a stable
+    causal token assigned when the intent is created. A repair watermark that
+    already covers the intent suppresses late marker registration, closing the
+    repair-before-registration race without resetting the SLO on retries.
     """
 
+    order = int(intent_order)
+    if order <= 0:
+        return False
     member = _missing_member(user_id, asset)
     created_raw = await redis.eval(
         _ATOMIC_MISSING_SCRIPT,
-        2,
+        4,
         _missing_started_key(),
         _missing_latest_key(),
+        _repair_latest_key(),
+        _metric_key('master_leverage_unavailable_count'),
         member,
-        f'{float(intent_created_at):.6f}',
+        str(order),
+        '' if now is None else f'{float(now):.6f}',
     )
-    created = bool(int(created_raw or 0))
-    if created:
-        await redis.incr(_metric_key('master_leverage_unavailable_count'))
-    return created
+    return bool(int(created_raw or 0))
 
 
 async def record_master_leverage_repaired(
@@ -184,48 +261,42 @@ async def record_master_leverage_repaired(
     user_id: object,
     asset: str,
     *,
-    evidence_created_at: float | None = None,
+    evidence_order: int | None = None,
     now: float | None = None,
 ) -> float | None:
-    """Resolve only when authoritative evidence covers the newest intent.
+    """Record authoritative repair with atomic marker removal and accounting.
 
-    Recovery admissibility compares the evidence timestamp with the latest
-    blocked intent. Recovery duration and SLO age remain anchored to the first
-    blocked job of the continuous outage. Compare and removal are atomic, so a
-    concurrent newer intent cannot be erased by stale reconciliation evidence.
+    The repair watermark is written even when marker registration has not
+    happened yet. If the marker exists, evidence must cover the newest blocked
+    intent order. Removal, recovery count/duration/max and historical SLO breach
+    accounting execute in the same Lua script, so a lost client reply cannot
+    leave the active marker and recovery metrics in contradictory states.
     """
 
-    if evidence_created_at is None:
+    if evidence_order is None:
         return None
-    current = time.time() if now is None else now
+    order = int(evidence_order)
+    if order <= 0:
+        return None
     member = _missing_member(user_id, asset)
-    raw_started = await redis.eval(
+    raw_duration = await redis.eval(
         _ATOMIC_REPAIR_SCRIPT,
-        2,
+        7,
         _missing_started_key(),
         _missing_latest_key(),
+        _repair_latest_key(),
+        _metric_key('master_leverage_recovery_count'),
+        _metric_key('master_leverage_recovery_last_seconds'),
+        _metric_key('master_leverage_recovery_max_seconds'),
+        _metric_key('master_leverage_recovery_slo_breach_count'),
         member,
-        f'{float(evidence_created_at):.6f}',
+        str(order),
+        f'{float(settings.MASTER_LEVERAGE_RECOVERY_SLO_SECONDS):.6f}',
+        '' if now is None else f'{float(now):.6f}',
     )
-    if raw_started in (None, False):
+    if raw_duration in (None, False):
         return None
-    started_at = float(_decode(raw_started))
-    duration = max(current - started_at, 0.0)
-    await redis.incr(_metric_key('master_leverage_recovery_count'))
-    await redis.set(_metric_key('master_leverage_recovery_last_seconds'), f'{duration:.6f}')
-
-    max_key = _metric_key('master_leverage_recovery_max_seconds')
-    previous_raw = await redis.get(max_key)
-    try:
-        previous = float(_decode(previous_raw)) if previous_raw else 0.0
-    except (TypeError, ValueError):
-        previous = 0.0
-    if duration > previous:
-        await redis.set(max_key, f'{duration:.6f}')
-
-    if duration > settings.MASTER_LEVERAGE_RECOVERY_SLO_SECONDS:
-        await redis.incr(_metric_key('master_leverage_recovery_slo_breach_count'))
-    return duration
+    return float(_decode(raw_duration))
 
 
 async def master_leverage_metric_snapshot(
@@ -233,7 +304,7 @@ async def master_leverage_metric_snapshot(
     *,
     now: float | None = None,
 ) -> dict[str, float | int]:
-    current = time.time() if now is None else now
+    current = await _redis_now(redis) if now is None else now
     names = (
         'master_leverage_unavailable_count',
         'master_leverage_shared_cache_hit_count',
