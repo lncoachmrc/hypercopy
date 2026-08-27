@@ -385,7 +385,8 @@ async def _reconcile_user_locked(
         risk_state.near_liquidation = bool(min_liq_distance is not None and min_liq_distance < Decimal('15'))
 
         if risk:
-            peak_equity = risk_state.peak_equity or equity
+            stored_peak_equity = risk_state.peak_equity
+            peak_equity = max(stored_peak_equity, equity) if stored_peak_equity is not None else equity
             risk_state.peak_equity = peak_equity
             dd = ((peak_equity - equity) / peak_equity * 100) if peak_equity > 0 else Decimal(0)
             if dd >= risk.max_drawdown_pct:
