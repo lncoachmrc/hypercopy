@@ -1,5 +1,7 @@
 from decimal import Decimal
 
+import pytest
+
 from app.engine.sizing import AssetSpec, FollowerState, MasterExposure, OrderIntent, plan, round_price
 
 SPEC = AssetSpec('BTC', 5, 40)
@@ -113,3 +115,28 @@ def test_round_price_still_applies_five_significant_figures_to_decimal_price():
 
 def test_round_price_still_applies_perp_decimal_place_limit():
     assert round_price(D('0.0012345'), sz_decimals=0) == D('0.001235')
+
+
+@pytest.mark.parametrize('price', [D('0'), D('-0.000001'), D('-10')])
+def test_round_price_rejects_non_positive_source_price(price):
+    with pytest.raises(ValueError, match='price must be positive'):
+        round_price(price, sz_decimals=0)
+
+
+@pytest.mark.parametrize('sz_decimals', range(7))
+def test_round_price_rejects_positive_price_that_quantizes_to_zero(sz_decimals):
+    max_places = max(6 - sz_decimals, 0)
+    quantum = D(1).scaleb(-max_places)
+    too_small = quantum * D('0.4')
+
+    with pytest.raises(ValueError, match='Rounded Hyperliquid price must be positive'):
+        round_price(too_small, sz_decimals=sz_decimals)
+
+
+@pytest.mark.parametrize('sz_decimals', range(7))
+def test_round_price_never_returns_non_positive_price(sz_decimals):
+    max_places = max(6 - sz_decimals, 0)
+    quantum = D(1).scaleb(-max_places)
+    rounded = round_price(quantum * D('0.6'), sz_decimals=sz_decimals)
+
+    assert rounded > 0
