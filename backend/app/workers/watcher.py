@@ -20,11 +20,7 @@ from app.db.session import SessionLocal
 from app.db.schema import assert_schema
 from app.models.entities import MasterEvent, SystemFlag, SystemIncident
 from app.services.copy import persist_master_fill_and_jobs
-from app.services.master_leverage_cache import (
-    cache_master_configs,
-    cached_master_config,
-    record_master_leverage_missing,
-)
+from app.services.master_leverage_cache import cache_master_configs, cached_master_config
 from app.services.queue import publish_job
 
 configure_logging(); log=get_logger(__name__)
@@ -204,12 +200,6 @@ class Watcher:
                 try: await publish_job(self.redis,db,job)
                 except Exception: log.warning('Redis publish failed; durable job remains in PostgreSQL',extra={'job_id':str(job.id)},exc_info=True)
             await db.commit()
-            if config is None:
-                for job in jobs:
-                    try:
-                        await record_master_leverage_missing(self.redis,job.user_id,asset)
-                    except Exception:
-                        log.warning('Master leverage missing-intent metric update failed',extra={'user_id':str(job.user_id),'asset':asset},exc_info=True)
             await _set_checkpoint(db,int(event.event_ts.timestamp()*1000),event.exchange_event_id)
             ai_payload={
                 'master_event_id':str(event.id),
