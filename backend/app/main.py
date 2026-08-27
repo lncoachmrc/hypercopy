@@ -12,6 +12,7 @@ from app.api.router import api_router
 from app.core.config import settings
 from app.core.errors import HyperCopyError
 from app.core.logging import configure_logging, correlation_id_var, get_logger
+from app.core.origins import browser_origins
 from app.db.redis import redis_client
 from app.adapters.ratelimit import Budget, WeightedRateLimiter
 from app.db.session import SessionLocal
@@ -22,7 +23,7 @@ log=get_logger(__name__)
 app=FastAPI(title='HyperCopy API',version=settings.APP_VERSION,docs_url='/docs' if settings.APP_ENV!='production' else None,redoc_url=None)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.PUBLIC_APP_URL, 'https://traxion.lucianonovello.com'],
+    allow_origins=list(browser_origins(settings.PUBLIC_APP_URL)),
     allow_credentials=True,
     allow_methods=['GET','POST','PUT','DELETE','OPTIONS'],
     allow_headers=['Content-Type','X-CSRF-Token','X-Requested-With','X-Metrics-Token'],
