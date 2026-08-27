@@ -43,6 +43,19 @@ def _persisted_ledger_decimal(value: Decimal) -> Decimal:
     return value.quantize(_LEDGER_DECIMAL_QUANTUM, rounding=ROUND_HALF_UP)
 
 
+def close_leg_flattened(
+    requested_size: Decimal,
+    filled_size: Decimal | None,
+    ledger_residual: Decimal,
+    sz_decimals: int,
+) -> bool:
+    """Require exchange fill and local ledger evidence before reopening a reversal."""
+    if requested_size <= 0 or filled_size is None:
+        return False
+    lot = Decimal(1).scaleb(-sz_decimals)
+    return filled_size >= requested_size and abs(ledger_residual) < lot
+
+
 def _effective_master_mark(origin: str, master_mark: Decimal, follower_mark: Decimal, same_network: bool) -> Decimal:
     if origin == 'CLOSE_ALL':
         return follower_mark
@@ -422,6 +435,30 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
             await _apply_fill_to_ledger(db, ledger, job, primary_kind, primary, outcome)
         except LedgerApplicationDeferred as exc:
             return await _retry_or_dead(db, job, f'Confirmed fill ledger application deferred: {exc}')
+        if primary.secondary and primary_kind == 'c':
+            close_requested = round_size(primary.order_size, spec.sz_decimals)
+            close_lot = Decimal(1).scaleb(-spec.sz_decimals)
+            if not close_leg_flattened(close_requested, outcome.filled_size, ledger.size, spec.sz_decimals):
+                reason = 'Reversal close did not flatten the position; open leg abandoned for fresh reconciliation'
+                evidence = {
+                    'asset': job.asset,
+                    'requested_close_size': str(close_requested),
+                    'filled_close_size': str(outcome.filled_size) if outcome.filled_size is not None else None,
+                    'ledger_residual': str(ledger.size),
+                    'lot_size': str(close_lot),
+                    'sz_decimals': spec.sz_decimals,
+                    'correlation_id': job.correlation_id,
+                    'network': network,
+                }
+                await audit(
+                    db,
+                    action='REVERSAL_OPEN_LEG_ABANDONED',
+                    subject_id=user.id,
+                    reason=reason,
+                    correlation_id=job.correlation_id,
+                    after=evidence,
+                )
+                return await _finish(db, job, JobState.SKIPPED, reason)
         if primary.secondary:
             outcome2 = await _execute_leg(db, hl, job, user.id, account.account_address, private_key, primary.secondary, follower_mark, risk.max_slippage_bps, 'o')
             if outcome2.state != 'FILLED':
