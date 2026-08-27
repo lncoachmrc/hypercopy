@@ -1,4 +1,4 @@
-"""PostgreSQL regression for HF-006 repair accounting through DB fallback."""
+"""PostgreSQL regressions for HF-006 repair accounting through DB fallback."""
 
 import os
 import uuid
@@ -8,8 +8,10 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.db.session import SessionLocal, engine
-from app.models.entities import CopyJob, CopyState, JobState, User, UserState
+from app.models.entities import CopyJob, CopyState, JobState, SystemFlag, User, UserState
+from app.services.master_leverage_cache import next_master_leverage_causal_order
 from app.services.queue import replay_completed_hf006_repairs
 from app.workers.resilient_execution_worker import ResilientExecutionWorker
 
@@ -23,6 +25,11 @@ pytestmark = pytest.mark.skipif(
 async def _dispose_pool_after_test():
     yield
     await engine.dispose()
+
+
+class BrokenMirrorRedis:
+    async def set(self, *_args, **_kwargs):
+        raise RuntimeError('redis unavailable')
 
 
 class RepairReplayRedis:
@@ -42,11 +49,31 @@ class RepairReplayRedis:
 
     async def xadd(self, *_args, **_kwargs):
         self.xadd_calls += 1
-        raise AssertionError('DONE fallback repair must never republish an order')
+        raise AssertionError('terminal fallback repair must never republish an order')
 
 
 @pytest.mark.asyncio
-async def test_done_database_fallback_replays_repair_accounting_without_republishing():
+async def test_causal_order_remains_durable_when_redis_is_unavailable(monkeypatch):
+    master_address = '0x' + uuid.uuid4().hex + '00000000'
+    monkeypatch.setattr(settings, 'HYPERLIQUID_MASTER_ADDRESS', master_address)
+
+    first = await next_master_leverage_causal_order(BrokenMirrorRedis())
+    second = await next_master_leverage_causal_order(BrokenMirrorRedis())
+
+    assert first > 0
+    assert second == first + 1
+
+    slug = f'hf006_causal_order:{settings.master_network}:{master_address.lower()}'
+    async with SessionLocal() as db:
+        row = await db.get(SystemFlag, slug)
+        assert row is not None
+        assert row.enabled is True
+        assert row.value['order'] == second
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('terminal_state', [JobState.DONE, JobState.SKIPPED])
+async def test_terminal_database_fallback_replays_repair_accounting_without_republishing(terminal_state):
     user_id = uuid.uuid4()
     job_id = uuid.uuid4()
 
@@ -83,7 +110,7 @@ async def test_done_database_fallback_replays_repair_accounting_without_republis
 
     # Redis is unavailable, so the production worker selects the durable DB
     # fallback. The HF-006 accounting obligation must be committed BEFORE the
-    # job can be executed and transition to DONE.
+    # job can execute and transition to a terminal success/no-op state.
     worker = object.__new__(ResilientExecutionWorker)
     selected = await worker._next_database_job_id()
     assert selected == str(job_id)
@@ -94,7 +121,7 @@ async def test_done_database_fallback_replays_repair_accounting_without_republis
         assert job.context['hf006_repair_pending'] is True
         job.state = JobState.PROCESSING
         await db.flush()
-        job.state = JobState.DONE
+        job.state = terminal_state
         await db.commit()
 
     # If Redis is still unavailable, the accounting obligation is not cleared.
@@ -107,11 +134,11 @@ async def test_done_database_fallback_replays_repair_accounting_without_republis
     async with SessionLocal() as db:
         job = await db.get(CopyJob, job_id)
         assert job is not None
-        assert job.state is JobState.DONE
+        assert job.state is terminal_state
         assert job.context['hf006_repair_pending'] is True
 
     # Once Redis returns, replay only the durable HF-006 bookkeeping obligation.
-    # This helper never republishes a completed corrective order to the stream.
+    # This helper never republishes the terminal corrective order to the stream.
     recovered_redis = RepairReplayRedis()
     async with SessionLocal() as db:
         accounted = await replay_completed_hf006_repairs(recovered_redis, db)
@@ -125,6 +152,6 @@ async def test_done_database_fallback_replays_repair_accounting_without_republis
         job = (
             await db.execute(select(CopyJob).where(CopyJob.id == job_id))
         ).scalar_one()
-        assert job.state is JobState.DONE
+        assert job.state is terminal_state
         assert job.context['hf006_repair_pending'] is False
         assert job.context['hf006_repair_accounted_order'] == 20
