@@ -24,6 +24,10 @@ class _FakeRedis:
     async def ttl(self, key: str) -> int:
         return self.ttls.get(key, -2)
 
+    async def pttl(self, key: str) -> int:
+        ttl = self.ttls.get(key, -2)
+        return ttl * 1000 if ttl >= 0 else ttl
+
     async def set(self, key: str, value: str, *, ex: int | None = None):
         self.values[key] = value
         if ex is not None:
@@ -128,7 +132,7 @@ async def test_tracker_waits_only_for_the_throttled_address(monkeypatch):
     await tracker.mark_throttled(throttled)
     backoff_key = tracker._backoff_key(throttled)
 
-    async def expire_after_sleep(_seconds: int):
+    async def expire_after_sleep(_seconds: float):
         redis.ttls[backoff_key] = -2
 
     sleep = AsyncMock(side_effect=expire_after_sleep)
@@ -137,9 +141,9 @@ async def test_tracker_waits_only_for_the_throttled_address(monkeypatch):
     waited = await tracker.wait_if_backed_off(throttled)
     not_waited = await tracker.wait_if_backed_off(other)
 
-    assert waited == ADDRESS_BACKOFF_SECONDS
+    assert waited == float(ADDRESS_BACKOFF_SECONDS)
     assert not_waited == 0
-    sleep.assert_awaited_once_with(ADDRESS_BACKOFF_SECONDS)
+    sleep.assert_awaited_once_with(float(ADDRESS_BACKOFF_SECONDS))
     assert redis.counters["hypercopy:metrics:hl_address_backoff_wait_count"] == 1
 
 
