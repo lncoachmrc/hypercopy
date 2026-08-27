@@ -52,7 +52,7 @@ def is_exchange_rate_limit_error(exc: Exception) -> bool:
         "429" in message
         or "too many requests" in message
         or "rate limit" in message
-        or "ratelimited" in compact
+        or "ratelimit" in compact
     )
 
 
