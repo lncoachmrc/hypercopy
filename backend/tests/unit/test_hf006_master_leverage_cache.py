@@ -81,6 +81,16 @@ class FakeRedis:
             selected = ordered[start:stop + 1]
         return selected if withscores else [member for member, _ in selected]
 
+    async def eval(self, script, numkeys, key, member, evidence_created_at):
+        assert numkeys == 1
+        values = self.zsets.setdefault(str(key), {})
+        item = str(member)
+        current = values.get(item)
+        if current is None or float(evidence_created_at) < current:
+            return None
+        del values[item]
+        return str(current)
+
 
 class DummySession:
     async def __aenter__(self):
@@ -181,7 +191,7 @@ async def test_retry_of_same_blocked_job_does_not_reset_slo(configured_master):
 
 
 @pytest.mark.asyncio
-async def test_newest_blocked_intent_controls_recovery_causality(configured_master):
+async def test_newest_blocked_intent_controls_atomic_recovery_causality(configured_master):
     redis = FakeRedis()
     await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=100.0)
     await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=120.0)
