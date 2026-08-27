@@ -142,6 +142,33 @@ def _transient_read_error(exc: Exception) -> bool:
     ))
 
 
+def _explicit_rate_limit_reason(response: object) -> str | None:
+    """Return a definite action-level throttle reason from a successful HTTP response."""
+    if not isinstance(response, dict):
+        return None
+
+    try:
+        statuses = response.get('response', {}).get('data', {}).get('statuses', [])
+        for status in statuses:
+            if not isinstance(status, dict) or 'error' not in status:
+                continue
+            reason = str(status.get('error') or '')
+            if is_exchange_rate_limit_error(RuntimeError(reason)):
+                return reason
+    except Exception:
+        pass
+
+    if response.get('status') not in (None, 'ok'):
+        for key in ('error', 'message', 'response'):
+            reason = response.get(key)
+            if reason is None:
+                continue
+            text = str(reason)
+            if is_exchange_rate_limit_error(RuntimeError(text)):
+                return text
+    return None
+
+
 class HyperliquidAdapter:
     def __init__(self, limiter: WeightedRateLimiter | None, network: Network | None = None):
         self.limiter = limiter
@@ -198,12 +225,14 @@ class HyperliquidAdapter:
             pass
 
     async def _observe_explicit_address_throttle(self, account_address: str, reason: object) -> None:
-        """Track a definite no-effect exchange rejection caused by address quota."""
+        """Refresh authoritative quota evidence after a known rate-limit rejection."""
         if self.address_limits is None:
             return
         if not is_exchange_rate_limit_error(RuntimeError(str(reason))):
             return
-        await self.address_limits.mark_throttled(account_address)
+        # The one-shot slot was already installed by _signed_call while the
+        # signer advisory lock was still held. Keep only the slower diagnostic
+        # request outside that critical section.
         await self._record_exchange_address_throttle(account_address)
 
     async def _signed_call(self, account_address: str, signer_address: str, func, *args):
@@ -211,10 +240,17 @@ class HyperliquidAdapter:
 
         The shared IP budget and signer lock can both block. The per-address
         throttle slot is therefore revalidated/reserved only after those steps,
-        immediately before the exchange call. This makes the documented 10-second
-        degraded cadence measure actual submission opportunities rather than time
-        spent waiting on unrelated locks. The action is still sent only once.
+        immediately before the exchange call. A definite action-level throttle
+        installs the next one-shot slot before the signer lock is released, so a
+        queued process cannot slip through between rejection and backoff. The
+        slower authoritative diagnostic remains outside this critical section.
         """
+
+        async def _mark_explicit_result(response: object) -> None:
+            if self.address_limits is None:
+                return
+            if _explicit_rate_limit_reason(response) is not None:
+                await self.address_limits.mark_throttled(account_address)
 
         async with signer_action_lock(signer_address):
             await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
@@ -225,10 +261,13 @@ class HyperliquidAdapter:
                 await self.address_limits.wait_if_backed_off(account_address)
             call_task = asyncio.create_task(self._call(func, *args))
             try:
-                return await asyncio.shield(call_task)
+                response = await asyncio.shield(call_task)
+                await _mark_explicit_result(response)
+                return response
             except asyncio.CancelledError:
                 try:
-                    await asyncio.shield(call_task)
+                    response = await asyncio.shield(call_task)
+                    await _mark_explicit_result(response)
                 except Exception as exc:
                     if self.address_limits is not None and is_exchange_rate_limit_error(exc):
                         await self.address_limits.mark_throttled(account_address)
