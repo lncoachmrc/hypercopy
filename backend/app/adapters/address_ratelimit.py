@@ -124,7 +124,7 @@ class AddressActionTracker:
         This lightweight pre-wait is safe to run before the signer lock so a
         known cooling account normally does not hold the signer critical section.
         The authoritative final reservation still happens at actual SDK thread
-        invocation via ``wait_if_backed_off`` because another process can race
+        invocation after action accounting because another process can race
         between this pre-wait and submission.
         """
 
@@ -140,16 +140,19 @@ class AddressActionTracker:
             waited += sleep_seconds
 
     async def wait_if_backed_off(self, address: str) -> float:
-        """Atomically reserve the next permitted action slot when quota-exhausted.
+        """Wait out any slot already present at actual SDK-thread start.
 
-        This is the final cadence gate and must run immediately before the sync
-        SDK function starts. When an authoritative ``userRateLimit`` snapshot
-        shows the address quota exhausted, every TRAXION process competes for the
-        same Redis ``SET NX PX`` slot. This releases at most one action per
-        10-second interval. A transport 429 without authoritative address evidence
-        installs only a one-shot delay, avoiding permanent per-address throttling
-        for a potentially IP-wide 429.
+        This is a final re-check after the worker thread begins. It deliberately
+        does not reserve the next sustained-mode slot: local action accounting
+        still performs Redis writes and can block. The actual atomic reservation
+        is therefore made at the end of ``record_action_attempt`` so no blocking
+        observability work remains between reservation and the sync SDK call.
         """
+
+        return await self.wait_for_existing_backoff(address)
+
+    async def _reserve_submission_slot_after_accounting(self, address: str) -> float:
+        """Re-check one-shot backoff and reserve sustained cadence as the last step."""
 
         waited = 0.0
         slot_key = self._slot_key(address)
@@ -157,30 +160,40 @@ class AddressActionTracker:
         slot_ms = ADDRESS_BACKOFF_SECONDS * 1000
 
         while True:
-            sustained = bool(await self._redis.exists(mode_key))
-            if sustained:
-                reserved = await self._redis.set(slot_key, "1", nx=True, px=slot_ms)
-                if reserved:
-                    return waited
             remaining_ms = int(await self._redis.pttl(slot_key) or 0)
-            if remaining_ms <= 0:
-                if sustained:
-                    # The slot may have expired between SET NX and PTTL. Retry
-                    # the atomic reservation rather than releasing all waiters.
-                    await asyncio.sleep(0)
-                    continue
+            if remaining_ms > 0:
+                await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_backoff_wait_count")
+                sleep_seconds = remaining_ms / 1000
+                await asyncio.sleep(sleep_seconds)
+                waited += sleep_seconds
+                continue
+
+            sustained = bool(await self._redis.exists(mode_key))
+            if not sustained:
                 return waited
-            await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_backoff_wait_count")
-            sleep_seconds = remaining_ms / 1000
-            await asyncio.sleep(sleep_seconds)
-            waited += sleep_seconds
+
+            reserved = await self._redis.set(slot_key, "1", nx=True, px=slot_ms)
+            if reserved:
+                return waited
+
+            # Another process won the reservation after our PTTL check. Loop so
+            # this process observes and waits for that exact slot before retrying.
+            await asyncio.sleep(0)
 
     async def record_action_attempt(self, address: str) -> None:
+        """Account the attempt, then make the final sustained-mode reservation.
+
+        All potentially blocking accounting writes happen before the 10-second
+        slot is created. When this method returns, the caller can invoke the sync
+        SDK immediately without consuming cadence time in additional Redis I/O.
+        """
+
         key = self._state_key(address)
         now_ms = int(time.time() * 1000)
         await self._redis.hincrby(key, "local_action_attempts", 1)
         await self._redis.hset(key, mapping={"last_action_at_ms": now_ms})
         await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_action_attempt_count")
+        await self._reserve_submission_slot_after_accounting(address)
 
     async def mark_throttled(self, address: str) -> None:
         """Best-effort one-shot throttle evidence that never replaces exchange truth.
