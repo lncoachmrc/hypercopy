@@ -48,8 +48,17 @@ Instead:
 - in sustained mode, every TRAXION process competes for the same Redis atomic
   `SET NX` 10-second slot, so no more than one subsequent action is released per
   10-second interval;
+- the final cadence reservation is made from the worker thread immediately
+  before the synchronous Hyperliquid SDK function starts. Executor queue time,
+  signer-lock contention and shared IP-budget waits therefore cannot consume the
+  reserved interval before the actual exchange invocation begins;
+- sustained mode is bounded to 60 seconds unless refreshed by new authoritative
+  evidence. This prevents a successful degraded trade that earns new address
+  capacity from leaving TRAXION permanently rate-limited. After expiry the next
+  action is a conservative probe; a real continuing throttle immediately
+  re-establishes the one-shot delay and authoritative diagnostic flow;
 - when a later authoritative snapshot reports `nRequestsUsed < nRequestsCap`,
-  sustained mode and its reserved slot are cleared;
+  sustained mode and its reserved slot are cleared immediately;
 - after an HTTP/transport 429, TRAXION does not assume the address itself is the
   exhausted limiter: it records the one-shot delay and propagates the ambiguous
   failure immediately so the execution layer can persist `UNKNOWN` without
@@ -82,8 +91,10 @@ particular, a definite `REJECTED` response remains definite even if Redis is
 unavailable while TRAXION records the throttle evidence.
 
 The local cadence gate delays only subsequent signed actions for that same
-account. The atomic Redis slot prevents concurrent TRAXION processes from being
-released together after the first 10-second cooldown.
+account. A cheap pre-wait occurs outside the signer lock when a current slot is
+already visible; the final atomic reservation is revalidated at actual SDK thread
+start while the signer lock remains held. Explicit action-level throttles install
+the next one-shot slot before that signer lock is released.
 
 ## Leverage-update suppression
 
