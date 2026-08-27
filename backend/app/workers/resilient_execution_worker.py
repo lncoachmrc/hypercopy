@@ -10,7 +10,11 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.db.session import SessionLocal
 from app.models.entities import CopyJob, JobState
-from app.services.queue import ensure_group, expire_stale_strategy_jobs
+from app.services.queue import (
+    ensure_group,
+    expire_stale_strategy_jobs,
+    mark_hf006_repair_pending,
+)
 from app.workers.execution_worker import Worker, stop
 
 log = get_logger(__name__)
@@ -33,9 +37,9 @@ class ResilientExecutionWorker(Worker):
             await expire_stale_strategy_jobs(db, now=now)
             await db.commit()
 
-            job_id = (
+            job = (
                 await db.execute(
-                    select(CopyJob.id)
+                    select(CopyJob)
                     .where(
                         CopyJob.state.in_([JobState.QUEUED, JobState.RETRYING]),
                         (
@@ -45,9 +49,20 @@ class ResilientExecutionWorker(Worker):
                     )
                     .order_by(CopyJob.created_at)
                     .limit(1)
+                    .with_for_update(skip_locked=True)
                 )
             ).scalar_one_or_none()
-        return str(job_id) if job_id else None
+            if job is None:
+                return None
+
+            # If this PostgreSQL fallback is about to execute an authoritative
+            # HF-006 repair while Redis is unavailable, persist the accounting
+            # obligation before execution can move the job to DONE. A later
+            # repair_stream pass can then replay bookkeeping without republishing
+            # the completed order.
+            mark_hf006_repair_pending(job)
+            await db.commit()
+            return str(job.id)
 
     async def _drain_database_once(self) -> bool:
         job_id = await self._next_database_job_id()
