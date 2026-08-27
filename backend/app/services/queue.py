@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -39,6 +40,21 @@ def reconcile_job_repairs_missing_leverage(job: CopyJob) -> bool:
         return Decimal(str(ctx.get('master_position', '0') or '0')) == 0
     except Exception:
         return False
+
+
+def reconcile_job_repair_evidence(job: CopyJob) -> float | None:
+    """Return only authoritative master-snapshot evidence for a repair job."""
+
+    if not reconcile_job_repairs_missing_leverage(job):
+        return None
+    raw = (job.context or {}).get('master_snapshot_observed_at')
+    try:
+        observed_at = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(observed_at) or observed_at <= 0:
+        return None
+    return observed_at
 
 
 def stale_enqueue_cutoff(now: datetime | None = None) -> datetime:
@@ -100,14 +116,14 @@ async def repair_stream(redis: Redis, db: AsyncSession, limit: int = 500) -> int
     count = 0
     for job in rows:
         await publish_job(redis, db, job)
-        if reconcile_job_repairs_missing_leverage(job):
+        evidence_observed_at = reconcile_job_repair_evidence(job)
+        if evidence_observed_at is not None:
             try:
-                evidence_created_at = job.created_at.timestamp() if job.created_at is not None else None
                 await record_master_leverage_repaired(
                     redis,
                     job.user_id,
                     job.asset,
-                    evidence_created_at=evidence_created_at,
+                    evidence_created_at=evidence_observed_at,
                 )
             except Exception:
                 # Recovery telemetry must never prevent a durable correction
