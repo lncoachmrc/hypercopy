@@ -23,7 +23,6 @@ from app.services.copy import persist_master_fill_and_jobs
 from app.services.master_leverage_cache import (
     cache_master_configs,
     cached_master_config,
-    record_master_leverage_available,
     record_master_leverage_missing,
 )
 from app.services.queue import publish_job
@@ -124,7 +123,11 @@ class Watcher:
         self._equity_at=now
         await self._metric_incr('master_snapshot_refresh_count')
         try:
-            await cache_master_configs(self.redis,position_configs(snapshot.perp_state))
+            await cache_master_configs(
+                self.redis,
+                position_configs(snapshot.perp_state),
+                master_equity=snapshot.account_value,
+            )
         except Exception:
             # Redis cache is an availability bridge only. A cache write failure
             # must never invalidate a freshly verified Hyperliquid snapshot.
@@ -167,27 +170,23 @@ class Watcher:
                 config=position_configs(snapshot.perp_state).get(asset)
             equity=snapshot.account_value
         except Exception:
-            equity=await self._persisted_master_equity()
             cached=await cached_master_config(self.redis,asset)
             if cached is not None:
                 config=cached.config
+                equity=cached.master_equity
                 config_source='shared_last_known_good'
                 log.warning(
-                    'Using short-lived shared master leverage cache after live snapshot failure',
+                    'Using short-lived shared master leverage/equity snapshot after live refresh failure',
                     extra={'asset':asset,'age_seconds':round(cached.age_seconds,3)},
                 )
+            else:
+                # Persisted equity is acceptable only when leverage remains
+                # unavailable, because execution will keep increases fail-closed.
+                # It must never be paired with shared leverage evidence.
+                equity=await self._persisted_master_equity()
 
         if config is None:
-            try: await record_master_leverage_missing(self.redis,asset)
-            except Exception: pass
             log.warning('Master leverage unavailable for realtime fill; increasing exposure will wait for reconciliation',extra={'asset':asset,'recovery_slo_seconds':settings.MASTER_LEVERAGE_RECOVERY_SLO_SECONDS})
-        else:
-            try:
-                recovered=await record_master_leverage_available(self.redis,asset)
-                if recovered is not None:
-                    log.info('Master leverage availability recovered',extra={'asset':asset,'recovery_seconds':round(recovered,3),'recovery_slo_seconds':settings.MASTER_LEVERAGE_RECOVERY_SLO_SECONDS})
-            except Exception:
-                pass
 
         cid=uuid.uuid4().hex
         ai_payload=None
@@ -205,6 +204,12 @@ class Watcher:
                 try: await publish_job(self.redis,db,job)
                 except Exception: log.warning('Redis publish failed; durable job remains in PostgreSQL',extra={'job_id':str(job.id)},exc_info=True)
             await db.commit()
+            if config is None:
+                for job in jobs:
+                    try:
+                        await record_master_leverage_missing(self.redis,job.user_id,asset)
+                    except Exception:
+                        log.warning('Master leverage missing-intent metric update failed',extra={'user_id':str(job.user_id),'asset':asset},exc_info=True)
             await _set_checkpoint(db,int(event.event_ts.timestamp()*1000),event.exchange_event_id)
             ai_payload={
                 'master_event_id':str(event.id),
