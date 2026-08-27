@@ -278,6 +278,13 @@ async def test_partial_ioc_fill_updates_actual_size_then_reconciles_exact_residu
         assert ledger.size == Decimal("0.400")
         assert ledger.target_size == Decimal("1")
 
+        # This test calls the execution primitive directly. Model the real worker
+        # claim before doing so: production never executes a QUEUED job directly.
+        residual_job.state = JobState.PROCESSING
+        residual_job.owner = "hf007"
+        residual_job.attempt_count += 1
+        await db.flush()
+
         residual = _target_plan(ledger.size)
         assert residual.order_size == Decimal("0.600")
         second = await _execute_leg(
