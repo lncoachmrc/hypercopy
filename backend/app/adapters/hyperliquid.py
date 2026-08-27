@@ -207,22 +207,22 @@ class HyperliquidAdapter:
         await self._record_exchange_address_throttle(account_address)
 
     async def _signed_call(self, account_address: str, signer_address: str, func, *args):
-        """Run one signed SDK action under signer serialization and address backoff.
+        """Run one signed SDK action under signer serialization and address cadence.
 
-        Address backoff happens before the signer lock, so a throttled user does
-        not occupy a database lock while cooling down. The action is still sent
-        only once. A transport/HTTP throttle is recorded locally and propagated
-        immediately so the execution layer can persist UNKNOWN without waiting
-        for any secondary diagnostic request.
+        The shared IP budget and signer lock can both block. The per-address
+        throttle slot is therefore revalidated/reserved only after those steps,
+        immediately before the exchange call. This makes the documented 10-second
+        degraded cadence measure actual submission opportunities rather than time
+        spent waiting on unrelated locks. The action is still sent only once.
         """
-
-        if self.address_limits is not None:
-            await self.address_limits.wait_if_backed_off(account_address)
 
         async with signer_action_lock(signer_address):
             await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
             if self.address_limits is not None:
                 await self.address_limits.record_action_attempt(account_address)
+                # Final cadence gate: no potentially blocking lock/budget step may
+                # occur between this reservation and the signed exchange action.
+                await self.address_limits.wait_if_backed_off(account_address)
             call_task = asyncio.create_task(self._call(func, *args))
             try:
                 return await asyncio.shield(call_task)
