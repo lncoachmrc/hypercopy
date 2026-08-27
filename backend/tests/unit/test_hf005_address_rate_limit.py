@@ -18,21 +18,54 @@ class _FakeRedis:
     def __init__(self):
         self.hashes: dict[str, dict[str, str]] = {}
         self.values: dict[str, str] = {}
-        self.ttls: dict[str, int] = {}
+        self.pttls: dict[str, int] = {}
         self.counters: dict[str, int] = {}
+        self.fail_set = False
 
     async def ttl(self, key: str) -> int:
-        return self.ttls.get(key, -2)
+        remaining = await self.pttl(key)
+        if remaining < 0:
+            return remaining
+        return remaining // 1000
 
     async def pttl(self, key: str) -> int:
-        ttl = self.ttls.get(key, -2)
-        return ttl * 1000 if ttl >= 0 else ttl
+        if key not in self.values:
+            return -2
+        return self.pttls.get(key, -1)
 
-    async def set(self, key: str, value: str, *, ex: int | None = None):
+    async def exists(self, key: str) -> int:
+        return int(key in self.values)
+
+    async def set(
+        self,
+        key: str,
+        value: str,
+        *,
+        ex: int | None = None,
+        px: int | None = None,
+        nx: bool = False,
+    ):
+        if self.fail_set:
+            raise RuntimeError("redis unavailable")
+        if nx and key in self.values:
+            return None
         self.values[key] = value
-        if ex is not None:
-            self.ttls[key] = ex
+        if px is not None:
+            self.pttls[key] = px
+        elif ex is not None:
+            self.pttls[key] = ex * 1000
+        else:
+            self.pttls.pop(key, None)
         return True
+
+    async def delete(self, *keys: str):
+        deleted = 0
+        for key in keys:
+            if key in self.values:
+                deleted += 1
+            self.values.pop(key, None)
+            self.pttls.pop(key, None)
+        return deleted
 
     async def hincrby(self, key: str, field: str, amount: int):
         bucket = self.hashes.setdefault(key, {})
@@ -52,6 +85,16 @@ class _FakeRedis:
     async def incr(self, key: str):
         self.counters[key] = self.counters.get(key, 0) + 1
         return self.counters[key]
+
+    def advance(self, seconds: float) -> None:
+        elapsed = int(seconds * 1000)
+        for key, remaining in list(self.pttls.items()):
+            updated = remaining - elapsed
+            if updated <= 0:
+                self.values.pop(key, None)
+                self.pttls.pop(key, None)
+            else:
+                self.pttls[key] = updated
 
 
 class _FakeLimiter:
@@ -119,9 +162,10 @@ async def test_tracker_accounts_per_address_and_authoritative_snapshot():
 
     snapshot = (await tracker.snapshot(address)).as_dict()
     assert snapshot["address"] == address.lower()
+    assert snapshot["throttled_mode"] is False
     assert snapshot["local_action_attempts"] == 2
     assert snapshot["local_throttle_count"] == 1
-    assert snapshot["backoff_seconds_remaining"] == ADDRESS_BACKOFF_SECONDS
+    assert snapshot["backoff_seconds_remaining"] == 0
     assert snapshot["exchange"] == {
         "cum_volume": "25000.5",
         "requests_used": 12000,
@@ -135,27 +179,44 @@ async def test_tracker_accounts_per_address_and_authoritative_snapshot():
 
 
 @pytest.mark.asyncio
-async def test_tracker_waits_only_for_the_throttled_address(monkeypatch):
+async def test_quota_exhausted_mode_atomically_spaces_each_subsequent_action(monkeypatch):
     redis = _FakeRedis()
     tracker = AddressActionTracker(redis, "testnet")
     throttled = "0x" + "11" * 20
     other = "0x" + "22" * 20
+
     await tracker.mark_throttled(throttled)
-    backoff_key = tracker._backoff_key(throttled)
+    await tracker.record_exchange_snapshot(
+        throttled,
+        {
+            "cumVlm": "100",
+            "nRequestsUsed": 10100,
+            "nRequestsCap": 10100,
+            "nRequestsSurplus": 0,
+        },
+    )
 
-    async def expire_after_sleep(_seconds: float):
-        redis.ttls[backoff_key] = -2
+    async def advance_clock(seconds: float):
+        redis.advance(seconds)
 
-    sleep = AsyncMock(side_effect=expire_after_sleep)
+    sleep = AsyncMock(side_effect=advance_clock)
     monkeypatch.setattr("app.adapters.address_ratelimit.asyncio.sleep", sleep)
 
-    waited = await tracker.wait_if_backed_off(throttled)
+    first_wait = await tracker.wait_if_backed_off(throttled)
+    # The first waiter reserves a fresh 10-second slot before it is released.
+    assert await redis.pttl(tracker._slot_key(throttled)) == ADDRESS_BACKOFF_SECONDS * 1000
+    second_wait = await tracker.wait_if_backed_off(throttled)
     not_waited = await tracker.wait_if_backed_off(other)
 
-    assert waited == float(ADDRESS_BACKOFF_SECONDS)
+    assert first_wait == float(ADDRESS_BACKOFF_SECONDS)
+    assert second_wait == float(ADDRESS_BACKOFF_SECONDS)
     assert not_waited == 0
-    sleep.assert_awaited_once_with(float(ADDRESS_BACKOFF_SECONDS))
-    assert redis.counters["hypercopy:metrics:hl_address_backoff_wait_count"] == 1
+    assert sleep.await_count == 2
+    assert [call.args[0] for call in sleep.await_args_list] == [
+        float(ADDRESS_BACKOFF_SECONDS),
+        float(ADDRESS_BACKOFF_SECONDS),
+    ]
+    assert redis.counters["hypercopy:metrics:hl_address_backoff_wait_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -184,6 +245,7 @@ async def test_signed_transport_throttle_is_observed_without_blind_retry_or_diag
     diagnostic.assert_not_awaited()
     limiter.acquire.assert_awaited_once()
     snapshot = (await adapter.address_limits.snapshot(account)).as_dict()
+    assert snapshot["throttled_mode"] is False
     assert snapshot["local_action_attempts"] == 1
     assert snapshot["local_throttle_count"] == 1
     assert snapshot["backoff_seconds_remaining"] == ADDRESS_BACKOFF_SECONDS
@@ -191,7 +253,7 @@ async def test_signed_transport_throttle_is_observed_without_blind_retry_or_diag
 
 
 @pytest.mark.asyncio
-async def test_explicit_action_throttle_marks_backoff_and_captures_exchange_snapshot(monkeypatch):
+async def test_explicit_action_throttle_marks_sustained_mode_and_captures_exchange_snapshot(monkeypatch):
     redis = _FakeRedis()
     limiter = _FakeLimiter(redis)
     monkeypatch.setattr("app.adapters.hyperliquid.Info", MagicMock())
@@ -208,6 +270,42 @@ async def test_explicit_action_throttle_marks_backoff_and_captures_exchange_snap
     await adapter._observe_explicit_address_throttle(account, "User rate limited")
 
     snapshot = (await adapter.address_limits.snapshot(account)).as_dict()
+    assert snapshot["throttled_mode"] is True
     assert snapshot["local_throttle_count"] == 1
     assert snapshot["backoff_seconds_remaining"] == ADDRESS_BACKOFF_SECONDS
     assert snapshot["exchange"]["requests_used"] == 10101
+
+
+@pytest.mark.asyncio
+async def test_explicit_rejection_survives_redis_throttle_tracking_failure(monkeypatch):
+    redis = _FakeRedis()
+    limiter = _FakeLimiter(redis)
+    monkeypatch.setattr("app.adapters.hyperliquid.Info", MagicMock())
+    adapter = HyperliquidAdapter(limiter, network="testnet")
+    account = "0x" + "66" * 20
+    redis.fail_set = True
+    monkeypatch.setattr(
+        adapter,
+        "user_rate_limit",
+        AsyncMock(
+            return_value={
+                "cumVlm": "100",
+                "nRequestsUsed": 10101,
+                "nRequestsCap": 10100,
+                "nRequestsSurplus": -1,
+            }
+        ),
+    )
+    fixture = {
+        "status": "ok",
+        "response": {
+            "type": "order",
+            "data": {"statuses": [{"error": "User rate limited"}]},
+        },
+    }
+    outcome = parse_order_response(fixture)
+    assert outcome.state == "REJECTED"
+
+    # Observability failure must not replace the exchange's known no-effect result.
+    await adapter._observe_explicit_address_throttle(account, outcome.reason)
+    assert outcome.state == "REJECTED"
