@@ -12,7 +12,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.adapters.hyperliquid import fill_event_id, signed_fill_delta
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.db.redis import redis_client
 from app.models.entities import CopyJob, MasterEvent
+from app.services.master_leverage_cache import next_master_leverage_causal_order
 
 log = get_logger(__name__)
 
@@ -57,6 +59,16 @@ async def persist_master_fill_and_jobs(
     db.add(event)
     await db.flush()
 
+    master_intent_order = None
+    try:
+        master_intent_order = await next_master_leverage_causal_order(redis_client())
+    except Exception:
+        log.warning(
+            'Unable to allocate master intent causal order; execution remains fail-closed',
+            extra={'asset': asset, 'master_event_id': str(event.id)},
+            exc_info=True,
+        )
+
     # The source event is shared, while the follower network is a user-level
     # choice. Read id + network in one query to avoid an N+1 lookup during fanout.
     eligible = (await db.execute(text("""
@@ -82,6 +94,8 @@ async def persist_master_fill_and_jobs(
             'master_network': source_network or settings.master_network,
             'follower_network': follower_network,
         }
+        if master_intent_order is not None:
+            context['master_intent_order'] = master_intent_order
         if master_leverage is not None:
             context['master_leverage'] = int(master_leverage)
             context['master_is_cross'] = bool(master_is_cross)

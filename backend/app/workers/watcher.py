@@ -20,6 +20,7 @@ from app.db.session import SessionLocal
 from app.db.schema import assert_schema
 from app.models.entities import MasterEvent, SystemFlag, SystemIncident
 from app.services.copy import persist_master_fill_and_jobs
+from app.services.master_leverage_cache import cache_master_configs, cached_master_config
 from app.services.queue import publish_job
 
 configure_logging(); log=get_logger(__name__)
@@ -117,6 +118,17 @@ class Watcher:
         self._equity=snapshot.account_value
         self._equity_at=now
         await self._metric_incr('master_snapshot_refresh_count')
+        try:
+            await cache_master_configs(
+                self.redis,
+                position_configs(snapshot.perp_state),
+                master_equity=snapshot.account_value,
+            )
+        except Exception:
+            # Redis cache is an availability bridge only. A cache write failure
+            # must never invalidate a freshly verified Hyperliquid snapshot.
+            await self._metric_incr('master_leverage_shared_cache_error_count')
+            log.warning('Shared master leverage cache refresh failed; live snapshot remains authoritative',exc_info=True)
         return snapshot
 
     async def _persisted_master_equity(self)->Decimal:
@@ -141,6 +153,7 @@ class Watcher:
     async def process_fill(self,fill:dict):
         asset=str(fill.get('coin') or '')
         config=None
+        config_source='live_snapshot'
         try:
             snapshot=await self.master_snapshot()
             configs=position_configs(snapshot.perp_state)
@@ -153,11 +166,23 @@ class Watcher:
                 config=position_configs(snapshot.perp_state).get(asset)
             equity=snapshot.account_value
         except Exception:
-            equity=await self._persisted_master_equity()
+            cached=await cached_master_config(self.redis,asset)
+            if cached is not None:
+                config=cached.config
+                equity=cached.master_equity
+                config_source='shared_last_known_good'
+                log.warning(
+                    'Using short-lived shared master leverage/equity snapshot after live refresh failure',
+                    extra={'asset':asset,'age_seconds':round(cached.age_seconds,3)},
+                )
+            else:
+                # Persisted equity is acceptable only when leverage remains
+                # unavailable, because execution will keep increases fail-closed.
+                # It must never be paired with shared leverage evidence.
+                equity=await self._persisted_master_equity()
 
         if config is None:
-            await self._metric_incr('master_leverage_unavailable_count')
-            log.warning('Master leverage unavailable for realtime fill; increasing exposure will wait for reconciliation',extra={'asset':asset})
+            log.warning('Master leverage unavailable for realtime fill; increasing exposure will wait for reconciliation',extra={'asset':asset,'recovery_slo_seconds':settings.MASTER_LEVERAGE_RECOVERY_SLO_SECONDS})
 
         cid=uuid.uuid4().hex
         ai_payload=None
@@ -170,6 +195,8 @@ class Watcher:
             )
             if not event: return
             for job in jobs:
+                if config is not None:
+                    job.context={**(job.context or {}),'master_leverage_source':config_source}
                 try: await publish_job(self.redis,db,job)
                 except Exception: log.warning('Redis publish failed; durable job remains in PostgreSQL',extra={'job_id':str(job.id)},exc_info=True)
             await db.commit()

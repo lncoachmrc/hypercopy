@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     # allowing old leverage data to live indefinitely.
     HL_MASTER_SNAPSHOT_TTL_SECONDS: float = 2.0
     HL_MASTER_SNAPSHOT_STALE_SECONDS: float = 15.0
+    # Operational SLO for recovering authoritative master leverage after a
+    # realtime fill could not carry it. The safety behavior remains fail-closed;
+    # this value drives observability and alerting, never a guessed leverage.
+    MASTER_LEVERAGE_RECOVERY_SLO_SECONDS: float = 60.0
     # Hyperliquid closes websocket connections that receive no server message
     # for 60s. Send the documented application heartbeat independently of fill
     # traffic so quiet subscriptions remain alive.
@@ -149,6 +153,8 @@ class Settings(BaseSettings):
             raise ValueError('HL_MASTER_SNAPSHOT_TTL_SECONDS must be positive')
         if self.HL_MASTER_SNAPSHOT_STALE_SECONDS < self.HL_MASTER_SNAPSHOT_TTL_SECONDS:
             raise ValueError('HL_MASTER_SNAPSHOT_STALE_SECONDS must be >= snapshot TTL')
+        if self.MASTER_LEVERAGE_RECOVERY_SLO_SECONDS < self.HL_MASTER_SNAPSHOT_STALE_SECONDS:
+            raise ValueError('MASTER_LEVERAGE_RECOVERY_SLO_SECONDS must be >= snapshot stale window')
         if not 0 < self.HL_WS_HEARTBEAT_SECONDS < 60:
             raise ValueError('HL_WS_HEARTBEAT_SECONDS must be between 1 and 59 seconds')
         if not 1 <= self.HL_SAFE_READ_RETRIES <= 5:
