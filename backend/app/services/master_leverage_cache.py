@@ -14,18 +14,31 @@ from app.core.config import settings
 _CACHE_PREFIX = 'hypercopy:master-leverage-cache'
 _METRIC_PREFIX = 'hypercopy:metrics:'
 _MISSING_PREFIX = 'hypercopy:master-leverage-missing'
+_ATOMIC_MISSING_SCRIPT = """
+local started = redis.call('ZSCORE', KEYS[1], ARGV[1])
+local created = 0
+if not started then
+  redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+  created = 1
+end
+local latest = redis.call('ZSCORE', KEYS[2], ARGV[1])
+if not latest or tonumber(ARGV[2]) > tonumber(latest) then
+  redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
+end
+return created
+"""
 _ATOMIC_REPAIR_SCRIPT = """
-local current = redis.call('ZSCORE', KEYS[1], ARGV[1])
-if not current then
+local started = redis.call('ZSCORE', KEYS[1], ARGV[1])
+local latest = redis.call('ZSCORE', KEYS[2], ARGV[1])
+if not started or not latest then
   return false
 end
-if tonumber(ARGV[2]) < tonumber(current) then
+if tonumber(ARGV[2]) < tonumber(latest) then
   return false
 end
-if redis.call('ZREM', KEYS[1], ARGV[1]) == 0 then
-  return false
-end
-return current
+redis.call('ZREM', KEYS[1], ARGV[1])
+redis.call('ZREM', KEYS[2], ARGV[1])
+return started
 """
 
 
@@ -45,8 +58,12 @@ def _cache_key(asset: str) -> str:
     return f'{_CACHE_PREFIX}:{_master_namespace()}:{asset}'
 
 
-def _missing_index_key() -> str:
-    return f'{_MISSING_PREFIX}:active:{_master_namespace()}'
+def _missing_started_key() -> str:
+    return f'{_MISSING_PREFIX}:started:{_master_namespace()}'
+
+
+def _missing_latest_key() -> str:
+    return f'{_MISSING_PREFIX}:latest:{_master_namespace()}'
 
 
 def _missing_member(user_id: object, asset: str) -> str:
@@ -138,22 +155,25 @@ async def record_master_leverage_missing(
     *,
     intent_created_at: float,
 ) -> bool:
-    """Track the newest durable intent actually fenced by missing leverage.
+    """Track one continuous outage plus the newest blocked intent atomically.
 
-    One sorted-set member is the complete active marker for a user/asset. Its
-    score is the creation time of the newest blocked job. ``ZADD GT`` updates
-    the score only when a newer intent is observed, so retries of the same job
-    cannot reset the SLO and an older worker cannot overwrite newer evidence.
-    There is deliberately no TTL: an unresolved safety condition remains
-    observable until an authoritative reconciliation explicitly repairs it.
+    ``outage_started_at`` stays fixed at the first blocked job for the current
+    outage, while ``latest_blocked_intent_at`` advances to the newest blocked
+    job. Retries therefore cannot reset the SLO, but stale reconciliation
+    evidence still cannot clear a newer blocked intent. Neither marker expires;
+    explicit authoritative repair is required.
     """
 
     member = _missing_member(user_id, asset)
-    created = bool(await redis.zadd(
-        _missing_index_key(),
-        {member: float(intent_created_at)},
-        gt=True,
-    ))
+    created_raw = await redis.eval(
+        _ATOMIC_MISSING_SCRIPT,
+        2,
+        _missing_started_key(),
+        _missing_latest_key(),
+        member,
+        f'{float(intent_created_at):.6f}',
+    )
+    created = bool(int(created_raw or 0))
     if created:
         await redis.incr(_metric_key('master_leverage_unavailable_count'))
     return created
@@ -167,11 +187,12 @@ async def record_master_leverage_repaired(
     evidence_created_at: float | None = None,
     now: float | None = None,
 ) -> float | None:
-    """Atomically resolve only the newest intent covered by reconciliation.
+    """Resolve only when authoritative evidence covers the newest intent.
 
-    The compare and remove happen in one Redis Lua execution. A concurrent
-    newer blocked intent therefore cannot be deleted between a separate ZSCORE
-    and ZREM; stale reconciliation evidence simply leaves the marker active.
+    Recovery admissibility compares the evidence timestamp with the latest
+    blocked intent. Recovery duration and SLO age remain anchored to the first
+    blocked job of the continuous outage. Compare and removal are atomic, so a
+    concurrent newer intent cannot be erased by stale reconciliation evidence.
     """
 
     if evidence_created_at is None:
@@ -180,8 +201,9 @@ async def record_master_leverage_repaired(
     member = _missing_member(user_id, asset)
     raw_started = await redis.eval(
         _ATOMIC_REPAIR_SCRIPT,
-        1,
-        _missing_index_key(),
+        2,
+        _missing_started_key(),
+        _missing_latest_key(),
         member,
         f'{float(evidence_created_at):.6f}',
     )
@@ -239,10 +261,11 @@ async def master_leverage_metric_snapshot(
     active = 0
     max_age = 0.0
     active_breaches = 0
-    for raw_member, raw_score in await redis.zrange(_missing_index_key(), 0, -1, withscores=True):
+    for raw_member, raw_score in await redis.zrange(_missing_started_key(), 0, -1, withscores=True):
         member = _decode(raw_member)
         if '|' not in member:
-            await redis.zrem(_missing_index_key(), member)
+            await redis.zrem(_missing_started_key(), member)
+            await redis.zrem(_missing_latest_key(), member)
             continue
         started_at = float(raw_score)
         age = max(current - started_at, 0.0)
