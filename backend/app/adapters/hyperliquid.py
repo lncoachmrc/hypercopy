@@ -198,6 +198,15 @@ class HyperliquidAdapter:
             # The local throttle/backoff evidence has already been persisted.
             pass
 
+    async def _observe_explicit_address_throttle(self, account_address: str, reason: object) -> None:
+        """Track a definite no-effect exchange rejection caused by address quota."""
+        if self.address_limits is None:
+            return
+        if not is_exchange_rate_limit_error(RuntimeError(str(reason))):
+            return
+        await self.address_limits.mark_throttled(account_address)
+        await self._record_exchange_address_throttle(account_address)
+
     async def _signed_call(self, account_address: str, signer_address: str, func, *args):
         """Run one signed SDK action under signer serialization and address backoff.
 
@@ -446,6 +455,7 @@ class HyperliquidAdapter:
         # resolved later by Cloid rather than blindly resubmitted.
         response = await self._signed_call(account_address, local.address, _submit_leverage)
         if not isinstance(response, dict) or response.get('status') not in (None, 'ok'):
+            await self._observe_explicit_address_throttle(account_address, response)
             raise RuntimeError(f'Hyperliquid leverage update failed: {response}')
         return response
 
@@ -480,7 +490,10 @@ class HyperliquidAdapter:
             )
 
         response = await self._signed_call(account_address, local.address, _submit)
-        return parse_order_response(response)
+        outcome = parse_order_response(response)
+        if outcome.state == 'REJECTED':
+            await self._observe_explicit_address_throttle(account_address, outcome.reason)
+        return outcome
 
     async def _heartbeat(self, ws, stop_event: asyncio.Event) -> None:
         """Send Hyperliquid's documented JSON heartbeat independent of fills."""
