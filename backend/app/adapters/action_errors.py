@@ -51,6 +51,14 @@ _TRANSIENT_TOKENS = (
     "openinterestincrease",
     "oracle issue",
     "oraclerejected",
+    # Only an explicit exchange rejection reaches this classifier. HTTP 429 and
+    # transport-level throttles stay outside it and remain Execution.UNKNOWN.
+    "rate limited",
+    "user rate limit",
+    "address rate limit",
+    "rate limit exceeded",
+    "user rate limit exceeded",
+    "address rate limit exceeded",
 )
 
 _TERMINAL_TOKENS = (
@@ -74,6 +82,14 @@ _TERMINAL_TOKENS = (
 )
 
 
+def _compact(value: str) -> str:
+    return value.replace("_", "").replace("-", "").replace(" ", "")
+
+
+def _matches(normalized: str, compact: str, tokens: tuple[str, ...]) -> bool:
+    return any(token in normalized or _compact(token) in compact for token in tokens)
+
+
 def classify_action_error(reason: str | None) -> ActionErrorDecision:
     """Classify an explicit exchange rejection without guessing side effects.
 
@@ -84,12 +100,12 @@ def classify_action_error(reason: str | None) -> ActionErrorDecision:
     """
 
     normalized = str(reason or "").strip().lower()
-    compact = normalized.replace("_", "").replace("-", "")
+    compact = _compact(normalized)
 
-    if any(token in normalized or token in compact for token in _LIQUIDITY_TOKENS):
+    if _matches(normalized, compact, _LIQUIDITY_TOKENS):
         return ActionErrorDecision(ActionErrorClass.LIQUIDITY, ActionRetryPolicy.RECONCILE)
-    if any(token in normalized or token in compact for token in _TRANSIENT_TOKENS):
+    if _matches(normalized, compact, _TRANSIENT_TOKENS):
         return ActionErrorDecision(ActionErrorClass.TRANSIENT, ActionRetryPolicy.RECONCILE)
-    if any(token in normalized or token in compact for token in _TERMINAL_TOKENS):
+    if _matches(normalized, compact, _TERMINAL_TOKENS):
         return ActionErrorDecision(ActionErrorClass.TERMINAL, ActionRetryPolicy.NONE)
     return ActionErrorDecision(ActionErrorClass.UNCLASSIFIED, ActionRetryPolicy.NONE)

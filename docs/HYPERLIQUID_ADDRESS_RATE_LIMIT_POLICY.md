@@ -1,0 +1,141 @@
+# TRAXION Hyperliquid address action rate-limit policy
+
+## Scope
+
+Hyperliquid enforces two independent classes of limits that matter to TRAXION:
+
+1. a shared REST/IP weighted budget;
+2. a per-user/address action budget.
+
+`app.adapters.ratelimit.WeightedRateLimiter` remains the authority for the first
+constraint. HF-005 adds observability and conservative backoff for the second.
+
+## Hyperliquid address rules
+
+The current official Hyperliquid rate-limit documentation states that address
+limits apply to exchange actions, not `/info` reads. Each address receives an
+initial action buffer of 10,000 requests and earns additional action capacity
+from cumulative traded volume at one request per 1 USDC traded. Subaccounts are
+accounted separately. A batch of `n` actions counts as `n` address requests.
+
+Once an address is rate-limited, Hyperliquid still permits one request every
+10 seconds. TRAXION mirrors that documented degraded cadence while authoritative
+`userRateLimit` evidence says the normal address budget is exhausted.
+
+The read-only `userRateLimit` info request exposes the exchange's current fields:
+
+- `cumVlm`;
+- `nRequestsUsed`;
+- `nRequestsCap`;
+- `nRequestsSurplus`.
+
+## TRAXION policy
+
+TRAXION deliberately does **not** synthesize an authoritative local address cap.
+An address can consume quota outside TRAXION and its exchange allowance depends
+on cumulative venue volume, so a purely local counter cannot be authoritative.
+
+Instead:
+
+- every signed follower action attempt is counted in Redis by public follower
+  account address and network;
+- an observed 429/rate-limit response records a per-address throttle event;
+- any observed throttle installs a one-shot Redis-backed 10-second delay;
+- after a definite action-level `rate limited` rejection, TRAXION best-effort
+  reads `userRateLimit` and persists the exchange snapshot for diagnostics;
+- when that authoritative snapshot reports `nRequestsUsed >= nRequestsCap`, the
+  address enters sustained throttled mode;
+- in sustained mode, every TRAXION process competes for the same Redis atomic
+  `SET NX` 10-second slot, so no more than one subsequent action is released per
+  10-second interval;
+- the final cadence reservation is made from the worker thread immediately
+  before the synchronous Hyperliquid SDK function starts. Executor queue time,
+  signer-lock contention and shared IP-budget waits therefore cannot consume the
+  reserved interval before the actual exchange invocation begins;
+- sustained mode is bounded to 60 seconds unless refreshed by new authoritative
+  evidence. This prevents a successful degraded trade that earns new address
+  capacity from leaving TRAXION permanently rate-limited. After expiry the next
+  action is a conservative probe; a real continuing throttle immediately
+  re-establishes the one-shot delay and authoritative diagnostic flow;
+- when a later authoritative snapshot reports `nRequestsUsed < nRequestsCap`,
+  sustained mode and its reserved slot are cleared immediately;
+- after an HTTP/transport 429, TRAXION does not assume the address itself is the
+  exhausted limiter: it records the one-shot delay and propagates the ambiguous
+  failure immediately so the execution layer can persist `UNKNOWN` without
+  waiting for a second network request;
+- other follower addresses are not delayed by the affected account's state;
+- an administrator can explicitly refresh the official snapshot through the
+  read-only admin diagnostic endpoint;
+- aggregate action/throttle/backoff counters are exported through `/metrics`
+  without address labels, avoiding high-cardinality Prometheus series.
+
+The diagnostic `/info` request is not polled on every order because its REST
+weight would unnecessarily consume the shared IP budget on the trading hot path.
+
+## Safety interaction with signed actions
+
+Address observability never changes the ambiguity policy for a submitted signed
+action. A 429 or transport error after submit can have an indeterminate external
+result. The execution layer therefore continues to persist that attempt as
+`UNKNOWN` and resolves exchange truth before any replacement action. HF-005 does
+not blind-retry an old CLOID.
+
+A definite exchange action status that explicitly says the action was rate
+limited is different: it is an observed no-effect rejection. It is classified as
+`TRANSIENT` and can be revisited only through a fresh reconciliation cycle, which
+creates a fresh job/CLOID after current exchange truth is read.
+
+Throttle tracking after an exchange response is best-effort. Redis or diagnostic
+failures cannot replace a known exchange rejection with an ambiguous result. In
+particular, a definite `REJECTED` response remains definite even if Redis is
+unavailable while TRAXION records the throttle evidence.
+
+The local cadence gate delays only subsequent signed actions for that same
+account. A cheap pre-wait occurs outside the signer lock when a current slot is
+already visible; the final atomic reservation is revalidated at actual SDK thread
+start while the signer lock remains held. Explicit action-level throttles install
+the next one-shot slot before that signer lock is released.
+
+## Leverage-update suppression
+
+The audit suggested suppressing redundant actions such as leverage updates when
+verified state already matches. Reconciliation already avoids creating a
+leverage-only job when its fresh exchange snapshot matches the desired config.
+For combined execution jobs, TRAXION still re-applies desired leverage immediately
+before an exposure-changing order. That is a deterministic execution safety
+precondition: relying on an older reconciliation snapshot could miss an external
+or manual leverage change between reconciliation and submit.
+
+HF-005 therefore does not remove that safety precondition. Further action
+suppression would require a fresh ownership/freshness proof at submit time and is
+outside this finding.
+
+## Operations
+
+Admin diagnostic:
+
+`GET /api/v1/admin/users/{user_id}/hyperliquid-rate-limit`
+
+It returns the follower network, public account address, the official
+`userRateLimit` fields and the local Redis accounting/backoff snapshot. The local
+snapshot also reports whether sustained `throttled_mode` is active. It does not
+expose signing credentials.
+
+Aggregate metrics:
+
+- `hypercopy_hl_address_action_attempt_count`;
+- `hypercopy_hl_address_throttle_count`;
+- `hypercopy_hl_address_backoff_wait_count`.
+
+An increase in `hypercopy_hl_address_throttle_count` should be treated as an
+operator alert and investigated using the admin diagnostic before increasing
+execution frequency or worker replicas.
+
+## Explicit non-goals
+
+- no real API stress test or deliberate quota exhaustion;
+- no automatic purchase/reservation of additional Hyperliquid action capacity;
+- no Railway replica change;
+- no mainnet enablement;
+- no change to the shared IP budget;
+- no change to Risk Engine, CLOID, UNKNOWN recovery or order sizing.
