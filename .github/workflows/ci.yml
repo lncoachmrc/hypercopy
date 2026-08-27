@@ -15,14 +15,19 @@ concurrency:
 jobs:
   repository-tree:
     runs-on: ubuntu-latest
+    env:
+      REPOSITORY_TREE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REPOSITORY_TREE_SHA }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: python scripts/generate_repository_tree.py --output REPOSITORY_TREE.generated.txt
       - run: |
           test -s REPOSITORY_TREE.generated.txt
+          test "$(git rev-parse HEAD)" = "$REPOSITORY_TREE_SHA"
           git ls-files --error-unmatch \
             backend/app/adapters/hyperliquid.py \
             backend/app/services/execution.py \
@@ -31,7 +36,7 @@ jobs:
             backend/app/workers/watcher.py
       - uses: actions/upload-artifact@v4
         with:
-          name: repository-tree-${{ github.sha }}
+          name: repository-tree-${{ env.REPOSITORY_TREE_SHA }}
           path: REPOSITORY_TREE.generated.txt
           if-no-files-found: error
           retention-days: 30
