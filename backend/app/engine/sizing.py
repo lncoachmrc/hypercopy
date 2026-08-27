@@ -32,6 +32,7 @@ EXCHANGE_MIN_NOTIONAL = Decimal("10")
 
 # VERIFIED (Hyperliquid docs, meta.universe): perp prices carry at most
 # 5 significant figures and at most (6 - szDecimals) decimal places.
+# Integer prices are always allowed regardless of significant-figure count.
 MAX_PRICE_SIG_FIGS = 5
 PERP_MAX_PRICE_DECIMALS = 6
 
@@ -120,14 +121,31 @@ def round_size(size: Decimal, sz_decimals: int) -> Decimal:
 
 
 def round_price(price: Decimal, sz_decimals: int) -> Decimal:
-    """Apply Hyperliquid's perp price-format rules."""
+    """Return the nearest Hyperliquid-valid perp price.
+
+    Non-integer prices are limited to five significant figures and at most
+    ``6 - szDecimals`` decimal places. Hyperliquid explicitly exempts integer
+    prices from the significant-figure limit, so compare the ordinary
+    significant-figure candidate with the nearest integer and keep whichever
+    represents the requested price more closely.
+    """
     if price <= 0:
         return price
+
     max_places = max(PERP_MAX_PRICE_DECIMALS - sz_decimals, 0)
+    place_quantum = Decimal(1).scaleb(-max_places)
+
     exponent = price.adjusted()
     sig_quantum = Decimal(1).scaleb(exponent - (MAX_PRICE_SIG_FIGS - 1))
-    stepped = price.quantize(sig_quantum, rounding=ROUND_HALF_UP)
-    return stepped.quantize(Decimal(1).scaleb(-max_places), rounding=ROUND_HALF_UP)
+    sig_candidate = price.quantize(sig_quantum, rounding=ROUND_HALF_UP).quantize(
+        place_quantum,
+        rounding=ROUND_HALF_UP,
+    )
+
+    integer_candidate = price.quantize(Decimal(1), rounding=ROUND_HALF_UP)
+    if integer_candidate > 0 and abs(price - integer_candidate) < abs(price - sig_candidate):
+        return integer_candidate
+    return sig_candidate
 
 
 def compute_target(
