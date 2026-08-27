@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from dataclasses import dataclass
 from decimal import Decimal
 
 from redis.asyncio import Redis
+from sqlalchemy import text
 
 from app.adapters.hyperliquid import PositionConfig
 from app.core.config import settings
+from app.db.session import SessionLocal
+from app.models.entities import SystemFlag
 
 _CACHE_PREFIX = 'hypercopy:master-leverage-cache'
 _METRIC_PREFIX = 'hypercopy:metrics:'
 _MISSING_PREFIX = 'hypercopy:master-leverage-missing'
+_MAX_CAUSAL_ORDER = 9_007_199_254_740_991
 _ATOMIC_MISSING_SCRIPT = """
 -- HF006_REGISTER_MISSING
 local member = ARGV[1]
@@ -166,6 +171,10 @@ def _causal_order_key() -> str:
     return f'{_MISSING_PREFIX}:order:{_master_namespace()}'
 
 
+def _causal_order_slug() -> str:
+    return f'hf006_causal_order:{_master_namespace()}'
+
+
 def _missing_member(user_id: object, asset: str) -> str:
     return f'{user_id}|{asset}'
 
@@ -185,12 +194,55 @@ async def _redis_now(redis: Redis) -> float:
     raise RuntimeError('Redis TIME returned an invalid payload')
 
 
-async def next_master_leverage_causal_order(redis: Redis) -> int:
-    """Allocate a master-namespace causal token from one shared Redis sequencer."""
+async def next_master_leverage_causal_order(redis: Redis | None = None) -> int:
+    """Allocate a durable master-namespace causal token from PostgreSQL.
 
-    value = int(await redis.incr(_causal_order_key()))
-    if value <= 0:
-        raise RuntimeError('Master leverage causal order must be positive')
+    Redis cannot be the causal source for the Redis-outage fallback itself. The
+    existing ``system_flags`` table therefore owns one monotonically increasing
+    counter per master network/address namespace. A PostgreSQL advisory
+    transaction lock serializes both the first insert and every later increment.
+
+    The optional Redis write is a bounded best-effort compatibility/diagnostic
+    mirror only. Repair admissibility never depends on that mirror.
+    """
+
+    slug = _causal_order_slug()
+    async with SessionLocal() as db:
+        await db.execute(
+            text('SELECT pg_advisory_xact_lock(hashtextextended(:slug, 0))'),
+            {'slug': slug},
+        )
+        row = await db.get(SystemFlag, slug, with_for_update=True)
+        if row is None:
+            value = 1
+            row = SystemFlag(
+                slug=slug,
+                enabled=True,
+                value={'order': value},
+                reason='HF-006 durable master causal ordering',
+            )
+            db.add(row)
+        else:
+            raw = (row.value or {}).get('order', 0)
+            try:
+                current = int(raw)
+            except Exception as exc:
+                raise RuntimeError('HF-006 PostgreSQL causal order is malformed') from exc
+            if current < 0 or current >= _MAX_CAUSAL_ORDER:
+                raise RuntimeError('HF-006 PostgreSQL causal order is out of range')
+            value = current + 1
+            row.enabled = True
+            row.value = {**(row.value or {}), 'order': value}
+        await db.commit()
+
+    if redis is not None:
+        try:
+            await asyncio.wait_for(
+                redis.set(_causal_order_key(), str(value)),
+                timeout=0.05,
+            )
+        except Exception:
+            pass
     return value
 
 
