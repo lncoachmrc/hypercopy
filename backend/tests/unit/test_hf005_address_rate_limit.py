@@ -68,12 +68,21 @@ def test_rate_limit_error_classifier_is_specific_to_throttling():
     assert not is_exchange_rate_limit_error(RuntimeError("nonce too low"))
 
 
-def test_explicit_rate_limit_rejection_reconciles_but_http_429_stays_ambiguous():
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "User rate limited",
+        "RateLimitExceeded",
+        "UserRateLimitExceeded",
+        "AddressRateLimitExceeded",
+    ],
+)
+def test_explicit_rate_limit_rejections_delegate_to_fresh_reconciliation(reason: str):
     fixture = {
         "status": "ok",
         "response": {
             "type": "order",
-            "data": {"statuses": [{"error": "User rate limited"}]},
+            "data": {"statuses": [{"error": reason}]},
         },
     }
     outcome = parse_order_response(fixture)
@@ -82,6 +91,8 @@ def test_explicit_rate_limit_rejection_reconciles_but_http_429_stays_ambiguous()
     assert explicit.error_class is ActionErrorClass.TRANSIENT
     assert explicit.retry_policy is ActionRetryPolicy.RECONCILE
 
+
+def test_http_429_stays_out_of_explicit_action_taxonomy():
     transport = classify_action_error("429 Too Many Requests")
     assert transport.error_class is ActionErrorClass.UNCLASSIFIED
     assert transport.retry_policy is ActionRetryPolicy.NONE
