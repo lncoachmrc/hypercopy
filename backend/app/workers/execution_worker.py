@@ -21,6 +21,7 @@ from app.models.entities import CopyJob, EquitySnapshot, JobState, PositionLedge
 from app.services.credentials import monitor_credential_expiry
 from app.services.execution import claim_job, process_job, release_stale_jobs
 from app.services.execution_resolution import resolve_ambiguous_executions
+from app.services.master_leverage_cache import record_master_leverage_missing
 from app.services.networking import user_network_state
 from app.services.queue import ensure_group, repair_stream
 from app.services.reconcile import master_snapshot, reconcile_active_users, reconcile_user
@@ -167,6 +168,22 @@ class Worker:
                 else:
                     network=(await user_network_state(db,job.user_id)).network
                     result=await process_job(db,self.follower_hl(network),job)
+                    if result in {JobState.RETRYING.value, JobState.DEAD.value}:
+                        await db.refresh(job)
+                        if (job.last_error or '').startswith('Master leverage unavailable') and job.created_at is not None:
+                            try:
+                                await record_master_leverage_missing(
+                                    self.redis,
+                                    job.user_id,
+                                    job.asset,
+                                    intent_created_at=job.created_at.timestamp(),
+                                )
+                            except Exception:
+                                log.warning(
+                                    'Master leverage missing-intent metric update failed',
+                                    extra={'job_id':str(job.id),'user_id':str(job.user_id),'asset':job.asset},
+                                    exc_info=True,
+                                )
             finally:
                 self.current_job=None
                 try: await self.heartbeat()
