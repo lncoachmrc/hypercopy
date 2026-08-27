@@ -25,6 +25,10 @@ from typing import Any
 from redis.asyncio import Redis
 
 ADDRESS_BACKOFF_SECONDS = 10
+# Sustained mode is authoritative but deliberately bounded. A successful
+# degraded action may trade enough volume to increase Hyperliquid's request cap;
+# expiry allows one conservative probe instead of pinning the account forever.
+ADDRESS_THROTTLED_MODE_REVALIDATE_SECONDS = 60
 _KEY_PREFIX = "hypercopy:hl:address"
 _METRIC_PREFIX = "hypercopy:metrics"
 
@@ -114,14 +118,37 @@ class AddressActionTracker:
     def _mode_key(self, address: str) -> str:
         return f"{self._state_key(address)}:throttled"
 
+    async def wait_for_existing_backoff(self, address: str) -> float:
+        """Wait for the currently reserved slot without reserving a new one.
+
+        This lightweight pre-wait is safe to run before the signer lock so a
+        known cooling account normally does not hold the signer critical section.
+        The authoritative final reservation still happens at actual SDK thread
+        invocation via ``wait_if_backed_off`` because another process can race
+        between this pre-wait and submission.
+        """
+
+        waited = 0.0
+        slot_key = self._slot_key(address)
+        while True:
+            remaining_ms = int(await self._redis.pttl(slot_key) or 0)
+            if remaining_ms <= 0:
+                return waited
+            await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_backoff_wait_count")
+            sleep_seconds = remaining_ms / 1000
+            await asyncio.sleep(sleep_seconds)
+            waited += sleep_seconds
+
     async def wait_if_backed_off(self, address: str) -> float:
         """Atomically reserve the next permitted action slot when quota-exhausted.
 
-        When an authoritative ``userRateLimit`` snapshot shows the address quota
-        exhausted, every TRAXION process competes for the same Redis ``SET NX PX``
-        slot. This releases at most one action per 10-second interval. A transport
-        429 without authoritative address evidence installs only a one-shot delay,
-        avoiding permanent per-address throttling for a potentially IP-wide 429.
+        This is the final cadence gate and must run immediately before the sync
+        SDK function starts. When an authoritative ``userRateLimit`` snapshot
+        shows the address quota exhausted, every TRAXION process competes for the
+        same Redis ``SET NX PX`` slot. This releases at most one action per
+        10-second interval. A transport 429 without authoritative address evidence
+        installs only a one-shot delay, avoiding permanent per-address throttling
+        for a potentially IP-wide 429.
         """
 
         waited = 0.0
@@ -186,8 +213,10 @@ class AddressActionTracker:
 
         ``nRequestsUsed >= nRequestsCap`` is direct exchange evidence that the
         normal address budget is exhausted, so sustained 10-second cadence is
-        enabled. ``nRequestsUsed < nRequestsCap`` clears it. Local counters never
-        guess this state.
+        enabled for a bounded revalidation interval. ``nRequestsUsed <
+        nRequestsCap`` clears it immediately. Local counters never guess this
+        state. Expiry prevents a recovered account from remaining throttled
+        forever when a permitted degraded trade increases its venue capacity.
         """
 
         def _numeric(name: str) -> str:
@@ -210,7 +239,11 @@ class AddressActionTracker:
         if used in (None, "") or cap in (None, ""):
             return
         if int(used) >= int(cap):
-            await self._redis.set(self._mode_key(address), "1")
+            await self._redis.set(
+                self._mode_key(address),
+                "1",
+                ex=ADDRESS_THROTTLED_MODE_REVALIDATE_SECONDS,
+            )
         else:
             await self._redis.delete(self._mode_key(address), self._slot_key(address))
 
