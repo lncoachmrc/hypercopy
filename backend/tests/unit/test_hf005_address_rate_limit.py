@@ -253,7 +253,7 @@ async def test_signed_transport_throttle_is_observed_without_blind_retry_or_diag
 
 
 @pytest.mark.asyncio
-async def test_explicit_action_throttle_marks_sustained_mode_and_captures_exchange_snapshot(monkeypatch):
+async def test_explicit_action_throttle_diagnostic_sets_sustained_mode_and_snapshot(monkeypatch):
     redis = _FakeRedis()
     limiter = _FakeLimiter(redis)
     monkeypatch.setattr("app.adapters.hyperliquid.Info", MagicMock())
@@ -267,12 +267,14 @@ async def test_explicit_action_throttle_marks_sustained_mode_and_captures_exchan
     }
     monkeypatch.setattr(adapter, "user_rate_limit", AsyncMock(return_value=official))
 
+    # Direct diagnostic refresh does not install the one-shot throttle; the real
+    # signed path does that inside _signed_call while the signer lock is held.
     await adapter._observe_explicit_address_throttle(account, "User rate limited")
 
     snapshot = (await adapter.address_limits.snapshot(account)).as_dict()
     assert snapshot["throttled_mode"] is True
-    assert snapshot["local_throttle_count"] == 1
-    assert snapshot["backoff_seconds_remaining"] == ADDRESS_BACKOFF_SECONDS
+    assert snapshot["local_throttle_count"] == 0
+    assert snapshot["backoff_seconds_remaining"] == 0
     assert snapshot["exchange"]["requests_used"] == 10101
 
 
