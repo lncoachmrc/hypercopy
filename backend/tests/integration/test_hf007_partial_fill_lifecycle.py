@@ -213,10 +213,11 @@ async def test_partial_ioc_fill_updates_actual_size_then_reconciles_exact_residu
             Decimal("100"),
             50,
             "o",
+            ledger.last_execution_id,
         )
         assert first.state == "FILLED"
         assert first.filled_size == Decimal("0.400")
-        await _apply_fill_to_ledger(db, ledger, primary, first)
+        await _apply_fill_to_ledger(db, ledger, job, "o", primary, first)
 
         await db.refresh(ledger)
         assert ledger.size == Decimal("0.400")
@@ -239,6 +240,7 @@ async def test_partial_ioc_fill_updates_actual_size_then_reconciles_exact_residu
             Decimal("100"),
             50,
             "o",
+            ledger.last_execution_id,
         )
         assert duplicate.filled_size == Decimal("0.400")
         assert len(hl.place_ioc_calls) == 1
@@ -291,10 +293,11 @@ async def test_partial_ioc_fill_updates_actual_size_then_reconciles_exact_residu
             Decimal("100"),
             50,
             "o",
+            ledger.last_execution_id,
         )
         assert second.state == "FILLED"
         assert second.filled_size == Decimal("0.600")
-        await _apply_fill_to_ledger(db, ledger, residual, second)
+        await _apply_fill_to_ledger(db, ledger, residual_job, "o", residual, second)
         await db.refresh(ledger)
         assert ledger.size == Decimal("1.000")
         residual_job.state = JobState.DONE
