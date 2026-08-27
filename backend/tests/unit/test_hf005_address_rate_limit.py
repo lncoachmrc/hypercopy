@@ -233,15 +233,14 @@ async def test_signed_transport_throttle_is_observed_without_blind_retry_or_diag
     adapter = HyperliquidAdapter(limiter, network="testnet")
     account = "0x" + "33" * 20
     signer = "0x" + "44" * 20
-    submitted = AsyncMock(side_effect=RuntimeError("429 Too Many Requests"))
+    submitted = MagicMock(side_effect=RuntimeError("429 Too Many Requests"))
     diagnostic = AsyncMock()
-    monkeypatch.setattr(adapter, "_call", submitted)
     monkeypatch.setattr(adapter, "user_rate_limit", diagnostic)
 
     with pytest.raises(RuntimeError, match="429 Too Many Requests"):
-        await adapter._signed_call(account, signer, lambda: {"status": "ok"})
+        await adapter._signed_call(account, signer, submitted)
 
-    assert submitted.await_count == 1
+    submitted.assert_called_once()
     diagnostic.assert_not_awaited()
     limiter.acquire.assert_awaited_once()
     snapshot = (await adapter.address_limits.snapshot(account)).as_dict()
