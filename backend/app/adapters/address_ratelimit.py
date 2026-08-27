@@ -155,24 +155,30 @@ class AddressActionTracker:
         await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_action_attempt_count")
 
     async def mark_throttled(self, address: str, *, sustained: bool = True) -> None:
-        """Record a throttle and block the next action for 10 seconds.
+        """Best-effort throttle evidence that can never replace an exchange result.
 
         ``sustained=True`` is reserved for a definite action-level address-quota
         rejection. Ambiguous HTTP/transport throttles use a one-shot delay only.
+        Redis is observability/control-plane state here: once Hyperliquid has
+        returned a definite rejection, a Redis failure must not turn it into an
+        ambiguous execution result.
         """
 
-        key = self._state_key(address)
-        now_ms = int(time.time() * 1000)
-        await self._redis.set(
-            self._slot_key(address),
-            "1",
-            px=ADDRESS_BACKOFF_SECONDS * 1000,
-        )
-        if sustained:
-            await self._redis.set(self._mode_key(address), "1")
-        await self._redis.hincrby(key, "local_throttle_count", 1)
-        await self._redis.hset(key, mapping={"last_throttled_at_ms": now_ms})
-        await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_throttle_count")
+        try:
+            key = self._state_key(address)
+            now_ms = int(time.time() * 1000)
+            await self._redis.set(
+                self._slot_key(address),
+                "1",
+                px=ADDRESS_BACKOFF_SECONDS * 1000,
+            )
+            if sustained:
+                await self._redis.set(self._mode_key(address), "1")
+            await self._redis.hincrby(key, "local_throttle_count", 1)
+            await self._redis.hset(key, mapping={"last_throttled_at_ms": now_ms})
+            await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_throttle_count")
+        except Exception:
+            return
 
     async def record_exchange_snapshot(self, address: str, payload: dict[str, Any]) -> None:
         """Persist documented userRateLimit fields and clear stale throttle mode.
