@@ -44,6 +44,10 @@ async def test_expired_persistent_state_loads_prior_value_before_transition_guar
                 copy_state=CopyState.SHADOW,
             )
         )
+        # The test models the state guard, not ORM relationship ordering. Flush
+        # the FK parent explicitly before inserting the dependent durable rows.
+        await db.flush()
+
         job = CopyJob(
             id=job_id,
             user_id=user_id,
@@ -66,6 +70,7 @@ async def test_expired_persistent_state_loads_prior_value_before_transition_guar
             filled_size=Decimal("0.100"),
         )
         db.add(job)
+        await db.flush()
         db.add(execution)
         await db.commit()
 
