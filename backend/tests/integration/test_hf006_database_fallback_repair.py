@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from app.db.session import SessionLocal, engine
 from app.models.entities import CopyJob, CopyState, JobState, User, UserState
-from app.services.queue import repair_stream
+from app.services.queue import replay_completed_hf006_repairs
 from app.workers.resilient_execution_worker import ResilientExecutionWorker
 
 pytestmark = pytest.mark.skipif(
@@ -101,7 +101,7 @@ async def test_done_database_fallback_replays_repair_accounting_without_republis
     failing_redis = RepairReplayRedis(fail=True)
     async with SessionLocal() as db:
         with pytest.raises(RuntimeError, match='redis unavailable'):
-            await repair_stream(failing_redis, db)
+            await replay_completed_hf006_repairs(failing_redis, db)
         await db.rollback()
 
     async with SessionLocal() as db:
@@ -110,12 +110,13 @@ async def test_done_database_fallback_replays_repair_accounting_without_republis
         assert job.state is JobState.DONE
         assert job.context['hf006_repair_pending'] is True
 
-    # Once Redis returns, repair_stream replays only the bookkeeping obligation.
-    # The completed corrective order is never put back on the execution stream.
+    # Once Redis returns, replay only the durable HF-006 bookkeeping obligation.
+    # This helper never republishes a completed corrective order to the stream.
     recovered_redis = RepairReplayRedis()
     async with SessionLocal() as db:
-        published = await repair_stream(recovered_redis, db)
-        assert published == 0
+        accounted = await replay_completed_hf006_repairs(recovered_redis, db)
+        assert accounted == 1
+        await db.commit()
 
     assert recovered_redis.eval_calls == 1
     assert recovered_redis.xadd_calls == 0
