@@ -10,6 +10,7 @@ import pytest
 
 from app.adapters.hyperliquid import PositionConfig
 from app.core.config import settings
+from app.services import reconcile as reconcile_module
 from app.services.master_leverage_cache import (
     cache_master_configs,
     cached_master_config,
@@ -27,8 +28,17 @@ class FakeRedis:
     def __init__(self):
         self.values: dict[str, str] = {}
         self.zsets: dict[str, dict[str, float]] = {}
+        self.now = time.time()
+        self.fail_external_metric_writes = False
+
+    async def time(self):
+        seconds = int(self.now)
+        micros = int((self.now - seconds) * 1_000_000)
+        return seconds, micros
 
     async def set(self, key, value, ex=None, nx=False):
+        if self.fail_external_metric_writes and str(key).startswith('hypercopy:metrics:'):
+            raise AssertionError('metric SET must stay inside the atomic Lua repair')
         if nx and key in self.values:
             return False
         self.values[str(key)] = str(value)
@@ -43,6 +53,8 @@ class FakeRedis:
         return 1
 
     async def incr(self, key):
+        if self.fail_external_metric_writes and str(key).startswith('hypercopy:metrics:'):
+            raise AssertionError('metric INCR must stay inside the atomic Lua repair')
         name = str(key)
         value = int(float(self.values.get(name, '0'))) + 1
         self.values[name] = str(value)
@@ -82,30 +94,60 @@ class FakeRedis:
             selected = ordered[start:stop + 1]
         return selected if withscores else [member for member, _ in selected]
 
-    async def eval(self, script, numkeys, started_key, latest_key, member, timestamp):
-        assert numkeys == 2
-        started = self.zsets.setdefault(str(started_key), {})
-        latest = self.zsets.setdefault(str(latest_key), {})
-        item = str(member)
-        observed = float(timestamp)
+    def _metric_incr(self, key: str) -> int:
+        value = int(float(self.values.get(key, '0'))) + 1
+        self.values[key] = str(value)
+        return value
 
-        if 'ZADD' in script:
+    async def eval(self, script, numkeys, *args):
+        keys = [str(value) for value in args[:numkeys]]
+        argv = list(args[numkeys:])
+
+        if 'HF006_REGISTER_MISSING' in script:
+            assert numkeys == 4
+            started = self.zsets.setdefault(keys[0], {})
+            latest = self.zsets.setdefault(keys[1], {})
+            repairs = self.zsets.setdefault(keys[2], {})
+            item = str(argv[0])
+            intent_order = float(argv[1])
+            repaired_order = repairs.get(item)
+            if repaired_order is not None and repaired_order >= intent_order:
+                return 0
             created = 0
             if item not in started:
-                started[item] = observed
+                current = float(argv[2]) if argv[2] != '' else self.now
+                started[item] = current
+                self._metric_incr(keys[3])
                 created = 1
-            if item not in latest or observed > latest[item]:
-                latest[item] = observed
+            if item not in latest or intent_order > latest[item]:
+                latest[item] = intent_order
             return created
 
-        if 'ZREM' in script:
+        if 'HF006_RECORD_REPAIR' in script:
+            assert numkeys == 7
+            started = self.zsets.setdefault(keys[0], {})
+            latest = self.zsets.setdefault(keys[1], {})
+            repairs = self.zsets.setdefault(keys[2], {})
+            item = str(argv[0])
+            evidence_order = float(argv[1])
+            slo_seconds = float(argv[2])
+            repairs[item] = max(repairs.get(item, 0.0), evidence_order)
             started_at = started.get(item)
-            latest_at = latest.get(item)
-            if started_at is None or latest_at is None or observed < latest_at:
+            latest_order = latest.get(item)
+            if started_at is None or latest_order is None or evidence_order < latest_order:
                 return None
+            current = float(argv[3]) if argv[3] != '' else self.now
+            duration = max(current - started_at, 0.0)
             del started[item]
             del latest[item]
-            return str(started_at)
+            self._metric_incr(keys[3])
+            self.values[keys[4]] = f'{duration:.6f}'
+            previous_max = float(self.values.get(keys[5], '0'))
+            if duration > previous_max:
+                self.values[keys[5]] = f'{duration:.6f}'
+            if duration > slo_seconds:
+                self._metric_incr(keys[6])
+            return f'{duration:.6f}'
 
         raise AssertionError('unexpected Lua script')
 
@@ -192,30 +234,34 @@ async def test_shared_cache_fails_closed_for_malformed_or_unpaired_equity(config
 
 
 @pytest.mark.asyncio
-async def test_master_snapshot_carries_authoritative_observation_timestamp(configured_master):
+async def test_master_snapshot_uses_shared_order_before_exchange_read(configured_master, monkeypatch):
+    redis = FakeRedis()
+    monkeypatch.setattr(reconcile_module, 'redis_client', lambda: redis)
+
     class FakeMasterAdapter:
         async def account_snapshot(self, *_args, **_kwargs):
+            order_keys = [key for key in redis.values if ':master-leverage-missing:order:' in key]
+            assert len(order_keys) == 1
+            assert redis.values[order_keys[0]] == '1'
             return SimpleNamespace(perp_state={'assetPositions': []}, account_value=Decimal('900'))
 
         async def mids(self):
             return {'BTC': '100'}
 
-    before = time.time()
     positions, equity, mids = await master_snapshot(FakeMasterAdapter())  # type: ignore[arg-type]
-    after = time.time()
 
     assert positions == {}
     assert equity == Decimal('900')
     assert mids == {'BTC': '100'}
-    assert before <= getattr(mids, 'observed_at') <= after
+    assert getattr(mids, 'snapshot_started_order') == 1
 
 
 @pytest.mark.asyncio
 async def test_retry_of_same_blocked_job_does_not_reset_slo(configured_master):
     redis = FakeRedis()
 
-    created = await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=100.0)
-    duplicate = await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=100.0)
+    created = await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_order=10, now=100.0)
+    duplicate = await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_order=10, now=130.0)
     metrics = await master_leverage_metric_snapshot(redis, now=161.0)
 
     assert created is True
@@ -230,14 +276,14 @@ async def test_retry_of_same_blocked_job_does_not_reset_slo(configured_master):
 @pytest.mark.asyncio
 async def test_newest_blocked_intent_controls_atomic_recovery_without_resetting_outage(configured_master):
     redis = FakeRedis()
-    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=100.0)
-    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=120.0)
+    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_order=10, now=100.0)
+    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_order=20, now=120.0)
 
     stale_repair = await record_master_leverage_repaired(
         redis,
         'user-1',
         'BTC',
-        evidence_created_at=110.0,
+        evidence_order=15,
         now=161.0,
     )
     pending = await master_leverage_metric_snapshot(redis, now=161.0)
@@ -252,7 +298,7 @@ async def test_newest_blocked_intent_controls_atomic_recovery_without_resetting_
         redis,
         'user-1',
         'BTC',
-        evidence_created_at=121.0,
+        evidence_order=21,
         now=162.0,
     )
     repaired = await master_leverage_metric_snapshot(redis, now=162.0)
@@ -263,18 +309,52 @@ async def test_newest_blocked_intent_controls_atomic_recovery_without_resetting_
 
 
 @pytest.mark.asyncio
+async def test_repair_before_marker_registration_suppresses_covered_outage(configured_master):
+    redis = FakeRedis()
+
+    no_marker_yet = await record_master_leverage_repaired(
+        redis,
+        'user-1',
+        'BTC',
+        evidence_order=20,
+        now=120.0,
+    )
+    covered = await record_master_leverage_missing(
+        redis,
+        'user-1',
+        'BTC',
+        intent_order=10,
+        now=130.0,
+    )
+    metrics = await master_leverage_metric_snapshot(redis, now=130.0)
+
+    assert no_marker_yet is None
+    assert covered is False
+    assert metrics['master_leverage_missing_active_count'] == 0
+
+    newer_intent = await record_master_leverage_missing(
+        redis,
+        'user-1',
+        'BTC',
+        intent_order=21,
+        now=131.0,
+    )
+    assert newer_intent is True
+
+
+@pytest.mark.asyncio
 async def test_continuous_new_blocked_intents_cannot_hide_slo_breach(configured_master):
     redis = FakeRedis()
-    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=100.0)
-    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=130.0)
-    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=159.0)
+    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_order=10, now=100.0)
+    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_order=20, now=130.0)
+    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_order=30, now=159.0)
 
     metrics = await master_leverage_metric_snapshot(redis, now=161.0)
     stale_repair = await record_master_leverage_repaired(
         redis,
         'user-1',
         'BTC',
-        evidence_created_at=158.0,
+        evidence_order=29,
         now=161.0,
     )
 
@@ -286,7 +366,7 @@ async def test_continuous_new_blocked_intents_cannot_hide_slo_breach(configured_
 @pytest.mark.asyncio
 async def test_unresolved_marker_remains_visible_beyond_24_hours(configured_master):
     redis = FakeRedis()
-    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=100.0)
+    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_order=10, now=100.0)
 
     metrics = await master_leverage_metric_snapshot(redis, now=100.0 + 3 * 86_400)
 
@@ -296,15 +376,16 @@ async def test_unresolved_marker_remains_visible_beyond_24_hours(configured_mast
 
 
 @pytest.mark.asyncio
-async def test_reconcile_repair_closes_active_marker_and_records_recovery(configured_master):
+async def test_reconcile_repair_closes_active_marker_and_records_recovery_atomically(configured_master):
     redis = FakeRedis()
-    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_created_at=100.0)
+    await record_master_leverage_missing(redis, 'user-1', 'BTC', intent_order=10, now=100.0)
+    redis.fail_external_metric_writes = True
 
     duration = await record_master_leverage_repaired(
         redis,
         'user-1',
         'BTC',
-        evidence_created_at=150.0,
+        evidence_order=20,
         now=165.0,
     )
     metrics = await master_leverage_metric_snapshot(redis, now=165.0)
@@ -328,6 +409,14 @@ def test_only_authoritative_reconcile_intent_marks_missing_leverage_repaired():
         origin='RECONCILE',
         context={'master_position': '0', 'master_leverage': None},
     )
+    empty_leverage = SimpleNamespace(
+        origin='RECONCILE',
+        context={'master_position': '1', 'master_leverage': ''},
+    )
+    malformed_leverage = SimpleNamespace(
+        origin='RECONCILE',
+        context={'master_position': '1', 'master_leverage': 'invalid'},
+    )
     still_unsafe = SimpleNamespace(
         origin='RECONCILE',
         context={'master_position': '1', 'master_leverage': None},
@@ -339,17 +428,27 @@ def test_only_authoritative_reconcile_intent_marks_missing_leverage_repaired():
 
     assert reconcile_job_repairs_missing_leverage(with_leverage)
     assert reconcile_job_repairs_missing_leverage(superseding_close)
+    assert not reconcile_job_repairs_missing_leverage(empty_leverage)
+    assert not reconcile_job_repairs_missing_leverage(malformed_leverage)
     assert not reconcile_job_repairs_missing_leverage(still_unsafe)
     assert not reconcile_job_repairs_missing_leverage(event_job)
 
 
-def test_reconcile_repair_evidence_requires_master_snapshot_observation():
+def test_reconcile_repair_evidence_requires_shared_snapshot_order():
     valid = SimpleNamespace(
         origin='RECONCILE',
         context={
             'master_position': '1',
             'master_leverage': 6,
-            'master_snapshot_observed_at': 150.25,
+            'master_snapshot_started_order': 15,
+        },
+    )
+    valid_close = SimpleNamespace(
+        origin='RECONCILE',
+        context={
+            'master_position': '0',
+            'master_leverage': None,
+            'master_snapshot_started_order': 16,
         },
     )
     missing = SimpleNamespace(
@@ -361,22 +460,32 @@ def test_reconcile_repair_evidence_requires_master_snapshot_observation():
         context={
             'master_position': '1',
             'master_leverage': 6,
-            'master_snapshot_observed_at': 'not-a-timestamp',
+            'master_snapshot_started_order': 'not-an-order',
         },
     )
-    non_finite = SimpleNamespace(
+    fractional = SimpleNamespace(
         origin='RECONCILE',
         context={
             'master_position': '1',
             'master_leverage': 6,
-            'master_snapshot_observed_at': 'nan',
+            'master_snapshot_started_order': 17.5,
+        },
+    )
+    invalid_leverage = SimpleNamespace(
+        origin='RECONCILE',
+        context={
+            'master_position': '1',
+            'master_leverage': '',
+            'master_snapshot_started_order': 18,
         },
     )
 
-    assert reconcile_job_repair_evidence(valid) == pytest.approx(150.25)
+    assert reconcile_job_repair_evidence(valid) == 15
+    assert reconcile_job_repair_evidence(valid_close) == 16
     assert reconcile_job_repair_evidence(missing) is None
     assert reconcile_job_repair_evidence(malformed) is None
-    assert reconcile_job_repair_evidence(non_finite) is None
+    assert reconcile_job_repair_evidence(fractional) is None
+    assert reconcile_job_repair_evidence(invalid_leverage) is None
 
 
 @pytest.mark.asyncio
