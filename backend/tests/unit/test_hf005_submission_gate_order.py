@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from unittest.mock import MagicMock
 
@@ -21,6 +22,10 @@ class _OrderedAddressTracker:
     def __init__(self, events: list[str]):
         self._events = events
 
+    async def wait_for_existing_backoff(self, _address: str):
+        self._events.append("pre_wait")
+        return 0.0
+
     async def record_action_attempt(self, _address: str):
         self._events.append("record_attempt")
 
@@ -33,7 +38,7 @@ class _OrderedAddressTracker:
 
 
 @pytest.mark.asyncio
-async def test_final_cadence_slot_is_reserved_after_blocking_gates_and_before_submit(monkeypatch):
+async def test_final_cadence_slot_is_reserved_at_worker_thread_start(monkeypatch):
     events: list[str] = []
     limiter = _OrderedLimiter(events)
     monkeypatch.setattr("app.adapters.hyperliquid.Info", MagicMock())
@@ -45,24 +50,52 @@ async def test_final_cadence_slot_is_reserved_after_blocking_gates_and_before_su
         events.append("signer_lock")
         yield
 
-    async def ordered_call(func, *args):
+    original_to_thread = asyncio.to_thread
+    allow_worker_start = asyncio.Event()
+
+    async def delayed_to_thread(func, *args):
+        events.append("thread_queued")
+        await allow_worker_start.wait()
+        events.append("thread_start")
+        return await original_to_thread(func, *args)
+
+    def submit():
         events.append("submit")
-        return func(*args)
+        return {"status": "ok"}
 
+    monkeypatch.setattr("app.adapters.hyperliquid.asyncio.to_thread", delayed_to_thread)
     monkeypatch.setattr("app.adapters.hyperliquid.signer_action_lock", ordered_signer_lock)
-    monkeypatch.setattr(adapter, "_call", ordered_call)
 
-    result = await adapter._signed_call(
-        "0x" + "22" * 20,
-        "0x" + "11" * 20,
-        lambda: {"status": "ok"},
+    task = asyncio.create_task(
+        adapter._signed_call(
+            "0x" + "22" * 20,
+            "0x" + "11" * 20,
+            submit,
+        )
     )
+
+    for _ in range(100):
+        if "thread_queued" in events:
+            break
+        await asyncio.sleep(0)
+
+    assert "thread_queued" in events
+    # The executor-equivalent queue delay must not consume a cadence slot.
+    assert "cadence_slot" not in events
+    assert "record_attempt" not in events
+    assert "submit" not in events
+
+    allow_worker_start.set()
+    result = await asyncio.wait_for(task, timeout=2)
 
     assert result == {"status": "ok"}
     assert events == [
+        "pre_wait",
         "signer_lock",
         "ip_budget",
-        "record_attempt",
+        "thread_queued",
+        "thread_start",
         "cadence_slot",
+        "record_attempt",
         "submit",
     ]
