@@ -700,8 +700,6 @@ async def _apply_fill_to_ledger(
     applied = False
     if ledger.last_execution_id == execution.id:
         mode = 'already_reflected_execution'
-    elif exchange_verified_after_resolution and observed in {expected_before, expected_after}:
-        mode = 'already_reflected_exchange_verified'
     elif ledger.last_execution_id != expected_last_execution_id:
         hf007.update({
             'ledger_apply_deferred_at': datetime.now(UTC).isoformat(),
@@ -718,6 +716,8 @@ async def _apply_fill_to_ledger(
         execution.response = response
         await db.commit()
         raise LedgerApplicationDeferred('ledger attribution changed since submit')
+    elif exchange_verified_after_resolution and observed in {expected_before, expected_after}:
+        mode = 'already_reflected_exchange_verified'
     elif observed == expected_before:
         ledger.size = expected_after
         applied = True
