@@ -5,12 +5,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.adapters.action_errors import ActionErrorClass, ActionRetryPolicy, classify_action_error
 from app.adapters.address_ratelimit import (
     ADDRESS_BACKOFF_SECONDS,
     AddressActionTracker,
     is_exchange_rate_limit_error,
 )
-from app.adapters.hyperliquid import HyperliquidAdapter
+from app.adapters.hyperliquid import HyperliquidAdapter, parse_order_response
 
 
 class _FakeRedis:
@@ -63,6 +64,25 @@ def test_rate_limit_error_classifier_is_specific_to_throttling():
     assert not is_exchange_rate_limit_error(RuntimeError("nonce too low"))
 
 
+def test_explicit_rate_limit_rejection_reconciles_but_http_429_stays_ambiguous():
+    fixture = {
+        "status": "ok",
+        "response": {
+            "type": "order",
+            "data": {"statuses": [{"error": "User rate limited"}]},
+        },
+    }
+    outcome = parse_order_response(fixture)
+    assert outcome.state == "REJECTED"
+    explicit = classify_action_error(outcome.reason)
+    assert explicit.error_class is ActionErrorClass.TRANSIENT
+    assert explicit.retry_policy is ActionRetryPolicy.RECONCILE
+
+    transport = classify_action_error("429 Too Many Requests")
+    assert transport.error_class is ActionErrorClass.UNCLASSIFIED
+    assert transport.retry_policy is ActionRetryPolicy.NONE
+
+
 @pytest.mark.asyncio
 async def test_tracker_accounts_per_address_and_authoritative_snapshot():
     redis = _FakeRedis()
@@ -106,7 +126,12 @@ async def test_tracker_waits_only_for_the_throttled_address(monkeypatch):
     throttled = "0x" + "11" * 20
     other = "0x" + "22" * 20
     await tracker.mark_throttled(throttled)
-    sleep = AsyncMock()
+    backoff_key = tracker._backoff_key(throttled)
+
+    async def expire_after_sleep(_seconds: int):
+        redis.ttls[backoff_key] = -2
+
+    sleep = AsyncMock(side_effect=expire_after_sleep)
     monkeypatch.setattr("app.adapters.address_ratelimit.asyncio.sleep", sleep)
 
     waited = await tracker.wait_if_backed_off(throttled)
@@ -154,3 +179,26 @@ async def test_signed_throttle_is_observed_without_blind_retry(monkeypatch):
     assert snapshot["exchange"]["requests_used"] == 10001
     assert snapshot["exchange"]["requests_cap"] == 19000
     assert snapshot["exchange"]["requests_surplus"] == 8999
+
+
+@pytest.mark.asyncio
+async def test_explicit_action_throttle_marks_backoff_without_transport_ambiguity(monkeypatch):
+    redis = _FakeRedis()
+    limiter = _FakeLimiter(redis)
+    monkeypatch.setattr("app.adapters.hyperliquid.Info", MagicMock())
+    adapter = HyperliquidAdapter(limiter, network="testnet")
+    account = "0x" + "55" * 20
+    official = {
+        "cumVlm": "100",
+        "nRequestsUsed": 10101,
+        "nRequestsCap": 10100,
+        "nRequestsSurplus": -1,
+    }
+    monkeypatch.setattr(adapter, "user_rate_limit", AsyncMock(return_value=official))
+
+    await adapter._observe_explicit_address_throttle(account, "User rate limited")
+
+    snapshot = (await adapter.address_limits.snapshot(account)).as_dict()
+    assert snapshot["local_throttle_count"] == 1
+    assert snapshot["backoff_seconds_remaining"] == ADDRESS_BACKOFF_SECONDS
+    assert snapshot["exchange"]["requests_used"] == 10101
