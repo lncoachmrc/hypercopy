@@ -88,6 +88,50 @@ if duration > slo_seconds then
 end
 return string.format('%.6f', duration)
 """
+_ATOMIC_PUBLISH_REPAIR_SCRIPT = """
+-- HF006_PUBLISH_REPAIR
+local member = ARGV[1]
+local evidence_order = tonumber(ARGV[2])
+local slo_seconds = tonumber(ARGV[3])
+local job_id = ARGV[4]
+local maxlen = tonumber(ARGV[5])
+if not evidence_order or not slo_seconds or not maxlen or not job_id or job_id == '' then
+  return redis.error_reply('invalid HF006 publish-repair arguments')
+end
+local message_id = redis.call('XADD', KEYS[1], 'MAXLEN', '~', maxlen, '*', 'job_id', job_id)
+local previous_repair = redis.call('ZSCORE', KEYS[4], member)
+if not previous_repair or evidence_order > tonumber(previous_repair) then
+  redis.call('ZADD', KEYS[4], evidence_order, member)
+end
+local started = redis.call('ZSCORE', KEYS[2], member)
+local latest = redis.call('ZSCORE', KEYS[3], member)
+if not started or not latest or evidence_order < tonumber(latest) then
+  return message_id
+end
+local current
+if ARGV[6] ~= '' then
+  current = tonumber(ARGV[6])
+else
+  local redis_time = redis.call('TIME')
+  current = tonumber(redis_time[1]) + tonumber(redis_time[2]) / 1000000
+end
+local duration = current - tonumber(started)
+if duration < 0 then
+  duration = 0
+end
+redis.call('ZREM', KEYS[2], member)
+redis.call('ZREM', KEYS[3], member)
+redis.call('INCR', KEYS[5])
+redis.call('SET', KEYS[6], string.format('%.6f', duration))
+local previous_max = tonumber(redis.call('GET', KEYS[7]) or '0')
+if duration > previous_max then
+  redis.call('SET', KEYS[7], string.format('%.6f', duration))
+end
+if duration > slo_seconds then
+  redis.call('INCR', KEYS[8])
+end
+return message_id
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +341,52 @@ async def record_master_leverage_repaired(
     if raw_duration in (None, False):
         return None
     return float(_decode(raw_duration))
+
+
+async def publish_master_leverage_repair(
+    redis: Redis,
+    *,
+    stream_name: str,
+    job_id: object,
+    user_id: object,
+    asset: str,
+    evidence_order: int,
+    maxlen: int = 100_000,
+    now: float | None = None,
+) -> str:
+    """Atomically publish a repair job and record its recovery bookkeeping.
+
+    A successful script execution guarantees that the corrective stream entry,
+    repair watermark, eligible marker removal and recovery metrics moved
+    together. If the client loses the reply after execution, a later republish
+    is safe: the durable job state prevents duplicate execution and absent
+    active markers prevent duplicate recovery accounting.
+    """
+
+    order = int(evidence_order)
+    if order <= 0 or maxlen <= 0:
+        raise ValueError('HF006 repair publish requires positive order and maxlen')
+    raw_message_id = await redis.eval(
+        _ATOMIC_PUBLISH_REPAIR_SCRIPT,
+        8,
+        stream_name,
+        _missing_started_key(),
+        _missing_latest_key(),
+        _repair_latest_key(),
+        _metric_key('master_leverage_recovery_count'),
+        _metric_key('master_leverage_recovery_last_seconds'),
+        _metric_key('master_leverage_recovery_max_seconds'),
+        _metric_key('master_leverage_recovery_slo_breach_count'),
+        _missing_member(user_id, asset),
+        str(order),
+        f'{float(settings.MASTER_LEVERAGE_RECOVERY_SLO_SECONDS):.6f}',
+        str(job_id),
+        str(int(maxlen)),
+        '' if now is None else f'{float(now):.6f}',
+    )
+    if not raw_message_id:
+        raise RuntimeError('HF006 atomic repair publish returned no stream id')
+    return _decode(raw_message_id)
 
 
 async def master_leverage_metric_snapshot(
