@@ -148,7 +148,7 @@ async def test_tracker_waits_only_for_the_throttled_address(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_signed_throttle_is_observed_without_blind_retry(monkeypatch):
+async def test_signed_transport_throttle_is_observed_without_blind_retry_or_diagnostic(monkeypatch):
     redis = _FakeRedis()
     limiter = _FakeLimiter(redis)
     monkeypatch.setattr("app.adapters.hyperliquid.Info", MagicMock())
@@ -162,31 +162,25 @@ async def test_signed_throttle_is_observed_without_blind_retry(monkeypatch):
     account = "0x" + "33" * 20
     signer = "0x" + "44" * 20
     submitted = AsyncMock(side_effect=RuntimeError("429 Too Many Requests"))
-    official = {
-        "cumVlm": "9000",
-        "nRequestsUsed": 10001,
-        "nRequestsCap": 19000,
-        "nRequestsSurplus": 8999,
-    }
+    diagnostic = AsyncMock()
     monkeypatch.setattr(adapter, "_call", submitted)
-    monkeypatch.setattr(adapter, "user_rate_limit", AsyncMock(return_value=official))
+    monkeypatch.setattr(adapter, "user_rate_limit", diagnostic)
 
     with pytest.raises(RuntimeError, match="429 Too Many Requests"):
         await adapter._signed_call(account, signer, lambda: {"status": "ok"})
 
     assert submitted.await_count == 1
+    diagnostic.assert_not_awaited()
     limiter.acquire.assert_awaited_once()
     snapshot = (await adapter.address_limits.snapshot(account)).as_dict()
     assert snapshot["local_action_attempts"] == 1
     assert snapshot["local_throttle_count"] == 1
     assert snapshot["backoff_seconds_remaining"] == ADDRESS_BACKOFF_SECONDS
-    assert snapshot["exchange"]["requests_used"] == 10001
-    assert snapshot["exchange"]["requests_cap"] == 19000
-    assert snapshot["exchange"]["requests_surplus"] == 8999
+    assert snapshot["exchange"]["requests_used"] is None
 
 
 @pytest.mark.asyncio
-async def test_explicit_action_throttle_marks_backoff_without_transport_ambiguity(monkeypatch):
+async def test_explicit_action_throttle_marks_backoff_and_captures_exchange_snapshot(monkeypatch):
     redis = _FakeRedis()
     limiter = _FakeLimiter(redis)
     monkeypatch.setattr("app.adapters.hyperliquid.Info", MagicMock())
