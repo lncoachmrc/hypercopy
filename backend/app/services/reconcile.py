@@ -27,6 +27,14 @@ _ACTIVE_AMBIGUITY_JOB_STATES = {JobState.QUEUED, JobState.PROCESSING, JobState.R
 _TERMINAL_AMBIGUITY_JOB_STATES = {JobState.DONE, JobState.SKIPPED, JobState.DEAD}
 
 
+class _ObservedMasterMids(dict[str, str]):
+    """Mids mapping carrying the lower-level master snapshot observation time."""
+
+    def __init__(self, values: dict[str, str], observed_at: float):
+        super().__init__(values)
+        self.observed_at = float(observed_at)
+
+
 def _positions(state: dict) -> dict[str, Decimal]:
     out: dict[str, Decimal] = {}
     for row in state.get('assetPositions', []):
@@ -256,7 +264,8 @@ async def _sync_missing_fills(db: AsyncSession, hl: HyperliquidAdapter, user: Us
 
 async def master_snapshot(hl: HyperliquidAdapter) -> tuple[dict[str, Decimal], Decimal, dict[str, str]]:
     snapshot = await hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
-    mids = await hl.mids()
+    observed_at = datetime.now(UTC).timestamp()
+    mids = _ObservedMasterMids(await hl.mids(), observed_at)
     return _positions(snapshot.perp_state), snapshot.account_value, mids
 
 
@@ -303,6 +312,13 @@ async def _reconcile_user_locked(
     if hl.network != network:
         raise RuntimeError(f'Follower adapter {hl.network} does not match user network {network}')
 
+    master_snapshot_observed_at = getattr(master_mids, 'observed_at', None)
+    try:
+        master_snapshot_observed_at = float(master_snapshot_observed_at) if master_snapshot_observed_at is not None else None
+        if master_snapshot_observed_at is not None and master_snapshot_observed_at <= 0:
+            master_snapshot_observed_at = None
+    except (TypeError, ValueError):
+        master_snapshot_observed_at = None
     follower_mids = mids
     source_mids = master_mids or mids
     source_configs = master_configs or {}
@@ -570,6 +586,8 @@ async def _reconcile_user_locked(
                 'ai_execution_factor': str(ai_factor),
                 'ai_target_without_influence': str(base_target),
             }
+            if master_snapshot_observed_at is not None:
+                context['master_snapshot_observed_at'] = master_snapshot_observed_at
             if ambiguity_safe_reduction:
                 context['ambiguity_safe_reduction'] = True
             if master_config is not None:
@@ -622,9 +640,10 @@ async def reconcile_active_users(
 ) -> int:
     source_hl = master_hl or hl
     source_snapshot = await source_hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
+    source_snapshot_observed_at = datetime.now(UTC).timestamp()
     mp = _positions(source_snapshot.perp_state)
     me = source_snapshot.account_value
-    source_mids = await source_hl.mids()
+    source_mids = _ObservedMasterMids(await source_hl.mids(), source_snapshot_observed_at)
     source_configs = position_configs(source_snapshot.perp_state)
     follower_mids = source_mids if source_hl.network == hl.network else await hl.mids()
     query = select(User).join(TradingAccount, TradingAccount.user_id == User.id).where(
