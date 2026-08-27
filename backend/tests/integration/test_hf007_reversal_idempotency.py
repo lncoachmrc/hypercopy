@@ -95,7 +95,12 @@ async def test_reversal_close_and_open_have_independent_idempotency_markers():
                     exchange_oid="hf007-close",
                     filled_size=Decimal("1"),
                     avg_price=Decimal("100"),
-                    response={"hf007": {"ledger_size_before_submit": "1"}},
+                    response={
+                        "hf007": {
+                            "ledger_size_before_submit": "1",
+                            "ledger_last_execution_id_before_submit": None,
+                        }
+                    },
                 ),
                 Execution(
                     id=open_execution_id,
@@ -112,7 +117,12 @@ async def test_reversal_close_and_open_have_independent_idempotency_markers():
                     exchange_oid="hf007-open",
                     filled_size=Decimal("0.5"),
                     avg_price=Decimal("100"),
-                    response={"hf007": {"ledger_size_before_submit": "0"}},
+                    response={
+                        "hf007": {
+                            "ledger_size_before_submit": "0",
+                            "ledger_last_execution_id_before_submit": str(close_execution_id),
+                        }
+                    },
                 ),
             ]
         )

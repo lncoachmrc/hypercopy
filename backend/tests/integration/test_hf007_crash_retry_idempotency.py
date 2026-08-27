@@ -2,6 +2,7 @@
 
 import os
 import uuid
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -58,11 +59,16 @@ def _leg(*, current: str = "0", order_size: str = "1") -> SizingResult:
     )
 
 
-async def _seed_case(*, ledger_size: Decimal = Decimal("0")) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+async def _seed_case(
+    *,
+    ledger_size: Decimal = Decimal("0"),
+    exchange_verified_after_execution: bool = False,
+) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
     user_id = uuid.uuid4()
     job_id = uuid.uuid4()
     execution_id = uuid.uuid4()
     wallet = "0x" + uuid.uuid4().hex + "00000000"
+    resolved_at = datetime.now(UTC)
 
     async with SessionLocal() as db:
         db.add(
@@ -106,9 +112,13 @@ async def _seed_case(*, ledger_size: Decimal = Decimal("0")) -> tuple[uuid.UUID,
                 exchange_oid="hf007-oid",
                 filled_size=Decimal("0.4"),
                 avg_price=Decimal("100"),
+                resolved_at=resolved_at,
                 response={
                     "status": "ok",
-                    "hf007": {"ledger_size_before_submit": "0"},
+                    "hf007": {
+                        "ledger_size_before_submit": "0",
+                        "ledger_last_execution_id_before_submit": None,
+                    },
                 },
             )
         )
@@ -120,6 +130,11 @@ async def _seed_case(*, ledger_size: Decimal = Decimal("0")) -> tuple[uuid.UUID,
                 target_size=Decimal("1"),
                 mark_price=Decimal("100"),
                 managed=True,
+                exchange_verified_at=(
+                    resolved_at + timedelta(seconds=1)
+                    if exchange_verified_after_execution
+                    else None
+                ),
             )
         )
         await db.commit()
@@ -194,6 +209,7 @@ async def test_crash_after_fill_application_does_not_apply_same_execution_twice(
             Decimal("100"),
             50,
             "o",
+            ledger.last_execution_id,
         )
         assert rediscovered.state == "FILLED"
         assert rediscovered.filled_size == Decimal("0.4")
@@ -212,7 +228,10 @@ async def test_crash_after_fill_application_does_not_apply_same_execution_twice(
 
 @pytest.mark.asyncio
 async def test_exchange_snapshot_that_already_reflects_fill_is_not_incremented_again():
-    user_id, job_id, execution_id = await _seed_case(ledger_size=Decimal("0.4"))
+    user_id, job_id, execution_id = await _seed_case(
+        ledger_size=Decimal("0.4"),
+        exchange_verified_after_execution=True,
+    )
     outcome = OrderOutcome(
         "FILLED",
         "hf007-oid",
@@ -223,7 +242,7 @@ async def test_exchange_snapshot_that_already_reflects_fill_is_not_incremented_a
 
     # This models a crash after the exchange fill but before local delta
     # application, followed by reconciliation/observability refreshing the
-    # ledger from authoritative exchange truth before the job is retried.
+    # ledger from authoritative exchange truth after the fill was resolved.
     async with SessionLocal() as db:
         job = await db.get(CopyJob, job_id)
         ledger = (
@@ -240,7 +259,92 @@ async def test_exchange_snapshot_that_already_reflects_fill_is_not_incremented_a
         execution = await db.get(Execution, execution_id)
         assert ledger.size == Decimal("0.4")
         assert (execution.response or {}).get("hf007", {}).get("ledger_applied_at")
-        assert (execution.response or {}).get("hf007", {}).get("ledger_apply_mode") == "already_reflected"
+        assert (
+            (execution.response or {}).get("hf007", {}).get("ledger_apply_mode")
+            == "already_reflected_exchange_verified"
+        )
+
+
+@pytest.mark.parametrize("colliding_size", [Decimal("0.4"), Decimal("0")])
+@pytest.mark.asyncio
+async def test_other_execution_cannot_impersonate_fill_by_matching_numeric_ledger_state(colliding_size):
+    user_id, job_id, execution_id = await _seed_case(ledger_size=colliding_size)
+    other_job_id = uuid.uuid4()
+    other_execution_id = uuid.uuid4()
+
+    # Another job can run after the crashed worker releases the advisory lock.
+    # Even if it happens to move the ledger to A's expected pre- or post-fill
+    # numeric value, last_execution_id proves that A is not the source.
+    async with SessionLocal() as db:
+        db.add(
+            CopyJob(
+                id=other_job_id,
+                user_id=user_id,
+                asset="BTC",
+                origin="EVENT",
+                state=JobState.DONE,
+                attempt_count=1,
+                correlation_id=uuid.uuid4().hex,
+                context={"follower_network": "testnet"},
+            )
+        )
+        await db.flush()
+        db.add(
+            Execution(
+                id=other_execution_id,
+                copy_job_id=other_job_id,
+                user_id=user_id,
+                attempt_kind="o",
+                cloid="0x" + uuid.uuid4().hex,
+                state=ExecutionState.FILLED,
+                asset="BTC",
+                is_buy=True,
+                requested_size=Decimal("0.4"),
+                reduce_only=False,
+                limit_px=Decimal("100"),
+                exchange_oid="hf007-other-oid",
+                filled_size=Decimal("0.4"),
+                avg_price=Decimal("100"),
+                resolved_at=datetime.now(UTC),
+                response={"status": "ok"},
+            )
+        )
+        await db.flush()
+        ledger = (
+            await db.execute(
+                select(PositionLedger).where(
+                    PositionLedger.user_id == user_id,
+                    PositionLedger.asset == "BTC",
+                )
+            )
+        ).scalar_one()
+        ledger.last_execution_id = other_execution_id
+        await db.commit()
+
+    async with SessionLocal() as db:
+        job = await db.get(CopyJob, job_id)
+        ledger = (
+            await db.execute(
+                select(PositionLedger).where(
+                    PositionLedger.user_id == user_id,
+                    PositionLedger.asset == "BTC",
+                )
+            )
+        ).scalar_one()
+        with pytest.raises(LedgerApplicationDeferred, match="attribution changed"):
+            await _apply_fill_to_ledger(
+                db,
+                ledger,
+                job,
+                "o",
+                _leg(),
+                OrderOutcome("FILLED", "hf007-oid", Decimal("0.4"), Decimal("100")),
+            )
+        await db.refresh(ledger)
+        execution = await db.get(Execution, execution_id)
+        assert ledger.size == colliding_size
+        assert ledger.last_execution_id == other_execution_id
+        assert not (execution.response or {}).get("hf007", {}).get("ledger_applied_at")
 
 
 @pytest.mark.asyncio

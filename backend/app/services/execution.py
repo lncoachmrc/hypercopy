@@ -417,7 +417,10 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
 
         primary = decision.plan
         primary_kind = 'c' if primary.intent.value == 'reverse' else 'o'
-        outcome = await _execute_leg(db, hl, job, user.id, account.account_address, private_key, primary, follower_mark, risk.max_slippage_bps, primary_kind)
+        outcome = await _execute_leg(
+            db, hl, job, user.id, account.account_address, private_key, primary,
+            follower_mark, risk.max_slippage_bps, primary_kind, ledger.last_execution_id,
+        )
         if outcome.state != 'FILLED':
             if outcome.state == 'UNKNOWN':
                 return await _retry_or_dead(db, job, outcome.reason or 'Ambiguous execution', ambiguous=True)
@@ -460,7 +463,10 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
                 )
                 return await _finish(db, job, JobState.SKIPPED, reason)
         if primary.secondary:
-            outcome2 = await _execute_leg(db, hl, job, user.id, account.account_address, private_key, primary.secondary, follower_mark, risk.max_slippage_bps, 'o')
+            outcome2 = await _execute_leg(
+                db, hl, job, user.id, account.account_address, private_key, primary.secondary,
+                follower_mark, risk.max_slippage_bps, 'o', ledger.last_execution_id,
+            )
             if outcome2.state != 'FILLED':
                 if outcome2.state == 'UNKNOWN':
                     return await _retry_or_dead(db, job, outcome2.reason or 'Ambiguous reversal open', ambiguous=True)
@@ -488,7 +494,19 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
         private_key = ''
 
 
-async def _execute_leg(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob, user_id, account_address: str, private_key: str, leg: SizingResult, mark: Decimal, slippage_bps: int, kind: str) -> OrderOutcome:
+async def _execute_leg(
+    db: AsyncSession,
+    hl: HyperliquidAdapter,
+    job: CopyJob,
+    user_id,
+    account_address: str,
+    private_key: str,
+    leg: SizingResult,
+    mark: Decimal,
+    slippage_bps: int,
+    kind: str,
+    ledger_last_execution_id_before_submit: uuid.UUID | None = None,
+) -> OrderOutcome:
     cloid = deterministic_cloid(str(job.id), kind)
     existing = (await db.execute(select(Execution).where(Execution.copy_job_id == job.id, Execution.attempt_kind == kind))).scalar_one_or_none()
     if existing:
@@ -517,6 +535,11 @@ async def _execute_leg(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob, u
         response={
             'hf007': {
                 'ledger_size_before_submit': str(_persisted_ledger_decimal(leg.current_size)),
+                'ledger_last_execution_id_before_submit': (
+                    str(ledger_last_execution_id_before_submit)
+                    if ledger_last_execution_id_before_submit is not None
+                    else None
+                ),
             }
         },
     )
@@ -593,9 +616,9 @@ async def _apply_fill_to_ledger(
     """Apply one durable Execution fill to the ledger at most once.
 
     The exchange outcome is persisted before this function runs. The pre-submit
-    ledger position is journaled in Execution.response before the signed action.
-    Ledger mutation and the per-Execution applied marker are committed together,
-    making a crash after this commit safe to replay.
+    ledger position and last applied Execution are journaled before the signed
+    action. Ledger mutation and the per-Execution applied marker are committed
+    together, making a crash after this commit safe to replay.
     """
 
     execution = (
@@ -622,7 +645,7 @@ async def _apply_fill_to_ledger(
         if ledger.last_execution_id == execution.id:
             hf007.update({
                 'ledger_applied_at': datetime.now(UTC).isoformat(),
-                'ledger_apply_mode': 'already_reflected',
+                'ledger_apply_mode': 'already_reflected_execution',
                 'ledger_size_after': str(_persisted_ledger_decimal(ledger.size)),
                 'legacy_metadata': True,
             })
@@ -640,8 +663,25 @@ async def _apply_fill_to_ledger(
         await db.commit()
         raise LedgerApplicationDeferred('legacy execution lacks pre-submit ledger evidence')
 
+    if 'ledger_last_execution_id_before_submit' not in hf007:
+        hf007.update({
+            'ledger_apply_deferred_at': datetime.now(UTC).isoformat(),
+            'ledger_apply_deferred_reason': 'execution lacks pre-submit ledger attribution',
+            'ledger_observed': str(_persisted_ledger_decimal(ledger.size)),
+        })
+        response['hf007'] = hf007
+        execution.response = response
+        await db.commit()
+        raise LedgerApplicationDeferred('execution lacks pre-submit ledger attribution')
+
     try:
         expected_before = _persisted_ledger_decimal(Decimal(str(before_raw)))
+        before_execution_raw = hf007.get('ledger_last_execution_id_before_submit')
+        expected_last_execution_id = (
+            uuid.UUID(str(before_execution_raw))
+            if before_execution_raw not in (None, '')
+            else None
+        )
     except Exception as exc:
         raise LedgerApplicationDeferred('invalid pre-submit ledger evidence') from exc
 
@@ -651,28 +691,51 @@ async def _apply_fill_to_ledger(
     signed = filled if execution.is_buy else -filled
     expected_after = _persisted_ledger_decimal(expected_before + signed)
     observed = _persisted_ledger_decimal(ledger.size)
+    exchange_verified_after_resolution = bool(
+        execution.resolved_at is not None
+        and ledger.exchange_verified_at is not None
+        and ledger.exchange_verified_at >= execution.resolved_at
+    )
 
     applied = False
-    if observed == expected_before:
-        ledger.size = expected_after
-        applied = True
-        mode = 'applied'
-    elif observed == expected_after or ledger.last_execution_id == execution.id:
-        mode = 'already_reflected'
-    else:
+    if ledger.last_execution_id == execution.id:
+        mode = 'already_reflected_execution'
+    elif exchange_verified_after_resolution and observed in {expected_before, expected_after}:
+        mode = 'already_reflected_exchange_verified'
+    elif ledger.last_execution_id != expected_last_execution_id:
         hf007.update({
             'ledger_apply_deferred_at': datetime.now(UTC).isoformat(),
-            'ledger_apply_deferred_reason': 'ledger moved outside expected pre/post fill states',
+            'ledger_apply_deferred_reason': 'ledger attribution changed since submit',
             'ledger_observed': str(observed),
             'ledger_expected_before': str(expected_before),
             'ledger_expected_after': str(expected_after),
+            'ledger_last_execution_id': str(ledger.last_execution_id) if ledger.last_execution_id else None,
+            'ledger_last_execution_id_before_submit': (
+                str(expected_last_execution_id) if expected_last_execution_id else None
+            ),
         })
         response['hf007'] = hf007
         execution.response = response
         await db.commit()
-        raise LedgerApplicationDeferred(
-            f'ledger {observed} is neither expected pre-fill {expected_before} nor post-fill {expected_after}'
-        )
+        raise LedgerApplicationDeferred('ledger attribution changed since submit')
+    elif observed == expected_before:
+        ledger.size = expected_after
+        applied = True
+        mode = 'applied'
+    else:
+        hf007.update({
+            'ledger_apply_deferred_at': datetime.now(UTC).isoformat(),
+            'ledger_apply_deferred_reason': 'ledger state is not durably attributable to this fill',
+            'ledger_observed': str(observed),
+            'ledger_expected_before': str(expected_before),
+            'ledger_expected_after': str(expected_after),
+            'exchange_verified_at': ledger.exchange_verified_at.isoformat() if ledger.exchange_verified_at else None,
+            'execution_resolved_at': execution.resolved_at.isoformat() if execution.resolved_at else None,
+        })
+        response['hf007'] = hf007
+        execution.response = response
+        await db.commit()
+        raise LedgerApplicationDeferred('ledger state is not durably attributable to this fill')
 
     if execution.avg_price is not None:
         ledger.mark_price = execution.avg_price
@@ -683,6 +746,8 @@ async def _apply_fill_to_ledger(
         'ledger_signed_fill': str(signed),
         'ledger_size_before': str(expected_before),
         'ledger_size_after': str(expected_after),
+        'exchange_verified_at': ledger.exchange_verified_at.isoformat() if ledger.exchange_verified_at else None,
+        'execution_resolved_at': execution.resolved_at.isoformat() if execution.resolved_at else None,
     })
     response['hf007'] = hf007
     execution.response = response
