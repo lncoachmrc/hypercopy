@@ -6,6 +6,7 @@ from decimal import Decimal
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 
 from app.adapters.hyperliquid import OrderOutcome
 from app.db.position_ledger_lock import position_ledger_lock_engine
@@ -66,6 +67,10 @@ async def _seed_case(*, ledger_size: Decimal = Decimal("0")) -> tuple[uuid.UUID,
                 state=UserState.SUSPENDED,
             )
         )
+        # These models do not have ORM relationships that let SQLAlchemy infer
+        # the insert order from pending objects, so flush the FK parents exactly
+        # as the production database requires.
+        await db.flush()
         db.add(
             CopyJob(
                 id=job_id,
@@ -79,6 +84,7 @@ async def _seed_case(*, ledger_size: Decimal = Decimal("0")) -> tuple[uuid.UUID,
                 context={"follower_network": "testnet"},
             )
         )
+        await db.flush()
         db.add(
             Execution(
                 id=execution_id,
@@ -134,7 +140,7 @@ async def test_crash_after_fill_application_does_not_apply_same_execution_twice(
         job = await db.get(CopyJob, job_id)
         ledger = (
             await db.execute(
-                __import__("sqlalchemy").select(PositionLedger).where(
+                select(PositionLedger).where(
                     PositionLedger.user_id == user_id,
                     PositionLedger.asset == "BTC",
                 )
@@ -161,7 +167,7 @@ async def test_crash_after_fill_application_does_not_apply_same_execution_twice(
         job = await db.get(CopyJob, job_id)
         ledger = (
             await db.execute(
-                __import__("sqlalchemy").select(PositionLedger).where(
+                select(PositionLedger).where(
                     PositionLedger.user_id == user_id,
                     PositionLedger.asset == "BTC",
                 )
@@ -198,7 +204,7 @@ async def test_exchange_snapshot_that_already_reflects_fill_is_not_incremented_a
         job = await db.get(CopyJob, job_id)
         ledger = (
             await db.execute(
-                __import__("sqlalchemy").select(PositionLedger).where(
+                select(PositionLedger).where(
                     PositionLedger.user_id == user_id,
                     PositionLedger.asset == "BTC",
                 )
