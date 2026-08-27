@@ -13,7 +13,8 @@ from app.adapters.hyperliquid import HyperliquidAdapter, PositionConfig, fill_ev
 from app.adapters.ratelimit import Priority
 from app.core.config import settings
 from app.db.position_ledger_lock import position_ledger_lock
-from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, FollowerState, MasterExposure, compute_target
+from app.engine.risk import RiskAction, RiskContext, evaluate
+from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, FollowerState, MasterExposure, compute_target, plan, round_size
 from app.models.entities import CopyJob, CopyState, EquitySnapshot, Execution, ExecutionState, Fill, JobState, PositionLedger, ReconciliationRun, RiskHalt, RiskProfile, RiskState, TradingAccount, User, UserState
 from app.services.ai_mode import read_ai_execution_policy
 from app.services.audit import audit
@@ -60,6 +61,68 @@ def _safe_ambiguity_reduction(real: Decimal, desired_target: Decimal) -> bool:
     return desired_target == 0 or real * desired_target > 0
 
 
+def _risk_limited_submitted_size(
+    *,
+    user_id,
+    asset: str,
+    master_pos: Decimal,
+    master_mark: Decimal,
+    master_equity: Decimal,
+    follower_equity: Decimal,
+    unmanaged_margin: Decimal,
+    real: Decimal,
+    multiplier: Decimal,
+    follower_mark: Decimal,
+    free_margin: Decimal,
+    risk: RiskProfile,
+    risk_state: RiskState | None,
+    allowed_asset: bool,
+    current_total_exposure: Decimal,
+    current_open_positions: int,
+    spec,
+) -> Decimal | None:
+    """Preview the size the execution Risk Engine would actually submit."""
+    if master_equity <= 0 or master_mark <= 0 or follower_mark <= 0:
+        return None
+
+    sizing = plan(
+        MasterExposure(asset, master_pos, master_mark, master_equity),
+        FollowerState(str(user_id), follower_equity, unmanaged_margin, real, multiplier),
+        spec,
+        min_notional=risk.min_notional,
+        follower_mark_price=follower_mark,
+    )
+    decision = evaluate(
+        sizing,
+        RiskContext(
+            close_only=risk.close_only,
+            asset_allowed=allowed_asset,
+            drawdown_halt=bool(risk_state and risk_state.state == RiskHalt.DRAWDOWN_HALT),
+            daily_loss_halt=bool(risk_state and risk_state.state == RiskHalt.DAILY_LOSS_HALT),
+            near_liquidation=bool(risk_state and risk_state.near_liquidation),
+            current_total_exposure=current_total_exposure,
+            current_asset_exposure=abs(real) * follower_mark,
+            free_margin=max(free_margin, Decimal(0)),
+            account_equity=max(follower_equity, Decimal(0)),
+            current_leverage=(
+                current_total_exposure / follower_equity
+                if follower_equity > 0
+                else Decimal(999)
+            ),
+            open_positions=current_open_positions,
+            is_new_market=real == 0,
+            max_notional_per_trade=risk.max_notional_per_trade,
+            max_total_exposure=risk.max_total_exposure,
+            max_asset_exposure=risk.max_asset_exposure,
+            max_leverage=min(risk.max_leverage, Decimal(spec.max_leverage)),
+            max_positions=risk.max_positions,
+        ),
+    )
+    if decision.action not in {RiskAction.ALLOW, RiskAction.TRIM} or not decision.plan.actionable:
+        return None
+    return round_size(decision.plan.order_size, spec.sz_decimals)
+
+
 async def _liquidity_backoff_seconds(db: AsyncSession, user_id, asset: str, started_at: datetime) -> int:
     rows = (await db.execute(
         select(Execution).where(
@@ -97,15 +160,15 @@ async def _terminal_action_rejection_blocks_unchanged_intent(
     network: str,
     desired_target: Decimal,
     real: Decimal,
+    submitted_size: Decimal | None,
 ) -> bool:
-    """Honor retry_policy=NONE only while rejection-time intent is unchanged.
+    """Honor retry_policy=NONE only while rejected intent and executable size are unchanged.
 
-    Rejection-time target and observed exchange position are immutable evidence
-    stored in CopyJob.context.last_action_error by the execution path. This must
-    not depend on PositionLedger because observability refreshes can update that
-    mutable ledger before normal reconciliation resumes. Comparisons use the
-    ledger's persisted Numeric(30, 12) precision to avoid false changes caused
-    only by extra Decimal digits in fresh exchange/sizing inputs.
+    Rejection-time target and observed exchange position live in immutable job
+    metadata. The actual submitted size already lives durably on Execution as
+    requested_size, so no additional rejection schema is required. A changed
+    risk cap/headroom releases the fence only when it changes the size that the
+    Risk Engine would submit; missing executable-plan evidence remains fail-closed.
     """
 
     latest = (await db.execute(
@@ -131,9 +194,26 @@ async def _terminal_action_rejection_blocks_unchanged_intent(
         rejected_real = Decimal(str(metadata['rejected_real']))
     except Exception:
         return False
-    return (
+
+    if not (
         _persisted_ledger_decimal(rejected_target) == _persisted_ledger_decimal(desired_target)
         and _persisted_ledger_decimal(rejected_real) == _persisted_ledger_decimal(real)
+    ):
+        return False
+
+    rejected_execution = (await db.execute(
+        select(Execution).where(
+            Execution.copy_job_id == latest.id,
+            Execution.state.in_([ExecutionState.REJECTED, ExecutionState.CANCELED]),
+        ).order_by(Execution.created_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    if rejected_execution is None or rejected_execution.requested_size is None:
+        return True
+    if submitted_size is None:
+        return True
+    return (
+        _persisted_ledger_decimal(rejected_execution.requested_size)
+        == _persisted_ledger_decimal(submitted_size)
     )
 
 
@@ -324,6 +404,20 @@ async def _reconcile_user_locked(
         liquidity_backoffs = []
         multiplier = risk.multiplier if risk else Decimal(1)
         min_notional = max(risk.min_notional if risk else EXCHANGE_MIN_NOTIONAL, EXCHANGE_MIN_NOTIONAL)
+        managed_assets = {x.asset for x in ledger_rows if x.managed} | {
+            name for name, size in master_positions.items() if size != 0
+        }
+        current_total_exposure = sum(
+            (
+                abs(real_positions.get(name, Decimal(0)))
+                * max(Decimal(str(follower_mids.get(name, '0') or '0')), Decimal(0))
+                for name in managed_assets
+            ),
+            Decimal(0),
+        )
+        current_open_positions = len([
+            name for name in managed_assets if real_positions.get(name, Decimal(0)) != 0
+        ])
 
         for asset in assets:
             real = real_positions.get(asset, Decimal(0))
@@ -380,6 +474,7 @@ async def _reconcile_user_locked(
             desired_leverage = None
             desired_is_cross = None
             leverage_mismatch = False
+            spec = None
             if user.copy_state == CopyState.ACTIVE and master_pos != 0 and master_config and risk and allowed_asset:
                 try:
                     spec = await hl.asset_spec(asset)
@@ -414,6 +509,33 @@ async def _reconcile_user_locked(
             if pending:
                 continue
 
+            submitted_size = None
+            if drift_notional >= min_notional and risk:
+                try:
+                    if spec is None:
+                        spec = await hl.asset_spec(asset)
+                    submitted_size = _risk_limited_submitted_size(
+                        user_id=user.id,
+                        asset=asset,
+                        master_pos=master_pos * ai_factor,
+                        master_mark=master_mark,
+                        master_equity=master_equity,
+                        follower_equity=equity,
+                        unmanaged_margin=unmanaged_margin,
+                        real=real,
+                        multiplier=multiplier,
+                        follower_mark=follower_mark,
+                        free_margin=free_margin,
+                        risk=risk,
+                        risk_state=risk_state,
+                        allowed_asset=allowed_asset,
+                        current_total_exposure=current_total_exposure,
+                        current_open_positions=current_open_positions,
+                        spec=spec,
+                    )
+                except Exception:
+                    submitted_size = None
+
             if drift_notional >= min_notional and await _terminal_action_rejection_blocks_unchanged_intent(
                 db,
                 user.id,
@@ -422,6 +544,7 @@ async def _reconcile_user_locked(
                 network=network,
                 desired_target=desired_target,
                 real=real,
+                submitted_size=submitted_size,
             ):
                 continue
 
