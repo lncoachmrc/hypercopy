@@ -102,7 +102,13 @@ async def repair_stream(redis: Redis, db: AsyncSession, limit: int = 500) -> int
         await publish_job(redis, db, job)
         if reconcile_job_repairs_missing_leverage(job):
             try:
-                await record_master_leverage_repaired(redis, job.user_id, job.asset)
+                evidence_created_at = job.created_at.timestamp() if job.created_at is not None else None
+                await record_master_leverage_repaired(
+                    redis,
+                    job.user_id,
+                    job.asset,
+                    evidence_created_at=evidence_created_at,
+                )
             except Exception:
                 # Recovery telemetry must never prevent a durable correction
                 # from reaching the execution stream.
