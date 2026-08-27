@@ -102,7 +102,11 @@ async def test_signed_call_holds_lock_until_inflight_action_finishes_after_cance
     monkeypatch.setattr(adapter, "_call", fake_call)
 
     task = asyncio.create_task(
-        adapter._signed_call("0x" + "11" * 20, lambda: {"status": "ok"})
+        adapter._signed_call(
+            "0x" + "22" * 20,
+            "0x" + "11" * 20,
+            lambda: {"status": "ok"},
+        )
     )
     await asyncio.wait_for(entered.wait(), timeout=1)
     await asyncio.wait_for(call_started.wait(), timeout=1)
