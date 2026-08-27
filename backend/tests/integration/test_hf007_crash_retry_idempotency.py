@@ -21,7 +21,12 @@ from app.models.entities import (
     User,
     UserState,
 )
-from app.services.execution import _apply_fill_to_ledger
+from app.services.execution import (
+    LedgerApplicationDeferred,
+    _apply_fill_to_ledger,
+    _execute_leg,
+    claim_job,
+)
 
 pytestmark = pytest.mark.skipif(
     os.getenv("RUN_INTEGRATION") != "1",
@@ -154,17 +159,21 @@ async def test_crash_after_fill_application_does_not_apply_same_execution_twice(
         assert ledger.last_execution_id == execution_id
         assert (execution.response or {}).get("hf007", {}).get("ledger_applied_at")
 
-        # Simulate the lease recovery path after the process dies before DONE.
+        # Simulate lease recovery after the process dies before job finalization.
         job.state = JobState.RETRYING
         job.owner = None
         job.locked_until = None
         await db.commit()
 
-    # A restarted worker can rediscover the terminal Execution. Even if its
-    # freshly recomputed plan is now the 0.6 residual, the already-accounted
-    # 0.4 fill must not be added again.
+    # The restarted worker claims the same durable job. `_execute_leg` must
+    # rediscover the terminal Execution instead of submitting the CLOID again,
+    # and fill application must be a no-op even though sizing would now see a
+    # 0.600 residual.
     async with SessionLocal() as db:
-        job = await db.get(CopyJob, job_id)
+        job = await claim_job(db, "hf007-restarted-worker", job_id)
+        assert job is not None
+        assert job.state == JobState.PROCESSING
+        assert job.attempt_count == 2
         ledger = (
             await db.execute(
                 select(PositionLedger).where(
@@ -173,13 +182,28 @@ async def test_crash_after_fill_application_does_not_apply_same_execution_twice(
                 )
             )
         ).scalar_one()
+        residual = _leg(current="0.4", order_size="0.6")
+        rediscovered = await _execute_leg(
+            db,
+            object(),  # terminal Execution means no exchange adapter method is called
+            job,
+            user_id,
+            "0x" + "1" * 40,
+            "test-only-key-never-used",
+            residual,
+            Decimal("100"),
+            50,
+            "o",
+        )
+        assert rediscovered.state == "FILLED"
+        assert rediscovered.filled_size == Decimal("0.4")
         applied = await _apply_fill_to_ledger(
             db,
             ledger,
             job,
             "o",
-            _leg(current="0.4", order_size="0.6"),
-            outcome,
+            residual,
+            rediscovered,
         )
         assert applied is False
         await db.refresh(ledger)
@@ -217,3 +241,60 @@ async def test_exchange_snapshot_that_already_reflects_fill_is_not_incremented_a
         assert ledger.size == Decimal("0.4")
         assert (execution.response or {}).get("hf007", {}).get("ledger_applied_at")
         assert (execution.response or {}).get("hf007", {}).get("ledger_apply_mode") == "already_reflected"
+
+
+@pytest.mark.asyncio
+async def test_legacy_execution_without_pre_submit_evidence_fails_closed():
+    user_id, job_id, execution_id = await _seed_case()
+    async with SessionLocal() as db:
+        execution = await db.get(Execution, execution_id)
+        execution.response = {"status": "ok"}
+        await db.commit()
+
+    async with SessionLocal() as db:
+        job = await db.get(CopyJob, job_id)
+        ledger = (
+            await db.execute(
+                select(PositionLedger).where(
+                    PositionLedger.user_id == user_id,
+                    PositionLedger.asset == "BTC",
+                )
+            )
+        ).scalar_one()
+        with pytest.raises(LedgerApplicationDeferred):
+            await _apply_fill_to_ledger(
+                db,
+                ledger,
+                job,
+                "o",
+                _leg(),
+                OrderOutcome("FILLED", "hf007-oid", Decimal("0.4"), Decimal("100")),
+            )
+        await db.refresh(ledger)
+        assert ledger.size == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_unexpected_ledger_position_fails_closed_instead_of_adding_fill():
+    user_id, job_id, _ = await _seed_case(ledger_size=Decimal("0.2"))
+    async with SessionLocal() as db:
+        job = await db.get(CopyJob, job_id)
+        ledger = (
+            await db.execute(
+                select(PositionLedger).where(
+                    PositionLedger.user_id == user_id,
+                    PositionLedger.asset == "BTC",
+                )
+            )
+        ).scalar_one()
+        with pytest.raises(LedgerApplicationDeferred):
+            await _apply_fill_to_ledger(
+                db,
+                ledger,
+                job,
+                "o",
+                _leg(),
+                OrderOutcome("FILLED", "hf007-oid", Decimal("0.4"), Decimal("100")),
+            )
+        await db.refresh(ledger)
+        assert ledger.size == Decimal("0.2")
