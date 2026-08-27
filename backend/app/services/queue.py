@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -30,31 +29,42 @@ async def publish_job(redis: Redis, db: AsyncSession, job: CopyJob) -> None:
     await db.flush()
 
 
+def _parsed_master_leverage(ctx: dict) -> int | None:
+    raw = ctx.get('master_leverage')
+    if raw in (None, ''):
+        return None
+    try:
+        return max(1, int(Decimal(str(raw))))
+    except Exception:
+        return None
+
+
 def reconcile_job_repairs_missing_leverage(job: CopyJob) -> bool:
     if job.origin != 'RECONCILE':
         return False
     ctx = job.context or {}
-    if ctx.get('master_leverage') is not None:
-        return True
     try:
-        return Decimal(str(ctx.get('master_position', '0') or '0')) == 0
+        master_position = Decimal(str(ctx.get('master_position', '0') or '0'))
     except Exception:
         return False
+    if master_position == 0:
+        return True
+    return _parsed_master_leverage(ctx) is not None
 
 
-def reconcile_job_repair_evidence(job: CopyJob) -> float | None:
-    """Return only authoritative master-snapshot evidence for a repair job."""
+def reconcile_job_repair_evidence(job: CopyJob) -> int | None:
+    """Return only conservative shared-order evidence for a repair job."""
 
     if not reconcile_job_repairs_missing_leverage(job):
         return None
-    raw = (job.context or {}).get('master_snapshot_observed_at')
+    raw = (job.context or {}).get('master_snapshot_started_order')
     try:
-        observed_at = float(raw)
-    except (TypeError, ValueError):
+        value = Decimal(str(raw))
+    except Exception:
         return None
-    if not math.isfinite(observed_at) or observed_at <= 0:
+    if not value.is_finite() or value <= 0 or value != value.to_integral_value():
         return None
-    return observed_at
+    return int(value)
 
 
 def stale_enqueue_cutoff(now: datetime | None = None) -> datetime:
@@ -116,14 +126,14 @@ async def repair_stream(redis: Redis, db: AsyncSession, limit: int = 500) -> int
     count = 0
     for job in rows:
         await publish_job(redis, db, job)
-        evidence_observed_at = reconcile_job_repair_evidence(job)
-        if evidence_observed_at is not None:
+        evidence_order = reconcile_job_repair_evidence(job)
+        if evidence_order is not None:
             try:
                 await record_master_leverage_repaired(
                     redis,
                     job.user_id,
                     job.asset,
-                    evidence_created_at=evidence_observed_at,
+                    evidence_order=evidence_order,
                 )
             except Exception:
                 # Recovery telemetry must never prevent a durable correction
