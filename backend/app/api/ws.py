@@ -4,6 +4,7 @@ import asyncio
 import uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.exceptions import HTTPException
 
 from app.core.config import settings
 from app.core.origins import is_allowed_browser_origin
@@ -18,7 +19,7 @@ router=APIRouter(tags=['realtime'])
 @router.websocket('/ws/events')
 async def events(ws: WebSocket):
     if not is_allowed_browser_origin(ws.headers.get('origin'), settings.PUBLIC_APP_URL):
-        await ws.close(code=4403); return
+        raise HTTPException(status_code=403, detail='WebSocket origin not allowed')
     token=ws.cookies.get(settings.SESSION_COOKIE_NAME)
     if not token:
         await ws.close(code=4401); return
