@@ -89,5 +89,8 @@ async def metrics(request:Request):
         lines.append(f'hypercopy_redis_used_memory_bytes {info.get("used_memory",0)}')
         lines.append(f'hypercopy_ws_reconnect_count {int(await rc.get("hypercopy:metrics:ws_reconnect_count") or 0)}')
         lines.append(f'hypercopy_hl_429_count {int(await rc.get("hypercopy:metrics:hl_429_count") or 0)}')
+        lines.append(f'hypercopy_hl_address_action_attempt_count {int(await rc.get("hypercopy:metrics:hl_address_action_attempt_count") or 0)}')
+        lines.append(f'hypercopy_hl_address_throttle_count {int(await rc.get("hypercopy:metrics:hl_address_throttle_count") or 0)}')
+        lines.append(f'hypercopy_hl_address_backoff_wait_count {int(await rc.get("hypercopy:metrics:hl_address_backoff_wait_count") or 0)}')
     except Exception: pass
     return PlainTextResponse('\n'.join(lines)+'\n',media_type='text/plain; version=0.0.4')
