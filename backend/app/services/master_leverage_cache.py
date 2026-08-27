@@ -14,6 +14,19 @@ from app.core.config import settings
 _CACHE_PREFIX = 'hypercopy:master-leverage-cache'
 _METRIC_PREFIX = 'hypercopy:metrics:'
 _MISSING_PREFIX = 'hypercopy:master-leverage-missing'
+_ATOMIC_REPAIR_SCRIPT = """
+local current = redis.call('ZSCORE', KEYS[1], ARGV[1])
+if not current then
+  return false
+end
+if tonumber(ARGV[2]) < tonumber(current) then
+  return false
+end
+if redis.call('ZREM', KEYS[1], ARGV[1]) == 0 then
+  return false
+end
+return current
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,22 +167,28 @@ async def record_master_leverage_repaired(
     evidence_created_at: float | None = None,
     now: float | None = None,
 ) -> float | None:
-    """Resolve a blocked intent only after newer reconciliation evidence exists."""
+    """Atomically resolve only the newest intent covered by reconciliation.
 
+    The compare and remove happen in one Redis Lua execution. A concurrent
+    newer blocked intent therefore cannot be deleted between a separate ZSCORE
+    and ZREM; stale reconciliation evidence simply leaves the marker active.
+    """
+
+    if evidence_created_at is None:
+        return None
     current = time.time() if now is None else now
     member = _missing_member(user_id, asset)
-    raw_started = await redis.zscore(_missing_index_key(), member)
-    if raw_started is None:
+    raw_started = await redis.eval(
+        _ATOMIC_REPAIR_SCRIPT,
+        1,
+        _missing_index_key(),
+        member,
+        f'{float(evidence_created_at):.6f}',
+    )
+    if raw_started in (None, False):
         return None
-    started_at = float(raw_started)
-
-    if evidence_created_at is None or evidence_created_at < started_at:
-        return None
-
+    started_at = float(_decode(raw_started))
     duration = max(current - started_at, 0.0)
-    removed = await redis.zrem(_missing_index_key(), member)
-    if not removed:
-        return None
     await redis.incr(_metric_key('master_leverage_recovery_count'))
     await redis.set(_metric_key('master_leverage_recovery_last_seconds'), f'{duration:.6f}')
 
