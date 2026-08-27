@@ -107,18 +107,19 @@ class AddressActionTracker:
     def _backoff_key(self, address: str) -> str:
         return f"{self._state_key(address)}:backoff"
 
-    async def wait_if_backed_off(self, address: str) -> int:
+    async def wait_if_backed_off(self, address: str) -> float:
         """Honor an observed address throttle, including cross-process extensions."""
 
-        waited = 0
+        waited = 0.0
         backoff_key = self._backoff_key(address)
         while True:
-            ttl = int(await self._redis.ttl(backoff_key) or 0)
-            if ttl <= 0:
+            remaining_ms = int(await self._redis.pttl(backoff_key) or 0)
+            if remaining_ms <= 0:
                 return waited
             await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_backoff_wait_count")
-            await asyncio.sleep(ttl)
-            waited += ttl
+            sleep_seconds = remaining_ms / 1000
+            await asyncio.sleep(sleep_seconds)
+            waited += sleep_seconds
 
     async def record_action_attempt(self, address: str) -> None:
         key = self._state_key(address)
