@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from app.api.ws import events
+from app.core.config import settings
 from app.core.origins import (
     TRAXION_PUBLIC_ORIGIN,
     browser_origins,
@@ -88,7 +89,8 @@ async def test_ws_events_rejects_untrusted_origin_before_auth(origin: str | None
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('origin', [STAGING_ORIGIN, TRAXION_PUBLIC_ORIGIN])
-async def test_ws_events_allowed_origin_preserves_session_auth_guard(origin: str):
+async def test_ws_events_allowed_origin_preserves_session_auth_guard(origin: str, monkeypatch):
+    monkeypatch.setattr(settings, 'PUBLIC_APP_URL', STAGING_ORIGIN)
     ws = _MissingSessionWebSocket(origin)
 
     await events(ws)  # type: ignore[arg-type]
