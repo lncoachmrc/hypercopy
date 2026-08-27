@@ -108,13 +108,17 @@ class AddressActionTracker:
         return f"{self._state_key(address)}:backoff"
 
     async def wait_if_backed_off(self, address: str) -> int:
-        """Honor the exchange's documented one-action-per-10s throttle locally."""
+        """Honor an observed address throttle, including cross-process extensions."""
 
-        ttl = int(await self._redis.ttl(self._backoff_key(address)) or 0)
-        if ttl > 0:
+        waited = 0
+        backoff_key = self._backoff_key(address)
+        while True:
+            ttl = int(await self._redis.ttl(backoff_key) or 0)
+            if ttl <= 0:
+                return waited
             await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_backoff_wait_count")
             await asyncio.sleep(ttl)
-        return max(ttl, 0)
+            waited += ttl
 
     async def record_action_attempt(self, address: str) -> None:
         key = self._state_key(address)
@@ -132,14 +136,20 @@ class AddressActionTracker:
         await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_throttle_count")
 
     async def record_exchange_snapshot(self, address: str, payload: dict[str, Any]) -> None:
-        """Persist only the documented userRateLimit fields plus observation time."""
+        """Persist only documented userRateLimit fields plus observation time."""
+
+        def _numeric(name: str) -> str:
+            value = payload.get(name)
+            if value in (None, ""):
+                return ""
+            return str(int(value))
 
         key = self._state_key(address)
         mapping = {
-            "exchange_cum_volume": str(payload.get("cumVlm", "")),
-            "exchange_requests_used": int(payload.get("nRequestsUsed", 0)),
-            "exchange_requests_cap": int(payload.get("nRequestsCap", 0)),
-            "exchange_requests_surplus": int(payload.get("nRequestsSurplus", 0)),
+            "exchange_cum_volume": str(payload.get("cumVlm") or ""),
+            "exchange_requests_used": _numeric("nRequestsUsed"),
+            "exchange_requests_cap": _numeric("nRequestsCap"),
+            "exchange_requests_surplus": _numeric("nRequestsSurplus"),
             "exchange_snapshot_at_ms": int(time.time() * 1000),
         }
         await self._redis.hset(key, mapping=mapping)
