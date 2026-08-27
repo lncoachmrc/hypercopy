@@ -13,11 +13,13 @@ from app.adapters.hyperliquid import HyperliquidAdapter, PositionConfig, fill_ev
 from app.adapters.ratelimit import Priority
 from app.core.config import settings
 from app.db.position_ledger_lock import position_ledger_lock
+from app.db.redis import redis_client
 from app.engine.risk import RiskAction, RiskContext, evaluate
 from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, FollowerState, MasterExposure, compute_target, plan, round_size
 from app.models.entities import CopyJob, CopyState, EquitySnapshot, Execution, ExecutionState, Fill, JobState, PositionLedger, ReconciliationRun, RiskHalt, RiskProfile, RiskState, TradingAccount, User, UserState
 from app.services.ai_mode import read_ai_execution_policy
 from app.services.audit import audit
+from app.services.master_leverage_cache import next_master_leverage_causal_order
 from app.services.networking import user_network_state
 
 log = __import__('app.core.logging', fromlist=['get_logger']).get_logger(__name__)
@@ -28,11 +30,11 @@ _TERMINAL_AMBIGUITY_JOB_STATES = {JobState.DONE, JobState.SKIPPED, JobState.DEAD
 
 
 class _ObservedMasterMids(dict[str, str]):
-    """Mids mapping carrying the lower-level master snapshot observation time."""
+    """Mids mapping carrying conservative master-snapshot causal evidence."""
 
-    def __init__(self, values: dict[str, str], observed_at: float):
+    def __init__(self, values: dict[str, str], snapshot_started_order: int | None):
         super().__init__(values)
-        self.observed_at = float(observed_at)
+        self.snapshot_started_order = snapshot_started_order
 
 
 def _positions(state: dict) -> dict[str, Decimal]:
@@ -262,10 +264,21 @@ async def _sync_missing_fills(db: AsyncSession, hl: HyperliquidAdapter, user: Us
     return inserted
 
 
+async def _master_snapshot_started_order() -> int | None:
+    try:
+        return await next_master_leverage_causal_order(redis_client())
+    except Exception:
+        log.warning(
+            'Master snapshot causal ordering unavailable; recovery telemetry remains fail-closed',
+            exc_info=True,
+        )
+        return None
+
+
 async def master_snapshot(hl: HyperliquidAdapter) -> tuple[dict[str, Decimal], Decimal, dict[str, str]]:
+    snapshot_started_order = await _master_snapshot_started_order()
     snapshot = await hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
-    observed_at = datetime.now(UTC).timestamp()
-    mids = _ObservedMasterMids(await hl.mids(), observed_at)
+    mids = _ObservedMasterMids(await hl.mids(), snapshot_started_order)
     return _positions(snapshot.perp_state), snapshot.account_value, mids
 
 
@@ -312,13 +325,15 @@ async def _reconcile_user_locked(
     if hl.network != network:
         raise RuntimeError(f'Follower adapter {hl.network} does not match user network {network}')
 
-    master_snapshot_observed_at = getattr(master_mids, 'observed_at', None)
+    master_snapshot_started_order = getattr(master_mids, 'snapshot_started_order', None)
     try:
-        master_snapshot_observed_at = float(master_snapshot_observed_at) if master_snapshot_observed_at is not None else None
-        if master_snapshot_observed_at is not None and master_snapshot_observed_at <= 0:
-            master_snapshot_observed_at = None
-    except (TypeError, ValueError):
-        master_snapshot_observed_at = None
+        raw_order = Decimal(str(master_snapshot_started_order))
+        if not raw_order.is_finite() or raw_order <= 0 or raw_order != raw_order.to_integral_value():
+            master_snapshot_started_order = None
+        else:
+            master_snapshot_started_order = int(raw_order)
+    except Exception:
+        master_snapshot_started_order = None
     follower_mids = mids
     source_mids = master_mids or mids
     source_configs = master_configs or {}
@@ -586,8 +601,9 @@ async def _reconcile_user_locked(
                 'ai_execution_factor': str(ai_factor),
                 'ai_target_without_influence': str(base_target),
             }
-            if master_snapshot_observed_at is not None:
-                context['master_snapshot_observed_at'] = master_snapshot_observed_at
+            if master_snapshot_started_order is not None:
+                context['master_snapshot_started_order'] = master_snapshot_started_order
+                context['master_intent_order'] = master_snapshot_started_order
             if ambiguity_safe_reduction:
                 context['ambiguity_safe_reduction'] = True
             if master_config is not None:
@@ -639,11 +655,11 @@ async def reconcile_active_users(
     master_hl: HyperliquidAdapter | None = None,
 ) -> int:
     source_hl = master_hl or hl
+    source_snapshot_started_order = await _master_snapshot_started_order()
     source_snapshot = await source_hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
-    source_snapshot_observed_at = datetime.now(UTC).timestamp()
     mp = _positions(source_snapshot.perp_state)
     me = source_snapshot.account_value
-    source_mids = _ObservedMasterMids(await source_hl.mids(), source_snapshot_observed_at)
+    source_mids = _ObservedMasterMids(await source_hl.mids(), source_snapshot_started_order)
     source_configs = position_configs(source_snapshot.perp_state)
     follower_mids = source_mids if source_hl.network == hl.network else await hl.mids()
     query = select(User).join(TradingAccount, TradingAccount.user_id == User.id).where(
