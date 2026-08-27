@@ -2,6 +2,7 @@
 
 import os
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
@@ -67,6 +68,10 @@ async def test_done_database_fallback_replays_repair_accounting_without_republis
                 origin='RECONCILE',
                 state=JobState.QUEUED,
                 correlation_id=uuid.uuid4().hex,
+                # The integration database is intentionally shared across the
+                # suite. Put this job clearly ahead of other live test jobs while
+                # keeping it well inside the 600s strategy-expiry boundary.
+                created_at=datetime.now(UTC) - timedelta(seconds=300),
                 context={
                     'master_position': '1',
                     'master_leverage': 5,
