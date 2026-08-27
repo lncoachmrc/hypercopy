@@ -13,6 +13,10 @@ class _Tracker:
         self.events = events
         self.mark_count = 0
 
+    async def wait_for_existing_backoff(self, _address: str) -> float:
+        self.events.append("pre_wait")
+        return 0.0
+
     async def record_action_attempt(self, _address: str) -> None:
         self.events.append("record_attempt")
 
