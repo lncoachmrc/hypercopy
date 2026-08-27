@@ -187,15 +187,14 @@ class HyperliquidAdapter:
             raise
 
     async def _record_exchange_address_throttle(self, account_address: str) -> None:
-        """Capture an authoritative userRateLimit snapshot after a signed throttle."""
+        """Capture authoritative userRateLimit evidence after a definite rejection."""
         if self.address_limits is None:
             return
         try:
             snapshot = await self.user_rate_limit(account_address, priority=Priority.DIAGNOSTIC)
             await self.address_limits.record_exchange_snapshot(account_address, snapshot)
         except Exception:
-            # The throttle may be IP-wide, so the diagnostic read can itself fail.
-            # The local throttle/backoff evidence has already been persisted.
+            # Diagnostic evidence must never alter the already-known action result.
             pass
 
     async def _observe_explicit_address_throttle(self, account_address: str, reason: object) -> None:
@@ -212,37 +211,32 @@ class HyperliquidAdapter:
 
         Address backoff happens before the signer lock, so a throttled user does
         not occupy a database lock while cooling down. The action is still sent
-        only once; any transport ambiguity remains the caller's UNKNOWN path.
+        only once. A transport/HTTP throttle is recorded locally and propagated
+        immediately so the execution layer can persist UNKNOWN without waiting
+        for any secondary diagnostic request.
         """
 
         if self.address_limits is not None:
             await self.address_limits.wait_if_backed_off(account_address)
 
-        exchange_throttled = False
-        try:
-            async with signer_action_lock(signer_address):
-                await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
-                if self.address_limits is not None:
-                    await self.address_limits.record_action_attempt(account_address)
-                call_task = asyncio.create_task(self._call(func, *args))
+        async with signer_action_lock(signer_address):
+            await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
+            if self.address_limits is not None:
+                await self.address_limits.record_action_attempt(account_address)
+            call_task = asyncio.create_task(self._call(func, *args))
+            try:
+                return await asyncio.shield(call_task)
+            except asyncio.CancelledError:
                 try:
-                    return await asyncio.shield(call_task)
-                except asyncio.CancelledError:
-                    try:
-                        await asyncio.shield(call_task)
-                    except Exception as exc:
-                        if self.address_limits is not None and is_exchange_rate_limit_error(exc):
-                            await self.address_limits.mark_throttled(account_address)
-                    raise
+                    await asyncio.shield(call_task)
                 except Exception as exc:
                     if self.address_limits is not None and is_exchange_rate_limit_error(exc):
                         await self.address_limits.mark_throttled(account_address)
-                        exchange_throttled = True
-                    raise
-        except Exception:
-            if exchange_throttled:
-                await self._record_exchange_address_throttle(account_address)
-            raise
+                raise
+            except Exception as exc:
+                if self.address_limits is not None and is_exchange_rate_limit_error(exc):
+                    await self.address_limits.mark_throttled(account_address)
+                raise
 
     async def _acquire(self, weight: int, priority: Priority, timeout: int | float) -> None:
         if self.limiter is None:
