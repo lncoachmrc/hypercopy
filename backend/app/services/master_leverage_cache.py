@@ -143,10 +143,10 @@ async def record_master_leverage_missing(
         nx=True,
         ex=86_400,
     ))
-    await redis.sadd(_missing_index_key(), _missing_member(user_id, asset))
-    await redis.expire(_missing_index_key(), 86_400)
     if created:
         await redis.incr(_metric_key('master_leverage_unavailable_count'))
+    await redis.sadd(_missing_index_key(), _missing_member(user_id, asset))
+    await redis.expire(_missing_index_key(), 86_400)
     return created
 
 
