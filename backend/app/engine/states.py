@@ -48,7 +48,8 @@ def _guard_job_state(_target: CopyJob, value: JobState, oldvalue: JobState, _ini
 
     SQLAlchemy uses ``NO_VALUE`` for a new object's first assignment. ORM row
     population bypasses normal attribute-set events, so loading existing rows is
-    unaffected; only application mutations are guarded.
+    unaffected; active history ensures an expired persistent value is loaded
+    before this listener validates a transition.
     """
     if oldvalue is not NO_VALUE and oldvalue is not None and oldvalue != value:
         assert_job_transition(oldvalue, value)
@@ -71,5 +72,5 @@ def _guard_execution_state(
 # them at the ORM attribute boundary so every normal runtime mutation of these
 # durable state machines is checked, including API, worker, queue and resolver
 # paths, without relying on each caller to remember a separate assertion.
-event.listen(CopyJob.state, 'set', _guard_job_state, retval=True)
-event.listen(Execution.state, 'set', _guard_execution_state, retval=True)
+event.listen(CopyJob.state, 'set', _guard_job_state, retval=True, active_history=True)
+event.listen(Execution.state, 'set', _guard_execution_state, retval=True, active_history=True)
