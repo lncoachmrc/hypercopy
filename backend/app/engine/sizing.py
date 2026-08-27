@@ -121,16 +121,20 @@ def round_size(size: Decimal, sz_decimals: int) -> Decimal:
 
 
 def round_price(price: Decimal, sz_decimals: int) -> Decimal:
-    """Return the nearest Hyperliquid-valid perp price.
+    """Return the nearest strictly-positive Hyperliquid-valid perp price.
 
     Non-integer prices are limited to five significant figures and at most
     ``6 - szDecimals`` decimal places. Hyperliquid explicitly exempts integer
     prices from the significant-figure limit, so compare the ordinary
     significant-figure candidate with the nearest integer and keep whichever
     represents the requested price more closely.
+
+    A positive source price can still quantize to zero at the market's allowed
+    decimal precision. Reject that result locally so a non-positive price can
+    never reach signing or order submission.
     """
     if price <= 0:
-        return price
+        raise ValueError('Hyperliquid price must be positive')
 
     max_places = max(PERP_MAX_PRICE_DECIMALS - sz_decimals, 0)
     place_quantum = Decimal(1).scaleb(-max_places)
@@ -143,9 +147,14 @@ def round_price(price: Decimal, sz_decimals: int) -> Decimal:
     )
 
     integer_candidate = price.quantize(Decimal(1), rounding=ROUND_HALF_UP)
-    if integer_candidate > 0 and abs(price - integer_candidate) < abs(price - sig_candidate):
-        return integer_candidate
-    return sig_candidate
+    rounded = (
+        integer_candidate
+        if integer_candidate > 0 and abs(price - integer_candidate) < abs(price - sig_candidate)
+        else sig_candidate
+    )
+    if rounded <= 0:
+        raise ValueError('Rounded Hyperliquid price must be positive')
+    return rounded
 
 
 def compute_target(
