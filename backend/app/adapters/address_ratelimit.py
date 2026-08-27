@@ -6,8 +6,8 @@ traded volume, so TRAXION must not invent an authoritative client-side cap.
 
 This module therefore does three things only:
 - account locally for signed action attempts per follower account address;
-- impose the documented one-action-per-10-seconds degraded cadence after a
-  definite address-quota rejection;
+- impose the documented one-action-per-10-seconds degraded cadence while the
+  exchange reports an exhausted address quota;
 - persist the latest authoritative ``userRateLimit`` snapshot for diagnostics.
 
 The public follower account address is used as the key. Private keys and Agent
@@ -115,12 +115,13 @@ class AddressActionTracker:
         return f"{self._state_key(address)}:throttled"
 
     async def wait_if_backed_off(self, address: str) -> float:
-        """Atomically reserve the next permitted action slot when throttled.
+        """Atomically reserve the next permitted action slot when quota-exhausted.
 
-        A definite address-quota rejection enables sustained throttled mode. In
-        that mode every process competes for the same Redis ``SET NX PX`` slot,
-        so at most one action can be released per 10-second interval. A transport
-        429, whose source may be IP-wide, installs only a one-shot 10-second delay.
+        When an authoritative ``userRateLimit`` snapshot shows the address quota
+        exhausted, every TRAXION process competes for the same Redis ``SET NX PX``
+        slot. This releases at most one action per 10-second interval. A transport
+        429 without authoritative address evidence installs only a one-shot delay,
+        avoiding permanent per-address throttling for a potentially IP-wide 429.
         """
 
         waited = 0.0
@@ -154,11 +155,13 @@ class AddressActionTracker:
         await self._redis.hset(key, mapping={"last_action_at_ms": now_ms})
         await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_action_attempt_count")
 
-    async def mark_throttled(self, address: str, *, sustained: bool = True) -> None:
-        """Best-effort throttle evidence that can never replace an exchange result.
+    async def mark_throttled(self, address: str) -> None:
+        """Best-effort one-shot throttle evidence that never replaces exchange truth.
 
-        ``sustained=True`` is reserved for a definite action-level address-quota
-        rejection. Ambiguous HTTP/transport throttles use a one-shot delay only.
+        A raw HTTP/transport throttle may be address-based or IP-wide, so this
+        method records a 10-second delay but does not independently assert that
+        the address quota is exhausted. Sustained mode is enabled only by an
+        authoritative ``userRateLimit`` snapshot in ``record_exchange_snapshot``.
         Redis is observability/control-plane state here: once Hyperliquid has
         returned a definite rejection, a Redis failure must not turn it into an
         ambiguous execution result.
@@ -172,8 +175,6 @@ class AddressActionTracker:
                 "1",
                 px=ADDRESS_BACKOFF_SECONDS * 1000,
             )
-            if sustained:
-                await self._redis.set(self._mode_key(address), "1")
             await self._redis.hincrby(key, "local_throttle_count", 1)
             await self._redis.hset(key, mapping={"last_throttled_at_ms": now_ms})
             await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_throttle_count")
@@ -181,11 +182,12 @@ class AddressActionTracker:
             return
 
     async def record_exchange_snapshot(self, address: str, payload: dict[str, Any]) -> None:
-        """Persist documented userRateLimit fields and clear stale throttle mode.
+        """Persist documented userRateLimit fields and synchronize throttle mode.
 
-        ``nRequestsUsed < nRequestsCap`` is direct exchange evidence that normal
-        address capacity is available again. Only that authoritative condition
-        clears sustained throttled mode; local counters never guess the cap.
+        ``nRequestsUsed >= nRequestsCap`` is direct exchange evidence that the
+        normal address budget is exhausted, so sustained 10-second cadence is
+        enabled. ``nRequestsUsed < nRequestsCap`` clears it. Local counters never
+        guess this state.
         """
 
         def _numeric(name: str) -> str:
@@ -205,7 +207,11 @@ class AddressActionTracker:
             "exchange_snapshot_at_ms": int(time.time() * 1000),
         }
         await self._redis.hset(key, mapping=mapping)
-        if used not in (None, "") and cap not in (None, "") and int(used) < int(cap):
+        if used in (None, "") or cap in (None, ""):
+            return
+        if int(used) >= int(cap):
+            await self._redis.set(self._mode_key(address), "1")
+        else:
             await self._redis.delete(self._mode_key(address), self._slot_key(address))
 
     async def snapshot(self, address: str) -> AddressRateLimitSnapshot:
