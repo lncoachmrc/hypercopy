@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 from redis.asyncio import Redis
 from sqlalchemy import or_, select
@@ -8,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.entities import CopyJob, JobState
+from app.services.master_leverage_cache import record_master_leverage_repaired
 
 
 STRATEGY_ORIGINS = {'EVENT', 'RECONCILE'}
@@ -25,6 +27,18 @@ async def publish_job(redis: Redis, db: AsyncSession, job: CopyJob) -> None:
     await redis.xadd(settings.STREAM_NAME, {'job_id': str(job.id)}, maxlen=100_000, approximate=True)
     job.enqueued_at = datetime.now(UTC)
     await db.flush()
+
+
+def reconcile_job_repairs_missing_leverage(job: CopyJob) -> bool:
+    if job.origin != 'RECONCILE':
+        return False
+    ctx = job.context or {}
+    if ctx.get('master_leverage') is not None:
+        return True
+    try:
+        return Decimal(str(ctx.get('master_position', '0') or '0')) == 0
+    except Exception:
+        return False
 
 
 def stale_enqueue_cutoff(now: datetime | None = None) -> datetime:
@@ -86,6 +100,13 @@ async def repair_stream(redis: Redis, db: AsyncSession, limit: int = 500) -> int
     count = 0
     for job in rows:
         await publish_job(redis, db, job)
+        if reconcile_job_repairs_missing_leverage(job):
+            try:
+                await record_master_leverage_repaired(redis, job.user_id, job.asset)
+            except Exception:
+                # Recovery telemetry must never prevent a durable correction
+                # from reaching the execution stream.
+                pass
         count += 1
     await db.commit()
     return count
