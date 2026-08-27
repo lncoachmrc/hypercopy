@@ -19,8 +19,8 @@ from cumulative traded volume at one request per 1 USDC traded. Subaccounts are
 accounted separately. A batch of `n` actions counts as `n` address requests.
 
 Once an address is rate-limited, Hyperliquid still permits one request every
-10 seconds. TRAXION mirrors that documented degraded cadence only after an
-exchange throttle has actually been observed.
+10 seconds. TRAXION mirrors that documented degraded cadence after a throttle
+has been observed.
 
 The read-only `userRateLimit` info request exposes the exchange's current fields:
 
@@ -43,8 +43,11 @@ Instead:
 - the affected address receives a Redis-backed 10-second backoff shared across
   TRAXION processes;
 - other follower addresses are not delayed by that backoff;
-- after an observed throttle, TRAXION best-effort reads `userRateLimit` and
-  persists the exchange snapshot for diagnostics;
+- after a definite action-level `rate limited` rejection, TRAXION best-effort
+  reads `userRateLimit` and persists the exchange snapshot for diagnostics;
+- after an HTTP/transport 429, TRAXION records the local backoff and propagates
+  the ambiguous failure immediately so the execution layer can persist
+  `UNKNOWN` without waiting for a second network request;
 - an administrator can explicitly refresh the official snapshot through the
   read-only admin diagnostic endpoint;
 - aggregate action/throttle/backoff counters are exported through `/metrics`
@@ -60,6 +63,11 @@ action. A 429 or transport error after submit can have an indeterminate external
 result. The execution layer therefore continues to persist that attempt as
 `UNKNOWN` and resolves exchange truth before any replacement action. HF-005 does
 not blind-retry an old CLOID.
+
+A definite exchange action status that explicitly says the action was rate
+limited is different: it is an observed no-effect rejection. It is classified as
+`TRANSIENT` and can be revisited only through a fresh reconciliation cycle, which
+creates a fresh job/CLOID after current exchange truth is read.
 
 The local backoff delays only a *subsequent* signed action for that same account.
 It is checked before acquiring the PostgreSQL signer lock, so a cooling account
