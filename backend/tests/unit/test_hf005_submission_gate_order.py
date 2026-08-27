@@ -27,10 +27,13 @@ class _OrderedAddressTracker:
         return 0.0
 
     async def record_action_attempt(self, _address: str):
+        # The real tracker writes attempt accounting first, then atomically
+        # reserves the sustained-mode cadence slot as its final operation.
         self._events.append("record_attempt")
+        self._events.append("cadence_slot")
 
     async def wait_if_backed_off(self, _address: str):
-        self._events.append("cadence_slot")
+        self._events.append("pre_final_wait")
         return 0.0
 
     async def mark_throttled(self, _address: str):
@@ -80,7 +83,8 @@ async def test_final_cadence_slot_is_reserved_at_worker_thread_start(monkeypatch
         await asyncio.sleep(0)
 
     assert "thread_queued" in events
-    # The executor-equivalent queue delay must not consume a cadence slot.
+    # Executor queue delay must not consume either accounting work or a cadence slot.
+    assert "pre_final_wait" not in events
     assert "cadence_slot" not in events
     assert "record_attempt" not in events
     assert "submit" not in events
@@ -95,7 +99,8 @@ async def test_final_cadence_slot_is_reserved_at_worker_thread_start(monkeypatch
         "ip_budget",
         "thread_queued",
         "thread_start",
-        "cadence_slot",
+        "pre_final_wait",
         "record_attempt",
+        "cadence_slot",
         "submit",
     ]
