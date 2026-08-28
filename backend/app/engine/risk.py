@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import Enum
 
-from app.engine.sizing import OrderIntent, SizingResult
+from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, OrderIntent, SizingResult
 
 
 class RiskAction(str, Enum):
@@ -94,6 +94,12 @@ def evaluate(plan: SizingResult, ctx: RiskContext) -> RiskDecision:
     allowed_notional = min(caps)
     if allowed_notional <= 0:
         return RiskDecision(RiskAction.DENY, plan, 'Exposure or margin limit reached')
+    if allowed_notional < EXCHANGE_MIN_NOTIONAL:
+        return RiskDecision(
+            RiskAction.DENY,
+            plan,
+            f'Risk headroom ${allowed_notional:.2f} is below exchange minimum ${EXCHANGE_MIN_NOTIONAL:.0f}',
+        )
     if plan.notional <= allowed_notional:
         return RiskDecision(RiskAction.ALLOW, plan)
     if plan.notional <= 0:

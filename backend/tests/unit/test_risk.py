@@ -48,6 +48,32 @@ def test_max_notional_trims_instead_of_rejecting():
     assert d.plan.notional == D('5000')
 
 
+def test_post_risk_headroom_below_exchange_minimum_is_denied():
+    d = evaluate(
+        _plan(),
+        RiskContext(
+            max_notional_per_trade=D('9'),
+            max_total_exposure=D('20000'),
+            max_asset_exposure=D('20000'),
+        ),
+    )
+    assert d.action == RiskAction.DENY
+    assert 'below exchange minimum' in (d.reason or '')
+
+
+def test_post_risk_headroom_at_exchange_minimum_remains_executable():
+    d = evaluate(
+        _plan(),
+        RiskContext(
+            max_notional_per_trade=D('10'),
+            max_total_exposure=D('20000'),
+            max_asset_exposure=D('20000'),
+        ),
+    )
+    assert d.action == RiskAction.TRIM
+    assert d.plan.notional == D('10')
+
+
 def test_leverage_headroom_trims_before_crossing_max_leverage():
     p = _plan()
     d = evaluate(p, RiskContext(
