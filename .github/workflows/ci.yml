@@ -24,6 +24,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - run: python scripts/targeted_release_preflight.py
       - run: python scripts/generate_repository_tree.py --output REPOSITORY_TREE.generated.txt
       - run: |
           test -s REPOSITORY_TREE.generated.txt
@@ -132,6 +133,8 @@ jobs:
       - run: npm run build:pages
       - run: npm audit --audit-level=high
 
+  # Authoritative repository secret scan. Keep full history; the targeted
+  # release preflight above is not a substitute for Gitleaks.
   secrets:
     runs-on: ubuntu-latest
     permissions:
