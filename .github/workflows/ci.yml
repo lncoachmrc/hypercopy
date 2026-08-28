@@ -133,18 +133,18 @@ jobs:
       - run: npm run build:pages
       - run: npm audit --audit-level=high
 
-  # Authoritative repository secret scan. Keep full history; the targeted
-  # release preflight above is not a substitute for Gitleaks.
+  # Authoritative repository secret scan. `gitleaks git` without custom
+  # --log-opts scans all reachable history; keep fetch-depth 0 so it is present.
+  # The targeted release preflight above is not a substitute for this gate.
   secrets:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_ENABLE_COMMENTS: "false"
+      - name: Gitleaks full-history scan
+        uses: docker://ghcr.io/gitleaks/gitleaks:v8.30.1
+        with:
+          args: git --redact --verbose .

@@ -3,8 +3,10 @@
 
 This is deliberately *not* a general-purpose secret scanner. It verifies a
 small set of release-critical files, the registered Alembic migration baseline,
-and a narrow set of obvious secret-assignment mistakes. GitHub Actions Gitleaks
-with full history is the authoritative repository secret-scanning gate.
+and a narrow set of obvious secret-assignment mistakes. The GitHub Actions
+`secrets` job is authoritative: it checks out complete history and runs the
+pinned official Gitleaks container with `gitleaks git` and no event-range
+`--log-opts`, which performs Gitleaks' full-history/all-refs git scan.
 """
 
 from pathlib import Path
@@ -55,7 +57,7 @@ missing_migrations = sorted(EXPECTED_MIGRATIONS - actual_migrations)
 unregistered_migrations = sorted(actual_migrations - EXPECTED_MIGRATIONS)
 
 # Deliberately line-bound and intentionally narrow. This heuristic catches only
-# a few obvious assignment forms; Gitleaks full-history in CI is authoritative.
+# a few obvious assignment forms; the GitHub Actions Gitleaks gate is authoritative.
 secret_assignment = re.compile(
     r'(?im)(private[_ -]?key|stripe_secret(?:_key)?|session_secret)'
     r'[ \t]*=[ \t]*["\']?([A-Za-z0-9_/+=-]{20,})'

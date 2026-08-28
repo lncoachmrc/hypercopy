@@ -22,7 +22,7 @@ All must be true: environment network is `mainnet`; Railway variable `ENABLE_LIV
 
 Never commit database URLs/passwords, Redis credentials, Stripe secrets, session secrets, API wallet keys, KMS credentials or encryption KEKs. Production runtime secrets belong in Railway Variables; GitHub Actions has no production deploy responsibility and therefore should receive no application production secrets.
 
-The authoritative repository secret-scanning gate is the GitHub Actions `secrets` job, which runs Gitleaks against full Git history (`fetch-depth: 0`). `scripts/targeted_release_preflight.py` is only a targeted release-structure check with a narrow heuristic for obvious assignment mistakes; it must not be treated as a substitute for Gitleaks or another general-purpose secret scanner.
+The authoritative repository secret-scanning gate is the GitHub Actions `secrets` job. It checks out complete history and runs the pinned official Gitleaks container with `gitleaks git` and no event-range `--log-opts`, so Gitleaks performs its full-history/all-refs git scan. `scripts/targeted_release_preflight.py` is only a targeted release-structure check with a narrow heuristic for obvious assignment mistakes; it must not be treated as a substitute for Gitleaks or another general-purpose secret scanner.
 
 ## Audit
 
