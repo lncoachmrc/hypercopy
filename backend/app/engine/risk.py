@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import Enum
 
-from app.engine.sizing import OrderIntent, SizingResult
+from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, OrderIntent, SizingResult, round_size
 
 
 class RiskAction(str, Enum):
@@ -94,11 +94,33 @@ def evaluate(plan: SizingResult, ctx: RiskContext) -> RiskDecision:
     allowed_notional = min(caps)
     if allowed_notional <= 0:
         return RiskDecision(RiskAction.DENY, plan, 'Exposure or margin limit reached')
+    if allowed_notional < EXCHANGE_MIN_NOTIONAL:
+        return RiskDecision(
+            RiskAction.DENY,
+            plan,
+            f'Risk headroom ${allowed_notional:.2f} is below exchange minimum ${EXCHANGE_MIN_NOTIONAL:.0f}',
+        )
     if plan.notional <= allowed_notional:
         return RiskDecision(RiskAction.ALLOW, plan)
     if plan.notional <= 0:
         return RiskDecision(RiskAction.SKIP, plan, 'No notional to execute')
+
     ratio = allowed_notional / plan.notional
-    trimmed_size = plan.order_size * ratio
-    trimmed = replace(plan, order_size=trimmed_size, notional=allowed_notional)
+    raw_trimmed_size = plan.order_size * ratio
+    exponent = plan.order_size.as_tuple().exponent
+    sz_decimals = -exponent if isinstance(exponent, int) and exponent < 0 else 0
+    trimmed_size = round_size(raw_trimmed_size, sz_decimals)
+    if trimmed_size <= 0:
+        return RiskDecision(RiskAction.DENY, plan, 'Risk cap rounds below the minimum executable lot')
+
+    unit_price = plan.notional / plan.order_size
+    trimmed_notional = trimmed_size * unit_price
+    if trimmed_notional < EXCHANGE_MIN_NOTIONAL:
+        return RiskDecision(
+            RiskAction.DENY,
+            plan,
+            f'Rounded risk-limited order ${trimmed_notional:.2f} is below exchange minimum ${EXCHANGE_MIN_NOTIONAL:.0f}',
+        )
+
+    trimmed = replace(plan, order_size=trimmed_size, notional=trimmed_notional)
     return RiskDecision(RiskAction.TRIM, trimmed, f'Trimmed to risk cap ${allowed_notional:.2f}')
