@@ -312,5 +312,10 @@ def test_ai_scaled_opening_cannot_bypass_deterministic_risk_caps(
     )
 
     assert abs(ai_target) <= abs(deterministic_target)
+    if sizing.actionable and allowed_notional < D('10'):
+        assert decision.action is RiskAction.DENY
     if decision.action in {RiskAction.ALLOW, RiskAction.TRIM}:
+        assert decision.plan.notional >= D('10')
         assert decision.plan.notional <= allowed_notional
+    if decision.action is RiskAction.TRIM:
+        assert decision.plan.order_size == round_size(decision.plan.order_size, 5)
