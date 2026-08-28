@@ -246,15 +246,21 @@ class Worker:
             mids={}
             log.warning('Follower mids unavailable during observability refresh', extra={'network': network}, exc_info=True)
 
-        users=(await db.execute(select(User).join(TradingAccount,TradingAccount.user_id==User.id))).scalars().all()
+        user_ids=(
+            await db.execute(
+                select(User.id)
+                .join(TradingAccount,TradingAccount.user_id==User.id)
+                .order_by(User.id)
+            )
+        ).scalars().all()
         refreshed=0
-        for user in users:
+        for user_id in user_ids:
             try:
-                async with position_ledger_lock(user.id):
-                    network_state=await user_network_state(db,user.id)
+                async with position_ledger_lock(user_id):
+                    network_state=await user_network_state(db,user_id)
                     if network_state.network != network:
                         continue
-                    account=(await db.execute(select(TradingAccount).where(TradingAccount.user_id==user.id))).scalar_one_or_none()
+                    account=(await db.execute(select(TradingAccount).where(TradingAccount.user_id==user_id))).scalar_one_or_none()
                     if not account:
                         continue
 
@@ -262,7 +268,7 @@ class Worker:
                     real_state=snapshot.perp_state
                     real_positions=_position_sizes(real_state)
                     follower_configs=position_configs(real_state)
-                    ledger_rows=(await db.execute(select(PositionLedger).where(PositionLedger.user_id==user.id))).scalars().all()
+                    ledger_rows=(await db.execute(select(PositionLedger).where(PositionLedger.user_id==user_id))).scalars().all()
                     ledger_by_asset={row.asset:row for row in ledger_rows}
                     now=datetime.now(UTC)
 
@@ -273,7 +279,7 @@ class Worker:
                         ledger=ledger_by_asset.get(asset)
                         if ledger is None:
                             ledger=PositionLedger(
-                                user_id=user.id,asset=asset,size=real,target_size=Decimal(0),
+                                user_id=user_id,asset=asset,size=real,target_size=Decimal(0),
                                 mark_price=mark,managed=False,exchange_verified_at=now,
                             )
                             db.add(ledger)
@@ -298,7 +304,7 @@ class Worker:
                                 pass
 
                     db.add(EquitySnapshot(
-                        user_id=user.id,
+                        user_id=user_id,
                         account_value=snapshot.account_value,
                         free_margin=snapshot.free_margin,
                         unmanaged_margin=unmanaged_margin,
@@ -313,7 +319,7 @@ class Worker:
                 await db.rollback()
                 log.warning(
                     'Follower observability refresh failed',
-                    extra={'user_id':str(user.id),'network':network},
+                    extra={'user_id':str(user_id),'network':network},
                     exc_info=True,
                 )
         return refreshed
