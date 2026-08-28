@@ -68,7 +68,9 @@ class ResilientExecutionWorker(Worker):
         job_id = await self._next_database_job_id()
         if not job_id:
             return False
-        log.warning(
+        # Consuming from the durable queue is an expected degraded-mode action,
+        # not itself an error. Redis unavailability is logged separately.
+        log.info(
             'Consuming copy job through PostgreSQL fallback',
             extra={'job_id': job_id},
         )
