@@ -24,6 +24,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - run: python scripts/targeted_release_preflight.py
       - run: python scripts/generate_repository_tree.py --output REPOSITORY_TREE.generated.txt
       - run: |
           test -s REPOSITORY_TREE.generated.txt
@@ -132,16 +133,28 @@ jobs:
       - run: npm run build:pages
       - run: npm audit --audit-level=high
 
+  # Authoritative repository secret scan. `gitleaks git` without custom
+  # --log-opts scans all reachable history; keep fetch-depth 0 so it is present.
+  # The targeted release preflight above is not a substitute for this gate.
   secrets:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_ENABLE_COMMENTS: "false"
+      - name: Gitleaks full-history scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          log_file="${RUNNER_TEMP}/gitleaks-full-history.log"
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/repo" \
+            -w /repo \
+            -e GIT_CONFIG_COUNT=1 \
+            -e GIT_CONFIG_KEY_0=safe.directory \
+            -e GIT_CONFIG_VALUE_0=/repo \
+            ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git --redact --verbose . 2>&1 | tee "$log_file"
+          grep -Eq '[1-9][0-9]* commits scanned' "$log_file"

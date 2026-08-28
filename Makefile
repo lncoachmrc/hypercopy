@@ -12,6 +12,6 @@ lint:
 frontend-build:
 	cd frontend && npm ci && npm run build
 preflight:
-	python scripts/release_preflight.py
+	python scripts/targeted_release_preflight.py
 migrate:
 	docker compose run --rm migrate
