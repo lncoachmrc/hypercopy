@@ -42,10 +42,12 @@ def test_near_liquidation_blocks_new_exposure_but_not_close():
     assert evaluate(_plan(master='0', current='0.20'), RiskContext(near_liquidation=True)).action == RiskAction.ALLOW
 
 
-def test_max_notional_trims_instead_of_rejecting():
+def test_max_notional_trims_instead_of_rejecting_without_exceeding_cap():
     d = evaluate(_plan(), RiskContext(max_notional_per_trade=D('5000'), max_total_exposure=D('20000'), max_asset_exposure=D('20000')))
     assert d.action == RiskAction.TRIM
-    assert d.plan.notional == D('5000')
+    assert d.plan.order_size == D('0.08333')
+    assert d.plan.notional == D('4999.80000')
+    assert d.plan.notional <= D('5000')
 
 
 def test_post_risk_headroom_below_exchange_minimum_is_denied():
@@ -61,7 +63,7 @@ def test_post_risk_headroom_below_exchange_minimum_is_denied():
     assert 'below exchange minimum' in (d.reason or '')
 
 
-def test_post_risk_headroom_at_exchange_minimum_remains_executable():
+def test_post_risk_headroom_at_exchange_minimum_is_denied_after_lot_rounding():
     d = evaluate(
         _plan(),
         RiskContext(
@@ -70,8 +72,22 @@ def test_post_risk_headroom_at_exchange_minimum_remains_executable():
             max_asset_exposure=D('20000'),
         ),
     )
+    assert d.action == RiskAction.DENY
+    assert 'Rounded risk-limited order' in (d.reason or '')
+
+
+def test_post_risk_headroom_with_first_valid_btc_lot_remains_executable():
+    d = evaluate(
+        _plan(),
+        RiskContext(
+            max_notional_per_trade=D('10.20'),
+            max_total_exposure=D('20000'),
+            max_asset_exposure=D('20000'),
+        ),
+    )
     assert d.action == RiskAction.TRIM
-    assert d.plan.notional == D('10')
+    assert d.plan.order_size == D('0.00017')
+    assert d.plan.notional == D('10.20000')
 
 
 def test_leverage_headroom_trims_before_crossing_max_leverage():
@@ -84,7 +100,8 @@ def test_leverage_headroom_trims_before_crossing_max_leverage():
         max_asset_exposure=D('100000'),
     ))
     assert d.action == RiskAction.TRIM
-    assert d.plan.notional == D('5000')
+    assert d.plan.notional == D('4999.80000')
+    assert d.plan.notional <= D('5000')
 
 
 def test_free_margin_is_converted_to_notional_at_max_leverage():
@@ -96,4 +113,4 @@ def test_free_margin_is_converted_to_notional_at_max_leverage():
         max_asset_exposure=D('100000'),
     ))
     assert d.action == RiskAction.TRIM
-    assert d.plan.notional == D('3000')
+    assert d.plan.notional == D('3000.00000')
