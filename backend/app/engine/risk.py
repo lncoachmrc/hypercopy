@@ -107,7 +107,8 @@ def evaluate(plan: SizingResult, ctx: RiskContext) -> RiskDecision:
 
     ratio = allowed_notional / plan.notional
     raw_trimmed_size = plan.order_size * ratio
-    sz_decimals = max(-plan.order_size.as_tuple().exponent, 0)
+    exponent = plan.order_size.as_tuple().exponent
+    sz_decimals = -exponent if isinstance(exponent, int) and exponent < 0 else 0
     trimmed_size = round_size(raw_trimmed_size, sz_decimals)
     if trimmed_size <= 0:
         return RiskDecision(RiskAction.DENY, plan, 'Risk cap rounds below the minimum executable lot')
