@@ -21,7 +21,9 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _dispose_pools_after_test():
+async def _dispose_pools_around_test():
+    await engine.dispose()
+    await position_ledger_lock_engine.dispose()
     yield
     await engine.dispose()
     await position_ledger_lock_engine.dispose()
