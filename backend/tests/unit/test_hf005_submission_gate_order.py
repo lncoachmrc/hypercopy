@@ -104,3 +104,46 @@ async def test_final_cadence_slot_is_reserved_at_worker_thread_start(monkeypatch
         "cadence_slot",
         "submit",
     ]
+
+
+@pytest.mark.asyncio
+async def test_optional_authorization_runs_after_all_waits_and_immediately_before_submit(monkeypatch):
+    events: list[str] = []
+    limiter = _OrderedLimiter(events)
+    monkeypatch.setattr("app.adapters.hyperliquid.Info", MagicMock())
+    adapter = HyperliquidAdapter(limiter, network="testnet")
+    adapter.address_limits = _OrderedAddressTracker(events)
+
+    @asynccontextmanager
+    async def ordered_signer_lock(_signer_address: str):
+        events.append("signer_lock")
+        yield
+
+    async def authorize():
+        events.append("authorize")
+
+    def submit():
+        events.append("submit")
+        return {"status": "ok"}
+
+    monkeypatch.setattr("app.adapters.hyperliquid.signer_action_lock", ordered_signer_lock)
+
+    result = await adapter._signed_call(
+        "0x" + "22" * 20,
+        "0x" + "11" * 20,
+        submit,
+        before_submit=authorize,
+    )
+
+    assert result == {"status": "ok"}
+    assert events == [
+        "pre_wait",
+        "signer_lock",
+        "ip_budget",
+        "pre_final_wait",
+        "record_attempt",
+        "cadence_slot",
+        "authorize",
+        "submit",
+    ]
+    assert events.index("authorize") + 1 == events.index("submit")
