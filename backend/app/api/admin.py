@@ -364,6 +364,7 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
         'leverage': int(diagnostic['desired']['leverage']),
         'is_cross': desired_is_cross,
     }
+    refreshed_source = {}
 
     async def _authorize_submission() -> tuple[int, bool]:
         # Source state and exchange constraints are re-read after signer/rate waits.
@@ -392,6 +393,13 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
             and not fresh_spec.only_isolated
             and initial_is_cross
         )
+        refreshed_source['master'] = {
+            'leverage': fresh_master_cfg.leverage,
+            'margin_mode': 'cross' if fresh_master_cfg.is_cross else 'isolated',
+        }
+        refreshed_source['exchange_max_leverage'] = fresh_spec.max_leverage
+        refreshed_source['exchange_only_isolated'] = fresh_spec.only_isolated
+        refreshed_source['effective_exchange_max_leverage'] = effective_exchange_max
         if follower_hl.address_limits is not None:
             await follower_hl.address_limits.reestablish_submission_slot_before_final_authorization(
                 account_address
@@ -500,6 +508,10 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
         raise HTTPException(502, f'Hyperliquid acknowledged the leverage update but follower state is {observed}; expected {desired}')
 
     verified = dict(diagnostic)
+    verified['master'] = dict(refreshed_source['master'])
+    verified['exchange_max_leverage'] = refreshed_source['exchange_max_leverage']
+    verified['exchange_only_isolated'] = refreshed_source['exchange_only_isolated']
+    verified['effective_exchange_max_leverage'] = refreshed_source['effective_exchange_max_leverage']
     verified['desired'] = desired
     verified['follower'] = {'leverage': follower_cfg.leverage, 'margin_mode': 'cross' if follower_cfg.is_cross else 'isolated'}
     verified['matches'] = True
