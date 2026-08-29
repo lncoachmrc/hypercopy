@@ -66,18 +66,19 @@ def _position_config_sync_confirmation(network: Network) -> str:
     return f'SYNC {network.upper()} LEVERAGE'
 
 
-async def _assert_fresh_position_config_sync_allowed(
+async def _fresh_position_config_sync_authorization(
     db: AsyncSession,
     target: User,
     expected_network: Network,
-) -> None:
+) -> tuple[uuid.UUID, str, SigningCredential]:
     current_network = (await user_network_state(db, target.id)).network
     if current_network != expected_network:
         raise HTTPException(409, 'Follower network changed during leverage synchronization')
 
-    # Collapse mutable execution controls into one fresh, final check immediately
-    # before credential decryption/signing. Expiring the identity map prevents a
-    # previous diagnostic read from masking a concurrent pause/stop/live change.
+    # Collapse mutable execution controls and signing material into one fresh,
+    # final authorization immediately before decryption/signing. Expiring the
+    # identity map prevents earlier diagnostic reads from masking concurrent
+    # pause/stop/live/credential changes.
     db.expire_all()
     await db.refresh(target, attribute_names=['copy_state'])
     if target.copy_state != CopyState.PAUSED:
@@ -93,6 +94,23 @@ async def _assert_fresh_position_config_sync_allowed(
     active_halts = sorted(flag.slug for flag in flags if flag.enabled)
     if active_halts:
         raise HTTPException(409, f"Leverage synchronization blocked by system halt: {', '.join(active_halts)}")
+
+    account = (await db.execute(
+        select(TradingAccount)
+        .where(TradingAccount.user_id == target.id)
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if not account:
+        raise HTTPException(409, 'Follower has no Hyperliquid trading account')
+    cred = (await db.execute(
+        select(SigningCredential)
+        .where(SigningCredential.trading_account_id == account.id)
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if not _credential_active(cred):
+        raise HTTPException(409, 'Trading credential is unavailable')
+    assert cred is not None
+    return account.id, account.account_address, cred
 
 
 @router.get('/system')
@@ -245,24 +263,15 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
     if diagnostic['matches']:
         return {'ok': True, 'changed': False, 'verified': True, 'diagnostic': diagnostic}
 
-    account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == target.id))).scalar_one()
-    cred = (await db.execute(
-        select(SigningCredential)
-        .where(SigningCredential.trading_account_id == account.id)
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
-    if not _credential_active(cred):
-        raise HTTPException(409, 'Trading credential is unavailable')
-
-    await _assert_fresh_position_config_sync_allowed(db, target, network)
+    account_id, account_address, cred = await _fresh_position_config_sync_authorization(db, target, network)
 
     desired = diagnostic['desired']
     follower_hl = _follower_adapter(network)
-    private_key = crypto.decrypt(_credential_blob(cred), user_id=str(target.id), account_id=str(account.id))
+    private_key = crypto.decrypt(_credential_blob(cred), user_id=str(target.id), account_id=str(account_id))
     try:
         try:
             response = await follower_hl.update_leverage(
-                account_address=account.account_address,
+                account_address=account_address,
                 private_key=private_key,
                 asset=asset,
                 leverage=int(desired['leverage']),
@@ -276,7 +285,7 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
         private_key = ''
 
     try:
-        follower_state = await follower_hl.user_state(account.account_address, priority=Priority.DIAGNOSTIC)
+        follower_state = await follower_hl.user_state(account_address, priority=Priority.DIAGNOSTIC)
         follower_cfg = position_configs(follower_state).get(asset)
     except Exception as exc:
         raise HTTPException(502, f'Leverage update sent, but verification read failed: {type(exc).__name__}: {exc}') from exc
