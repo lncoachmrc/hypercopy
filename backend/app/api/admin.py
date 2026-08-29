@@ -375,18 +375,36 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
     finally:
         private_key = ''
 
-    try:
-        follower_state = await follower_hl.user_state(account_address, priority=Priority.DIAGNOSTIC)
-        follower_cfg = position_configs(follower_state).get(asset)
-    except Exception as exc:
-        raise HTTPException(502, f'Leverage update sent, but verification read failed: {type(exc).__name__}: {exc}') from exc
-
     expected_leverage = int(submitted['leverage'])
     expected_cross = bool(submitted['is_cross'])
     desired = {
         'leverage': expected_leverage,
         'margin_mode': 'cross' if expected_cross else 'isolated',
     }
+
+    try:
+        follower_state = await follower_hl.user_state(account_address, priority=Priority.DIAGNOSTIC)
+        follower_cfg = position_configs(follower_state).get(asset)
+    except Exception as exc:
+        verification_error = f'{type(exc).__name__}: {exc}'
+        await audit(
+            db,
+            action='ADMIN_FOLLOWER_LEVERAGE_SYNC_UNVERIFIED',
+            actor_id=actor.id,
+            subject_id=target.id,
+            reason=body.reason,
+            after={
+                'asset': asset,
+                'network': network,
+                'response': response,
+                'desired': desired,
+                'observed': None,
+                'verification_error': verification_error,
+            },
+        )
+        await db.commit()
+        raise HTTPException(502, f'Leverage update sent, but verification read failed: {verification_error}') from exc
+
     verified_match = bool(
         follower_cfg
         and follower_cfg.leverage == expected_leverage
