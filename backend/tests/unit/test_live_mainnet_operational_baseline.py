@@ -45,28 +45,31 @@ def test_position_config_sync_confirmation_is_network_aware() -> None:
     assert _position_config_sync_confirmation('mainnet') == 'SYNC MAINNET LEVERAGE'
 
 
-def test_position_config_sync_uses_one_fresh_pre_sign_guard() -> None:
+def test_position_config_sync_uses_one_fresh_pre_sign_authorization() -> None:
     source = inspect.getsource(admin.sync_position_config)
     assert 'restricted to TESTNET' not in source
-    assert source.count('await _assert_fresh_position_config_sync_allowed(db, target, network)') == 1
+    assert source.count('await _fresh_position_config_sync_authorization(db, target, network)') == 1
     assert 'await live_trading_allowed(db, network)' not in source
     assert '_active_system_execution_halts' not in source
     assert "diagnostic['allowed_asset']" in source
-    assert '_credential_active(cred)' in source
 
     diagnostic_index = source.index('diagnostic = await _position_config_diagnostic')
-    guard_index = source.index('await _assert_fresh_position_config_sync_allowed')
+    guard_index = source.index('await _fresh_position_config_sync_authorization')
     decrypt_index = source.index('private_key = crypto.decrypt')
     signed_update_index = source.index('response = await follower_hl.update_leverage')
     assert diagnostic_index < guard_index < decrypt_index < signed_update_index
 
 
-def test_final_sync_guard_refreshes_all_mutable_execution_controls() -> None:
-    source = inspect.getsource(admin._assert_fresh_position_config_sync_allowed)
+def test_final_sync_authorization_refreshes_controls_and_signing_material() -> None:
+    source = inspect.getsource(admin._fresh_position_config_sync_authorization)
     assert 'current_network = (await user_network_state(db, target.id)).network' in source
     assert 'db.expire_all()' in source
     assert "await db.refresh(target, attribute_names=['copy_state'])" in source
     assert 'target.copy_state != CopyState.PAUSED' in source
     assert 'await live_trading_allowed(db, expected_network)' in source
     assert "SystemFlag.slug.in_(('global_pause', 'emergency_stop'))" in source
-    assert 'execution_options(populate_existing=True)' in source
+    assert 'select(TradingAccount)' in source
+    assert 'select(SigningCredential)' in source
+    assert '_credential_active(cred)' in source
+    assert source.count('execution_options(populate_existing=True)') >= 3
+    assert 'return account.id, account.account_address, cred' in source
