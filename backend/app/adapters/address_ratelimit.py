@@ -195,6 +195,27 @@ class AddressActionTracker:
         await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_action_attempt_count")
         await self._reserve_submission_slot_after_accounting(address)
 
+    async def reestablish_submission_slot_before_final_authorization(self, address: str) -> None:
+        """Restore the full degraded-cadence window before the final DB snapshot.
+
+        ``record_action_attempt`` reserves the authoritative 10-second slot before
+        an optional signed-action callback runs. Admin leverage sync performs fresh
+        exchange reads in that callback, so those reads must not consume the
+        degraded cadence. When authoritative sustained mode is still active, reset
+        the slot to a full 10 seconds immediately before the final single-query DB
+        authorization. If sustained mode expired meanwhile, no slot is required.
+        The caller still holds the trading account's unique credential signer lock.
+        """
+
+        mode_key = self._mode_key(address)
+        if not bool(await self._redis.exists(mode_key)):
+            return
+        await self._redis.set(
+            self._slot_key(address),
+            "1",
+            px=ADDRESS_BACKOFF_SECONDS * 1000,
+        )
+
     async def mark_throttled(self, address: str) -> None:
         """Best-effort one-shot throttle evidence that never replaces exchange truth.
 

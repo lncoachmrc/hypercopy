@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.hyperliquid import HyperliquidAdapter, position_configs
@@ -60,6 +60,141 @@ def _credential_active(cred: SigningCredential | None) -> bool:
         and cred.status in {CredentialStatus.ACTIVE, CredentialStatus.EXPIRING}
         and (cred.expires_at is None or cred.expires_at > datetime.now(UTC))
     )
+
+
+def _position_config_sync_confirmation(network: Network) -> str:
+    return f'SYNC {network.upper()} LEVERAGE'
+
+
+async def _position_config_sync_signing_material(
+    db: AsyncSession,
+    target: User,
+) -> tuple[uuid.UUID, str, SigningCredential]:
+    """Load the API-wallet material needed to enter the signed-action path.
+
+    This is deliberately not the mutable policy decision. The material is
+    revalidated by the single final authorization immediately before SDK submit.
+    """
+    account = (await db.execute(
+        select(TradingAccount)
+        .where(TradingAccount.user_id == target.id)
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if not account:
+        raise HTTPException(409, 'Follower has no Hyperliquid trading account')
+    cred = (await db.execute(
+        select(SigningCredential)
+        .where(SigningCredential.trading_account_id == account.id)
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if not _credential_active(cred):
+        raise HTTPException(409, 'Trading credential is unavailable')
+    assert cred is not None
+    return account.id, account.account_address, cred
+
+
+async def _fresh_position_config_sync_authorization(
+    db: AsyncSession,
+    target: User,
+    expected_network: Network,
+    *,
+    expected_account_id: uuid.UUID,
+    expected_account_address: str,
+    expected_credential_id: uuid.UUID,
+    asset: str,
+    master_leverage: int,
+    exchange_max_leverage: int,
+    desired_is_cross: bool,
+) -> tuple[int, bool, str]:
+    """Take one final PostgreSQL snapshot of every mutable submission control.
+
+    This helper is intentionally a *single* database round-trip. The caller runs
+    it after fresh master/exchange reads and after restoring any degraded address
+    cadence slot, so there is no additional await between this authoritative
+    follower/control snapshot and the synchronous Hyperliquid SDK submission.
+    """
+    row = (await db.execute(
+        text(
+            """
+            SELECT
+                u.execution_network,
+                u.copy_state,
+                r.max_leverage AS risk_max_leverage,
+                r.allow_assets,
+                r.block_assets,
+                ta.id AS account_id,
+                ta.account_address,
+                sc.id AS credential_id,
+                sc.status AS credential_status,
+                sc.expires_at AS credential_expires_at,
+                COALESCE((SELECT enabled FROM system_flags WHERE slug = 'live_trading'), FALSE) AS live_trading,
+                COALESCE((SELECT enabled FROM system_flags WHERE slug = 'global_pause'), FALSE) AS global_pause,
+                COALESCE((SELECT enabled FROM system_flags WHERE slug = 'emergency_stop'), FALSE) AS emergency_stop
+            FROM users u
+            LEFT JOIN risk_profiles r ON r.user_id = u.id
+            LEFT JOIN trading_accounts ta ON ta.user_id = u.id
+            LEFT JOIN signing_credentials sc ON sc.trading_account_id = ta.id
+            WHERE u.id = :user_id
+            """
+        ),
+        {'user_id': target.id},
+    )).mappings().one_or_none()
+    if not row:
+        raise HTTPException(404, 'User not found during leverage synchronization')
+
+    current_network = str(row['execution_network'] or settings.follower_network).lower()
+    if current_network != expected_network:
+        raise HTTPException(409, 'Follower network changed during leverage synchronization')
+    if str(row['copy_state'] or '') != CopyState.PAUSED.value:
+        raise HTTPException(409, 'Pause the follower before direct leverage synchronization')
+
+    if row['risk_max_leverage'] is None:
+        raise HTTPException(409, 'Follower risk profile is missing')
+    risk_max_leverage = Decimal(str(row['risk_max_leverage']))
+    allow_assets = list(row['allow_assets'] or [])
+    block_assets = list(row['block_assets'] or [])
+    allowed_asset = (not allow_assets or asset in allow_assets) and asset not in block_assets
+    if not allowed_asset:
+        raise HTTPException(409, f'{asset} is not permitted by the follower Risk Engine')
+    desired_leverage = max(
+        1,
+        min(
+            int(master_leverage),
+            int(risk_max_leverage),
+            int(exchange_max_leverage),
+        ),
+    )
+
+    account_id = row['account_id']
+    account_address = str(row['account_address'] or '')
+    if (
+        account_id != expected_account_id
+        or account_address.lower() != expected_account_address.lower()
+    ):
+        raise HTTPException(409, 'Follower trading account changed during leverage synchronization')
+
+    credential_status = str(row['credential_status'] or '')
+    credential_expires_at = row['credential_expires_at']
+    if (
+        row['credential_id'] != expected_credential_id
+        or credential_status not in {CredentialStatus.ACTIVE.value, CredentialStatus.EXPIRING.value}
+        or (credential_expires_at is not None and credential_expires_at <= datetime.now(UTC))
+    ):
+        raise HTTPException(409, 'Trading credential changed or became unavailable')
+
+    if expected_network == 'mainnet' and (
+        not settings.ENABLE_LIVE_TRADING or not bool(row['live_trading'])
+    ):
+        raise HTTPException(409, 'Mainnet live-trading gate is closed')
+    active_halts = sorted(
+        slug
+        for slug in ('global_pause', 'emergency_stop')
+        if bool(row[slug])
+    )
+    if active_halts:
+        raise HTTPException(409, f"Leverage synchronization blocked by system halt: {', '.join(active_halts)}")
+
+    return desired_leverage, desired_is_cross, str(risk_max_leverage)
 
 
 @router.get('/system')
@@ -116,7 +251,13 @@ async def master_state(user: User = Depends(admin)):
         raise HTTPException(502, f'Master state read failed: {type(exc).__name__}: {exc}') from exc
 
 
-async def _position_config_diagnostic(db: AsyncSession, target: User, asset: str) -> dict:
+async def _position_config_diagnostic(
+    db: AsyncSession,
+    target: User,
+    asset: str,
+    *,
+    follower_hl: HyperliquidAdapter | None = None,
+) -> dict:
     asset = asset.upper().strip()
     network_state = await user_network_state(db, target.id)
     network = network_state.network
@@ -128,7 +269,9 @@ async def _position_config_diagnostic(db: AsyncSession, target: User, asset: str
         raise HTTPException(409, 'HYPERLIQUID_MASTER_ADDRESS is not configured')
 
     master_hl = _master_adapter()
-    follower_hl = _follower_adapter(network)
+    follower_hl = follower_hl or _follower_adapter(network)
+    if follower_hl.network != network:
+        raise HTTPException(409, 'Follower adapter does not match the selected execution network')
     try:
         master_state, follower_state, spec = await asyncio.gather(
             master_hl.user_state(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.DIAGNOSTIC),
@@ -197,41 +340,124 @@ async def position_config_diagnostic(user_id: uuid.UUID, asset: str, actor: User
 
 @router.post('/users/{user_id}/position-config/{asset}/sync', dependencies=[Depends(require_csrf)])
 async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction, actor: User = Depends(superadmin), db: AsyncSession = Depends(get_db)):
-    if body.confirmation != 'SYNC TESTNET LEVERAGE':
-        raise HTTPException(422, 'Confirmation must be SYNC TESTNET LEVERAGE')
     target = await db.get(User, user_id)
     if not target:
         raise HTTPException(404, 'User not found')
     network = (await user_network_state(db, target.id)).network
-    if network != 'testnet':
-        raise HTTPException(409, 'Direct position-config sync is restricted to TESTNET')
-    if target.copy_state != CopyState.PAUSED:
-        raise HTTPException(409, 'Pause the follower before direct leverage synchronization')
+    expected_confirmation = _position_config_sync_confirmation(network)
+    if body.confirmation != expected_confirmation:
+        raise HTTPException(422, f'Confirmation must be {expected_confirmation}')
 
     asset = asset.upper().strip()
-    diagnostic = await _position_config_diagnostic(db, target, asset)
-    if not diagnostic['allowed_asset']:
-        raise HTTPException(409, f'{asset} is not permitted by the follower Risk Engine')
+    follower_hl = _follower_adapter(network)
+    diagnostic = await _position_config_diagnostic(db, target, asset, follower_hl=follower_hl)
     if diagnostic['matches']:
         return {'ok': True, 'changed': False, 'verified': True, 'diagnostic': diagnostic}
 
-    account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == target.id))).scalar_one()
-    cred = (await db.execute(select(SigningCredential).where(SigningCredential.trading_account_id == account.id))).scalar_one_or_none()
-    if not _credential_active(cred):
-        raise HTTPException(409, 'Trading credential is unavailable')
+    # Ensure signing metadata is already loaded before entering the signed-action
+    # path. The one mutable policy authorization itself runs later, inside
+    # _signed_call, after signer/rate/cadence waits and immediately before SDK submit.
+    await follower_hl.asset_spec(asset)
+    account_id, account_address, cred = await _position_config_sync_signing_material(db, target)
+    expected_credential_id = cred.id
+    desired_is_cross = diagnostic['desired']['margin_mode'] == 'cross'
+    submitted = {
+        'leverage': int(diagnostic['desired']['leverage']),
+        'is_cross': desired_is_cross,
+    }
+    refreshed_source = {}
 
-    desired = diagnostic['desired']
-    follower_hl = _follower_adapter(network)
-    private_key = crypto.decrypt(_credential_blob(cred), user_id=str(target.id), account_id=str(account.id))
+    async def _authorize_submission() -> tuple[int, bool]:
+        # Source state and exchange constraints are re-read after signer/rate waits.
+        # A fresh adapter prevents the normal metadata TTL from reusing the
+        # diagnostic cache. After this expensive work, restore the degraded-cadence
+        # slot and take ONE PostgreSQL snapshot of every mutable follower/control
+        # input. No await remains between that snapshot and SDK submit.
+        fresh_master_hl = _master_adapter()
+        fresh_spec_hl = _follower_adapter(network)
+        fresh_master_state, fresh_spec = await asyncio.gather(
+            fresh_master_hl.user_state(
+                settings.HYPERLIQUID_MASTER_ADDRESS,
+                priority=Priority.ORDER,
+            ),
+            fresh_spec_hl.asset_spec(asset),
+        )
+        fresh_master_cfg = position_configs(fresh_master_state).get(asset)
+        if not fresh_master_cfg:
+            raise HTTPException(409, f'Master no longer has an open {asset} position/configuration')
+
+        initial_exchange_max = int(diagnostic['exchange_max_leverage'])
+        effective_exchange_max = min(fresh_spec.max_leverage, initial_exchange_max)
+        initial_is_cross = diagnostic['desired']['margin_mode'] == 'cross'
+        fresh_desired_is_cross = bool(
+            fresh_master_cfg.is_cross
+            and not fresh_spec.only_isolated
+            and initial_is_cross
+        )
+        refreshed_source['master'] = {
+            'leverage': fresh_master_cfg.leverage,
+            'margin_mode': 'cross' if fresh_master_cfg.is_cross else 'isolated',
+        }
+        refreshed_source['exchange_max_leverage'] = fresh_spec.max_leverage
+        refreshed_source['exchange_only_isolated'] = fresh_spec.only_isolated
+        refreshed_source['effective_exchange_max_leverage'] = effective_exchange_max
+        if follower_hl.address_limits is not None:
+            await follower_hl.address_limits.reestablish_submission_slot_before_final_authorization(
+                account_address
+            )
+        leverage, is_cross, risk_max_leverage = await _fresh_position_config_sync_authorization(
+            db,
+            target,
+            network,
+            expected_account_id=account_id,
+            expected_account_address=account_address,
+            expected_credential_id=expected_credential_id,
+            asset=asset,
+            master_leverage=fresh_master_cfg.leverage,
+            exchange_max_leverage=effective_exchange_max,
+            desired_is_cross=fresh_desired_is_cross,
+        )
+        refreshed_source['risk_max_leverage'] = risk_max_leverage
+        submitted['leverage'] = leverage
+        submitted['is_cross'] = is_cross
+        return leverage, is_cross
+
+    private_key = crypto.decrypt(_credential_blob(cred), user_id=str(target.id), account_id=str(account_id))
     try:
         try:
             response = await follower_hl.update_leverage(
-                account_address=account.account_address,
+                account_address=account_address,
                 private_key=private_key,
                 asset=asset,
-                leverage=int(desired['leverage']),
-                is_cross=desired['margin_mode'] == 'cross',
+                leverage=int(submitted['leverage']),
+                is_cross=bool(submitted['is_cross']),
+                before_submit=_authorize_submission,
             )
+        except asyncio.CancelledError:
+            cancelled_desired = {
+                'leverage': int(submitted['leverage']),
+                'margin_mode': 'cross' if bool(submitted['is_cross']) else 'isolated',
+            }
+            await audit(
+                db,
+                action='ADMIN_FOLLOWER_LEVERAGE_SYNC_UNVERIFIED',
+                actor_id=actor.id,
+                subject_id=target.id,
+                reason=body.reason,
+                after={
+                    'asset': asset,
+                    'network': network,
+                    'response': None,
+                    'desired': cancelled_desired,
+                    'observed': None,
+                    'submission_status': 'UNKNOWN_DUE_TO_CANCELLATION',
+                    'verification_error': 'CancelledError: signed leverage synchronization cancelled before response propagation',
+                },
+            )
+            await db.commit()
+            raise
+        except HTTPException:
+            raise
         except Exception as exc:
             await audit(db, action='ADMIN_FOLLOWER_LEVERAGE_SYNC_FAILED', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'asset': asset, 'network': network, 'error': f'{type(exc).__name__}: {exc}'})
             await db.commit()
@@ -239,14 +465,36 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
     finally:
         private_key = ''
 
+    expected_leverage = int(submitted['leverage'])
+    expected_cross = bool(submitted['is_cross'])
+    desired = {
+        'leverage': expected_leverage,
+        'margin_mode': 'cross' if expected_cross else 'isolated',
+    }
+
     try:
-        follower_state = await follower_hl.user_state(account.account_address, priority=Priority.DIAGNOSTIC)
+        follower_state = await follower_hl.user_state(account_address, priority=Priority.DIAGNOSTIC)
         follower_cfg = position_configs(follower_state).get(asset)
     except Exception as exc:
-        raise HTTPException(502, f'Leverage update sent, but verification read failed: {type(exc).__name__}: {exc}') from exc
+        verification_error = f'{type(exc).__name__}: {exc}'
+        await audit(
+            db,
+            action='ADMIN_FOLLOWER_LEVERAGE_SYNC_UNVERIFIED',
+            actor_id=actor.id,
+            subject_id=target.id,
+            reason=body.reason,
+            after={
+                'asset': asset,
+                'network': network,
+                'response': response,
+                'desired': desired,
+                'observed': None,
+                'verification_error': verification_error,
+            },
+        )
+        await db.commit()
+        raise HTTPException(502, f'Leverage update sent, but verification read failed: {verification_error}') from exc
 
-    expected_leverage = int(desired['leverage'])
-    expected_cross = desired['margin_mode'] == 'cross'
     verified_match = bool(
         follower_cfg
         and follower_cfg.leverage == expected_leverage
@@ -262,6 +510,12 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
         raise HTTPException(502, f'Hyperliquid acknowledged the leverage update but follower state is {observed}; expected {desired}')
 
     verified = dict(diagnostic)
+    verified['master'] = dict(refreshed_source['master'])
+    verified['exchange_max_leverage'] = refreshed_source['exchange_max_leverage']
+    verified['exchange_only_isolated'] = refreshed_source['exchange_only_isolated']
+    verified['effective_exchange_max_leverage'] = refreshed_source['effective_exchange_max_leverage']
+    verified['risk_max_leverage'] = refreshed_source['risk_max_leverage']
+    verified['desired'] = desired
     verified['follower'] = {'leverage': follower_cfg.leverage, 'margin_mode': 'cross' if follower_cfg.is_cross else 'isolated'}
     verified['matches'] = True
     await audit(db, action='ADMIN_FOLLOWER_LEVERAGE_SYNCED', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'asset': asset, 'network': network, 'response': response, 'diagnostic': verified})
@@ -457,6 +711,7 @@ async def reconcile_status(user_id: uuid.UUID, job_id: uuid.UUID, actor: User = 
     if not job or job.user_id != user_id or job.origin != 'ADMIN_RECONCILE':
         raise HTTPException(404, 'Reconciliation job not found')
     return _reconcile_job_payload(job)
+
 
 async def _flag(db: AsyncSession, slug: str, enabled: bool, actor: User, reason: str):
     flag = await db.get(SystemFlag, slug)
