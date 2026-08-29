@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.hyperliquid import HyperliquidAdapter, position_configs
@@ -106,66 +106,89 @@ async def _fresh_position_config_sync_authorization(
     exchange_max_leverage: int,
     desired_is_cross: bool,
 ) -> tuple[int, bool]:
-    """Authoritative mutable decision executed at the actual submission boundary."""
-    current_network = (await user_network_state(db, target.id)).network
+    """Take one final PostgreSQL snapshot of every mutable submission control.
+
+    This helper is intentionally a *single* database round-trip. The caller runs
+    it after fresh master/exchange reads and after restoring any degraded address
+    cadence slot, so there is no additional await between this authoritative
+    follower/control snapshot and the synchronous Hyperliquid SDK submission.
+    """
+    row = (await db.execute(
+        text(
+            """
+            SELECT
+                u.execution_network,
+                u.copy_state,
+                r.max_leverage AS risk_max_leverage,
+                r.allow_assets,
+                r.block_assets,
+                ta.id AS account_id,
+                ta.account_address,
+                sc.id AS credential_id,
+                sc.status AS credential_status,
+                sc.expires_at AS credential_expires_at,
+                COALESCE((SELECT enabled FROM system_flags WHERE slug = 'live_trading'), FALSE) AS live_trading,
+                COALESCE((SELECT enabled FROM system_flags WHERE slug = 'global_pause'), FALSE) AS global_pause,
+                COALESCE((SELECT enabled FROM system_flags WHERE slug = 'emergency_stop'), FALSE) AS emergency_stop
+            FROM users u
+            LEFT JOIN risk_profiles r ON r.user_id = u.id
+            LEFT JOIN trading_accounts ta ON ta.user_id = u.id
+            LEFT JOIN signing_credentials sc ON sc.trading_account_id = ta.id
+            WHERE u.id = :user_id
+            """
+        ),
+        {'user_id': target.id},
+    )).mappings().one_or_none()
+    if not row:
+        raise HTTPException(404, 'User not found during leverage synchronization')
+
+    current_network = str(row['execution_network'] or settings.follower_network).lower()
     if current_network != expected_network:
         raise HTTPException(409, 'Follower network changed during leverage synchronization')
-
-    await db.refresh(target, attribute_names=['copy_state'])
-    if target.copy_state != CopyState.PAUSED:
+    if str(row['copy_state'] or '') != CopyState.PAUSED.value:
         raise HTTPException(409, 'Pause the follower before direct leverage synchronization')
 
-    risk = (await db.execute(
-        select(RiskProfile)
-        .where(RiskProfile.user_id == target.id)
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
-    if not risk:
+    if row['risk_max_leverage'] is None:
         raise HTTPException(409, 'Follower risk profile is missing')
-    allowed_asset = (not risk.allow_assets or asset in risk.allow_assets) and asset not in risk.block_assets
+    allow_assets = list(row['allow_assets'] or [])
+    block_assets = list(row['block_assets'] or [])
+    allowed_asset = (not allow_assets or asset in allow_assets) and asset not in block_assets
     if not allowed_asset:
         raise HTTPException(409, f'{asset} is not permitted by the follower Risk Engine')
-    desired_leverage = max(1, min(master_leverage, int(risk.max_leverage), exchange_max_leverage))
+    desired_leverage = max(
+        1,
+        min(
+            int(master_leverage),
+            int(Decimal(str(row['risk_max_leverage']))),
+            int(exchange_max_leverage),
+        ),
+    )
 
-    account = (await db.execute(
-        select(TradingAccount)
-        .where(TradingAccount.user_id == target.id)
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
+    account_id = row['account_id']
+    account_address = str(row['account_address'] or '')
     if (
-        not account
-        or account.id != expected_account_id
-        or account.account_address.lower() != expected_account_address.lower()
+        account_id != expected_account_id
+        or account_address.lower() != expected_account_address.lower()
     ):
         raise HTTPException(409, 'Follower trading account changed during leverage synchronization')
-    cred = (await db.execute(
-        select(SigningCredential)
-        .where(SigningCredential.trading_account_id == account.id)
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
+
+    credential_status = str(row['credential_status'] or '')
+    credential_expires_at = row['credential_expires_at']
     if (
-        not _credential_active(cred)
-        or cred is None
-        or cred.id != expected_credential_id
+        row['credential_id'] != expected_credential_id
+        or credential_status not in {CredentialStatus.ACTIVE.value, CredentialStatus.EXPIRING.value}
+        or (credential_expires_at is not None and credential_expires_at <= datetime.now(UTC))
     ):
         raise HTTPException(409, 'Trading credential changed or became unavailable')
 
-    # System execution controls are deliberately the final DB await in this
-    # authorization. The callback itself runs after signer/rate/cadence waits,
-    # so a halt/live-trading change committed while the earlier identity/risk
-    # checks are running is observed before the callback returns to SDK submit.
-    flags = (await db.execute(
-        select(SystemFlag)
-        .where(SystemFlag.slug.in_(('live_trading', 'global_pause', 'emergency_stop')))
-        .execution_options(populate_existing=True)
-    )).scalars().all()
-    flag_state = {flag.slug: bool(flag.enabled) for flag in flags}
     if expected_network == 'mainnet' and (
-        not settings.ENABLE_LIVE_TRADING or not flag_state.get('live_trading', False)
+        not settings.ENABLE_LIVE_TRADING or not bool(row['live_trading'])
     ):
         raise HTTPException(409, 'Mainnet live-trading gate is closed')
     active_halts = sorted(
-        slug for slug in ('global_pause', 'emergency_stop') if flag_state.get(slug, False)
+        slug
+        for slug in ('global_pause', 'emergency_stop')
+        if bool(row[slug])
     )
     if active_halts:
         raise HTTPException(409, f"Leverage synchronization blocked by system halt: {', '.join(active_halts)}")
@@ -343,9 +366,11 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
     }
 
     async def _authorize_submission() -> tuple[int, bool]:
-        # The master and exchange constraints must both be read after every
-        # signer/rate/cadence wait. A fresh adapter is used for metadata so the
-        # normal 300-second market cache cannot make this admin sync stale.
+        # Source state and exchange constraints are re-read after signer/rate waits.
+        # A fresh adapter prevents the normal metadata TTL from reusing the
+        # diagnostic cache. After this expensive work, restore the degraded-cadence
+        # slot and take ONE PostgreSQL snapshot of every mutable follower/control
+        # input. No await remains between that snapshot and SDK submit.
         fresh_master_hl = _master_adapter()
         fresh_spec_hl = _follower_adapter(network)
         fresh_master_state, fresh_spec = await asyncio.gather(
@@ -359,10 +384,6 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
         if not fresh_master_cfg:
             raise HTTPException(409, f'Master no longer has an open {asset} position/configuration')
 
-        # Intersect the fresh exchange constraint with the already-loaded spec
-        # used internally by update_leverage. This keeps the effective SDK call
-        # identical to the audited target even if Hyperliquid relaxed a limit
-        # during the wait; tightened limits are always honored immediately.
         initial_exchange_max = int(diagnostic['exchange_max_leverage'])
         effective_exchange_max = min(fresh_spec.max_leverage, initial_exchange_max)
         initial_is_cross = diagnostic['desired']['margin_mode'] == 'cross'
@@ -371,6 +392,10 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
             and not fresh_spec.only_isolated
             and initial_is_cross
         )
+        if follower_hl.address_limits is not None:
+            await follower_hl.address_limits.reestablish_submission_slot_before_final_authorization(
+                account_address
+            )
         leverage, is_cross = await _fresh_position_config_sync_authorization(
             db,
             target,
