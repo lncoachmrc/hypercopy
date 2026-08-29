@@ -159,6 +159,24 @@ def test_diagnostic_can_reuse_preloaded_follower_adapter() -> None:
     assert 'follower_hl.network != network' in source
 
 
+def test_success_audit_replaces_stale_source_inputs_with_refreshed_values() -> None:
+    source = inspect.getsource(admin.sync_position_config)
+    callback_start = source.index('async def _authorize_submission()')
+    callback_end = source.index('private_key = crypto.decrypt', callback_start)
+    callback = source[callback_start:callback_end]
+    success_start = source.index('verified = dict(diagnostic)')
+    success = source[success_start:]
+
+    assert "refreshed_source['master'] = {" in callback
+    assert "refreshed_source['exchange_max_leverage'] = fresh_spec.max_leverage" in callback
+    assert "refreshed_source['exchange_only_isolated'] = fresh_spec.only_isolated" in callback
+    assert "refreshed_source['effective_exchange_max_leverage'] = effective_exchange_max" in callback
+    assert "verified['master'] = dict(refreshed_source['master'])" in success
+    assert "verified['exchange_max_leverage'] = refreshed_source['exchange_max_leverage']" in success
+    assert "verified['exchange_only_isolated'] = refreshed_source['exchange_only_isolated']" in success
+    assert "verified['effective_exchange_max_leverage'] = refreshed_source['effective_exchange_max_leverage']" in success
+
+
 def test_cancelled_signed_sync_is_audited_before_cancellation_propagates() -> None:
     source = inspect.getsource(admin.sync_position_config)
     signed_update = source.index('response = await follower_hl.update_leverage')
