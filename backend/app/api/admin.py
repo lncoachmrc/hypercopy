@@ -66,13 +66,33 @@ def _position_config_sync_confirmation(network: Network) -> str:
     return f'SYNC {network.upper()} LEVERAGE'
 
 
-async def _active_system_execution_halts(db: AsyncSession) -> list[str]:
-    active: list[str] = []
-    for slug in ('global_pause', 'emergency_stop'):
-        flag = await db.get(SystemFlag, slug)
-        if flag and flag.enabled:
-            active.append(slug)
-    return active
+async def _assert_fresh_position_config_sync_allowed(
+    db: AsyncSession,
+    target: User,
+    expected_network: Network,
+) -> None:
+    current_network = (await user_network_state(db, target.id)).network
+    if current_network != expected_network:
+        raise HTTPException(409, 'Follower network changed during leverage synchronization')
+
+    # Collapse mutable execution controls into one fresh, final check immediately
+    # before credential decryption/signing. Expiring the identity map prevents a
+    # previous diagnostic read from masking a concurrent pause/stop/live change.
+    db.expire_all()
+    await db.refresh(target, attribute_names=['copy_state'])
+    if target.copy_state != CopyState.PAUSED:
+        raise HTTPException(409, 'Pause the follower before direct leverage synchronization')
+    if not await live_trading_allowed(db, expected_network):
+        raise HTTPException(409, 'Mainnet live-trading gate is closed')
+
+    flags = (await db.execute(
+        select(SystemFlag)
+        .where(SystemFlag.slug.in_(('global_pause', 'emergency_stop')))
+        .execution_options(populate_existing=True)
+    )).scalars().all()
+    active_halts = sorted(flag.slug for flag in flags if flag.enabled)
+    if active_halts:
+        raise HTTPException(409, f"Leverage synchronization blocked by system halt: {', '.join(active_halts)}")
 
 
 @router.get('/system')
@@ -217,13 +237,6 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
     expected_confirmation = _position_config_sync_confirmation(network)
     if body.confirmation != expected_confirmation:
         raise HTTPException(422, f'Confirmation must be {expected_confirmation}')
-    if not await live_trading_allowed(db, network):
-        raise HTTPException(409, 'Mainnet live-trading gate is closed')
-    active_halts = await _active_system_execution_halts(db)
-    if active_halts:
-        raise HTTPException(409, f"Leverage synchronization blocked by system halt: {', '.join(active_halts)}")
-    if target.copy_state != CopyState.PAUSED:
-        raise HTTPException(409, 'Pause the follower before direct leverage synchronization')
 
     asset = asset.upper().strip()
     diagnostic = await _position_config_diagnostic(db, target, asset)
@@ -233,9 +246,15 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
         return {'ok': True, 'changed': False, 'verified': True, 'diagnostic': diagnostic}
 
     account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == target.id))).scalar_one()
-    cred = (await db.execute(select(SigningCredential).where(SigningCredential.trading_account_id == account.id))).scalar_one_or_none()
+    cred = (await db.execute(
+        select(SigningCredential)
+        .where(SigningCredential.trading_account_id == account.id)
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
     if not _credential_active(cred):
         raise HTTPException(409, 'Trading credential is unavailable')
+
+    await _assert_fresh_position_config_sync_allowed(db, target, network)
 
     desired = diagnostic['desired']
     follower_hl = _follower_adapter(network)
