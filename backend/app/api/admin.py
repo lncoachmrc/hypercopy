@@ -105,7 +105,7 @@ async def _fresh_position_config_sync_authorization(
     master_leverage: int,
     exchange_max_leverage: int,
     desired_is_cross: bool,
-) -> tuple[int, bool]:
+) -> tuple[int, bool, str]:
     """Take one final PostgreSQL snapshot of every mutable submission control.
 
     This helper is intentionally a *single* database round-trip. The caller runs
@@ -150,6 +150,7 @@ async def _fresh_position_config_sync_authorization(
 
     if row['risk_max_leverage'] is None:
         raise HTTPException(409, 'Follower risk profile is missing')
+    risk_max_leverage = Decimal(str(row['risk_max_leverage']))
     allow_assets = list(row['allow_assets'] or [])
     block_assets = list(row['block_assets'] or [])
     allowed_asset = (not allow_assets or asset in allow_assets) and asset not in block_assets
@@ -159,7 +160,7 @@ async def _fresh_position_config_sync_authorization(
         1,
         min(
             int(master_leverage),
-            int(Decimal(str(row['risk_max_leverage']))),
+            int(risk_max_leverage),
             int(exchange_max_leverage),
         ),
     )
@@ -193,7 +194,7 @@ async def _fresh_position_config_sync_authorization(
     if active_halts:
         raise HTTPException(409, f"Leverage synchronization blocked by system halt: {', '.join(active_halts)}")
 
-    return desired_leverage, desired_is_cross
+    return desired_leverage, desired_is_cross, str(risk_max_leverage)
 
 
 @router.get('/system')
@@ -404,7 +405,7 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
             await follower_hl.address_limits.reestablish_submission_slot_before_final_authorization(
                 account_address
             )
-        leverage, is_cross = await _fresh_position_config_sync_authorization(
+        leverage, is_cross, risk_max_leverage = await _fresh_position_config_sync_authorization(
             db,
             target,
             network,
@@ -416,6 +417,7 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
             exchange_max_leverage=effective_exchange_max,
             desired_is_cross=fresh_desired_is_cross,
         )
+        refreshed_source['risk_max_leverage'] = risk_max_leverage
         submitted['leverage'] = leverage
         submitted['is_cross'] = is_cross
         return leverage, is_cross
@@ -512,6 +514,7 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
     verified['exchange_max_leverage'] = refreshed_source['exchange_max_leverage']
     verified['exchange_only_isolated'] = refreshed_source['exchange_only_isolated']
     verified['effective_exchange_max_leverage'] = refreshed_source['effective_exchange_max_leverage']
+    verified['risk_max_leverage'] = refreshed_source['risk_max_leverage']
     verified['desired'] = desired
     verified['follower'] = {'leverage': follower_cfg.leverage, 'margin_mode': 'cross' if follower_cfg.is_cross else 'isolated'}
     verified['matches'] = True
