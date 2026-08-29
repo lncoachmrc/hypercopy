@@ -70,30 +70,49 @@ async def _fresh_position_config_sync_authorization(
     db: AsyncSession,
     target: User,
     expected_network: Network,
-) -> tuple[uuid.UUID, str, SigningCredential]:
+    *,
+    asset: str,
+    master_leverage: int,
+    exchange_max_leverage: int,
+) -> tuple[uuid.UUID, str, SigningCredential, int]:
     current_network = (await user_network_state(db, target.id)).network
     if current_network != expected_network:
         raise HTTPException(409, 'Follower network changed during leverage synchronization')
 
-    # Collapse mutable execution controls and signing material into one fresh,
-    # final authorization immediately before decryption/signing. Expiring the
-    # identity map prevents earlier diagnostic reads from masking concurrent
-    # pause/stop/live/credential changes.
-    db.expire_all()
+    # One authoritative pre-sign read of mutable TRAXION state. Do not expire
+    # the whole identity map: actor/account objects belong to this same async
+    # session and session-wide expiration can trigger invalid implicit reloads.
     await db.refresh(target, attribute_names=['copy_state'])
     if target.copy_state != CopyState.PAUSED:
         raise HTTPException(409, 'Pause the follower before direct leverage synchronization')
-    if not await live_trading_allowed(db, expected_network):
-        raise HTTPException(409, 'Mainnet live-trading gate is closed')
 
     flags = (await db.execute(
         select(SystemFlag)
-        .where(SystemFlag.slug.in_(('global_pause', 'emergency_stop')))
+        .where(SystemFlag.slug.in_(('live_trading', 'global_pause', 'emergency_stop')))
         .execution_options(populate_existing=True)
     )).scalars().all()
-    active_halts = sorted(flag.slug for flag in flags if flag.enabled)
+    flag_state = {flag.slug: bool(flag.enabled) for flag in flags}
+    if expected_network == 'mainnet' and (
+        not settings.ENABLE_LIVE_TRADING or not flag_state.get('live_trading', False)
+    ):
+        raise HTTPException(409, 'Mainnet live-trading gate is closed')
+    active_halts = sorted(
+        slug for slug in ('global_pause', 'emergency_stop') if flag_state.get(slug, False)
+    )
     if active_halts:
         raise HTTPException(409, f"Leverage synchronization blocked by system halt: {', '.join(active_halts)}")
+
+    risk = (await db.execute(
+        select(RiskProfile)
+        .where(RiskProfile.user_id == target.id)
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if not risk:
+        raise HTTPException(409, 'Follower risk profile is missing')
+    allowed_asset = (not risk.allow_assets or asset in risk.allow_assets) and asset not in risk.block_assets
+    if not allowed_asset:
+        raise HTTPException(409, f'{asset} is not permitted by the follower Risk Engine')
+    desired_leverage = max(1, min(master_leverage, int(risk.max_leverage), exchange_max_leverage))
 
     account = (await db.execute(
         select(TradingAccount)
@@ -110,7 +129,7 @@ async def _fresh_position_config_sync_authorization(
     if not _credential_active(cred):
         raise HTTPException(409, 'Trading credential is unavailable')
     assert cred is not None
-    return account.id, account.account_address, cred
+    return account.id, account.account_address, cred, desired_leverage
 
 
 @router.get('/system')
@@ -167,7 +186,13 @@ async def master_state(user: User = Depends(admin)):
         raise HTTPException(502, f'Master state read failed: {type(exc).__name__}: {exc}') from exc
 
 
-async def _position_config_diagnostic(db: AsyncSession, target: User, asset: str) -> dict:
+async def _position_config_diagnostic(
+    db: AsyncSession,
+    target: User,
+    asset: str,
+    *,
+    follower_hl: HyperliquidAdapter | None = None,
+) -> dict:
     asset = asset.upper().strip()
     network_state = await user_network_state(db, target.id)
     network = network_state.network
@@ -179,7 +204,9 @@ async def _position_config_diagnostic(db: AsyncSession, target: User, asset: str
         raise HTTPException(409, 'HYPERLIQUID_MASTER_ADDRESS is not configured')
 
     master_hl = _master_adapter()
-    follower_hl = _follower_adapter(network)
+    follower_hl = follower_hl or _follower_adapter(network)
+    if follower_hl.network != network:
+        raise HTTPException(409, 'Follower adapter does not match the selected execution network')
     try:
         master_state, follower_state, spec = await asyncio.gather(
             master_hl.user_state(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.DIAGNOSTIC),
@@ -257,16 +284,26 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
         raise HTTPException(422, f'Confirmation must be {expected_confirmation}')
 
     asset = asset.upper().strip()
-    diagnostic = await _position_config_diagnostic(db, target, asset)
-    if not diagnostic['allowed_asset']:
-        raise HTTPException(409, f'{asset} is not permitted by the follower Risk Engine')
+    follower_hl = _follower_adapter(network)
+    diagnostic = await _position_config_diagnostic(db, target, asset, follower_hl=follower_hl)
     if diagnostic['matches']:
         return {'ok': True, 'changed': False, 'verified': True, 'diagnostic': diagnostic}
 
-    account_id, account_address, cred = await _fresh_position_config_sync_authorization(db, target, network)
+    # Refresh/prime the same adapter's market metadata before the only mutable
+    # authorization read. update_leverage() will therefore hit the 300s cache
+    # rather than introduce another Hyperliquid metadata request after the gate.
+    await follower_hl.asset_spec(asset)
+    account_id, account_address, cred, desired_leverage = await _fresh_position_config_sync_authorization(
+        db,
+        target,
+        network,
+        asset=asset,
+        master_leverage=int(diagnostic['master']['leverage']),
+        exchange_max_leverage=int(diagnostic['exchange_max_leverage']),
+    )
 
-    desired = diagnostic['desired']
-    follower_hl = _follower_adapter(network)
+    desired = dict(diagnostic['desired'])
+    desired['leverage'] = desired_leverage
     private_key = crypto.decrypt(_credential_blob(cred), user_id=str(target.id), account_id=str(account_id))
     try:
         try:
@@ -307,6 +344,7 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
         raise HTTPException(502, f'Hyperliquid acknowledged the leverage update but follower state is {observed}; expected {desired}')
 
     verified = dict(diagnostic)
+    verified['desired'] = desired
     verified['follower'] = {'leverage': follower_cfg.leverage, 'margin_mode': 'cross' if follower_cfg.is_cross else 'isolated'}
     verified['matches'] = True
     await audit(db, action='ADMIN_FOLLOWER_LEVERAGE_SYNCED', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'asset': asset, 'network': network, 'response': response, 'diagnostic': verified})
