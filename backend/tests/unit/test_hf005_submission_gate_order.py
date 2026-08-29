@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from unittest.mock import MagicMock
 
@@ -147,3 +148,64 @@ async def test_optional_authorization_runs_after_all_waits_and_immediately_befor
         "submit",
     ]
     assert events.index("authorize") + 1 == events.index("submit")
+
+
+@pytest.mark.asyncio
+async def test_optional_authorization_cannot_starve_nested_default_executor_reads(monkeypatch):
+    events: list[str] = []
+    limiter = _OrderedLimiter(events)
+    monkeypatch.setattr("app.adapters.hyperliquid.Info", MagicMock())
+    adapter = HyperliquidAdapter(limiter, network="testnet")
+    adapter.address_limits = _OrderedAddressTracker(events)
+
+    @asynccontextmanager
+    async def ordered_signer_lock(_signer_address: str):
+        events.append("signer_lock")
+        yield
+
+    monkeypatch.setattr("app.adapters.hyperliquid.signer_action_lock", ordered_signer_lock)
+
+    loop = asyncio.get_running_loop()
+    # Ensure there is an existing default executor we can restore after the test.
+    await asyncio.to_thread(lambda: None)
+    previous_default_executor = loop._default_executor
+    assert previous_default_executor is not None
+    single_default_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hf005-default")
+    loop.set_default_executor(single_default_worker)
+
+    async def authorize():
+        events.append("authorize_start")
+        await asyncio.to_thread(lambda: events.append("nested_default_worker"))
+        events.append("authorize_done")
+
+    def submit():
+        events.append("submit")
+        return {"status": "ok"}
+
+    try:
+        result = await asyncio.wait_for(
+            adapter._signed_call(
+                "0x" + "44" * 20,
+                "0x" + "33" * 20,
+                submit,
+                before_submit=authorize,
+            ),
+            timeout=2,
+        )
+    finally:
+        loop.set_default_executor(previous_default_executor)
+        single_default_worker.shutdown(wait=True)
+
+    assert result == {"status": "ok"}
+    assert events == [
+        "pre_wait",
+        "signer_lock",
+        "ip_budget",
+        "pre_final_wait",
+        "record_attempt",
+        "cadence_slot",
+        "authorize_start",
+        "nested_default_worker",
+        "authorize_done",
+        "submit",
+    ]
