@@ -366,6 +366,29 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
                 is_cross=bool(submitted['is_cross']),
                 before_submit=_authorize_submission,
             )
+        except asyncio.CancelledError:
+            cancelled_desired = {
+                'leverage': int(submitted['leverage']),
+                'margin_mode': 'cross' if bool(submitted['is_cross']) else 'isolated',
+            }
+            await audit(
+                db,
+                action='ADMIN_FOLLOWER_LEVERAGE_SYNC_UNVERIFIED',
+                actor_id=actor.id,
+                subject_id=target.id,
+                reason=body.reason,
+                after={
+                    'asset': asset,
+                    'network': network,
+                    'response': None,
+                    'desired': cancelled_desired,
+                    'observed': None,
+                    'submission_status': 'UNKNOWN_DUE_TO_CANCELLATION',
+                    'verification_error': 'CancelledError: signed leverage synchronization cancelled before response propagation',
+                },
+            )
+            await db.commit()
+            raise
         except HTTPException:
             raise
         except Exception as exc:
