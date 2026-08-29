@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 from app.api import admin, auth
 from app.api.admin import _position_config_sync_confirmation
 from app.core.config import Settings
 
 
-def test_runtime_follower_fallback_defaults_to_mainnet() -> None:
+def test_runtime_follower_fallback_defaults_to_mainnet(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv('HYPERLIQUID_NETWORK', raising=False)
+    monkeypatch.delenv('HYPERLIQUID_FOLLOWER_NETWORK', raising=False)
     assert Settings.model_fields['HYPERLIQUID_NETWORK'].default == 'mainnet'
     cfg = Settings(_env_file=None)
     assert cfg.follower_network == 'mainnet'
