@@ -66,22 +66,51 @@ def _position_config_sync_confirmation(network: Network) -> str:
     return f'SYNC {network.upper()} LEVERAGE'
 
 
+async def _position_config_sync_signing_material(
+    db: AsyncSession,
+    target: User,
+) -> tuple[uuid.UUID, str, SigningCredential]:
+    """Load the API-wallet material needed to enter the signed-action path.
+
+    This is deliberately not the mutable policy decision. The material is
+    revalidated by the single final authorization immediately before SDK submit.
+    """
+    account = (await db.execute(
+        select(TradingAccount)
+        .where(TradingAccount.user_id == target.id)
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if not account:
+        raise HTTPException(409, 'Follower has no Hyperliquid trading account')
+    cred = (await db.execute(
+        select(SigningCredential)
+        .where(SigningCredential.trading_account_id == account.id)
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if not _credential_active(cred):
+        raise HTTPException(409, 'Trading credential is unavailable')
+    assert cred is not None
+    return account.id, account.account_address, cred
+
+
 async def _fresh_position_config_sync_authorization(
     db: AsyncSession,
     target: User,
     expected_network: Network,
     *,
+    expected_account_id: uuid.UUID,
+    expected_account_address: str,
+    expected_credential_id: uuid.UUID,
     asset: str,
     master_leverage: int,
     exchange_max_leverage: int,
-) -> tuple[uuid.UUID, str, SigningCredential, int]:
+    desired_is_cross: bool,
+) -> tuple[int, bool]:
+    """Authoritative mutable decision executed at the actual submission boundary."""
     current_network = (await user_network_state(db, target.id)).network
     if current_network != expected_network:
         raise HTTPException(409, 'Follower network changed during leverage synchronization')
 
-    # One authoritative pre-sign read of mutable TRAXION state. Do not expire
-    # the whole identity map: actor/account objects belong to this same async
-    # session and session-wide expiration can trigger invalid implicit reloads.
     await db.refresh(target, attribute_names=['copy_state'])
     if target.copy_state != CopyState.PAUSED:
         raise HTTPException(409, 'Pause the follower before direct leverage synchronization')
@@ -119,17 +148,25 @@ async def _fresh_position_config_sync_authorization(
         .where(TradingAccount.user_id == target.id)
         .execution_options(populate_existing=True)
     )).scalar_one_or_none()
-    if not account:
-        raise HTTPException(409, 'Follower has no Hyperliquid trading account')
+    if (
+        not account
+        or account.id != expected_account_id
+        or account.account_address.lower() != expected_account_address.lower()
+    ):
+        raise HTTPException(409, 'Follower trading account changed during leverage synchronization')
     cred = (await db.execute(
         select(SigningCredential)
         .where(SigningCredential.trading_account_id == account.id)
         .execution_options(populate_existing=True)
     )).scalar_one_or_none()
-    if not _credential_active(cred):
-        raise HTTPException(409, 'Trading credential is unavailable')
-    assert cred is not None
-    return account.id, account.account_address, cred, desired_leverage
+    if (
+        not _credential_active(cred)
+        or cred is None
+        or cred.id != expected_credential_id
+    ):
+        raise HTTPException(409, 'Trading credential changed or became unavailable')
+
+    return desired_leverage, desired_is_cross
 
 
 @router.get('/system')
@@ -289,21 +326,35 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
     if diagnostic['matches']:
         return {'ok': True, 'changed': False, 'verified': True, 'diagnostic': diagnostic}
 
-    # Refresh/prime the same adapter's market metadata before the only mutable
-    # authorization read. update_leverage() will therefore hit the 300s cache
-    # rather than introduce another Hyperliquid metadata request after the gate.
+    # Ensure signing metadata is already loaded before entering the signed-action
+    # path. The one mutable policy authorization itself runs later, inside
+    # _signed_call, after signer/rate/cadence waits and immediately before SDK submit.
     await follower_hl.asset_spec(asset)
-    account_id, account_address, cred, desired_leverage = await _fresh_position_config_sync_authorization(
-        db,
-        target,
-        network,
-        asset=asset,
-        master_leverage=int(diagnostic['master']['leverage']),
-        exchange_max_leverage=int(diagnostic['exchange_max_leverage']),
-    )
+    account_id, account_address, cred = await _position_config_sync_signing_material(db, target)
+    expected_credential_id = cred.id
+    desired_is_cross = diagnostic['desired']['margin_mode'] == 'cross'
+    submitted = {
+        'leverage': int(diagnostic['desired']['leverage']),
+        'is_cross': desired_is_cross,
+    }
 
-    desired = dict(diagnostic['desired'])
-    desired['leverage'] = desired_leverage
+    async def _authorize_submission() -> tuple[int, bool]:
+        leverage, is_cross = await _fresh_position_config_sync_authorization(
+            db,
+            target,
+            network,
+            expected_account_id=account_id,
+            expected_account_address=account_address,
+            expected_credential_id=expected_credential_id,
+            asset=asset,
+            master_leverage=int(diagnostic['master']['leverage']),
+            exchange_max_leverage=int(diagnostic['exchange_max_leverage']),
+            desired_is_cross=desired_is_cross,
+        )
+        submitted['leverage'] = leverage
+        submitted['is_cross'] = is_cross
+        return leverage, is_cross
+
     private_key = crypto.decrypt(_credential_blob(cred), user_id=str(target.id), account_id=str(account_id))
     try:
         try:
@@ -311,9 +362,12 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
                 account_address=account_address,
                 private_key=private_key,
                 asset=asset,
-                leverage=int(desired['leverage']),
-                is_cross=desired['margin_mode'] == 'cross',
+                leverage=int(submitted['leverage']),
+                is_cross=bool(submitted['is_cross']),
+                before_submit=_authorize_submission,
             )
+        except HTTPException:
+            raise
         except Exception as exc:
             await audit(db, action='ADMIN_FOLLOWER_LEVERAGE_SYNC_FAILED', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'asset': asset, 'network': network, 'error': f'{type(exc).__name__}: {exc}'})
             await db.commit()
@@ -327,8 +381,12 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
     except Exception as exc:
         raise HTTPException(502, f'Leverage update sent, but verification read failed: {type(exc).__name__}: {exc}') from exc
 
-    expected_leverage = int(desired['leverage'])
-    expected_cross = desired['margin_mode'] == 'cross'
+    expected_leverage = int(submitted['leverage'])
+    expected_cross = bool(submitted['is_cross'])
+    desired = {
+        'leverage': expected_leverage,
+        'margin_mode': 'cross' if expected_cross else 'isolated',
+    }
     verified_match = bool(
         follower_cfg
         and follower_cfg.leverage == expected_leverage
