@@ -6,7 +6,7 @@ import json
 import time
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 import websockets
 from eth_account import Account
@@ -235,17 +235,25 @@ class HyperliquidAdapter:
         # request outside that critical section.
         await self._record_exchange_address_throttle(account_address)
 
-    async def _signed_call(self, account_address: str, signer_address: str, func, *args):
+    async def _signed_call(
+        self,
+        account_address: str,
+        signer_address: str,
+        func,
+        *args,
+        before_submit: Callable[[], Awaitable[None]] | None = None,
+    ):
         """Run one signed SDK action under signer serialization and address cadence.
 
         A lightweight pre-wait happens outside the signer lock. The authoritative
         cadence reservation is then performed from the worker thread that is
         about to invoke the synchronous SDK function, eliminating thread-pool
-        queue time between reservation and actual exchange invocation. The signer
-        lock remains held through reservation, signing, network I/O and result
-        classification. A definite action-level throttle installs the next
-        one-shot slot before signer unlock; slower `userRateLimit` diagnostics
-        remain outside this critical section.
+        queue time between reservation and actual exchange invocation. An optional
+        action-specific authorization callback runs after every asynchronous
+        submission wait and immediately before the synchronous SDK call. Existing
+        copy-trading actions do not install this callback, so their path is
+        unchanged. The signer lock remains held through reservation, signing,
+        network I/O and result classification.
         """
 
         if self.address_limits is not None:
@@ -260,16 +268,17 @@ class HyperliquidAdapter:
         loop = asyncio.get_running_loop()
 
         async def _prepare_actual_submission() -> None:
-            if self.address_limits is None:
-                return
-            # This coroutine is scheduled by the worker thread immediately before
-            # the sync SDK call. It is therefore the final cross-process cadence
-            # gate; no executor queue can consume its 10-second reservation.
-            await self.address_limits.wait_if_backed_off(account_address)
-            await self.address_limits.record_action_attempt(account_address)
+            if self.address_limits is not None:
+                # Reserve/account for the actual action before the final optional
+                # authorization. The callback is deliberately the last await so
+                # no lock, rate-budget or cadence wait can make its decision stale.
+                await self.address_limits.wait_if_backed_off(account_address)
+                await self.address_limits.record_action_attempt(account_address)
+            if before_submit is not None:
+                await before_submit()
 
         def _invoke_after_cadence():
-            if self.address_limits is not None:
+            if self.address_limits is not None or before_submit is not None:
                 preparation = asyncio.run_coroutine_threadsafe(_prepare_actual_submission(), loop)
                 preparation.result()
             return func(*args)
@@ -486,24 +495,47 @@ class HyperliquidAdapter:
         asset: str,
         leverage: int,
         is_cross: bool,
+        before_submit: Callable[[], Awaitable[tuple[int, bool] | None]] | None = None,
     ) -> dict:
         """Set the follower market's leverage/margin mode using its API wallet."""
         spec = await self.asset_spec(asset)
-        leverage = max(1, min(int(leverage), spec.max_leverage))
-        if spec.only_isolated:
-            is_cross = False
+        effective = {
+            'leverage': max(1, min(int(leverage), spec.max_leverage)),
+            'is_cross': False if spec.only_isolated else bool(is_cross),
+        }
         local = Account.from_key(private_key)
         exchange = self._exchange(local, account_address)
+
+        async def _apply_before_submit() -> None:
+            if before_submit is None:
+                return
+            override = await before_submit()
+            if override is None:
+                return
+            override_leverage, override_cross = override
+            effective['leverage'] = max(1, min(int(override_leverage), spec.max_leverage))
+            effective['is_cross'] = False if spec.only_isolated else bool(override_cross)
 
         def _submit_leverage():
             # Calculate expiration only after the signer lock is held; otherwise
             # lock contention could age expiresAfter before the action is sent.
             exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
-            return exchange.update_leverage(leverage, asset, is_cross)
+            return exchange.update_leverage(
+                int(effective['leverage']),
+                asset,
+                bool(effective['is_cross']),
+            )
 
         # Exchange actions are intentionally one-shot. Ambiguous results are
-        # resolved later by Cloid rather than blindly resubmitted.
-        response = await self._signed_call(account_address, local.address, _submit_leverage)
+        # resolved later by Cloid rather than blindly resubmitted. Only callers
+        # that explicitly supply before_submit get the extra action-boundary
+        # authorization; ordinary copy-trading orders keep their existing path.
+        response = await self._signed_call(
+            account_address,
+            local.address,
+            _submit_leverage,
+            before_submit=_apply_before_submit if before_submit is not None else None,
+        )
         if not isinstance(response, dict) or response.get('status') not in (None, 'ok'):
             await self._observe_explicit_address_throttle(account_address, response)
             raise RuntimeError(f'Hyperliquid leverage update failed: {response}')
