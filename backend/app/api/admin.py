@@ -115,22 +115,6 @@ async def _fresh_position_config_sync_authorization(
     if target.copy_state != CopyState.PAUSED:
         raise HTTPException(409, 'Pause the follower before direct leverage synchronization')
 
-    flags = (await db.execute(
-        select(SystemFlag)
-        .where(SystemFlag.slug.in_(('live_trading', 'global_pause', 'emergency_stop')))
-        .execution_options(populate_existing=True)
-    )).scalars().all()
-    flag_state = {flag.slug: bool(flag.enabled) for flag in flags}
-    if expected_network == 'mainnet' and (
-        not settings.ENABLE_LIVE_TRADING or not flag_state.get('live_trading', False)
-    ):
-        raise HTTPException(409, 'Mainnet live-trading gate is closed')
-    active_halts = sorted(
-        slug for slug in ('global_pause', 'emergency_stop') if flag_state.get(slug, False)
-    )
-    if active_halts:
-        raise HTTPException(409, f"Leverage synchronization blocked by system halt: {', '.join(active_halts)}")
-
     risk = (await db.execute(
         select(RiskProfile)
         .where(RiskProfile.user_id == target.id)
@@ -165,6 +149,26 @@ async def _fresh_position_config_sync_authorization(
         or cred.id != expected_credential_id
     ):
         raise HTTPException(409, 'Trading credential changed or became unavailable')
+
+    # System execution controls are deliberately the final DB await in this
+    # authorization. The callback itself runs after signer/rate/cadence waits,
+    # so a halt/live-trading change committed while the earlier identity/risk
+    # checks are running is observed before the callback returns to SDK submit.
+    flags = (await db.execute(
+        select(SystemFlag)
+        .where(SystemFlag.slug.in_(('live_trading', 'global_pause', 'emergency_stop')))
+        .execution_options(populate_existing=True)
+    )).scalars().all()
+    flag_state = {flag.slug: bool(flag.enabled) for flag in flags}
+    if expected_network == 'mainnet' and (
+        not settings.ENABLE_LIVE_TRADING or not flag_state.get('live_trading', False)
+    ):
+        raise HTTPException(409, 'Mainnet live-trading gate is closed')
+    active_halts = sorted(
+        slug for slug in ('global_pause', 'emergency_stop') if flag_state.get(slug, False)
+    )
+    if active_halts:
+        raise HTTPException(409, f"Leverage synchronization blocked by system halt: {', '.join(active_halts)}")
 
     return desired_leverage, desired_is_cross
 
@@ -339,22 +343,34 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
     }
 
     async def _authorize_submission() -> tuple[int, bool]:
-        # Refresh the source configuration after every signed-action wait. The
-        # final database authorization then runs after this exchange read, so
-        # mutable follower controls are still the last awaited decision before
-        # the synchronous SDK submit.
+        # The master and exchange constraints must both be read after every
+        # signer/rate/cadence wait. A fresh adapter is used for metadata so the
+        # normal 300-second market cache cannot make this admin sync stale.
         fresh_master_hl = _master_adapter()
+        fresh_spec_hl = _follower_adapter(network)
         fresh_master_state, fresh_spec = await asyncio.gather(
             fresh_master_hl.user_state(
                 settings.HYPERLIQUID_MASTER_ADDRESS,
                 priority=Priority.ORDER,
             ),
-            follower_hl.asset_spec(asset),
+            fresh_spec_hl.asset_spec(asset),
         )
         fresh_master_cfg = position_configs(fresh_master_state).get(asset)
         if not fresh_master_cfg:
             raise HTTPException(409, f'Master no longer has an open {asset} position/configuration')
-        fresh_desired_is_cross = bool(fresh_master_cfg.is_cross and not fresh_spec.only_isolated)
+
+        # Intersect the fresh exchange constraint with the already-loaded spec
+        # used internally by update_leverage. This keeps the effective SDK call
+        # identical to the audited target even if Hyperliquid relaxed a limit
+        # during the wait; tightened limits are always honored immediately.
+        initial_exchange_max = int(diagnostic['exchange_max_leverage'])
+        effective_exchange_max = min(fresh_spec.max_leverage, initial_exchange_max)
+        initial_is_cross = diagnostic['desired']['margin_mode'] == 'cross'
+        fresh_desired_is_cross = bool(
+            fresh_master_cfg.is_cross
+            and not fresh_spec.only_isolated
+            and initial_is_cross
+        )
         leverage, is_cross = await _fresh_position_config_sync_authorization(
             db,
             target,
@@ -364,7 +380,7 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
             expected_credential_id=expected_credential_id,
             asset=asset,
             master_leverage=fresh_master_cfg.leverage,
-            exchange_max_leverage=fresh_spec.max_leverage,
+            exchange_max_leverage=effective_exchange_max,
             desired_is_cross=fresh_desired_is_cross,
         )
         submitted['leverage'] = leverage
