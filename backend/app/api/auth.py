@@ -27,6 +27,7 @@ from app.models.entities import AuthNonce, CopyState, Plan, RiskProfile, RiskSta
 from app.schemas.auth import ChallengeIn, ChallengeOut, SessionOut, SessionUser, VerifyIn
 from app.services.audit import audit
 from app.services.entitlement import entitlement
+from app.services.networking import set_user_network
 
 router = APIRouter(prefix='/auth', tags=['auth'])
 _REFRESH_PREFIX = 'session:refresh:'
@@ -224,6 +225,10 @@ async def verify(body: VerifyIn, request: Request, response: Response, db: Async
         role = Role.SUPERADMIN if address in settings.superadmin_addresses else Role.ADMIN if address in settings.admin_addresses else Role.USER
         user = User(auth_wallet=address, role=role, copy_state=CopyState.SHADOW, shadow_started_at=datetime.now(UTC))
         db.add(user); await db.flush()
+        # Do not inherit the historical schema default (TESTNET). New accounts
+        # start on the deployment's configured follower network; the current
+        # operational fallback is MAINNET while local/test can override it.
+        await set_user_network(db, user.id, settings.follower_network)
         db.add(RiskProfile(user_id=user.id)); db.add(RiskState(user_id=user.id))
         if not await db.get(Plan, 'trial'):
             db.add(Plan(slug='trial', name='Trial', limits={
