@@ -66,6 +66,29 @@ def test_position_config_sync_authorizes_inside_signed_submission_path() -> None
     assert metadata_index < material_index < decrypt_index < signed_update_index
 
 
+def test_submission_callback_refreshes_master_config_before_final_db_authorization() -> None:
+    source = inspect.getsource(admin.sync_position_config)
+    callback_start = source.index('async def _authorize_submission()')
+    callback_end = source.index('private_key = crypto.decrypt', callback_start)
+    callback = source[callback_start:callback_end]
+
+    master_read = callback.index('fresh_master_state, fresh_spec = await asyncio.gather(')
+    master_config = callback.index('fresh_master_cfg = position_configs(fresh_master_state).get(asset)')
+    final_db_auth = callback.index('leverage, is_cross = await _fresh_position_config_sync_authorization(')
+    submitted_update = callback.index("submitted['leverage'] = leverage")
+
+    assert master_read < master_config < final_db_auth < submitted_update
+    assert 'fresh_master_hl.user_state(' in callback
+    assert 'priority=Priority.ORDER' in callback
+    assert 'follower_hl.asset_spec(asset)' in callback
+    assert 'master_leverage=fresh_master_cfg.leverage' in callback
+    assert 'exchange_max_leverage=fresh_spec.max_leverage' in callback
+    assert 'fresh_desired_is_cross = bool(fresh_master_cfg.is_cross and not fresh_spec.only_isolated)' in callback
+    assert 'desired_is_cross=fresh_desired_is_cross' in callback
+    assert "master_leverage=int(diagnostic['master']['leverage'])" not in callback
+    assert 'desired_is_cross=desired_is_cross' not in callback
+
+
 def test_final_sync_authorization_revalidates_controls_risk_and_signing_identity() -> None:
     source = inspect.getsource(admin._fresh_position_config_sync_authorization)
     assert 'current_network = (await user_network_state(db, target.id)).network' in source
