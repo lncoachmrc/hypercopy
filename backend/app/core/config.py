@@ -24,8 +24,10 @@ class Settings(BaseSettings):
 
     # Legacy single-network settings are follower-side only. The configured
     # strategy master is an architectural MAINNET source and cannot be moved by
-    # user settings or a stale deployment-level network override.
-    HYPERLIQUID_NETWORK: Network = 'testnet'
+    # user settings or a stale deployment-level network override. TRAXION's
+    # operational fallback is MAINNET; local/test environments can explicitly
+    # override it to TESTNET (the repository .env.example does so).
+    HYPERLIQUID_NETWORK: Network = 'mainnet'
     # Deprecated compatibility input. master_network intentionally ignores it.
     HYPERLIQUID_MASTER_NETWORK: Network | None = None
     HYPERLIQUID_FOLLOWER_NETWORK: Network | None = None
