@@ -339,6 +339,22 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
     }
 
     async def _authorize_submission() -> tuple[int, bool]:
+        # Refresh the source configuration after every signed-action wait. The
+        # final database authorization then runs after this exchange read, so
+        # mutable follower controls are still the last awaited decision before
+        # the synchronous SDK submit.
+        fresh_master_hl = _master_adapter()
+        fresh_master_state, fresh_spec = await asyncio.gather(
+            fresh_master_hl.user_state(
+                settings.HYPERLIQUID_MASTER_ADDRESS,
+                priority=Priority.ORDER,
+            ),
+            follower_hl.asset_spec(asset),
+        )
+        fresh_master_cfg = position_configs(fresh_master_state).get(asset)
+        if not fresh_master_cfg:
+            raise HTTPException(409, f'Master no longer has an open {asset} position/configuration')
+        fresh_desired_is_cross = bool(fresh_master_cfg.is_cross and not fresh_spec.only_isolated)
         leverage, is_cross = await _fresh_position_config_sync_authorization(
             db,
             target,
@@ -347,9 +363,9 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
             expected_account_address=account_address,
             expected_credential_id=expected_credential_id,
             asset=asset,
-            master_leverage=int(diagnostic['master']['leverage']),
-            exchange_max_leverage=int(diagnostic['exchange_max_leverage']),
-            desired_is_cross=desired_is_cross,
+            master_leverage=fresh_master_cfg.leverage,
+            exchange_max_leverage=fresh_spec.max_leverage,
+            desired_is_cross=fresh_desired_is_cross,
         )
         submitted['leverage'] = leverage
         submitted['is_cross'] = is_cross
