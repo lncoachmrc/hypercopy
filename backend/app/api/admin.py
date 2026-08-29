@@ -66,6 +66,15 @@ def _position_config_sync_confirmation(network: Network) -> str:
     return f'SYNC {network.upper()} LEVERAGE'
 
 
+async def _active_system_execution_halts(db: AsyncSession) -> list[str]:
+    active: list[str] = []
+    for slug in ('global_pause', 'emergency_stop'):
+        flag = await db.get(SystemFlag, slug)
+        if flag and flag.enabled:
+            active.append(slug)
+    return active
+
+
 @router.get('/system')
 async def system(user: User = Depends(admin), db: AsyncSession = Depends(get_db)):
     limiter = _limiter()
@@ -210,6 +219,9 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
         raise HTTPException(422, f'Confirmation must be {expected_confirmation}')
     if not await live_trading_allowed(db, network):
         raise HTTPException(409, 'Mainnet live-trading gate is closed')
+    active_halts = await _active_system_execution_halts(db)
+    if active_halts:
+        raise HTTPException(409, f"Leverage synchronization blocked by system halt: {', '.join(active_halts)}")
     if target.copy_state != CopyState.PAUSED:
         raise HTTPException(409, 'Pause the follower before direct leverage synchronization')
 
@@ -462,6 +474,7 @@ async def reconcile_status(user_id: uuid.UUID, job_id: uuid.UUID, actor: User = 
     if not job or job.user_id != user_id or job.origin != 'ADMIN_RECONCILE':
         raise HTTPException(404, 'Reconciliation job not found')
     return _reconcile_job_payload(job)
+
 
 async def _flag(db: AsyncSession, slug: str, enabled: bool, actor: User, reason: str):
     flag = await db.get(SystemFlag, slug)
