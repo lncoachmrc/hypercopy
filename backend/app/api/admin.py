@@ -62,6 +62,10 @@ def _credential_active(cred: SigningCredential | None) -> bool:
     )
 
 
+def _position_config_sync_confirmation(network: Network) -> str:
+    return f'SYNC {network.upper()} LEVERAGE'
+
+
 @router.get('/system')
 async def system(user: User = Depends(admin), db: AsyncSession = Depends(get_db)):
     limiter = _limiter()
@@ -197,14 +201,15 @@ async def position_config_diagnostic(user_id: uuid.UUID, asset: str, actor: User
 
 @router.post('/users/{user_id}/position-config/{asset}/sync', dependencies=[Depends(require_csrf)])
 async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction, actor: User = Depends(superadmin), db: AsyncSession = Depends(get_db)):
-    if body.confirmation != 'SYNC TESTNET LEVERAGE':
-        raise HTTPException(422, 'Confirmation must be SYNC TESTNET LEVERAGE')
     target = await db.get(User, user_id)
     if not target:
         raise HTTPException(404, 'User not found')
     network = (await user_network_state(db, target.id)).network
-    if network != 'testnet':
-        raise HTTPException(409, 'Direct position-config sync is restricted to TESTNET')
+    expected_confirmation = _position_config_sync_confirmation(network)
+    if body.confirmation != expected_confirmation:
+        raise HTTPException(422, f'Confirmation must be {expected_confirmation}')
+    if not await live_trading_allowed(db, network):
+        raise HTTPException(409, 'Mainnet live-trading gate is closed')
     if target.copy_state != CopyState.PAUSED:
         raise HTTPException(409, 'Pause the follower before direct leverage synchronization')
 
