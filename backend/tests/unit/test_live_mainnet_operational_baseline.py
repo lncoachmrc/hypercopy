@@ -102,3 +102,21 @@ def test_diagnostic_can_reuse_preloaded_follower_adapter() -> None:
     assert 'follower_hl: HyperliquidAdapter | None = None' in source
     assert 'follower_hl = follower_hl or _follower_adapter(network)' in source
     assert 'follower_hl.network != network' in source
+
+
+def test_verification_read_failure_is_audited_before_502() -> None:
+    source = inspect.getsource(admin.sync_position_config)
+    verification_start = source.index(
+        'follower_state = await follower_hl.user_state(account_address, priority=Priority.DIAGNOSTIC)'
+    )
+    verification_error = source.index("verification_error = f'{type(exc).__name__}: {exc}'", verification_start)
+    audit_index = source.index("action='ADMIN_FOLLOWER_LEVERAGE_SYNC_UNVERIFIED'", verification_error)
+    commit_index = source.index('await db.commit()', audit_index)
+    raise_index = source.index("raise HTTPException(502, f'Leverage update sent, but verification read failed", commit_index)
+
+    assert verification_start < verification_error < audit_index < commit_index < raise_index
+    failure_block = source[verification_error:raise_index]
+    assert "'response': response" in failure_block
+    assert "'desired': desired" in failure_block
+    assert "'observed': None" in failure_block
+    assert "'verification_error': verification_error" in failure_block
