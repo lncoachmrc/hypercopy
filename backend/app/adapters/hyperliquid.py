@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, AsyncIterator, Awaitable, Callable
@@ -202,9 +203,12 @@ class HyperliquidAdapter:
         except Exception:
             pass
 
-    async def _call(self, func, *args):
+    async def _call(self, func, *args, executor: ThreadPoolExecutor | None = None):
         try:
-            return await asyncio.to_thread(func, *args)
+            if executor is None:
+                return await asyncio.to_thread(func, *args)
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(executor, func, *args)
         except Exception as exc:
             msg = str(exc).lower()
             if '429' in msg or 'rate limit' in msg or 'too many requests' in msg:
@@ -250,10 +254,12 @@ class HyperliquidAdapter:
         about to invoke the synchronous SDK function, eliminating thread-pool
         queue time between reservation and actual exchange invocation. An optional
         action-specific authorization callback runs after every asynchronous
-        submission wait and immediately before the synchronous SDK call. Existing
-        copy-trading actions do not install this callback, so their path is
-        unchanged. The signer lock remains held through reservation, signing,
-        network I/O and result classification.
+        submission wait and immediately before the synchronous SDK call. Calls
+        that install that callback use a per-call worker so callback reads that
+        themselves use ``asyncio.to_thread`` cannot starve the shared default
+        executor. Existing copy-trading actions do not install the callback and
+        keep their existing default-executor path. The signer lock remains held
+        through reservation, signing, network I/O and result classification.
         """
 
         if self.address_limits is not None:
@@ -283,25 +289,46 @@ class HyperliquidAdapter:
                 preparation.result()
             return func(*args)
 
-        async with signer_action_lock(signer_address):
-            await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
-            call_task = asyncio.create_task(self._call(_invoke_after_cadence))
-            try:
-                response = await asyncio.shield(call_task)
-                await _mark_explicit_result(response)
-                return response
-            except asyncio.CancelledError:
+        # Only the exceptional admin path with a callback gets its own one-worker
+        # executor. That worker may synchronously wait for the event-loop callback,
+        # while the callback's exchange reads remain free to use the default pool.
+        # A per-call pool also avoids queue delay between final authorization and
+        # the SDK submission. Ordinary copy actions keep using asyncio.to_thread.
+        callback_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix='traxion-hl-authorized-submit')
+            if before_submit is not None
+            else None
+        )
+
+        try:
+            async with signer_action_lock(signer_address):
+                await self._acquire(WEIGHT_EXCHANGE_ACTION, Priority.ORDER, timeout=5)
+                call_task = asyncio.create_task(
+                    self._call(_invoke_after_cadence, executor=callback_executor)
+                    if callback_executor is not None
+                    else self._call(_invoke_after_cadence)
+                )
                 try:
                     response = await asyncio.shield(call_task)
                     await _mark_explicit_result(response)
+                    return response
+                except asyncio.CancelledError:
+                    try:
+                        response = await asyncio.shield(call_task)
+                        await _mark_explicit_result(response)
+                    except Exception as exc:
+                        if self.address_limits is not None and is_exchange_rate_limit_error(exc):
+                            await self.address_limits.mark_throttled(account_address)
+                    raise
                 except Exception as exc:
                     if self.address_limits is not None and is_exchange_rate_limit_error(exc):
                         await self.address_limits.mark_throttled(account_address)
-                raise
-            except Exception as exc:
-                if self.address_limits is not None and is_exchange_rate_limit_error(exc):
-                    await self.address_limits.mark_throttled(account_address)
-                raise
+                    raise
+        finally:
+            if callback_executor is not None:
+                # call_task is always awaited to completion, including cancellation,
+                # so non-blocking shutdown only releases the completed pool resources.
+                callback_executor.shutdown(wait=False, cancel_futures=False)
 
     async def _acquire(self, weight: int, priority: Priority, timeout: int | float) -> None:
         if self.limiter is None:
