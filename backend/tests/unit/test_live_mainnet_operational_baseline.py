@@ -4,6 +4,7 @@ import inspect
 
 import pytest
 
+from app.adapters.address_ratelimit import AddressActionTracker
 from app.api import admin, auth
 from app.api.admin import _position_config_sync_confirmation
 from app.core.config import Settings
@@ -68,7 +69,7 @@ def test_position_config_sync_authorizes_inside_signed_submission_path() -> None
     assert metadata_index < material_index < decrypt_index < signed_update_index
 
 
-def test_submission_callback_refreshes_master_and_metadata_before_final_db_authorization() -> None:
+def test_submission_callback_reestablishes_cadence_before_one_final_db_snapshot() -> None:
     source = inspect.getsource(admin.sync_position_config)
     callback_start = source.index('async def _authorize_submission()')
     callback_end = source.index('private_key = crypto.decrypt', callback_start)
@@ -78,10 +79,19 @@ def test_submission_callback_refreshes_master_and_metadata_before_final_db_autho
     master_read = callback.index('fresh_master_state, fresh_spec = await asyncio.gather(')
     master_config = callback.index('fresh_master_cfg = position_configs(fresh_master_state).get(asset)')
     effective_exchange_max = callback.index('effective_exchange_max = min(fresh_spec.max_leverage, initial_exchange_max)')
+    cadence_refresh = callback.index('reestablish_submission_slot_before_final_authorization(')
     final_db_auth = callback.index('leverage, is_cross = await _fresh_position_config_sync_authorization(')
     submitted_update = callback.index("submitted['leverage'] = leverage")
 
-    assert fresh_spec_adapter < master_read < master_config < effective_exchange_max < final_db_auth < submitted_update
+    assert (
+        fresh_spec_adapter
+        < master_read
+        < master_config
+        < effective_exchange_max
+        < cadence_refresh
+        < final_db_auth
+        < submitted_update
+    )
     assert 'fresh_master_hl.user_state(' in callback
     assert 'priority=Priority.ORDER' in callback
     assert 'fresh_spec_hl.asset_spec(asset)' in callback
@@ -95,31 +105,41 @@ def test_submission_callback_refreshes_master_and_metadata_before_final_db_autho
     assert 'desired_is_cross=desired_is_cross' not in callback
 
 
-def test_final_sync_authorization_revalidates_controls_risk_and_signing_identity() -> None:
+def test_final_sync_authorization_is_one_db_snapshot_of_all_mutable_controls() -> None:
     source = inspect.getsource(admin._fresh_position_config_sync_authorization)
-    assert 'current_network = (await user_network_state(db, target.id)).network' in source
-    assert 'db.expire_all()' not in source
-    assert "await db.refresh(target, attribute_names=['copy_state'])" in source
-    assert 'target.copy_state != CopyState.PAUSED' in source
-    assert "SystemFlag.slug.in_(('live_trading', 'global_pause', 'emergency_stop'))" in source
-    assert "expected_network == 'mainnet'" in source
-    assert 'select(RiskProfile)' in source
+    assert source.count('await db.execute(') == 1
+    assert 'user_network_state(' not in source
+    assert 'db.refresh(' not in source
+    assert 'execution_options(populate_existing=True)' not in source
+    assert 'FROM users u' in source
+    assert 'LEFT JOIN risk_profiles r ON r.user_id = u.id' in source
+    assert 'LEFT JOIN trading_accounts ta ON ta.user_id = u.id' in source
+    assert 'LEFT JOIN signing_credentials sc ON sc.trading_account_id = ta.id' in source
+    assert "slug = 'live_trading'" in source
+    assert "slug = 'global_pause'" in source
+    assert "slug = 'emergency_stop'" in source
+    assert "str(row['copy_state'] or '') != CopyState.PAUSED.value" in source
+    assert "row['risk_max_leverage'] is None" in source
     assert 'allowed_asset =' in source
-    assert 'desired_leverage = max(1, min(master_leverage, int(risk.max_leverage), exchange_max_leverage))' in source
-    assert 'select(TradingAccount)' in source
-    assert 'account.id != expected_account_id' in source
-    assert 'account.account_address.lower() != expected_account_address.lower()' in source
-    assert 'select(SigningCredential)' in source
-    assert 'cred.id != expected_credential_id' in source
-    assert '_credential_active(cred)' in source
-    assert source.count('execution_options(populate_existing=True)') >= 4
+    assert "account_id != expected_account_id" in source
+    assert 'account_address.lower() != expected_account_address.lower()' in source
+    assert "row['credential_id'] != expected_credential_id" in source
+    assert 'CredentialStatus.ACTIVE.value' in source
+    assert 'CredentialStatus.EXPIRING.value' in source
+    assert "expected_network == 'mainnet'" in source
+    assert "bool(row['live_trading'])" in source
+    assert "bool(row[slug])" in source
+    assert 'return desired_leverage, desired_is_cross' in source
 
-    risk_index = source.index('select(RiskProfile)')
-    account_index = source.index('select(TradingAccount)')
-    credential_index = source.index('select(SigningCredential)')
-    flags_index = source.index('select(SystemFlag)')
-    return_index = source.index('return desired_leverage, desired_is_cross')
-    assert risk_index < account_index < credential_index < flags_index < return_index
+
+def test_degraded_slot_refresh_happens_only_when_sustained_mode_is_active() -> None:
+    source = inspect.getsource(AddressActionTracker.reestablish_submission_slot_before_final_authorization)
+    exists_index = source.index('await self._redis.exists(mode_key)')
+    return_index = source.index('return', exists_index)
+    set_index = source.index('await self._redis.set(', return_index)
+    assert exists_index < return_index < set_index
+    assert 'px=ADDRESS_BACKOFF_SECONDS * 1000' in source
+    assert 'nx=True' not in source
 
 
 def test_signing_material_is_prerequisite_not_policy_gate() -> None:
