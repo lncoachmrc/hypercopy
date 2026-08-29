@@ -195,17 +195,16 @@ class AddressActionTracker:
         await self._redis.incr(f"{_METRIC_PREFIX}:hl_address_action_attempt_count")
         await self._reserve_submission_slot_after_accounting(address)
 
-    async def reestablish_submission_slot_after_authorization(self, address: str) -> None:
-        """Restore a full degraded-cadence slot after an expensive final callback.
+    async def reestablish_submission_slot_before_final_authorization(self, address: str) -> None:
+        """Restore the full degraded-cadence window before the final DB snapshot.
 
         ``record_action_attempt`` reserves the authoritative 10-second slot before
-        an optional signed-action authorization callback runs. Admin leverage sync
-        deliberately performs fresh exchange and database reads in that callback;
-        those reads must not consume the degraded cadence. When authoritative
-        sustained mode is still active, reset the slot to a full 10 seconds at the
-        end of that expensive work. If sustained mode expired meanwhile, no slot is
-        required. TRAXION permits one active signing credential per trading account,
-        and the caller still holds that credential's cross-process signer lock.
+        an optional signed-action callback runs. Admin leverage sync performs fresh
+        exchange reads in that callback, so those reads must not consume the
+        degraded cadence. When authoritative sustained mode is still active, reset
+        the slot to a full 10 seconds immediately before the final single-query DB
+        authorization. If sustained mode expired meanwhile, no slot is required.
+        The caller still holds the trading account's unique credential signer lock.
         """
 
         mode_key = self._mode_key(address)
@@ -308,7 +307,7 @@ class AddressActionTracker:
             last_throttled_at_ms=_int("last_throttled_at_ms"),
             exchange_cum_volume=values.get("exchange_cum_volume") or None,
             exchange_requests_used=_int("exchange_requests_used"),
-            exchange_requests_cap=_int("exchange_requests_cap") or None,
+            exchange_requests_cap=_int("exchange_requests_cap"),
             exchange_requests_surplus=_int("exchange_requests_surplus"),
             exchange_snapshot_at_ms=_int("exchange_snapshot_at_ms"),
         )
