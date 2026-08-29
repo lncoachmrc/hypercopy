@@ -48,7 +48,9 @@ def test_position_config_sync_confirmation_is_network_aware() -> None:
 def test_position_config_sync_authorizes_inside_signed_submission_path() -> None:
     source = inspect.getsource(admin.sync_position_config)
     assert 'restricted to TESTNET' not in source
-    assert source.count('_follower_adapter(network)') == 1
+    assert source.count('_follower_adapter(network)') == 2
+    assert 'follower_hl = _follower_adapter(network)' in source
+    assert 'fresh_spec_hl = _follower_adapter(network)' in source
     assert 'await live_trading_allowed(db, network)' not in source
     assert '_active_system_execution_halts' not in source
     assert "if not diagnostic['allowed_asset']" not in source
@@ -66,24 +68,28 @@ def test_position_config_sync_authorizes_inside_signed_submission_path() -> None
     assert metadata_index < material_index < decrypt_index < signed_update_index
 
 
-def test_submission_callback_refreshes_master_config_before_final_db_authorization() -> None:
+def test_submission_callback_refreshes_master_and_metadata_before_final_db_authorization() -> None:
     source = inspect.getsource(admin.sync_position_config)
     callback_start = source.index('async def _authorize_submission()')
     callback_end = source.index('private_key = crypto.decrypt', callback_start)
     callback = source[callback_start:callback_end]
 
+    fresh_spec_adapter = callback.index('fresh_spec_hl = _follower_adapter(network)')
     master_read = callback.index('fresh_master_state, fresh_spec = await asyncio.gather(')
     master_config = callback.index('fresh_master_cfg = position_configs(fresh_master_state).get(asset)')
+    effective_exchange_max = callback.index('effective_exchange_max = min(fresh_spec.max_leverage, initial_exchange_max)')
     final_db_auth = callback.index('leverage, is_cross = await _fresh_position_config_sync_authorization(')
     submitted_update = callback.index("submitted['leverage'] = leverage")
 
-    assert master_read < master_config < final_db_auth < submitted_update
+    assert fresh_spec_adapter < master_read < master_config < effective_exchange_max < final_db_auth < submitted_update
     assert 'fresh_master_hl.user_state(' in callback
     assert 'priority=Priority.ORDER' in callback
-    assert 'follower_hl.asset_spec(asset)' in callback
+    assert 'fresh_spec_hl.asset_spec(asset)' in callback
     assert 'master_leverage=fresh_master_cfg.leverage' in callback
-    assert 'exchange_max_leverage=fresh_spec.max_leverage' in callback
-    assert 'fresh_desired_is_cross = bool(fresh_master_cfg.is_cross and not fresh_spec.only_isolated)' in callback
+    assert 'exchange_max_leverage=effective_exchange_max' in callback
+    assert 'fresh_master_cfg.is_cross' in callback
+    assert 'not fresh_spec.only_isolated' in callback
+    assert 'and initial_is_cross' in callback
     assert 'desired_is_cross=fresh_desired_is_cross' in callback
     assert "master_leverage=int(diagnostic['master']['leverage'])" not in callback
     assert 'desired_is_cross=desired_is_cross' not in callback
@@ -107,7 +113,13 @@ def test_final_sync_authorization_revalidates_controls_risk_and_signing_identity
     assert 'cred.id != expected_credential_id' in source
     assert '_credential_active(cred)' in source
     assert source.count('execution_options(populate_existing=True)') >= 4
-    assert 'return desired_leverage, desired_is_cross' in source
+
+    risk_index = source.index('select(RiskProfile)')
+    account_index = source.index('select(TradingAccount)')
+    credential_index = source.index('select(SigningCredential)')
+    flags_index = source.index('select(SystemFlag)')
+    return_index = source.index('return desired_leverage, desired_is_cross')
+    assert risk_index < account_index < credential_index < flags_index < return_index
 
 
 def test_signing_material_is_prerequisite_not_policy_gate() -> None:
