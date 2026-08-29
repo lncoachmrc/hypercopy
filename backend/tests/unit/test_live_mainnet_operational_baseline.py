@@ -80,7 +80,7 @@ def test_submission_callback_reestablishes_cadence_before_one_final_db_snapshot(
     master_config = callback.index('fresh_master_cfg = position_configs(fresh_master_state).get(asset)')
     effective_exchange_max = callback.index('effective_exchange_max = min(fresh_spec.max_leverage, initial_exchange_max)')
     cadence_refresh = callback.index('reestablish_submission_slot_before_final_authorization(')
-    final_db_auth = callback.index('leverage, is_cross = await _fresh_position_config_sync_authorization(')
+    final_db_auth = callback.index('leverage, is_cross, risk_max_leverage = await _fresh_position_config_sync_authorization(')
     submitted_update = callback.index("submitted['leverage'] = leverage")
 
     assert (
@@ -120,6 +120,7 @@ def test_final_sync_authorization_is_one_db_snapshot_of_all_mutable_controls() -
     assert "slug = 'emergency_stop'" in source
     assert "str(row['copy_state'] or '') != CopyState.PAUSED.value" in source
     assert "row['risk_max_leverage'] is None" in source
+    assert "risk_max_leverage = Decimal(str(row['risk_max_leverage']))" in source
     assert 'allowed_asset =' in source
     assert "account_id != expected_account_id" in source
     assert 'account_address.lower() != expected_account_address.lower()' in source
@@ -129,7 +130,7 @@ def test_final_sync_authorization_is_one_db_snapshot_of_all_mutable_controls() -
     assert "expected_network == 'mainnet'" in source
     assert "bool(row['live_trading'])" in source
     assert "bool(row[slug])" in source
-    assert 'return desired_leverage, desired_is_cross' in source
+    assert 'return desired_leverage, desired_is_cross, str(risk_max_leverage)' in source
 
 
 def test_degraded_slot_refresh_happens_only_when_sustained_mode_is_active() -> None:
@@ -171,10 +172,12 @@ def test_success_audit_replaces_stale_source_inputs_with_refreshed_values() -> N
     assert "refreshed_source['exchange_max_leverage'] = fresh_spec.max_leverage" in callback
     assert "refreshed_source['exchange_only_isolated'] = fresh_spec.only_isolated" in callback
     assert "refreshed_source['effective_exchange_max_leverage'] = effective_exchange_max" in callback
+    assert "refreshed_source['risk_max_leverage'] = risk_max_leverage" in callback
     assert "verified['master'] = dict(refreshed_source['master'])" in success
     assert "verified['exchange_max_leverage'] = refreshed_source['exchange_max_leverage']" in success
     assert "verified['exchange_only_isolated'] = refreshed_source['exchange_only_isolated']" in success
     assert "verified['effective_exchange_max_leverage'] = refreshed_source['effective_exchange_max_leverage']" in success
+    assert "verified['risk_max_leverage'] = refreshed_source['risk_max_leverage']" in success
 
 
 def test_cancelled_signed_sync_is_audited_before_cancellation_propagates() -> None:
