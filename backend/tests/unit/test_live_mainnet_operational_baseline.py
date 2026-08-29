@@ -104,6 +104,22 @@ def test_diagnostic_can_reuse_preloaded_follower_adapter() -> None:
     assert 'follower_hl.network != network' in source
 
 
+def test_cancelled_signed_sync_is_audited_before_cancellation_propagates() -> None:
+    source = inspect.getsource(admin.sync_position_config)
+    signed_update = source.index('response = await follower_hl.update_leverage')
+    cancellation = source.index('except asyncio.CancelledError:', signed_update)
+    audit_index = source.index("action='ADMIN_FOLLOWER_LEVERAGE_SYNC_UNVERIFIED'", cancellation)
+    commit_index = source.index('await db.commit()', audit_index)
+    raise_index = source.index('\n            raise\n', commit_index)
+
+    assert signed_update < cancellation < audit_index < commit_index < raise_index
+    cancellation_block = source[cancellation:raise_index]
+    assert "'response': None" in cancellation_block
+    assert "'desired': cancelled_desired" in cancellation_block
+    assert "'observed': None" in cancellation_block
+    assert "'submission_status': 'UNKNOWN_DUE_TO_CANCELLATION'" in cancellation_block
+
+
 def test_verification_read_failure_is_audited_before_502() -> None:
     source = inspect.getsource(admin.sync_position_config)
     verification_start = source.index(
