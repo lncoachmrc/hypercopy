@@ -257,9 +257,9 @@ class HyperliquidAdapter:
         submission wait and immediately before the synchronous SDK call. Calls
         that install that callback use a per-call worker so callback reads that
         themselves use ``asyncio.to_thread`` cannot starve the shared default
-        executor. Existing copy-trading actions do not install the callback and
-        keep their existing default-executor path. The signer lock remains held
-        through reservation, signing, network I/O and result classification.
+        executor. Strategy orders and sensitive admin actions may install this
+        final authorization fence. The signer lock remains held through
+        reservation, signing, network I/O and result classification.
         """
 
         if self.address_limits is not None:
@@ -289,11 +289,9 @@ class HyperliquidAdapter:
                 preparation.result()
             return func(*args)
 
-        # Only the exceptional admin path with a callback gets its own one-worker
-        # executor. That worker may synchronously wait for the event-loop callback,
-        # while the callback's exchange reads remain free to use the default pool.
-        # A per-call pool also avoids queue delay between final authorization and
-        # the SDK submission. Ordinary copy actions keep using asyncio.to_thread.
+        # Any action with a final authorization callback gets a dedicated
+        # one-worker executor. The callback may itself perform idempotent exchange
+        # reads through asyncio.to_thread without starving the shared default pool.
         callback_executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix='traxion-hl-authorized-submit')
             if before_submit is not None
@@ -554,9 +552,9 @@ class HyperliquidAdapter:
             )
 
         # Exchange actions are intentionally one-shot. Ambiguous results are
-        # resolved later by Cloid rather than blindly resubmitted. Only callers
-        # that explicitly supply before_submit get the extra action-boundary
-        # authorization; ordinary copy-trading orders keep their existing path.
+        # resolved later by Cloid rather than blindly resubmitted. Callers that
+        # explicitly supply before_submit get the extra action-boundary
+        # authorization immediately before the signed SDK action.
         response = await self._signed_call(
             account_address,
             local.address,
@@ -584,12 +582,58 @@ class HyperliquidAdapter:
         self, *, account_address: str, private_key: str, asset: str, is_buy: bool,
         size: Decimal, mark_price: Decimal, slippage_bps: int, reduce_only: bool, cloid: str,
     ) -> OrderOutcome:
+        from app.services.strategy_intents import (
+            StrategyIntentAuthorizationError,
+            StrategyIntentSuperseded,
+            current_strategy_intent_for_cloid,
+            master_position_from_state,
+        )
+
         spec = await self.asset_spec(asset)
         slip = Decimal(slippage_bps) / Decimal(10_000)
         aggressive = mark_price * (Decimal(1) + slip if is_buy else Decimal(1) - slip)
         px = round_price(aggressive, spec.sz_decimals)
         local = Account.from_key(private_key)
         exchange = self._exchange(local, account_address)
+
+        async def _authorize_strategy_order() -> None:
+            evidence = await current_strategy_intent_for_cloid(
+                cloid=cloid,
+                follower_network=self.network,
+                asset=asset,
+            )
+            if evidence is None:
+                # Administrative/emergency actions such as CLOSE_ALL deliberately
+                # keep their independent execution semantics.
+                return
+            master_address = settings.HYPERLIQUID_MASTER_ADDRESS
+            if not master_address:
+                raise StrategyIntentAuthorizationError(
+                    'Master source address is unavailable at order authorization'
+                )
+            master_hl = (
+                self
+                if self.network == settings.master_network
+                else HyperliquidAdapter(self.limiter, network=settings.master_network)
+            )
+            try:
+                fresh_master_state = await master_hl.user_state(
+                    master_address,
+                    priority=Priority.ORDER,
+                )
+            except StrategyIntentAuthorizationError:
+                raise
+            except Exception as exc:
+                raise StrategyIntentAuthorizationError(
+                    f'Fresh master state unavailable before order submission: {type(exc).__name__}: {exc}'
+                ) from exc
+
+            fresh_position = master_position_from_state(fresh_master_state, asset)
+            if fresh_position != evidence.source_master_position:
+                raise StrategyIntentSuperseded(
+                    f'Source master position moved from {evidence.source_master_position} '
+                    f'to {fresh_position} before order submission'
+                )
 
         def _submit():
             exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
@@ -598,7 +642,28 @@ class HyperliquidAdapter:
                 reduce_only=reduce_only, cloid=Cloid.from_str(cloid),
             )
 
-        response = await self._signed_call(account_address, local.address, _submit)
+        try:
+            response = await self._signed_call(
+                account_address,
+                local.address,
+                _submit,
+                before_submit=_authorize_strategy_order,
+            )
+        except StrategyIntentAuthorizationError as exc:
+            # The callback runs as the last awaited step inside the signer lock,
+            # before the synchronous SDK function is invoked. Therefore this is a
+            # definitive pre-submit cancellation, never an ambiguous exchange result.
+            return OrderOutcome(
+                'CANCELED',
+                reason=f'Strategy intent canceled pre-submit: {exc}',
+                raw={
+                    'status': 'strategyIntentCanceled',
+                    'reason': str(exc),
+                    'asset': asset,
+                    'network': self.network,
+                },
+            )
+
         outcome = parse_order_response(response)
         if outcome.state == 'REJECTED':
             await self._observe_explicit_address_throttle(account_address, outcome.reason)

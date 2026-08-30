@@ -41,6 +41,12 @@ async def test_all_current_signed_adapter_actions_use_public_signer_lock(monkeyp
         lock_entries.append(signer_address.lower())
         yield
 
+    # This test owns the signer-serialization invariant, not the durable strategy
+    # intent lookup. Treat its synthetic IOC as a non-strategy/admin action so the
+    # new production pre-submit fence does not require a database Execution row.
+    async def no_strategy_intent(**_kwargs):
+        return None
+
     adapter = HyperliquidAdapter(None, network="testnet")
     fake_exchange = _FakeExchange()
 
@@ -48,6 +54,10 @@ async def test_all_current_signed_adapter_actions_use_public_signer_lock(monkeyp
         return AssetSpec(asset, sz_decimals=5, max_leverage=20)
 
     monkeypatch.setattr("app.adapters.hyperliquid.signer_action_lock", fake_signer_lock)
+    monkeypatch.setattr(
+        "app.services.strategy_intents.current_strategy_intent_for_cloid",
+        no_strategy_intent,
+    )
     monkeypatch.setattr(adapter, "asset_spec", fake_asset_spec)
     monkeypatch.setattr(adapter, "_exchange", lambda local, account_address: fake_exchange)
 

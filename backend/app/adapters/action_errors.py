@@ -5,11 +5,13 @@ from enum import Enum
 
 
 class ActionErrorClass(str, Enum):
-    """Semantic class for an explicit Hyperliquid order rejection.
+    """Semantic class for a definitive action rejection/cancellation.
 
     Transport ambiguity, HTTP failures and nonce ownership are deliberately
     handled outside this classifier. A signed action with an indeterminate
     transport result must remain UNKNOWN and be reconciled before replacement.
+    The strategy freshness fence can also produce a definitive pre-submit
+    cancellation; that case is safe to revisit only through fresh reconciliation.
     """
 
     TERMINAL = "TERMINAL"
@@ -42,6 +44,9 @@ _LIQUIDITY_TOKENS = (
 )
 
 _TRANSIENT_TOKENS = (
+    # Internal definitive pre-submit cancellation. No exchange order was sent;
+    # only a newly computed authoritative intent may replace this stale job.
+    "strategy intent canceled pre-submit",
     "open interest is capped",
     "open interest cap",
     "openinterestcap",
@@ -51,8 +56,9 @@ _TRANSIENT_TOKENS = (
     "openinterestincrease",
     "oracle issue",
     "oraclerejected",
-    # Only an explicit exchange rejection reaches this classifier. HTTP 429 and
-    # transport-level throttles stay outside it and remain Execution.UNKNOWN.
+    # Only an explicit exchange rejection reaches the remaining throttle cases.
+    # HTTP 429 and transport-level throttles stay outside this classifier and
+    # remain Execution.UNKNOWN.
     "rate limited",
     "user rate limit",
     "address rate limit",
@@ -91,7 +97,7 @@ def _matches(normalized: str, compact: str, tokens: tuple[str, ...]) -> bool:
 
 
 def classify_action_error(reason: str | None) -> ActionErrorDecision:
-    """Classify an explicit exchange rejection without guessing side effects.
+    """Classify a definitive rejection/cancellation without guessing side effects.
 
     `LIQUIDITY` and `TRANSIENT` are safe to revisit only through a fresh
     reconciliation cycle. We intentionally never ask the same durable job to

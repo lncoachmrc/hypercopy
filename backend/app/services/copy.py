@@ -69,15 +69,17 @@ async def persist_master_fill_and_jobs(
             exc_info=True,
         )
 
-    # The configured master wallet is a source principal only. Even if legacy
-    # follower state/trading-account rows still exist, never fan source events
-    # back into that same wallet as copy jobs.
+    # The configured master wallet is a source principal only. Paused followers
+    # deliberately do not accumulate realtime EVENT intents: their next resume
+    # performs a fresh authoritative reconciliation. SHADOW followers still need
+    # realtime intents so simulation remains representative.
     master_address = settings.HYPERLIQUID_MASTER_ADDRESS or ''
     eligible = (await db.execute(text("""
         SELECT u.id, u.execution_network
         FROM users AS u
         JOIN trading_accounts AS ta ON ta.user_id = u.id
         WHERE u.state = 'ACTIVE'
+          AND u.copy_state IN ('ACTIVE', 'SHADOW')
           AND (:master_address = '' OR lower(u.auth_wallet) <> lower(:master_address))
     """), {'master_address': master_address})).all()
 
