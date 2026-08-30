@@ -17,9 +17,9 @@ from app.services.master_source_identity import (
     MASTER_SOURCE_FOLLOWER_BLOCK_REASON,
     is_master_source_user,
 )
+from app.services.strategy_intents import STRATEGY_ORIGINS, prepare_strategy_job_for_publish
 
 
-STRATEGY_ORIGINS = {'EVENT', 'RECONCILE'}
 _HF006_REPAIR_PENDING = 'hf006_repair_pending'
 _HF006_REPAIR_ACCOUNTED_ORDER = 'hf006_repair_accounted_order'
 
@@ -42,6 +42,8 @@ async def publish_job(redis: Redis, db: AsyncSession, job: CopyJob) -> None:
         job.next_attempt_at = None
         job.enqueued_at = None
         await db.flush()
+        return
+    if job.origin in STRATEGY_ORIGINS and not await prepare_strategy_job_for_publish(db, job):
         return
     await redis.xadd(settings.STREAM_NAME, {'job_id': str(job.id)}, maxlen=100_000, approximate=True)
     job.enqueued_at = datetime.now(UTC)
@@ -226,6 +228,8 @@ async def repair_stream(redis: Redis, db: AsyncSession, limit: int = 500) -> int
     )).scalars().all()
     count = 0
     for job in rows:
+        if job.origin in STRATEGY_ORIGINS and not await prepare_strategy_job_for_publish(db, job):
+            continue
         evidence_order = reconcile_job_repair_evidence(job)
         if evidence_order is None:
             await publish_job(redis, db, job)
