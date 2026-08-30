@@ -22,6 +22,7 @@ from app.models.entities import (
     SystemFlag, TradingAccount, User, UserState,
 )
 from app.services.audit import audit
+from app.services.effective_risk import resolve_effective_risk
 from app.services.entitlement import entitlement
 from app.services.networking import user_network_state
 
@@ -261,6 +262,11 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
         return await _retry_or_dead(db, job, 'Master market price unavailable')
 
     spec = await hl.asset_spec(job.asset)
+    effective_risk = resolve_effective_risk(
+        risk,
+        ent,
+        exchange_max_leverage=spec.max_leverage,
+    )
     master_leverage = None
     if ctx.get('master_leverage') not in (None, ''):
         try:
@@ -273,15 +279,25 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
             desired_leverage = max(1, int(Decimal(str(ctx['desired_follower_leverage']))))
         except Exception:
             desired_leverage = None
-    if desired_leverage is None and master_leverage is not None:
-        desired_leverage = max(1, min(master_leverage, int(risk.max_leverage), spec.max_leverage))
+    if desired_leverage is not None:
+        # Re-cap queued leverage against the current profile/exchange ceiling so
+        # a later risk reduction cannot be bypassed by stale job context.
+        desired_leverage = max(1, min(desired_leverage, int(effective_risk.max_leverage)))
+    elif master_leverage is not None:
+        desired_leverage = max(1, min(master_leverage, int(effective_risk.max_leverage)))
     desired_is_cross = bool(ctx.get('desired_follower_is_cross', ctx.get('master_is_cross', True)))
     if spec.only_isolated:
         desired_is_cross = False
 
     sizing = plan(
         MasterExposure(job.asset, master_pos, master_mark, master_eq),
-        FollowerState(str(user.id), equity.account_value, equity.unmanaged_margin, current, risk.multiplier),
+        FollowerState(
+            str(user.id),
+            equity.account_value,
+            equity.unmanaged_margin,
+            current,
+            effective_risk.multiplier,
+        ),
         spec,
         min_notional=risk.min_notional,
         follower_mark_price=follower_mark,
@@ -322,8 +338,11 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
         account_equity=max(equity.account_value, Decimal(0)),
         current_leverage=total_exposure / equity.account_value if equity.account_value > 0 else Decimal(999),
         open_positions=len([x for x in ledgers if x.size != 0]), is_new_market=current == 0,
-        max_notional_per_trade=risk.max_notional_per_trade, max_total_exposure=risk.max_total_exposure,
-        max_asset_exposure=risk.max_asset_exposure, max_leverage=min(risk.max_leverage, Decimal(spec.max_leverage)), max_positions=risk.max_positions,
+        max_notional_per_trade=effective_risk.max_notional_per_trade,
+        max_total_exposure=effective_risk.max_total_exposure,
+        max_asset_exposure=effective_risk.max_asset_exposure,
+        max_leverage=effective_risk.max_leverage,
+        max_positions=effective_risk.max_positions,
     )
     decision = evaluate(sizing, profile_ctx)
 
@@ -333,6 +352,8 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
             'master_network': settings.master_network, 'follower_network': network,
             'master_mark': str(master_mark), 'follower_mark': str(follower_mark),
             'master_leverage': master_leverage, 'desired_follower_leverage': desired_leverage,
+            'selected_multiplier': str(risk.multiplier), 'effective_multiplier': str(effective_risk.multiplier),
+            'selected_max_positions': risk.max_positions, 'effective_max_positions': effective_risk.max_positions,
         })
         return await _finish(db, job, JobState.DONE, 'Shadow mode')
 
@@ -369,7 +390,16 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
             private_key = ''
 
     if decision.action in {RiskAction.DENY, RiskAction.SKIP}:
-        await audit(db, action='COPY_JOB_BLOCKED', subject_id=user.id, reason=decision.reason, correlation_id=job.correlation_id, after={'asset': job.asset, 'target': str(sizing.target_size), 'current': str(current), 'network': network})
+        await audit(db, action='COPY_JOB_BLOCKED', subject_id=user.id, reason=decision.reason, correlation_id=job.correlation_id, after={
+            'asset': job.asset,
+            'target': str(sizing.target_size),
+            'current': str(current),
+            'network': network,
+            'selected_max_positions': risk.max_positions,
+            'effective_max_positions': effective_risk.max_positions,
+            'selected_max_notional_per_trade': str(risk.max_notional_per_trade),
+            'effective_max_notional_per_trade': str(effective_risk.max_notional_per_trade),
+        })
         return await _finish(db, job, JobState.SKIPPED, decision.reason or 'Not actionable')
 
     if ctx.get('ambiguity_safe_reduction') and not _ambiguity_reduction_plan_safe(decision.plan):
@@ -490,6 +520,8 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
             'asset': job.asset, 'target': str(sizing.target_size), 'ledger_size': str(ledger.size),
             'network': network, 'leverage': desired_leverage,
             'margin_mode': 'cross' if desired_is_cross else 'isolated',
+            'effective_multiplier': str(effective_risk.multiplier),
+            'effective_max_positions': effective_risk.max_positions,
         })
         return await _finish(db, job, JobState.DONE, None)
     finally:
