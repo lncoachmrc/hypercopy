@@ -60,7 +60,7 @@ test("renders the verified TRAXION commercial experience", async () => {
   assert.match(html, /modalità SHADOW/i);
   assert.match(html, /FAQPage/);
 
-  assert.match(html, /https:\/\/frontend-staging-9498\.up\.railway\.app\/login/);
+  assert.match(html, /https:\/\/app\.traxion\.lucianonovello\.com\/login/);
   assert.match(html, /href="https:\/\/app\.hyperliquid\.xyz\/join\/DIGITALEMPOWER"[^>]*rel="sponsored noopener noreferrer"/);
   assert.match(html, /href="https:\/\/app\.hyperliquid\.xyz\/API"[^>]*rel="noopener noreferrer"/);
 
