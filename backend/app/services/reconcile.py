@@ -22,6 +22,7 @@ from app.services.audit import audit
 from app.services.effective_risk import resolve_effective_risk
 from app.services.entitlement import entitlement
 from app.services.master_leverage_cache import next_master_leverage_causal_order
+from app.services.master_source_identity import MASTER_SOURCE_NETWORK, is_master_source_user
 from app.services.networking import user_network_state
 
 log = __import__('app.core.logging', fromlist=['get_logger']).get_logger(__name__)
@@ -62,12 +63,10 @@ def _is_liquidity_reject(reason: str | None) -> bool:
 
 
 def _persisted_ledger_decimal(value: Decimal) -> Decimal:
-    """Normalize to the Numeric(30, 12) precision used by PositionLedger."""
     return value.quantize(_LEDGER_DECIMAL_QUANTUM, rounding=ROUND_HALF_UP)
 
 
 def _safe_ambiguity_reduction(real: Decimal, desired_target: Decimal) -> bool:
-    """Only a same-side reduction or full close is safe while outcome is unknown."""
     if real == 0 or abs(desired_target) >= abs(real):
         return False
     return desired_target == 0 or real * desired_target > 0
@@ -94,7 +93,6 @@ def _risk_limited_submitted_size(
     current_open_positions: int,
     spec,
 ) -> Decimal | None:
-    """Preview the size the execution Risk Engine would actually submit."""
     if master_equity <= 0 or master_mark <= 0 or follower_mark <= 0:
         return None
 
@@ -180,15 +178,6 @@ async def _terminal_action_rejection_blocks_unchanged_intent(
     real: Decimal,
     submitted_size: Decimal | None,
 ) -> bool:
-    """Honor retry_policy=NONE only while rejected intent and executable size are unchanged.
-
-    Rejection-time target and observed exchange position live in immutable job
-    metadata. The actual submitted size already lives durably on Execution as
-    requested_size, so no additional rejection schema is required. A changed
-    risk cap/headroom releases the fence only when it changes the size that the
-    Risk Engine would submit; missing executable-plan evidence remains fail-closed.
-    """
-
     latest = (await db.execute(
         select(CopyJob).where(
             CopyJob.user_id == user_id,
@@ -302,6 +291,8 @@ async def reconcile_user(
     master_configs: dict[str, PositionConfig] | None = None,
     create_jobs: bool = True,
 ) -> dict:
+    if is_master_source_user(user):
+        return {'status': 'SKIPPED_MASTER_SOURCE', 'network': MASTER_SOURCE_NETWORK, 'jobs_created': 0}
     async with position_ledger_lock(user.id):
         return await _reconcile_user_locked(
             db,
@@ -705,6 +696,8 @@ async def reconcile_active_users(
     users = (await db.execute(query)).scalars().all()
     reconciled = 0
     for user in users:
+        if is_master_source_user(user):
+            continue
         network_state = await user_network_state(db, user.id)
         if network_state.network != hl.network:
             continue

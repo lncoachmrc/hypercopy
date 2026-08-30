@@ -23,6 +23,13 @@ from app.models.entities import (
 from app.schemas.admin import AdminAction, AdminReconcile
 from app.services.audit import audit
 from app.services.execution import live_trading_allowed
+from app.services.master_source_identity import (
+    MASTER_SOURCE_FOLLOWER_BLOCK_REASON,
+    MASTER_SOURCE_MODE,
+    MASTER_SOURCE_NETWORK,
+    follower_controls_enabled,
+    is_master_source_user,
+)
 from app.services.metrics import system_snapshot
 from app.services.networking import UserNetworkState, user_network_state
 from app.services.queue import publish_job, repair_stream
@@ -46,6 +53,11 @@ def _follower_adapter(network: Network) -> HyperliquidAdapter:
     return HyperliquidAdapter(_limiter(), network=network)
 
 
+def _require_follower_target(target: User) -> None:
+    if is_master_source_user(target):
+        raise HTTPException(409, MASTER_SOURCE_FOLLOWER_BLOCK_REASON)
+
+
 def _credential_active(cred: SigningCredential | None) -> bool:
     return bool(
         cred
@@ -62,11 +74,7 @@ async def _position_config_sync_signing_material(
     db: AsyncSession,
     target: User,
 ) -> tuple[uuid.UUID, str, SigningCredential]:
-    """Load public signing metadata without decrypting the API-wallet secret.
-
-    The execution-worker revalidates these identifiers immediately before the
-    signed action and is the only service that needs credential-decrypt authority.
-    """
+    _require_follower_target(target)
     account = (await db.execute(
         select(TradingAccount)
         .where(TradingAccount.user_id == target.id)
@@ -98,7 +106,7 @@ async def _queue_position_config_sync_job(
     diagnostic: dict,
     reason: str,
 ) -> CopyJob:
-    """Create/reuse a durable one-shot signed leverage job before Redis publish."""
+    _require_follower_target(target)
     active_states = [JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING]
     existing = (await db.execute(
         select(CopyJob).where(
@@ -166,8 +174,6 @@ async def _queue_position_config_sync_job(
             'desired': diagnostic['desired'],
         },
     )
-    # Commit the durable job before publishing its ID so the worker can never
-    # consume a Redis message whose PostgreSQL row is still invisible.
     await db.commit()
     try:
         await publish_job(redis_client(), db, job)
@@ -265,6 +271,7 @@ async def _position_config_diagnostic(
     *,
     follower_hl: HyperliquidAdapter | None = None,
 ) -> dict:
+    _require_follower_target(target)
     asset = asset.upper().strip()
     network_state = await user_network_state(db, target.id)
     network = network_state.network
@@ -350,6 +357,7 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
     target = await db.get(User, user_id)
     if not target:
         raise HTTPException(404, 'User not found')
+    _require_follower_target(target)
     network_state = await user_network_state(db, target.id)
     network = network_state.network
     expected_confirmation = _position_config_sync_confirmation(network)
@@ -474,7 +482,20 @@ async def users(user: User = Depends(admin), db: AsyncSession = Depends(get_db),
     result=[]
     for row in rows:
         network=(await user_network_state(db,row.id)).network
-        result.append({'id': str(row.id), 'auth_wallet': row.auth_wallet, 'role': row.role.value, 'state': row.state.value, 'copy_state': row.copy_state.value, 'execution_network': network, 'created_at': row.created_at})
+        is_master=is_master_source_user(row)
+        result.append({
+            'id': str(row.id),
+            'auth_wallet': row.auth_wallet,
+            'role': row.role.value,
+            'state': row.state.value,
+            'copy_state': row.copy_state.value,
+            'execution_network': network,
+            'created_at': row.created_at,
+            'is_master_source': is_master,
+            'operational_mode': MASTER_SOURCE_MODE if is_master else 'FOLLOWER',
+            'operational_network': MASTER_SOURCE_NETWORK if is_master else network,
+            'follower_controls_enabled': follower_controls_enabled(row),
+        })
     return result
 
 
@@ -484,7 +505,20 @@ async def user_detail(user_id: uuid.UUID, actor: User = Depends(admin), db: Asyn
     if not target:
         raise HTTPException(404, 'User not found')
     network=(await user_network_state(db,target.id)).network
-    return {'id': str(target.id), 'auth_wallet': target.auth_wallet, 'role': target.role.value, 'state': target.state.value, 'copy_state': target.copy_state.value, 'execution_network': network, 'manual_trade_policy': target.manual_trade_policy.value}
+    is_master=is_master_source_user(target)
+    return {
+        'id': str(target.id),
+        'auth_wallet': target.auth_wallet,
+        'role': target.role.value,
+        'state': target.state.value,
+        'copy_state': target.copy_state.value,
+        'execution_network': network,
+        'manual_trade_policy': target.manual_trade_policy.value,
+        'is_master_source': is_master,
+        'operational_mode': MASTER_SOURCE_MODE if is_master else 'FOLLOWER',
+        'operational_network': MASTER_SOURCE_NETWORK if is_master else network,
+        'follower_controls_enabled': follower_controls_enabled(target),
+    }
 
 
 @router.post('/users/{user_id}/pause', dependencies=[Depends(require_csrf)])
@@ -492,6 +526,7 @@ async def pause_user(user_id: uuid.UUID, body: AdminAction, actor: User = Depend
     target = await db.get(User, user_id)
     if not target:
         raise HTTPException(404, 'User not found')
+    _require_follower_target(target)
     target.copy_state = CopyState.PAUSED
     network=(await user_network_state(db,target.id)).network
     await audit(db, action='ADMIN_USER_PAUSE', actor_id=actor.id, subject_id=target.id, reason=body.reason, after={'follower_network': network})
@@ -504,6 +539,7 @@ async def resume_user(user_id: uuid.UUID, body: AdminAction, actor: User = Depen
     target = await db.get(User, user_id)
     if not target:
         raise HTTPException(404, 'User not found')
+    _require_follower_target(target)
     network=(await user_network_state(db,target.id)).network
     if not await live_trading_allowed(db, network):
         raise HTTPException(409, 'Mainnet live-trading gate is closed')
@@ -560,6 +596,7 @@ async def queue_reconcile(user_id: uuid.UUID, body: AdminReconcile, actor: User 
     target = await db.get(User, user_id)
     if not target:
         raise HTTPException(404, 'User not found')
+    _require_follower_target(target)
     network_state = await user_network_state(db, target.id)
     network = network_state.network
 

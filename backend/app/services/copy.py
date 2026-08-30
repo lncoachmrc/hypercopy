@@ -69,14 +69,17 @@ async def persist_master_fill_and_jobs(
             exc_info=True,
         )
 
-    # The source event is shared, while the follower network is a user-level
-    # choice. Read id + network in one query to avoid an N+1 lookup during fanout.
+    # The configured master wallet is a source principal only. Even if legacy
+    # follower state/trading-account rows still exist, never fan source events
+    # back into that same wallet as copy jobs.
+    master_address = settings.HYPERLIQUID_MASTER_ADDRESS or ''
     eligible = (await db.execute(text("""
         SELECT u.id, u.execution_network
         FROM users AS u
         JOIN trading_accounts AS ta ON ta.user_id = u.id
         WHERE u.state = 'ACTIVE'
-    """))).all()
+          AND (:master_address = '' OR lower(u.auth_wallet) <> lower(:master_address))
+    """), {'master_address': master_address})).all()
 
     jobs: list[CopyJob] = []
     for user_id, raw_network in eligible:
