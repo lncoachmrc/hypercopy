@@ -78,12 +78,17 @@ class Settings(BaseSettings):
     SIWE_URI: str = 'http://localhost:5173'
     AUTH_NONCE_TTL_SECONDS: int = 300
 
-    # Local: AES KEK from ENCRYPTION_KEY_B64. Production: AWS KMS is the
-    # concrete external KMS implementation shipped with this repository.
-    KEK_PROVIDER: Literal['env', 'aws_kms'] = 'env'
+    # Local/staging may use the shared environment KEK. Production live trading
+    # requires a separated credential provider: AWS KMS or local RSA wrapping.
+    KEK_PROVIDER: Literal['env', 'aws_kms', 'local_rsa'] = 'env'
     ENCRYPTION_KEY_B64: str = ''
     ENCRYPTION_KEY_REFERENCE: str = ''
     AWS_REGION: str = ''
+    # local_rsa keeps encryption/decryption authority separated without an
+    # external KMS: api receives only the public key; execution-worker receives
+    # only the matching private key. Values are base64-encoded PEM documents.
+    TRAXION_KEK_PUBLIC_KEY_B64: str = ''
+    TRAXION_KEK_PRIVATE_KEY_B64: str = ''
 
     STRIPE_SECRET_KEY: str = ''
     STRIPE_WEBHOOK_SECRET: str = ''
@@ -142,7 +147,7 @@ class Settings(BaseSettings):
             if self.SESSION_SECRET == 'development-only-change-me' or len(self.SESSION_SECRET) < 32:
                 raise ValueError('SESSION_SECRET must be a strong production secret')
             if self.ENABLE_LIVE_TRADING and self.KEK_PROVIDER == 'env':
-                raise ValueError('Mainnet live execution requires an external KMS provider')
+                raise ValueError('Mainnet live execution requires aws_kms or local_rsa credential wrapping')
         if self.SESSION_TTL_SECONDS <= 0:
             raise ValueError('SESSION_TTL_SECONDS must be positive')
         if self.SESSION_REFRESH_TTL_SECONDS <= self.SESSION_TTL_SECONDS:

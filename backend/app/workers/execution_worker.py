@@ -9,15 +9,30 @@ from decimal import Decimal
 from sqlalchemy import select, text
 
 from app.adapters.hyperliquid import HyperliquidAdapter, position_configs
-from app.adapters.ratelimit import Budget, WeightedRateLimiter
+from app.adapters.ratelimit import Budget, Priority, WeightedRateLimiter
 from app.core.config import Network, settings
+from app.core.crypto import EncryptedCredential, crypto
 from app.core.logging import configure_logging, get_logger
 from app.db.lease import replica_identity
 from app.db.position_ledger_lock import position_ledger_lock
 from app.db.redis import redis_client
 from app.db.session import SessionLocal, engine
 from app.db.schema import assert_schema
-from app.models.entities import CopyJob, EquitySnapshot, JobState, PositionLedger, TradingAccount, User, WorkerHeartbeat
+from app.models.entities import (
+    CopyJob,
+    EquitySnapshot,
+    JobState,
+    PositionLedger,
+    SigningCredential,
+    TradingAccount,
+    User,
+    WorkerHeartbeat,
+)
+from app.services.admin_leverage_sync import (
+    LeverageSyncAuthorizationError,
+    fresh_position_config_sync_authorization,
+)
+from app.services.audit import audit
 from app.services.credentials import monitor_credential_expiry
 from app.services.execution import claim_job, process_job, release_stale_jobs
 from app.services.execution_resolution import resolve_ambiguous_executions
@@ -52,6 +67,18 @@ def _position_sizes(state: dict) -> dict[str, Decimal]:
     return out
 
 
+def _credential_blob(cred: SigningCredential) -> EncryptedCredential:
+    return EncryptedCredential(
+        cred.ciphertext_b64,
+        cred.nonce_b64,
+        cred.wrapped_dek_b64,
+        cred.wrap_nonce_b64,
+        cred.key_provider,
+        cred.key_reference,
+        cred.key_version,
+    )
+
+
 async def _retry_admin_job(db, job_id: uuid.UUID, reason: str) -> str:
     await db.rollback()
     job = await db.get(CopyJob, job_id)
@@ -69,6 +96,63 @@ async def _retry_admin_job(db, job_id: uuid.UUID, reason: str) -> str:
         job.enqueued_at = None
     await db.commit()
     return job.state.value
+
+
+async def _finish_admin_leverage_job(
+    db,
+    job: CopyJob,
+    state: JobState,
+    *,
+    error: str | None = None,
+    result: dict | None = None,
+    status_code: int | None = None,
+) -> str:
+    ctx = dict(job.context or {})
+    if result is not None:
+        ctx['result'] = result
+    if status_code is not None:
+        ctx['status_code'] = int(status_code)
+    ctx['completed_at'] = datetime.now(UTC).isoformat()
+    job.context = ctx
+    job.state = state
+    job.last_error = error
+    job.owner = None
+    job.locked_until = None
+    job.next_attempt_at = None
+    await db.commit()
+    return state.value
+
+
+async def _quarantine_stale_admin_leverage_jobs(db) -> int:
+    """Never auto-retry a stale one-shot signed admin action.
+
+    A process can die after Hyperliquid received the leverage update but before
+    PostgreSQL observed the response. Replaying that action from a generic stale
+    lease recovery path would erase the ambiguity boundary. Mark it terminal and
+    require a fresh diagnostic/manual command instead.
+    """
+    now = datetime.now(UTC)
+    rows = (await db.execute(
+        select(CopyJob).where(
+            CopyJob.origin == 'ADMIN_LEVERAGE_SYNC',
+            CopyJob.state == JobState.PROCESSING,
+            CopyJob.locked_until < now,
+        ).with_for_update(skip_locked=True)
+    )).scalars().all()
+    for job in rows:
+        ctx = dict(job.context or {})
+        ctx['submission_status'] = 'UNKNOWN_AFTER_WORKER_LOSS'
+        ctx['completed_at'] = now.isoformat()
+        job.context = ctx
+        job.state = JobState.DEAD
+        job.last_error = 'Signed leverage sync worker lease expired; exchange state must be verified before retry'
+        job.owner = None
+        job.locked_until = None
+        job.next_attempt_at = None
+        job.enqueued_at = None
+    if rows:
+        await db.commit()
+    return len(rows)
 
 
 class Worker:
@@ -143,6 +227,278 @@ class Worker:
         await db.commit()
         return JobState.DONE.value
 
+    async def _run_admin_leverage_sync(self, db, job: CopyJob) -> str:
+        """Execute a SUPERADMIN leverage sync where signing custody belongs.
+
+        This action is deliberately one-shot. The API queues only public metadata;
+        the execution-worker alone decrypts the API Wallet credential. A failed or
+        ambiguous signed submission is never retried automatically.
+        """
+        if job.attempt_count != 1:
+            return await _finish_admin_leverage_job(
+                db,
+                job,
+                JobState.DEAD,
+                error='Signed admin leverage sync cannot be retried automatically',
+                status_code=502,
+            )
+
+        ctx = dict(job.context or {})
+        user = await db.get(User, job.user_id)
+        if not user:
+            return await _finish_admin_leverage_job(db, job, JobState.SKIPPED, error='User no longer exists', status_code=404)
+
+        try:
+            expected_network = str(ctx['follower_network']).lower()
+            if expected_network not in {'testnet', 'mainnet'}:
+                raise ValueError('invalid follower network')
+            network: Network = expected_network  # type: ignore[assignment]
+            expected_account_id = uuid.UUID(str(ctx['expected_account_id']))
+            expected_credential_id = uuid.UUID(str(ctx['expected_credential_id']))
+            expected_account_address = str(ctx['expected_account_address'])
+            initial_exchange_max = int(ctx['initial_exchange_max_leverage'])
+            initial_desired_leverage = int(ctx['initial_desired_leverage'])
+            initial_desired_is_cross = bool(ctx['initial_desired_is_cross'])
+            actor_id = uuid.UUID(str(ctx['actor_id']))
+            reason = str(ctx.get('reason') or 'Controlled leverage synchronization')
+        except Exception as exc:
+            return await _finish_admin_leverage_job(
+                db,
+                job,
+                JobState.DEAD,
+                error=f'Invalid signed leverage job context: {type(exc).__name__}: {exc}',
+                status_code=500,
+            )
+
+        current_network = (await user_network_state(db, user.id)).network
+        if current_network != network:
+            return await _finish_admin_leverage_job(
+                db,
+                job,
+                JobState.SKIPPED,
+                error='Follower network changed before leverage synchronization',
+                status_code=409,
+            )
+
+        account = await db.get(TradingAccount, expected_account_id)
+        if not account or account.user_id != user.id or account.account_address.lower() != expected_account_address.lower():
+            return await _finish_admin_leverage_job(
+                db,
+                job,
+                JobState.SKIPPED,
+                error='Follower trading account changed before leverage synchronization',
+                status_code=409,
+            )
+        cred = await db.get(SigningCredential, expected_credential_id)
+        if not cred or cred.trading_account_id != account.id:
+            return await _finish_admin_leverage_job(
+                db,
+                job,
+                JobState.SKIPPED,
+                error='Trading credential changed before leverage synchronization',
+                status_code=409,
+            )
+
+        follower_hl = self.follower_hl(network)
+        try:
+            await follower_hl.asset_spec(job.asset)
+            signing_secret = crypto.decrypt(
+                _credential_blob(cred),
+                user_id=str(user.id),
+                account_id=str(account.id),
+            )
+        except Exception as exc:
+            await audit(
+                db,
+                action='ADMIN_FOLLOWER_LEVERAGE_SYNC_FAILED',
+                actor_id=actor_id,
+                subject_id=user.id,
+                reason=reason,
+                correlation_id=job.correlation_id,
+                after={'asset': job.asset, 'network': network, 'stage': 'credential_prepare', 'error': f'{type(exc).__name__}: {exc}'},
+            )
+            await db.flush()
+            return await _finish_admin_leverage_job(
+                db,
+                job,
+                JobState.DEAD,
+                error=f'Credential preparation failed: {type(exc).__name__}: {exc}',
+                status_code=502,
+            )
+
+        submitted = {
+            'leverage': max(1, initial_desired_leverage),
+            'is_cross': initial_desired_is_cross,
+        }
+        refreshed_source: dict[str, object] = {}
+
+        async def _authorize_submission() -> tuple[int, bool]:
+            fresh_master_hl = HyperliquidAdapter(self.limiter, network=settings.master_network)
+            fresh_spec_hl = HyperliquidAdapter(self.limiter, network=network)
+            fresh_master_state, fresh_spec = await asyncio.gather(
+                fresh_master_hl.user_state(
+                    settings.HYPERLIQUID_MASTER_ADDRESS,
+                    priority=Priority.ORDER,
+                ),
+                fresh_spec_hl.asset_spec(job.asset),
+            )
+            fresh_master_cfg = position_configs(fresh_master_state).get(job.asset)
+            if not fresh_master_cfg:
+                raise LeverageSyncAuthorizationError(409, f'Master no longer has an open {job.asset} position/configuration')
+
+            effective_exchange_max = min(fresh_spec.max_leverage, initial_exchange_max)
+            fresh_desired_is_cross = bool(
+                fresh_master_cfg.is_cross
+                and not fresh_spec.only_isolated
+                and initial_desired_is_cross
+            )
+            refreshed_source['master'] = {
+                'leverage': fresh_master_cfg.leverage,
+                'margin_mode': 'cross' if fresh_master_cfg.is_cross else 'isolated',
+            }
+            refreshed_source['exchange_max_leverage'] = fresh_spec.max_leverage
+            refreshed_source['exchange_only_isolated'] = fresh_spec.only_isolated
+            refreshed_source['effective_exchange_max_leverage'] = effective_exchange_max
+            if follower_hl.address_limits is not None:
+                await follower_hl.address_limits.reestablish_submission_slot_before_final_authorization(
+                    account.account_address
+                )
+            leverage, is_cross, risk_max_leverage = await fresh_position_config_sync_authorization(
+                db,
+                user.id,
+                network,
+                expected_account_id=expected_account_id,
+                expected_account_address=expected_account_address,
+                expected_credential_id=expected_credential_id,
+                asset=job.asset,
+                master_leverage=fresh_master_cfg.leverage,
+                exchange_max_leverage=effective_exchange_max,
+                desired_is_cross=fresh_desired_is_cross,
+            )
+            refreshed_source['risk_max_leverage'] = risk_max_leverage
+            submitted['leverage'] = leverage
+            submitted['is_cross'] = is_cross
+            return leverage, is_cross
+
+        job.context = {**ctx, 'submission_status': 'SUBMITTING'}
+        await db.commit()
+        try:
+            response = await follower_hl.update_leverage(
+                account_address=account.account_address,
+                private_key=signing_secret,
+                asset=job.asset,
+                leverage=int(submitted['leverage']),
+                is_cross=bool(submitted['is_cross']),
+                before_submit=_authorize_submission,
+            )
+        except LeverageSyncAuthorizationError as exc:
+            await audit(
+                db,
+                action='ADMIN_FOLLOWER_LEVERAGE_SYNC_BLOCKED',
+                actor_id=actor_id,
+                subject_id=user.id,
+                reason=reason,
+                correlation_id=job.correlation_id,
+                after={'asset': job.asset, 'network': network, 'error': str(exc)},
+            )
+            await db.flush()
+            return await _finish_admin_leverage_job(
+                db,
+                job,
+                JobState.SKIPPED,
+                error=str(exc),
+                status_code=exc.status_code,
+            )
+        except asyncio.CancelledError:
+            cancelled_desired = {
+                'leverage': int(submitted['leverage']),
+                'margin_mode': 'cross' if bool(submitted['is_cross']) else 'isolated',
+            }
+            await audit(
+                db,
+                action='ADMIN_FOLLOWER_LEVERAGE_SYNC_UNVERIFIED',
+                actor_id=actor_id,
+                subject_id=user.id,
+                reason=reason,
+                correlation_id=job.correlation_id,
+                after={
+                    'asset': job.asset,
+                    'network': network,
+                    'response': None,
+                    'desired': cancelled_desired,
+                    'observed': None,
+                    'submission_status': 'UNKNOWN_DUE_TO_CANCELLATION',
+                    'verification_error': 'CancelledError: worker cancelled after entering signed leverage path',
+                },
+            )
+            await db.flush()
+            await _finish_admin_leverage_job(
+                db,
+                job,
+                JobState.DEAD,
+                error='Signed leverage synchronization cancelled with unknown exchange outcome',
+                result={
+                    'response': None,
+                    'submitted': submitted,
+                    'refreshed_source': refreshed_source,
+                    'submission_status': 'UNKNOWN_DUE_TO_CANCELLATION',
+                },
+                status_code=502,
+            )
+            raise
+        except Exception as exc:
+            await audit(
+                db,
+                action='ADMIN_FOLLOWER_LEVERAGE_SYNC_UNVERIFIED',
+                actor_id=actor_id,
+                subject_id=user.id,
+                reason=reason,
+                correlation_id=job.correlation_id,
+                after={
+                    'asset': job.asset,
+                    'network': network,
+                    'response': None,
+                    'desired': submitted,
+                    'observed': None,
+                    'submission_status': 'UNKNOWN_OR_FAILED',
+                    'verification_error': f'{type(exc).__name__}: {exc}',
+                },
+            )
+            await db.flush()
+            return await _finish_admin_leverage_job(
+                db,
+                job,
+                JobState.DEAD,
+                error=f'Hyperliquid leverage sync failed or became ambiguous: {type(exc).__name__}: {exc}',
+                result={
+                    'response': None,
+                    'submitted': submitted,
+                    'refreshed_source': refreshed_source,
+                    'submission_status': 'UNKNOWN_OR_FAILED',
+                },
+                status_code=502,
+            )
+        finally:
+            signing_secret = ''
+
+        result = {
+            'response': response,
+            'submitted': submitted,
+            'refreshed_source': refreshed_source,
+            'submission_status': 'SUBMITTED',
+        }
+        await audit(
+            db,
+            action='ADMIN_FOLLOWER_LEVERAGE_SYNC_SUBMITTED',
+            actor_id=actor_id,
+            subject_id=user.id,
+            reason=reason,
+            correlation_id=job.correlation_id,
+            after={'asset': job.asset, 'network': network, **result},
+        )
+        await db.flush()
+        return await _finish_admin_leverage_job(db, job, JobState.DONE, result=result)
+
     async def handle_job_id(self,job_id:str)->bool:
         try: uid=uuid.UUID(job_id)
         except Exception: return True
@@ -165,6 +521,8 @@ class Worker:
             try:
                 if job.origin=='ADMIN_RECONCILE':
                     result=await self._run_admin_reconcile(db,job)
+                elif job.origin=='ADMIN_LEVERAGE_SYNC':
+                    result=await self._run_admin_leverage_sync(db,job)
                 else:
                     network=(await user_network_state(db,job.user_id)).network
                     result=await process_job(db,self.follower_hl(network),job)
@@ -219,6 +577,7 @@ class Worker:
         while not stop.is_set():
             try:
                 async with SessionLocal() as db:
+                    await _quarantine_stale_admin_leverage_jobs(db)
                     await release_stale_jobs(db)
                     await repair_stream(self.redis,db)
                     await monitor_credential_expiry(db, self.redis)
