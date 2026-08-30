@@ -42,6 +42,22 @@ type Risk={
   block_assets:string[];
 };
 
+type Entitlements={
+  entitled:boolean;
+  status:string;
+  plan:string|null;
+  commercial_plan:string|null;
+  limits:{
+    max_multiplier?:number|string;
+    max_notional_per_trade?:number|string;
+    max_positions?:number;
+    max_equity_usd?:number|string;
+  };
+  portfolio_equity:number|null;
+  portfolio_limit_usd:number|null;
+  portfolio_limit_exceeded:boolean;
+};
+
 type RiskMode='basic'|'pro';
 type BasicProfile='prudent'|'balanced'|'faithful'|'custom';
 type BasicMarkets='all'|'majors'|'btc'|'custom';
@@ -103,6 +119,7 @@ export default function Settings(){
   const [me,setMe]=useState<Me|null>(null);
   const [risk,setRisk]=useState<Risk|null>(null);
   const [equity,setEquity]=useState<number|null>(null);
+  const [entitlements,setEntitlements]=useState<Entitlements|null>(null);
   const [agent,setAgent]=useState('');
   const [key,setKey]=useState('');
   const [msg,setMsg]=useState('');
@@ -115,11 +132,12 @@ export default function Settings(){
     const [meValue,riskValue,dashboard]=await Promise.all([
       get<Me>('/me'),
       get<Risk>('/risk-profile'),
-      get<{equity:number|null}>('/dashboard'),
+      get<{equity:number|null;entitlements:Entitlements}>('/dashboard'),
     ]);
     setMe(meValue);
     setRisk(riskValue);
     setEquity(dashboard.equity);
+    setEntitlements(dashboard.entitlements||null);
     setBasicProfile(inferBasicProfile(riskValue));
     setBasicMarkets(inferBasicMarkets(riskValue));
   };
@@ -154,6 +172,7 @@ export default function Settings(){
       setAgent('');
       setKey('');
       setEquity(null);
+      setEntitlements(null);
       await load();
       setMsg(`Rete ${label} selezionata. Configura ora l’API Wallet ${label}.`);
     }catch(e){
@@ -192,7 +211,9 @@ export default function Settings(){
     if(!value)return;
     const stored=await put('/risk-profile',value) as Risk;
     setRisk(stored);
-    setMsg('Profilo rischio salvato.');
+    setBasicProfile(inferBasicProfile(stored));
+    setBasicMarkets(inferBasicMarkets(stored));
+    setMsg('Profilo rischio selezionato salvato. Gli eventuali limiti del piano vengono applicati soltanto in esecuzione.');
   };
 
   const applyBasic=async()=>{
@@ -206,7 +227,7 @@ export default function Settings(){
     setRisk(stored);
     setBasicProfile(inferBasicProfile(stored));
     setBasicMarkets(inferBasicMarkets(stored));
-    setMsg(`Profilo Basic “${BASIC_PROFILES[basicProfile].title}” applicato. Lo stato operativo non è stato modificato.`);
+    setMsg(`Profilo Basic “${BASIC_PROFILES[basicProfile].title}” salvato. Lo stato operativo non è stato modificato; i cap del piano restano separati e vengono applicati a runtime.`);
   };
 
   const presetBtc=async()=>{
@@ -280,6 +301,9 @@ export default function Settings(){
   };
 
   const canChangeNetwork=Boolean(me?.network_switch_ready);
+  const effectiveRisk=risk?applyEntitlementCaps(risk,entitlements):null;
+  const proConstraints=risk&&effectiveRisk?planConstraintText(risk,effectiveRisk,entitlements):'';
+  const entitlementWarning=entitlementWarningText(entitlements);
 
   return <>
     <div className="title">
@@ -361,6 +385,7 @@ export default function Settings(){
         {risk&&riskMode==='basic'&&<BasicRisk
           risk={risk}
           equity={equity}
+          entitlements={entitlements}
           profile={basicProfile}
           markets={basicMarkets}
           setProfile={setBasicProfile}
@@ -370,7 +395,9 @@ export default function Settings(){
         />}
 
         {risk&&riskMode==='pro'&&<>
-          <div className="pro-warning">Modalità Pro: controllo completo dei limiti. Le modifiche possono cambiare direttamente sizing, leva consentita e comportamento dell'esecuzione automatizzata.</div>
+          <div className="pro-warning">Modalità Pro: controllo completo dei limiti selezionati. I cap commerciali del piano restano separati e vengono applicati dinamicamente dal Risk Engine in esecuzione.</div>
+          {proConstraints&&<p className="basic-footnote"><strong>Cap piano {planName(entitlements)}:</strong> {proConstraints}. I valori inseriti restano salvati e torneranno operativi automaticamente se il piano consentirà limiti superiori.</p>}
+          {entitlementWarning&&<p className="basic-footnote"><strong>Stato esecuzione:</strong> {entitlementWarning}</p>}
           <div className="formgrid">
             <Num label="Multiplier" value={risk.multiplier} set={v=>setRisk({...risk,multiplier:v})}/>
             <Num label="Max / trade $" value={risk.max_notional_per_trade} set={v=>setRisk({...risk,max_notional_per_trade:v})}/>
@@ -387,7 +414,7 @@ export default function Settings(){
             <label className="check"><input type="checkbox" checked={risk.close_only} onChange={e=>setRisk({...risk,close_only:e.target.checked})}/> Close-only</label>
             {me?.follower_network==='testnet'&&<button onClick={()=>void presetBtc()}>Preset test BTC sicuro</button>}
             {me?.follower_network==='testnet'&&me?.role==='SUPERADMIN'&&<button onClick={()=>void presetMulti()}>Preset test multi-asset TESTNET</button>}
-            <button className="primary" onClick={()=>void save()}>Salva limiti</button>
+            <button className="primary" onClick={()=>void save()}>Salva limiti selezionati</button>
           </div>
         </>}
       </section>
@@ -443,9 +470,10 @@ function NetworkSwitchDialog({me,target,kind,close,refreshState,confirm}:{
   </div>;
 }
 
-function BasicRisk({risk,equity,profile,markets,setProfile,setMarkets,apply,openPro}:{
+function BasicRisk({risk,equity,entitlements,profile,markets,setProfile,setMarkets,apply,openPro}:{
   risk:Risk;
   equity:number|null;
+  entitlements:Entitlements|null;
   profile:BasicProfile;
   markets:BasicMarkets;
   setProfile:(v:BasicProfile)=>void;
@@ -454,6 +482,9 @@ function BasicRisk({risk,equity,profile,markets,setProfile,setMarkets,apply,open
   openPro:()=>void;
 }){
   const preview=buildBasicRisk(risk,profile,markets,equity);
+  const effectivePreview=applyEntitlementCaps(preview,entitlements);
+  const constraints=planConstraintText(preview,effectivePreview,entitlements);
+  const entitlementWarning=entitlementWarningText(entitlements);
   return <div className="basic-risk">
     <div className="basic-section">
       <div className="basic-section-title"><span>1</span><div><h3>Quanto vuoi seguire la strategia?</h3><p>TRAXION traduce questa scelta in sizing, leva e limiti tecnici del Risk Engine.</p></div></div>
@@ -463,7 +494,7 @@ function BasicRisk({risk,equity,profile,markets,setProfile,setMarkets,apply,open
           return <button key={key} className={`risk-choice ${profile===key?'active':''}`} onClick={()=>setProfile(key)}>
             <div className="risk-choice-top"><strong>{item.title}</strong>{item.badge&&<span className="choice-badge">{item.badge}</span>}</div>
             <span>{item.description}</span>
-            <small>Intensità {Math.round(item.multiplier*100)}% · leva max {item.maxLeverage}× · drawdown {item.maxDrawdown}%</small>
+            <small>Intensità {Math.round(item.multiplier*100)}% · leva max {item.maxLeverage}× · max {item.maxPositions} posizioni · drawdown {item.maxDrawdown}%</small>
           </button>;
         })}
         {profile==='custom'&&<button className="risk-choice active custom" onClick={openPro}>
@@ -485,16 +516,19 @@ function BasicRisk({risk,equity,profile,markets,setProfile,setMarkets,apply,open
     </div>
 
     <div className="basic-summary">
-      <div className="basic-summary-head"><div><h3>Riepilogo</h3><p>Questi sono i principali limiti che TRAXION applicherà alla strategia.</p></div>{equity!=null&&<span className="badge">Equity {usd(equity)}</span>}</div>
+      <div className="basic-summary-head"><div><h3>Riepilogo</h3><p>La scelta dell’utente resta salvata; eventuali cap del piano vengono applicati dinamicamente soltanto al valore operativo.</p></div>{equity!=null&&<span className="badge">Equity {usd(equity)}</span>}</div>
       <div className="basic-summary-grid">
-        <SummaryItem label="Intensità strategia" value={`${Math.round(Number(preview.multiplier)*100)}%`}/>
+        <SummaryItem label="Intensità strategia" value={dualPercent(preview.multiplier,effectivePreview.multiplier)}/>
         <SummaryItem label="Leva account" value={`Strategia fino a ${Number(preview.max_leverage)}×`}/>
         <SummaryItem label="Soglia drawdown" value={`${Number(preview.max_drawdown_pct)}%`}/>
         <SummaryItem label="Perdita giornaliera" value={`${Number(preview.max_daily_loss_pct)}%`}/>
-        <SummaryItem label="Max posizioni" value={String(preview.max_positions)}/>
+        <SummaryItem label="Max posizioni" value={dualInteger(preview.max_positions,effectivePreview.max_positions)}/>
+        <SummaryItem label="Max / trade" value={dualMoney(preview.max_notional_per_trade,effectivePreview.max_notional_per_trade)}/>
         <SummaryItem label="Mercati" value={marketLabel(markets)}/>
       </div>
       <p className="basic-footnote">I tetti monetari vengono calibrati automaticamente sull'equity disponibile quando è presente. La leva viene allineata alla strategia sorgente ma non può superare il limite del profilo o quello del singolo mercato.</p>
+      {constraints&&<p className="basic-footnote"><strong>Cap piano {planName(entitlements)}:</strong> {constraints}. Le preferenze selezionate restano salvate e si espandono automaticamente se il piano cambia.</p>}
+      {entitlementWarning&&<p className="basic-footnote"><strong>Stato esecuzione:</strong> {entitlementWarning}</p>}
       <div className="actions basic-actions">
         <button className="primary" onClick={apply} disabled={profile==='custom'}>Applica profilo Basic</button>
         <button onClick={openPro}>Vedi parametri Pro</button>
@@ -538,11 +572,35 @@ function buildBasicRisk(risk:Risk,profile:BasicProfile,markets:BasicMarkets,equi
   return next;
 }
 
+function applyEntitlementCaps(risk:Risk,entitlements:Entitlements|null):Risk{
+  const next:Risk={...risk,allow_assets:[...risk.allow_assets],block_assets:[...risk.block_assets]};
+  const limits=entitlements?.limits||{};
+  if(limits.max_multiplier!=null){
+    next.multiplier=cleanNumber(Math.min(Number(next.multiplier),Number(limits.max_multiplier)));
+  }
+  if(limits.max_notional_per_trade!=null){
+    next.max_notional_per_trade=cleanNumber(Math.min(Number(next.max_notional_per_trade),Number(limits.max_notional_per_trade)));
+  }
+  if(limits.max_positions!=null){
+    next.max_positions=Math.min(next.max_positions,Number(limits.max_positions));
+  }
+  return next;
+}
+
 function inferBasicProfile(risk:Risk):BasicProfile{
   const candidates=(Object.keys(BASIC_PROFILES) as Exclude<BasicProfile,'custom'>[]);
   for(const key of candidates){
     const p=BASIC_PROFILES[key];
-    if(close(Number(risk.multiplier),p.multiplier)&&close(Number(risk.max_leverage),p.maxLeverage)&&close(Number(risk.max_drawdown_pct),p.maxDrawdown)&&close(Number(risk.max_daily_loss_pct),p.dailyLoss))return key;
+    if(
+      close(Number(risk.multiplier),p.multiplier)
+      &&close(Number(risk.max_leverage),p.maxLeverage)
+      &&risk.max_positions===p.maxPositions
+      &&close(Number(risk.max_drawdown_pct),p.maxDrawdown)
+      &&close(Number(risk.max_daily_loss_pct),p.dailyLoss)
+      &&close(Number(risk.min_notional),10)
+      &&risk.max_slippage_bps===50
+      &&!risk.close_only
+    )return key;
   }
   return 'custom';
 }
@@ -568,9 +626,51 @@ function marketLabel(markets:BasicMarkets){
   return 'Personalizzati';
 }
 
+function planName(entitlements:Entitlements|null){
+  return String(entitlements?.commercial_plan||entitlements?.plan||'corrente').toUpperCase();
+}
+
+function planConstraintText(selected:Risk,effective:Risk,entitlements:Entitlements|null){
+  if(!entitlements)return '';
+  const items:string[]=[];
+  if(!close(Number(selected.multiplier),Number(effective.multiplier))){
+    items.push(`intensità ${Math.round(Number(selected.multiplier)*100)}% selezionata → ${Math.round(Number(effective.multiplier)*100)}% operativa`);
+  }
+  if(selected.max_positions!==effective.max_positions){
+    items.push(`max posizioni ${selected.max_positions} selezionate → ${effective.max_positions} operative`);
+  }
+  if(!close(Number(selected.max_notional_per_trade),Number(effective.max_notional_per_trade))){
+    items.push(`max/trade ${usd(Number(selected.max_notional_per_trade))} selezionato → ${usd(Number(effective.max_notional_per_trade))} operativo`);
+  }
+  return items.join(' · ');
+}
+
+function entitlementWarningText(entitlements:Entitlements|null){
+  if(!entitlements||entitlements.entitled)return '';
+  if(entitlements.portfolio_limit_exceeded&&entitlements.portfolio_equity!=null&&entitlements.portfolio_limit_usd!=null){
+    return `nuove esposizioni sospese perché l’equity ${usd(entitlements.portfolio_equity)} supera il limite ${usd(entitlements.portfolio_limit_usd)} del piano. Riduzioni e chiusure restano consentite dal Risk Engine.`;
+  }
+  if(entitlements.status==='none')return 'nuove esposizioni sospese finché non viene attivato un piano. Riduzioni e chiusure restano consentite dal Risk Engine.';
+  return `nuove esposizioni sospese: piano ${planName(entitlements)} con stato ${entitlements.status}. Riduzioni e chiusure restano consentite dal Risk Engine.`;
+}
+
+function dualPercent(selected:string,effective:string){
+  const s=Math.round(Number(selected)*100),e=Math.round(Number(effective)*100);
+  return s===e?`${s}%`:`${s}% selezionato · ${e}% operativo`;
+}
+
+function dualInteger(selected:number,effective:number){
+  return selected===effective?String(selected):`${selected} selezionate · ${effective} operative`;
+}
+
+function dualMoney(selected:string,effective:string){
+  const s=Number(selected),e=Number(effective);
+  return close(s,e)?usd(s):`${usd(s)} selezionato · ${usd(e)} operativo`;
+}
+
 function cleanNumber(value:number){return Number(value.toFixed(2)).toString()}
 function roundMoney(value:number){return Math.round(value*100)/100}
-function close(a:number,b:number){return Number.isFinite(a)&&Math.abs(a-b)<0.0001}
+function close(a:number,b:number){return Number.isFinite(a)&&Number.isFinite(b)&&Math.abs(a-b)<0.0001}
 function usd(value:number){return value.toLocaleString('en-US',{style:'currency',currency:'USD',maximumFractionDigits:2})}
 
 function Num({label,value,set}:{label:string;value:string;set:(v:string)=>void}){
