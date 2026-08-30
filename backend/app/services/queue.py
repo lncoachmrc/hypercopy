@@ -8,10 +8,14 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.models.entities import CopyJob, JobState
+from app.models.entities import CopyJob, JobState, User
 from app.services.master_leverage_cache import (
     publish_master_leverage_repair,
     record_master_leverage_repaired,
+)
+from app.services.master_source_identity import (
+    MASTER_SOURCE_FOLLOWER_BLOCK_REASON,
+    is_master_source_user,
 )
 
 
@@ -29,6 +33,16 @@ async def ensure_group(redis: Redis) -> None:
 
 
 async def publish_job(redis: Redis, db: AsyncSession, job: CopyJob) -> None:
+    user = await db.get(User, job.user_id)
+    if user and is_master_source_user(user):
+        job.state = JobState.SKIPPED
+        job.last_error = MASTER_SOURCE_FOLLOWER_BLOCK_REASON
+        job.owner = None
+        job.locked_until = None
+        job.next_attempt_at = None
+        job.enqueued_at = None
+        await db.flush()
+        return
     await redis.xadd(settings.STREAM_NAME, {'job_id': str(job.id)}, maxlen=100_000, approximate=True)
     job.enqueued_at = datetime.now(UTC)
     await db.flush()
@@ -136,8 +150,6 @@ async def replay_completed_hf006_repairs(
     for job in rows:
         evidence_order = reconcile_job_repair_evidence(job)
         if evidence_order is None:
-            # Corrupt/malformed evidence remains visibly pending instead of
-            # being silently acknowledged without authoritative proof.
             continue
         await record_master_leverage_repaired(
             redis,
@@ -202,8 +214,6 @@ async def repair_stream(redis: Redis, db: AsyncSession, limit: int = 500) -> int
     now = datetime.now(UTC)
     await expire_stale_strategy_jobs(db, now=now, limit=limit)
 
-    # First discharge durable bookkeeping obligations left by PostgreSQL
-    # fallback execution. This path never republishes a terminal repair job.
     await replay_completed_hf006_repairs(redis, db, limit=limit)
 
     stale_before = stale_enqueue_cutoff(now)
@@ -220,10 +230,16 @@ async def repair_stream(redis: Redis, db: AsyncSession, limit: int = 500) -> int
         if evidence_order is None:
             await publish_job(redis, db, job)
         else:
-            # For an authoritative RECONCILE, publication and HF-006 recovery
-            # bookkeeping are one Redis transaction. If Redis fails before the
-            # script executes, neither happens. If PostgreSQL fallback wins the
-            # race, its durable context flag is replayed above after completion.
+            user = await db.get(User, job.user_id)
+            if user and is_master_source_user(user):
+                job.state = JobState.SKIPPED
+                job.last_error = MASTER_SOURCE_FOLLOWER_BLOCK_REASON
+                job.owner = None
+                job.locked_until = None
+                job.next_attempt_at = None
+                job.enqueued_at = None
+                await db.flush()
+                continue
             await publish_master_leverage_repair(
                 redis,
                 stream_name=settings.STREAM_NAME,
@@ -237,6 +253,7 @@ async def repair_stream(redis: Redis, db: AsyncSession, limit: int = 500) -> int
                 mark_hf006_repair_accounted(job, evidence_order)
             job.enqueued_at = datetime.now(UTC)
             await db.flush()
-        count += 1
+        if job.state not in {JobState.SKIPPED, JobState.DEAD}:
+            count += 1
     await db.commit()
     return count
