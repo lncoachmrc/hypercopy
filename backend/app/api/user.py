@@ -324,16 +324,24 @@ async def get_risk(user: User = Depends(current_user), db: AsyncSession = Depend
 async def put_risk(body: RiskProfileIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     row = (await db.execute(select(RiskProfile).where(RiskProfile.user_id == user.id))).scalar_one()
     values = body.model_dump()
-    ent = await entitlement(db, user)
-    limits = ent.get('limits') or {}
-    if 'max_multiplier' in limits:
-        values['multiplier'] = min(values['multiplier'], __import__('decimal').Decimal(str(limits['max_multiplier'])))
-    if 'max_notional_per_trade' in limits:
-        values['max_notional_per_trade'] = min(values['max_notional_per_trade'], __import__('decimal').Decimal(str(limits['max_notional_per_trade'])))
-    if 'max_positions' in limits:
-        values['max_positions'] = min(values['max_positions'], int(limits['max_positions']))
-    for k, v in values.items(): setattr(row, k, v)
-    await audit(db, action='RISK_PROFILE_UPDATED', actor_id=user.id, subject_id=user.id, after={k: str(v) if hasattr(v, 'as_tuple') else v for k, v in values.items()})
+    before = {
+        k: str(getattr(row, k)) if hasattr(getattr(row, k), 'as_tuple') else getattr(row, k)
+        for k in values
+    }
+    # Persist exactly what the user selected. Commercial plan limits are applied
+    # dynamically by reconciliation/execution so upgrades and downgrades never
+    # destroy or leave stale strategy preferences in RiskProfile.
+    for k, v in values.items():
+        setattr(row, k, v)
+    await audit(
+        db,
+        action='RISK_PROFILE_UPDATED',
+        actor_id=user.id,
+        subject_id=user.id,
+        reason='Selected risk profile persisted; entitlement caps resolve at runtime',
+        before=before,
+        after={k: str(v) if hasattr(v, 'as_tuple') else v for k, v in values.items()},
+    )
     await db.commit(); return await get_risk(user, db)
 
 
