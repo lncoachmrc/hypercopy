@@ -19,6 +19,8 @@ from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, FollowerState, MasterExposu
 from app.models.entities import CopyJob, CopyState, EquitySnapshot, Execution, ExecutionState, Fill, JobState, PositionLedger, ReconciliationRun, RiskHalt, RiskProfile, RiskState, TradingAccount, User, UserState
 from app.services.ai_mode import read_ai_execution_policy
 from app.services.audit import audit
+from app.services.effective_risk import resolve_effective_risk
+from app.services.entitlement import entitlement
 from app.services.master_leverage_cache import next_master_leverage_causal_order
 from app.services.networking import user_network_state
 
@@ -85,6 +87,7 @@ def _risk_limited_submitted_size(
     follower_mark: Decimal,
     free_margin: Decimal,
     risk: RiskProfile,
+    entitlement_data: dict,
     risk_state: RiskState | None,
     allowed_asset: bool,
     current_total_exposure: Decimal,
@@ -95,6 +98,11 @@ def _risk_limited_submitted_size(
     if master_equity <= 0 or master_mark <= 0 or follower_mark <= 0:
         return None
 
+    effective_risk = resolve_effective_risk(
+        risk,
+        entitlement_data,
+        exchange_max_leverage=spec.max_leverage,
+    )
     sizing = plan(
         MasterExposure(asset, master_pos, master_mark, master_equity),
         FollowerState(str(user_id), follower_equity, unmanaged_margin, real, multiplier),
@@ -121,11 +129,11 @@ def _risk_limited_submitted_size(
             ),
             open_positions=current_open_positions,
             is_new_market=real == 0,
-            max_notional_per_trade=risk.max_notional_per_trade,
-            max_total_exposure=risk.max_total_exposure,
-            max_asset_exposure=risk.max_asset_exposure,
-            max_leverage=min(risk.max_leverage, Decimal(spec.max_leverage)),
-            max_positions=risk.max_positions,
+            max_notional_per_trade=effective_risk.max_notional_per_trade,
+            max_total_exposure=effective_risk.max_total_exposure,
+            max_asset_exposure=effective_risk.max_asset_exposure,
+            max_leverage=effective_risk.max_leverage,
+            max_positions=effective_risk.max_positions,
         ),
     )
     if decision.action not in {RiskAction.ALLOW, RiskAction.TRIM} or not decision.plan.actionable:
@@ -364,6 +372,8 @@ async def _reconcile_user_locked(
             risk_state = RiskState(user_id=user.id, peak_equity=equity, day_start_equity=equity, day_key=datetime.now(UTC).date().isoformat())
             db.add(risk_state)
         risk = (await db.execute(select(RiskProfile).where(RiskProfile.user_id == user.id))).scalar_one_or_none()
+        ent = await entitlement(db, user, portfolio_equity_override=equity)
+        effective_risk = resolve_effective_risk(risk, ent) if risk else None
         ai_policy = await read_ai_execution_policy(db)
         ai_factor = ai_policy.factor
 
@@ -438,7 +448,7 @@ async def _reconcile_user_locked(
         assets = set(master_positions) | set(real_positions) | set(ledger_by_asset)
         discrepancies = []
         liquidity_backoffs = []
-        multiplier = risk.multiplier if risk else Decimal(1)
+        multiplier = effective_risk.multiplier if effective_risk else Decimal(1)
         min_notional = max(risk.min_notional if risk else EXCHANGE_MIN_NOTIONAL, EXCHANGE_MIN_NOTIONAL)
         managed_assets = {x.asset for x in ledger_rows if x.managed} | {
             name for name, size in master_positions.items() if size != 0
@@ -514,7 +524,12 @@ async def _reconcile_user_locked(
             if user.copy_state == CopyState.ACTIVE and master_pos != 0 and master_config and risk and allowed_asset:
                 try:
                     spec = await hl.asset_spec(asset)
-                    desired_leverage = max(1, min(master_config.leverage, int(risk.max_leverage), spec.max_leverage))
+                    asset_effective_risk = resolve_effective_risk(
+                        risk,
+                        ent,
+                        exchange_max_leverage=spec.max_leverage,
+                    )
+                    desired_leverage = max(1, min(master_config.leverage, int(asset_effective_risk.max_leverage)))
                     desired_is_cross = bool(master_config.is_cross and not spec.only_isolated)
                     leverage_mismatch = real != 0 and (
                         follower_config is None
@@ -563,6 +578,7 @@ async def _reconcile_user_locked(
                         follower_mark=follower_mark,
                         free_margin=free_margin,
                         risk=risk,
+                        entitlement_data=ent,
                         risk_state=risk_state,
                         allowed_asset=allowed_asset,
                         current_total_exposure=current_total_exposure,
@@ -605,6 +621,11 @@ async def _reconcile_user_locked(
                 'ai_execution_influence': ai_policy.effective,
                 'ai_execution_factor': str(ai_factor),
                 'ai_target_without_influence': str(base_target),
+                'selected_multiplier': str(risk.multiplier) if risk else '1',
+                'effective_multiplier': str(multiplier),
+                'selected_max_positions': risk.max_positions if risk else None,
+                'effective_max_positions': effective_risk.max_positions if effective_risk else None,
+                'entitlement_plan': ent.get('commercial_plan') or ent.get('plan'),
             }
             if master_snapshot_started_order is not None:
                 context['master_snapshot_started_order'] = master_snapshot_started_order
@@ -644,10 +665,20 @@ async def _reconcile_user_locked(
             taken_at=datetime.now(UTC),
         ))
 
-        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'network': network, 'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created, 'ai_mode': ai_policy.effective_mode, 'ai_execution_factor': str(ai_factor)}; run.finished_at = datetime.now(UTC)
-        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'network': network, 'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created, 'ai_mode': ai_policy.effective_mode, 'ai_execution_factor': str(ai_factor)})
+        effective_summary = {
+            'selected_multiplier': str(risk.multiplier) if risk else None,
+            'effective_multiplier': str(effective_risk.multiplier) if effective_risk else None,
+            'selected_max_positions': risk.max_positions if risk else None,
+            'effective_max_positions': effective_risk.max_positions if effective_risk else None,
+            'selected_max_notional_per_trade': str(risk.max_notional_per_trade) if risk else None,
+            'effective_max_notional_per_trade': str(effective_risk.max_notional_per_trade) if effective_risk else None,
+            'entitlement_plan': ent.get('commercial_plan') or ent.get('plan'),
+            'entitled': bool(ent.get('entitled')),
+        }
+        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'network': network, 'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created, 'ai_mode': ai_policy.effective_mode, 'ai_execution_factor': str(ai_factor), **effective_summary}; run.finished_at = datetime.now(UTC)
+        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'network': network, 'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created, 'ai_mode': ai_policy.effective_mode, 'ai_execution_factor': str(ai_factor), **effective_summary})
         await db.commit()
-        return {'status': 'OK', 'network': network, 'discrepancies': discrepancies, 'equity': str(equity), 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created, 'ai_mode': ai_policy.effective_mode, 'ai_execution_factor': str(ai_factor)}
+        return {'status': 'OK', 'network': network, 'discrepancies': discrepancies, 'equity': str(equity), 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created, 'ai_mode': ai_policy.effective_mode, 'ai_execution_factor': str(ai_factor), **effective_summary}
     except Exception as exc:
         run.status = 'FAILED'; run.error = f'{type(exc).__name__}: {exc}'; run.finished_at = datetime.now(UTC); await db.commit(); raise
 
