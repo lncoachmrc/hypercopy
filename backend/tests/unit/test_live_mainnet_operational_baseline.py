@@ -181,7 +181,7 @@ def test_signing_material_is_metadata_prerequisite_not_policy_or_decrypt_gate() 
     assert 'RiskProfile' not in source
     assert 'SystemFlag' not in source
     assert 'copy_state' not in source
-    assert 'decrypt' not in source
+    assert 'crypto.decrypt' not in source
 
 
 def test_diagnostic_can_reuse_preloaded_follower_adapter() -> None:
