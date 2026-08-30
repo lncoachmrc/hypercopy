@@ -8,18 +8,12 @@ from app.adapters.hyperliquid import HyperliquidAdapter
 from app.adapters.ratelimit import Budget, Priority, WeightedRateLimiter
 from app.api.deps import current_user
 from app.core.config import settings
-from app.core.security import normalize_address
 from app.db.redis import redis_client
 from app.models.entities import User
+from app.services.master_source_identity import is_master_source_user
 
 
 router = APIRouter(tags=['master-source'])
-
-
-def _is_master_source(user: User) -> bool:
-    if not settings.HYPERLIQUID_MASTER_ADDRESS:
-        return False
-    return normalize_address(user.auth_wallet) == normalize_address(settings.HYPERLIQUID_MASTER_ADDRESS)
 
 
 def _decimal(value) -> Decimal:
@@ -31,15 +25,15 @@ def _decimal(value) -> Decimal:
 
 @router.get('/master-source/status')
 async def master_source_status(user: User = Depends(current_user)):
-    if not _is_master_source(user):
+    if not is_master_source_user(user):
         raise HTTPException(403, 'This account is not the configured master source')
 
     limiter = WeightedRateLimiter(
         redis_client(),
         Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN),
     )
-    # The canonical source is MAINNET regardless of any follower network chosen
-    # in the UI. This endpoint is strictly read-only and never signs an action.
+    # The canonical source is MAINNET regardless of any legacy follower network
+    # stored on the auth user. This endpoint is strictly read-only and never signs.
     hl = HyperliquidAdapter(limiter, network='mainnet')
     try:
         snapshot = await hl.account_snapshot(
