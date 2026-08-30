@@ -71,9 +71,14 @@ async def test_activation_uses_fresh_follower_equity_for_entitlement(monkeypatch
             'portfolio_limit_usd': 2500,
         }
 
+    async def causal_order(*, required=False):
+        assert required is True
+        return 41
+
     monkeypatch.setattr(activation, 'user_network_state', network_state)
     monkeypatch.setattr(activation, 'live_trading_allowed', live_allowed)
     monkeypatch.setattr(activation, 'entitlement', capped_entitlement)
+    monkeypatch.setattr(activation, 'master_snapshot_started_order', causal_order)
     monkeypatch.setattr(activation, 'HyperliquidAdapter', _FakeHyperliquidAdapter)
     monkeypatch.setattr(activation, '_limiter', lambda: None)
     monkeypatch.setattr(activation.settings, 'HYPERLIQUID_MASTER_ADDRESS', '0xmaster')
@@ -85,6 +90,14 @@ async def test_activation_uses_fresh_follower_equity_for_entitlement(monkeypatch
     assert exc.value.status_code == 409
     assert '$3200.00' in exc.value.detail
     assert '$2500.00' in exc.value.detail
+
+
+def test_activation_allocates_causal_order_before_master_snapshot() -> None:
+    source = __import__('inspect').getsource(activation.resume_copy_immediate)
+    order_index = source.index('master_snapshot_started_order(required=True)')
+    snapshot_index = source.index('master_hl.account_snapshot(')
+    assert order_index < snapshot_index
+    assert 'observed_master_mids(await master_hl.mids(), snapshot_started_order)' in source
 
 
 def test_activation_entitlement_error_explains_missing_plan():

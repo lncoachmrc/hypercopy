@@ -597,43 +597,43 @@ class HyperliquidAdapter:
         exchange = self._exchange(local, account_address)
 
         async def _authorize_strategy_order() -> None:
-            evidence = await current_strategy_intent_for_cloid(
-                cloid=cloid,
-                follower_network=self.network,
-                asset=asset,
-            )
-            if evidence is None:
-                # Administrative/emergency actions such as CLOSE_ALL deliberately
-                # keep their independent execution semantics.
-                return
-            master_address = settings.HYPERLIQUID_MASTER_ADDRESS
-            if not master_address:
-                raise StrategyIntentAuthorizationError(
-                    'Master source address is unavailable at order authorization'
-                )
-            master_hl = (
-                self
-                if self.network == settings.master_network
-                else HyperliquidAdapter(self.limiter, network=settings.master_network)
-            )
             try:
+                evidence = await current_strategy_intent_for_cloid(
+                    cloid=cloid,
+                    follower_network=self.network,
+                    asset=asset,
+                )
+                if evidence is None:
+                    # Administrative/emergency actions such as CLOSE_ALL deliberately
+                    # keep their independent execution semantics.
+                    return
+                master_address = settings.HYPERLIQUID_MASTER_ADDRESS
+                if not master_address:
+                    raise StrategyIntentAuthorizationError(
+                        'Master source address is unavailable at order authorization'
+                    )
+                master_hl = (
+                    self
+                    if self.network == settings.master_network
+                    else HyperliquidAdapter(self.limiter, network=settings.master_network)
+                )
                 fresh_master_state = await master_hl.user_state(
                     master_address,
                     priority=Priority.ORDER,
                 )
+                fresh_position = master_position_from_state(fresh_master_state, asset)
+                if fresh_position != evidence.source_master_position:
+                    raise StrategyIntentSuperseded(
+                        f'Source master position moved from {evidence.source_master_position} '
+                        f'to {fresh_position} before order submission'
+                    )
             except StrategyIntentAuthorizationError:
                 raise
             except Exception as exc:
                 raise StrategyIntentAuthorizationError(
-                    f'Fresh master state unavailable before order submission: {type(exc).__name__}: {exc}'
+                    f'Strategy authorization unavailable before order submission: '
+                    f'{type(exc).__name__}: {exc}'
                 ) from exc
-
-            fresh_position = master_position_from_state(fresh_master_state, asset)
-            if fresh_position != evidence.source_master_position:
-                raise StrategyIntentSuperseded(
-                    f'Source master position moved from {evidence.source_master_position} '
-                    f'to {fresh_position} before order submission'
-                )
 
         def _submit():
             exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)

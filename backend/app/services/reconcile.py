@@ -261,21 +261,29 @@ async def _sync_missing_fills(db: AsyncSession, hl: HyperliquidAdapter, user: Us
     return inserted
 
 
-async def _master_snapshot_started_order() -> int | None:
+async def master_snapshot_started_order(*, required: bool = False) -> int | None:
     try:
         return await next_master_leverage_causal_order(redis_client())
-    except Exception:
+    except Exception as exc:
         log.warning(
             'Master snapshot causal ordering unavailable; recovery telemetry remains fail-closed',
             exc_info=True,
         )
+        if required:
+            raise RuntimeError(
+                'Master snapshot causal ordering unavailable; activation remains paused'
+            ) from exc
         return None
 
 
+def observed_master_mids(values: dict[str, str], snapshot_started_order: int | None) -> dict[str, str]:
+    return _ObservedMasterMids(values, snapshot_started_order)
+
+
 async def master_snapshot(hl: HyperliquidAdapter) -> tuple[dict[str, Decimal], Decimal, dict[str, str]]:
-    snapshot_started_order = await _master_snapshot_started_order()
+    snapshot_started_order = await master_snapshot_started_order()
     snapshot = await hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
-    mids = _ObservedMasterMids(await hl.mids(), snapshot_started_order)
+    mids = observed_master_mids(await hl.mids(), snapshot_started_order)
     return _positions(snapshot.perp_state), snapshot.account_value, mids
 
 
@@ -682,11 +690,11 @@ async def reconcile_active_users(
     master_hl: HyperliquidAdapter | None = None,
 ) -> int:
     source_hl = master_hl or hl
-    source_snapshot_started_order = await _master_snapshot_started_order()
+    source_snapshot_started_order = await master_snapshot_started_order()
     source_snapshot = await source_hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
     mp = _positions(source_snapshot.perp_state)
     me = source_snapshot.account_value
-    source_mids = _ObservedMasterMids(await source_hl.mids(), source_snapshot_started_order)
+    source_mids = observed_master_mids(await source_hl.mids(), source_snapshot_started_order)
     source_configs = position_configs(source_snapshot.perp_state)
     follower_mids = source_mids if source_hl.network == hl.network else await hl.mids()
     query = select(User).join(TradingAccount, TradingAccount.user_id == User.id).where(

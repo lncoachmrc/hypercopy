@@ -103,6 +103,9 @@ async def test_terminal_database_fallback_replays_repair_accounting_without_repu
                     'master_position': '1',
                     'master_leverage': 5,
                     'master_snapshot_started_order': 20,
+                    'master_intent_order': 20,
+                    'master_network': settings.master_network,
+                    'follower_network': settings.follower_network,
                 },
             )
         )

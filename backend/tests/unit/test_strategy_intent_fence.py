@@ -150,6 +150,56 @@ async def test_moved_master_position_cancels_before_exchange_sdk_order(monkeypat
     assert order_called is False
 
 
+@pytest.mark.asyncio
+async def test_intent_lookup_failure_is_definitive_pre_submit_cancel(monkeypatch) -> None:
+    account = Account.create()
+    adapter = HyperliquidAdapter(None, network='mainnet')
+    order_called = False
+
+    class FakeExchange:
+        def set_expires_after(self, _value):
+            pass
+
+        def order(self, *_args, **_kwargs):
+            nonlocal order_called
+            order_called = True
+            raise AssertionError('authorization failure must prevent exchange.order')
+
+    @asynccontextmanager
+    async def no_op_signer_lock(_signer_address: str):
+        yield
+
+    async def fake_asset_spec(asset: str):
+        return AssetSpec(asset, sz_decimals=5, max_leverage=40)
+
+    async def failed_intent_lookup(**_kwargs):
+        raise RuntimeError('database unavailable')
+
+    monkeypatch.setattr('app.adapters.hyperliquid.signer_action_lock', no_op_signer_lock)
+    monkeypatch.setattr(
+        'app.services.strategy_intents.current_strategy_intent_for_cloid',
+        failed_intent_lookup,
+    )
+    monkeypatch.setattr(adapter, 'asset_spec', fake_asset_spec)
+    monkeypatch.setattr(adapter, '_exchange', lambda _local, _account_address: FakeExchange())
+
+    outcome = await adapter.place_ioc(
+        account_address='0x' + '22' * 20,
+        private_key=account.key.hex(),
+        asset='BTC',
+        is_buy=True,
+        size=Decimal('0.01'),
+        mark_price=Decimal('100000'),
+        slippage_bps=25,
+        reduce_only=False,
+        cloid='0x' + '44' * 16,
+    )
+
+    assert outcome.state == 'CANCELED'
+    assert 'Strategy authorization unavailable before order submission' in (outcome.reason or '')
+    assert order_called is False
+
+
 def test_stale_intent_pre_submit_cancel_requires_fresh_reconciliation() -> None:
     decision = classify_action_error(
         'Strategy intent canceled pre-submit: Source master position moved from 1 to 0'
@@ -162,6 +212,13 @@ def test_paused_followers_do_not_receive_realtime_event_fanout() -> None:
     source = inspect.getsource(copy_service.persist_master_fill_and_jobs)
     assert "u.copy_state IN ('ACTIVE', 'SHADOW')" in source
     assert "u.state = 'ACTIVE'" in source
+
+
+def test_historical_fill_age_is_measured_from_exchange_event_time() -> None:
+    source = inspect.getsource(copy_service.persist_master_fill_and_jobs)
+    assert 'historical_event = event.event_ts <=' in source
+    assert 'settings.STRATEGY_JOB_MAX_AGE_SECONDS' in source
+    assert 'if not create_copy_jobs or historical_event:' in source
 
 
 def test_queue_coalesces_strategy_intents_before_any_publish_path() -> None:

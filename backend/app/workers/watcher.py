@@ -152,7 +152,7 @@ class Watcher:
         except Exception:
             return await self._persisted_master_equity()
 
-    async def process_fill(self,fill:dict):
+    async def process_fill(self,fill:dict,*,create_copy_jobs:bool=True):
         asset=str(fill.get('coin') or '')
         config=None
         config_source='live_snapshot'
@@ -194,6 +194,7 @@ class Watcher:
                 correlation_id=cid,source_network=settings.master_network,
                 master_leverage=config.leverage if config else None,
                 master_is_cross=config.is_cross if config else None,
+                create_copy_jobs=create_copy_jobs,
             )
             if not event: return
             for job in jobs:
@@ -229,7 +230,11 @@ class Watcher:
             new=[f for f in fills if int(f.get('time',0))>=cursor]
             if not new: return
             for fill in new:
-                await self.process_fill(fill); seen+=1
+                # Replay is an audit/continuity recovery path. Persist every
+                # missed master fill, then let fresh reconciliation converge to
+                # the master's current portfolio. Executing these historical
+                # intermediate positions would create fee-generating churn.
+                await self.process_fill(fill,create_copy_jobs=False); seen+=1
             if len(fills)<2000: return
             cursor=max(int(f.get('time',cursor)) for f in fills)+1
             if seen>=settings.HL_REPLAY_MAX_FILLS: break
