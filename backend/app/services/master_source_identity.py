@@ -27,7 +27,7 @@ def is_master_source_wallet(wallet: str | None) -> bool:
 
 
 def is_master_source_user(user: User) -> bool:
-    return is_master_source_wallet(user.auth_wallet)
+    return is_master_source_wallet(getattr(user, 'auth_wallet', None))
 
 
 def follower_controls_enabled(user: User) -> bool:
