@@ -23,6 +23,13 @@ from app.schemas.user import RiskProfileIn, TradingAccountIn, TradingNetworkIn
 from app.services.audit import audit
 from app.services.entitlement import entitlement
 from app.services.execution import live_trading_allowed
+from app.services.master_source_identity import (
+    MASTER_SOURCE_FOLLOWER_BLOCK_REASON,
+    MASTER_SOURCE_MODE,
+    MASTER_SOURCE_NETWORK,
+    follower_controls_enabled,
+    is_master_source_user,
+)
 from app.services.metrics import dashboard_for_user
 from app.services.networking import set_user_network, user_network_state
 from app.services.queue import publish_job
@@ -41,6 +48,11 @@ def _follower_hl(network: Network) -> HyperliquidAdapter:
 
 def _master_hl() -> HyperliquidAdapter:
     return HyperliquidAdapter(_limiter(), network=settings.master_network)
+
+
+def _require_follower_user(user: User) -> None:
+    if is_master_source_user(user):
+        raise HTTPException(409, MASTER_SOURCE_FOLLOWER_BLOCK_REASON)
 
 
 def _network_switch_blockers(*, copy_state: str, has_open_managed: bool, has_pending_jobs: bool, has_unresolved_execution: bool) -> list[dict[str, str]]:
@@ -89,6 +101,7 @@ async def _serialize_user(db: AsyncSession, user: User) -> dict:
         cred = (await db.execute(select(SigningCredential).where(SigningCredential.trading_account_id == account.id))).scalar_one_or_none()
     rs = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
     switch_status = await _network_switch_status(db, user, network_state.started_at)
+    is_master = is_master_source_user(user)
     return {
         'id': str(user.id), 'auth_wallet': user.auth_wallet, 'role': user.role.value, 'state': user.state.value,
         'copy_state': user.copy_state.value, 'manual_trade_policy': user.manual_trade_policy.value,
@@ -97,8 +110,12 @@ async def _serialize_user(db: AsyncSession, user: User) -> dict:
         'master_network': settings.master_network,
         'follower_network': network_state.network,
         'network_started_at': network_state.started_at,
-        'network_switch_ready': switch_status['ready'],
-        'network_switch_blockers': switch_status['blockers'],
+        'network_switch_ready': False if is_master else switch_status['ready'],
+        'network_switch_blockers': ([{'code': 'master_source', 'message': MASTER_SOURCE_FOLLOWER_BLOCK_REASON}] if is_master else switch_status['blockers']),
+        'is_master_source': is_master,
+        'operational_mode': MASTER_SOURCE_MODE if is_master else 'FOLLOWER',
+        'operational_network': MASTER_SOURCE_NETWORK if is_master else network_state.network,
+        'follower_controls_enabled': follower_controls_enabled(user),
         'trading_account': None if not account else {
             'account_address': account.account_address,
             'network': network_state.network,
@@ -118,6 +135,7 @@ async def me(user: User = Depends(current_user), db: AsyncSession = Depends(get_
 
 @router.put('/trading-network', dependencies=[Depends(require_csrf)])
 async def trading_network(body: TradingNetworkIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    _require_follower_user(user)
     current = await user_network_state(db, user.id)
     network: Network = body.network
     if network == current.network:
@@ -128,18 +146,12 @@ async def trading_network(body: TradingNetworkIn, user: User = Depends(current_u
         instructions = ' '.join(item['message'] for item in status['blockers'])
         raise HTTPException(409, f'Rete non ancora pronta al cambio. {instructions}')
 
-    # The credential belongs to the old network. Once the operational state is
-    # clean, remove it automatically so the user can switch with a single action
-    # and immediately configure the API Wallet for the new network.
     account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
     removed_agent = bool(account)
     if account:
         await db.delete(account)
         await db.flush()
 
-    # Position ledger and automatic risk-state peaks are network-scoped derived
-    # state. Reset them at the network boundary while preserving immutable
-    # execution/fill/audit history. Metrics use network_started_at as the epoch.
     await db.execute(delete(PositionLedger).where(PositionLedger.user_id == user.id))
     risk_state = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
     if risk_state:
@@ -247,6 +259,7 @@ async def executions(user: User = Depends(current_user), db: AsyncSession = Depe
 
 @router.post('/trading-account', dependencies=[Depends(require_csrf)])
 async def link_trading_account(body: TradingAccountIn, request: Request, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    _require_follower_user(user)
     network = (await user_network_state(db, user.id)).network
     if network == 'mainnet' and settings.APP_ENV == 'production' and settings.KEK_PROVIDER == 'env':
         raise HTTPException(409, 'La produzione MAINNET richiede il provider KMS esterno prima di salvare una credenziale operativa')
@@ -303,6 +316,7 @@ async def link_trading_account(body: TradingAccountIn, request: Request, user: U
 
 @router.delete('/trading-account', dependencies=[Depends(require_csrf)], status_code=204)
 async def unlink_trading_account(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    _require_follower_user(user)
     open_managed = (await db.execute(select(PositionLedger.id).where(
         PositionLedger.user_id == user.id, PositionLedger.managed.is_(True), PositionLedger.size != 0
     ).limit(1))).scalar_one_or_none()
@@ -322,15 +336,13 @@ async def get_risk(user: User = Depends(current_user), db: AsyncSession = Depend
 
 @router.put('/risk-profile', dependencies=[Depends(require_csrf)])
 async def put_risk(body: RiskProfileIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    _require_follower_user(user)
     row = (await db.execute(select(RiskProfile).where(RiskProfile.user_id == user.id))).scalar_one()
     values = body.model_dump()
     before = {
         k: str(getattr(row, k)) if hasattr(getattr(row, k), 'as_tuple') else getattr(row, k)
         for k in values
     }
-    # Persist exactly what the user selected. Commercial plan limits are applied
-    # dynamically by reconciliation/execution so upgrades and downgrades never
-    # destroy or leave stale strategy preferences in RiskProfile.
     for k, v in values.items():
         setattr(row, k, v)
     await audit(
@@ -347,11 +359,13 @@ async def put_risk(body: RiskProfileIn, user: User = Depends(current_user), db: 
 
 @router.post('/copy/pause', dependencies=[Depends(require_csrf)])
 async def pause(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    _require_follower_user(user)
     user.copy_state = CopyState.PAUSED; await audit(db, action='COPY_PAUSED', actor_id=user.id, subject_id=user.id); await db.commit(); return await _serialize_user(db, user)
 
 
 @router.post('/copy/shadow', dependencies=[Depends(require_csrf)])
 async def shadow(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    _require_follower_user(user)
     account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
     if not account:
         raise HTTPException(409, 'Connect a Hyperliquid trading account first')
@@ -365,6 +379,7 @@ async def shadow(user: User = Depends(current_user), db: AsyncSession = Depends(
 
 @router.post('/copy/resume', dependencies=[Depends(require_csrf)])
 async def resume(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    _require_follower_user(user)
     rs = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
     if rs and rs.state != RiskHalt.NORMAL: raise HTTPException(409, f'Cannot resume while {rs.state.value} is active')
     account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
@@ -392,6 +407,7 @@ async def resume(user: User = Depends(current_user), db: AsyncSession = Depends(
 
 @router.post('/copy/close-positions', dependencies=[Depends(require_csrf)])
 async def close_positions(body: ClosePositionsIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    _require_follower_user(user)
     network_state = await user_network_state(db, user.id)
     network = network_state.network
     rows = (await db.execute(select(PositionLedger).where(
@@ -421,9 +437,6 @@ async def close_positions(body: ClosePositionsIn, user: User = Depends(current_u
         )
         db.add(job); jobs.append(job)
     await db.flush()
-    # Commit the PAUSED state and durable PostgreSQL jobs before publishing any
-    # Redis stream message. Otherwise a fast worker can consume the message
-    # before the job row is visible and acknowledge it as missing.
     await db.commit()
 
     deferred_enqueue = 0
