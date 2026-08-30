@@ -6,6 +6,7 @@ from decimal import Decimal
 
 import pytest
 
+from app.adapters.action_errors import ActionErrorClass, ActionRetryPolicy, classify_action_error
 from app.adapters.hyperliquid import HyperliquidAdapter
 from app.models.entities import CopyJob, JobState
 from app.services import copy as copy_service
@@ -80,6 +81,14 @@ def test_copy_order_has_final_signed_action_authorization_fence() -> None:
     assert 'before_submit=_authorize_strategy_order' in source
     assert 'except StrategyIntentAuthorizationError as exc:' in source
     assert "'CANCELED'" in source
+
+
+def test_stale_intent_pre_submit_cancel_requires_fresh_reconciliation() -> None:
+    decision = classify_action_error(
+        'Strategy intent canceled pre-submit: Source master position moved from 1 to 0'
+    )
+    assert decision.error_class is ActionErrorClass.TRANSIENT
+    assert decision.retry_policy is ActionRetryPolicy.RECONCILE
 
 
 def test_paused_followers_do_not_receive_realtime_event_fanout() -> None:
