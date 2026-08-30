@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select, text
+from sqlalchemy import text
 
 from app.db.position_ledger_lock import position_ledger_lock_engine
 from app.db.session import SessionLocal, engine
@@ -32,8 +32,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest_asyncio.fixture(autouse=True)
+@pytest_asyncio.fixture(autouse=True, loop_scope='module')
 async def _dispose_pools_after_test():
+    # These tests open nested SessionLocal scopes from the production
+    # action-boundary helper. Keep the whole module on one asyncio loop while
+    # still clearing both pools after every test, so no asyncpg connection can
+    # leak into the next test module's event loop.
     yield
     await engine.dispose()
     await position_ledger_lock_engine.dispose()
@@ -112,7 +116,7 @@ async def _add_job(
     return job_id, cloid
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope='module')
 async def test_newer_reconcile_supersedes_older_event_at_action_boundary():
     user_id = await _user()
     _, old_cloid = await _add_job(
@@ -129,7 +133,7 @@ async def test_newer_reconcile_supersedes_older_event_at_action_boundary():
         )
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope='module')
 async def test_latest_strategy_intent_returns_durable_source_evidence():
     user_id = await _user()
     _, latest_cloid = await _add_job(
@@ -148,7 +152,7 @@ async def test_latest_strategy_intent_returns_durable_source_evidence():
     assert evidence.source_master_position == Decimal('0.125')
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope='module')
 async def test_unversioned_strategy_job_is_fail_closed_before_submission():
     user_id = await _user()
     _, cloid = await _add_job(
@@ -164,7 +168,7 @@ async def test_unversioned_strategy_job_is_fail_closed_before_submission():
         )
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope='module')
 async def test_publish_coalescing_skips_older_event_and_reconcile_together():
     user_id = await _user()
     old_event_id, _ = await _add_job(user_id, order=30, origin='EVENT')
@@ -188,7 +192,7 @@ async def test_publish_coalescing_skips_older_event_and_reconcile_together():
         assert 'Superseded by newer strategy intent 32' in (old_reconcile.last_error or '')
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope='module')
 async def test_older_job_cannot_publish_when_newer_terminal_intent_exists():
     user_id = await _user()
     old_id, _ = await _add_job(user_id, order=40, origin='EVENT')
@@ -214,7 +218,7 @@ async def test_older_job_cannot_publish_when_newer_terminal_intent_exists():
         assert 'newer causal order 41' in (old.last_error or '')
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope='module')
 async def test_unversioned_job_is_quarantined_by_publish_coalescer():
     user_id = await _user()
     job_id, _ = await _add_job(user_id, order=None, origin='RECONCILE')
