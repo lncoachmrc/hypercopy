@@ -75,9 +75,56 @@ def evaluate(plan: SizingResult, ctx: RiskContext) -> RiskDecision:
         return RiskDecision(RiskAction.DENY, plan, 'Trading credential is unavailable')
     if ctx.data_stale:
         return RiskDecision(RiskAction.DENY, plan, 'Account data is stale; refresh required')
+
+    # A reversal is deliberately two-phase: flattening the current side is a
+    # reduction and stays allowed, but the secondary opening leg must pass the
+    # complete runtime Risk Engine again using the post-close book. This prevents
+    # plan/entitlement downgrades, stale queued context, or per-trade/exposure
+    # caps from being bypassed by a close-then-open sequence.
+    if plan.intent is OrderIntent.REVERSE and plan.secondary is not None:
+        total_after_close = max(
+            ctx.current_total_exposure - ctx.current_asset_exposure,
+            Decimal(0),
+        )
+        open_after_close = max(ctx.open_positions - 1, 0)
+        leverage_after_close = (
+            total_after_close / ctx.account_equity
+            if ctx.account_equity > 0
+            else Decimal(999)
+        )
+        secondary_ctx = replace(
+            ctx,
+            current_total_exposure=total_after_close,
+            current_asset_exposure=Decimal(0),
+            current_leverage=leverage_after_close,
+            open_positions=open_after_close,
+            is_new_market=True,
+        )
+        secondary_decision = evaluate(plan.secondary, secondary_ctx)
+        if secondary_decision.action in {RiskAction.ALLOW, RiskAction.TRIM}:
+            return RiskDecision(
+                RiskAction.ALLOW,
+                replace(plan, secondary=secondary_decision.plan),
+                secondary_decision.reason,
+            )
+        return RiskDecision(
+            RiskAction.ALLOW,
+            replace(plan, secondary=None),
+            f'Reversal open leg suppressed: {secondary_decision.reason or secondary_decision.action.value}',
+        )
+
     if reducing:
         return RiskDecision(RiskAction.ALLOW, plan)
 
+    # A plan/profile downgrade can leave more positions open than the new cap.
+    # In that state, permit only exposure reductions until the book is compliant;
+    # otherwise existing over-cap markets could keep increasing indefinitely.
+    if ctx.open_positions > ctx.max_positions:
+        return RiskDecision(
+            RiskAction.DENY,
+            plan,
+            'Open positions exceed maximum; reductions only until compliant',
+        )
     if ctx.is_new_market and ctx.open_positions >= ctx.max_positions:
         return RiskDecision(RiskAction.DENY, plan, 'Maximum open positions reached')
 
