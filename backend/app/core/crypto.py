@@ -164,11 +164,11 @@ class EnvelopeCrypto:
         )
 
     def _local_rsa_decrypt(self, wrapped: bytes, key_reference: str) -> bytes:
-        private_key = _load_local_rsa_private_key()
-        actual_reference = _rsa_key_reference(private_key.public_key())
+        rsa_secret = _load_local_rsa_private_key()
+        actual_reference = _rsa_key_reference(rsa_secret.public_key())
         if key_reference != actual_reference:
             raise RuntimeError('local_rsa key fingerprint does not match the credential key reference')
-        return private_key.decrypt(
+        return rsa_secret.decrypt(
             wrapped,
             padding.OAEP(
                 mgf=padding.MGF1(algorithm=hashes.SHA256()),
