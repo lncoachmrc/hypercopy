@@ -78,6 +78,15 @@ def evaluate(plan: SizingResult, ctx: RiskContext) -> RiskDecision:
     if reducing:
         return RiskDecision(RiskAction.ALLOW, plan)
 
+    # A plan/profile downgrade can leave more positions open than the new cap.
+    # In that state, permit only exposure reductions until the book is compliant;
+    # otherwise existing over-cap markets could keep increasing indefinitely.
+    if ctx.open_positions > ctx.max_positions:
+        return RiskDecision(
+            RiskAction.DENY,
+            plan,
+            'Open positions exceed maximum; reductions only until compliant',
+        )
     if ctx.is_new_market and ctx.open_positions >= ctx.max_positions:
         return RiskDecision(RiskAction.DENY, plan, 'Maximum open positions reached')
 
