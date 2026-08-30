@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Deployment trigger: reload shared P0 latest-intent safety modules in Railway staging.
+
 import asyncio
 import signal
 from datetime import UTC, datetime
