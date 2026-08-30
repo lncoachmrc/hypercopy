@@ -17,6 +17,7 @@ from app.models.entities import CopyJob, CopyState, JobState, RiskHalt, RiskStat
 from app.services.audit import audit
 from app.services.entitlement import entitlement
 from app.services.execution import live_trading_allowed
+from app.services.master_source_identity import MASTER_SOURCE_FOLLOWER_BLOCK_REASON, is_master_source_user
 from app.services.networking import user_network_state
 from app.services.queue import repair_stream
 from app.services.reconcile import reconcile_user
@@ -74,6 +75,9 @@ async def resume_copy_immediate(
     preserves the independent mainnet live-trading gates, and rolls back to
     PAUSED if the initial ACTIVE reconciliation fails.
     """
+    if is_master_source_user(user):
+        raise HTTPException(409, MASTER_SOURCE_FOLLOWER_BLOCK_REASON)
+
     network = (await user_network_state(db, user.id)).network
     if not await live_trading_allowed(db, network):
         raise HTTPException(409, 'Mainnet live-trading gate is closed')
