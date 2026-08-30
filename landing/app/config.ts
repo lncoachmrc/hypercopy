@@ -1,5 +1,5 @@
 export const TRAXION_APP_URL =
-  "https://frontend-staging-9498.up.railway.app/login";
+  "https://app.traxion.lucianonovello.com/login";
 
 export const HYPERLIQUID_REFERRAL_URL =
   "https://app.hyperliquid.xyz/join/DIGITALEMPOWER";
