@@ -6,11 +6,11 @@ alembic==1.19.1
 redis==8.1.0
 pydantic==2.13.4
 pydantic-settings==2.15.0
-cryptography==50.0.0
+cryptography==50.0.1
 PyJWT==2.13.0
-eth-account==0.13.7
+eth-account==0.14.0
 hyperliquid-python-sdk==0.24.0
 websockets==16.1.1
-stripe==15.5.1
-boto3==1.43.75
+stripe==15.6.0
+boto3==1.43.81
 python-multipart==0.0.32

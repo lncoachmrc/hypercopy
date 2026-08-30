@@ -2,7 +2,7 @@
 pytest==9.1.1
 pytest-asyncio==1.4.0
 hypothesis==6.165.10
-ruff==0.16.3
+ruff==0.16.4
 pyright==1.1.411
 pip-audit==2.10.1
 httpx==0.28.1
