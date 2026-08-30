@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import inspect
 import uuid
+from contextlib import asynccontextmanager
 from decimal import Decimal
 
 import pytest
+from eth_account import Account
 
 from app.adapters.action_errors import ActionErrorClass, ActionRetryPolicy, classify_action_error
 from app.adapters.hyperliquid import HyperliquidAdapter
+from app.core.config import settings
+from app.engine.sizing import AssetSpec
 from app.models.entities import CopyJob, JobState
 from app.services import copy as copy_service
 from app.services import queue as queue_service
 from app.services.strategy_intents import (
     StrategyIntentAuthorizationError,
+    StrategyIntentEvidence,
     _job_evidence,
     master_position_from_state,
 )
@@ -81,6 +86,68 @@ def test_copy_order_has_final_signed_action_authorization_fence() -> None:
     assert 'before_submit=_authorize_strategy_order' in source
     assert 'except StrategyIntentAuthorizationError as exc:' in source
     assert "'CANCELED'" in source
+
+
+@pytest.mark.asyncio
+async def test_moved_master_position_cancels_before_exchange_sdk_order(monkeypatch) -> None:
+    account = Account.create()
+    adapter = HyperliquidAdapter(None, network='mainnet')
+    order_called = False
+
+    class FakeExchange:
+        def set_expires_after(self, _value):
+            pass
+
+        def order(self, *_args, **_kwargs):
+            nonlocal order_called
+            order_called = True
+            raise AssertionError('stale strategy intent must never invoke exchange.order')
+
+    @asynccontextmanager
+    async def no_op_signer_lock(_signer_address: str):
+        yield
+
+    async def fake_asset_spec(asset: str):
+        return AssetSpec(asset, sz_decimals=5, max_leverage=40)
+
+    async def fake_current_intent(**_kwargs):
+        return StrategyIntentEvidence(
+            job_id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            asset='BTC',
+            follower_network='mainnet',
+            intent_order=100,
+            source_master_position=Decimal('1'),
+        )
+
+    async def fresh_master_state(_address: str, **_kwargs):
+        return {'assetPositions': [{'position': {'coin': 'BTC', 'szi': '0'}}]}
+
+    monkeypatch.setattr(settings, 'HYPERLIQUID_MASTER_ADDRESS', '0x' + '11' * 20)
+    monkeypatch.setattr('app.adapters.hyperliquid.signer_action_lock', no_op_signer_lock)
+    monkeypatch.setattr(
+        'app.services.strategy_intents.current_strategy_intent_for_cloid',
+        fake_current_intent,
+    )
+    monkeypatch.setattr(adapter, 'asset_spec', fake_asset_spec)
+    monkeypatch.setattr(adapter, 'user_state', fresh_master_state)
+    monkeypatch.setattr(adapter, '_exchange', lambda _local, _account_address: FakeExchange())
+
+    outcome = await adapter.place_ioc(
+        account_address='0x' + '22' * 20,
+        private_key=account.key.hex(),
+        asset='BTC',
+        is_buy=True,
+        size=Decimal('0.01'),
+        mark_price=Decimal('100000'),
+        slippage_bps=25,
+        reduce_only=False,
+        cloid='0x' + '33' * 16,
+    )
+
+    assert outcome.state == 'CANCELED'
+    assert 'Source master position moved from 1 to 0' in (outcome.reason or '')
+    assert order_called is False
 
 
 def test_stale_intent_pre_submit_cancel_requires_fresh_reconciliation() -> None:
