@@ -21,8 +21,14 @@ def _set_writer_identity(monkeypatch, *, expected: str, actual: str) -> None:
     monkeypatch.setattr(settings, "RAILWAY_ENVIRONMENT_ID", actual)
 
 
+@asynccontextmanager
+async def _noop_signer_lock(_signer: str):
+    yield
+
+
 def _adapter(monkeypatch, network: str) -> HyperliquidAdapter:
     monkeypatch.setattr("app.adapters.hyperliquid.Info", MagicMock())
+    monkeypatch.setattr("app.adapters.hyperliquid.signer_action_lock", _noop_signer_lock)
     return HyperliquidAdapter(None, network=network)
 
 
