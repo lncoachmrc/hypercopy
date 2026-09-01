@@ -127,6 +127,12 @@ class Settings(BaseSettings):
     METRICS_TOKEN: str = ''
     SENTRY_DSN: str = ''
 
+    # Deployment-unique identity used by the single-writer MAINNET strategy
+    # order fence. Required in production whenever live trading is enabled so
+    # two independently deployed execution-workers can never both authorize
+    # strategy orders for the same MAINNET follower wallet.
+    EXECUTION_WORKER_IDENTITY: str = ''
+
     @field_validator('DATABASE_URL')
     @classmethod
     def async_database_url(cls, value: str) -> str:
@@ -148,6 +154,8 @@ class Settings(BaseSettings):
                 raise ValueError('SESSION_SECRET must be a strong production secret')
             if self.ENABLE_LIVE_TRADING and self.KEK_PROVIDER == 'env':
                 raise ValueError('Mainnet live execution requires aws_kms or local_rsa credential wrapping')
+            if self.ENABLE_LIVE_TRADING and not self.EXECUTION_WORKER_IDENTITY:
+                raise ValueError('production live trading requires EXECUTION_WORKER_IDENTITY configured')
         if self.SESSION_TTL_SECONDS <= 0:
             raise ValueError('SESSION_TTL_SECONDS must be positive')
         if self.SESSION_REFRESH_TTL_SECONDS <= self.SESSION_TTL_SECONDS:

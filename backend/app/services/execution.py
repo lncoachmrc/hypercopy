@@ -14,6 +14,7 @@ from app.core.config import Network, settings
 from app.core.crypto import EncryptedCredential, crypto
 from app.core.logging import get_logger
 from app.db.position_ledger_lock import position_ledger_lock
+from app.db.redis import redis_client
 from app.engine.risk import RiskAction, RiskContext, evaluate
 from app.engine.sizing import FollowerState, MasterExposure, SizingResult, plan, round_size
 from app.models.entities import (
@@ -25,8 +26,10 @@ from app.services.audit import audit
 from app.services.effective_risk import resolve_effective_risk
 from app.services.entitlement import entitlement
 from app.services.networking import user_network_state
+from app.services.writer_identity import WriterIdentityRegistry
 
 log = get_logger(__name__)
+_writer_identity_registry = WriterIdentityRegistry(redis_client())
 TERMINAL_EXEC = {
     ExecutionState.FILLED,
     ExecutionState.REJECTED,
@@ -174,6 +177,24 @@ async def live_trading_allowed(db: AsyncSession, network: Network) -> bool:
         return False
     flag = await db.get(SystemFlag, 'live_trading')
     return bool(flag and flag.enabled)
+
+
+async def _verify_writer_authority(
+    registry: WriterIdentityRegistry,
+    network: Network,
+    wallet: str,
+) -> bool:
+    """Single-writer MAINNET fence for strategy (EVENT/RECONCILE) orders.
+
+    Testnet is an unconditional passthrough. CLOSE_ALL is handled by the caller
+    and never reaches this function. Any Redis error or missing/mismatched
+    deployment identity fails closed (returns False), which the caller must
+    translate into a SKIPPED job rather than an order submission.
+    """
+
+    if network != 'mainnet':
+        return True
+    return await registry.verify_writer_authority(wallet)
 
 
 async def process_job(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) -> str:
@@ -425,6 +446,25 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
         return await _finish(db, job, JobState.SKIPPED, 'Mainnet live-trading gate is closed')
     if not cred:
         return await _finish(db, job, JobState.SKIPPED, 'Credential unavailable')
+
+    if job.origin != 'CLOSE_ALL' and network == 'mainnet':
+        if not await _verify_writer_authority(_writer_identity_registry, network, account.account_address):
+            reason = 'Writer authority not held for this mainnet wallet'
+            await audit(
+                db,
+                action='WRITER_AUTHORITY_DENIED',
+                subject_id=user.id,
+                reason=reason,
+                correlation_id=job.correlation_id,
+                after={
+                    'asset': job.asset,
+                    'origin': job.origin,
+                    'network': network,
+                    'wallet': account.account_address,
+                    'identity': settings.EXECUTION_WORKER_IDENTITY or None,
+                },
+            )
+            return await _finish(db, job, JobState.SKIPPED, reason)
 
     if not sizing.reduce_only and master_pos != 0 and desired_leverage is None:
         return await _retry_or_dead(db, job, 'Master leverage unavailable; refusing to increase exposure')
