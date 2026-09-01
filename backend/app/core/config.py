@@ -90,6 +90,14 @@ class Settings(BaseSettings):
     TRAXION_KEK_PUBLIC_KEY_B64: str = ''
     TRAXION_KEK_PRIVATE_KEY_B64: str = ''
 
+    # MAINNET single-writer fence: when two execution-worker deployments share
+    # the same DB/Redis, only the deployment whose RAILWAY_ENVIRONMENT_ID
+    # matches the designated TRAXION_MAINNET_WRITER_ENVIRONMENT_ID may
+    # authorize live MAINNET strategy orders. Enforced in production_safety().
+    TRAXION_MAINNET_WRITER_ENVIRONMENT_ID: str = ''
+    RAILWAY_ENVIRONMENT_ID: str = ''
+    RAILWAY_ENVIRONMENT_NAME: str = ''
+
     STRIPE_SECRET_KEY: str = ''
     STRIPE_WEBHOOK_SECRET: str = ''
 
@@ -148,6 +156,17 @@ class Settings(BaseSettings):
                 raise ValueError('SESSION_SECRET must be a strong production secret')
             if self.ENABLE_LIVE_TRADING and self.KEK_PROVIDER == 'env':
                 raise ValueError('Mainnet live execution requires aws_kms or local_rsa credential wrapping')
+            if self.ENABLE_LIVE_TRADING and (
+                not self.TRAXION_MAINNET_WRITER_ENVIRONMENT_ID
+                or not self.RAILWAY_ENVIRONMENT_ID
+                or self.RAILWAY_ENVIRONMENT_ID != self.TRAXION_MAINNET_WRITER_ENVIRONMENT_ID
+            ):
+                raise ValueError(
+                    'MAINNET single-writer fence failed: ENABLE_LIVE_TRADING=True requires '
+                    'TRAXION_MAINNET_WRITER_ENVIRONMENT_ID and RAILWAY_ENVIRONMENT_ID to be set '
+                    'and equal (this ensures only one designated writer environment can '
+                    'authorize MAINNET strategy orders)'
+                )
         if self.SESSION_TTL_SECONDS <= 0:
             raise ValueError('SESSION_TTL_SECONDS must be positive')
         if self.SESSION_REFRESH_TTL_SECONDS <= self.SESSION_TTL_SECONDS:
