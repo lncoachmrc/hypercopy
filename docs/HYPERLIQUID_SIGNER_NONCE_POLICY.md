@@ -23,6 +23,15 @@ TRAXION currently enforces this invariant with
 - database/lock failure is fail-closed: the signed action is not sent;
 - private keys, seed phrases and main-wallet secrets are never lock inputs.
 
+The signer lock solves same-database process serialization. It is not the
+MAINNET writer authority across Railway environments: two environments may have
+independent PostgreSQL/Redis while still controlling the same external wallet.
+Therefore `_signed_call()` also enforces an environment-identity fence on every
+MAINNET signed action. `RAILWAY_ENVIRONMENT_ID` must match the explicit
+`TRAXION_MAINNET_WRITER_ENVIRONMENT_ID`; missing or mismatched identities are
+rejected immediately before the synchronous SDK function with no exchange
+action sent. TESTNET is unaffected.
+
 Current signed adapter actions covered by the policy:
 
 - `HyperliquidAdapter.update_leverage()`;
@@ -31,15 +40,16 @@ Current signed adapter actions covered by the policy:
 Any new signed Hyperliquid action must be added inside this same adapter-level
 critical section before it is eligible for deployment. Instantiating or calling
 `hyperliquid.exchange.Exchange` from a new application path without signer
-serialization is prohibited.
+serialization and the common MAINNET writer fence is prohibited.
 
 ## Scaling policy
 
 The execution worker remains configured at one replica by default. Horizontal
-scale-out does not remove or bypass the signer lock. Before increasing worker
-replicas, the PostgreSQL multi-process regression for HF-003 must remain green,
-and the real Hyperliquid rate-budget/address-quota evidence required by the
-release plan must also be reviewed.
+scale-out does not remove or bypass the signer lock or MAINNET environment
+fence. Before increasing worker replicas, the PostgreSQL multi-process
+regression for HF-003 must remain green, and the real Hyperliquid
+rate-budget/address-quota evidence required by the release plan must also be
+reviewed.
 
 Using a distinct API wallet per process is an acceptable future topology, but it
 is not required by the current implementation and must not be introduced by
@@ -53,5 +63,8 @@ silently duplicating or sharing user credentials.
 - `tests/unit/test_hf003_signed_action_path.py` proves every currently supported
   signed adapter action enters the signer lock using the public Agent Wallet
   address.
+- `tests/unit/test_mainnet_single_writer_fence.py` proves TESTNET passthrough,
+  MAINNET matching/missing/mismatched writer identity behavior, final boundary
+  ordering, CLOSE_ALL-style IOC coverage and leverage/admin coverage.
 
 No test in this policy sends a real Hyperliquid order.
