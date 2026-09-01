@@ -20,7 +20,11 @@ from app.services.execution import live_trading_allowed
 from app.services.master_source_identity import MASTER_SOURCE_FOLLOWER_BLOCK_REASON, is_master_source_user
 from app.services.networking import user_network_state
 from app.services.queue import repair_stream
-from app.services.reconcile import reconcile_user
+from app.services.reconcile import (
+    master_snapshot_started_order,
+    observed_master_mids,
+    reconcile_user,
+)
 
 router = APIRouter(tags=['activation'])
 
@@ -104,6 +108,10 @@ async def resume_copy_immediate(
     follower_hl = HyperliquidAdapter(limiter, network=network)
 
     try:
+        # Allocate the causal boundary before reading master state. Activation
+        # must never report success with unversioned jobs that the latest-intent
+        # fence will immediately quarantine.
+        snapshot_started_order = await master_snapshot_started_order(required=True)
         source_snapshot = await master_hl.account_snapshot(
             settings.HYPERLIQUID_MASTER_ADDRESS,
             priority=Priority.RECONCILE,
@@ -114,7 +122,7 @@ async def resume_copy_immediate(
         )
         master_positions = _positions(source_snapshot.perp_state)
         master_configs = position_configs(source_snapshot.perp_state)
-        master_mids = await master_hl.mids()
+        master_mids = observed_master_mids(await master_hl.mids(), snapshot_started_order)
         follower_mids = master_mids if settings.master_network == network else await follower_hl.mids()
     except Exception as exc:
         raise HTTPException(503, f'Strategy activation preflight failed: {type(exc).__name__}: {exc}') from exc

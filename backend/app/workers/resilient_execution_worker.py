@@ -17,6 +17,7 @@ from app.services.queue import (
     expire_stale_strategy_jobs,
     mark_hf006_repair_pending,
 )
+from app.services.strategy_intents import STRATEGY_ORIGINS, prepare_strategy_job_for_publish
 from app.workers.execution_worker import Worker, stop
 
 log = get_logger(__name__)
@@ -39,23 +40,31 @@ class ResilientExecutionWorker(Worker):
             await expire_stale_strategy_jobs(db, now=now)
             await db.commit()
 
-            job = (
-                await db.execute(
-                    select(CopyJob)
-                    .where(
-                        CopyJob.state.in_([JobState.QUEUED, JobState.RETRYING]),
-                        (
-                            CopyJob.next_attempt_at.is_(None)
-                            | (CopyJob.next_attempt_at <= now)
-                        ),
+            while True:
+                job = (
+                    await db.execute(
+                        select(CopyJob)
+                        .where(
+                            CopyJob.state.in_([JobState.QUEUED, JobState.RETRYING]),
+                            (
+                                CopyJob.next_attempt_at.is_(None)
+                                | (CopyJob.next_attempt_at <= now)
+                            ),
+                        )
+                        .order_by(CopyJob.created_at)
+                        .limit(1)
+                        .with_for_update(skip_locked=True)
                     )
-                    .order_by(CopyJob.created_at)
-                    .limit(1)
-                    .with_for_update(skip_locked=True)
-                )
-            ).scalar_one_or_none()
-            if job is None:
-                return None
+                ).scalar_one_or_none()
+                if job is None:
+                    return None
+                if job.origin not in STRATEGY_ORIGINS:
+                    break
+                if await prepare_strategy_job_for_publish(db, job):
+                    break
+                # The oldest intent was superseded or unversioned. Persist the
+                # quarantine and keep scanning instead of executing stale work.
+                await db.commit()
 
             # If this PostgreSQL fallback is about to execute an authoritative
             # HF-006 repair while Redis is unavailable, persist the accounting

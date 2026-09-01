@@ -44,9 +44,10 @@ _LIQUIDITY_TOKENS = (
 )
 
 _TRANSIENT_TOKENS = (
-    # Internal definitive pre-submit cancellation. No exchange order was sent;
-    # only a newly computed authoritative intent may replace this stale job.
+    # Internal definitive pre-submit cancellations. No exchange action was sent;
+    # only a newly computed authoritative intent may replace the skipped job.
     "strategy intent canceled pre-submit",
+    "mainnet single-writer fence blocked signed action",
     "open interest is capped",
     "open interest cap",
     "openinterestcap",

@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.core.config import settings
 from app.db.session import SessionLocal, engine
@@ -87,6 +87,17 @@ async def test_terminal_database_fallback_replays_repair_accounting_without_repu
             )
         )
         await db.flush()
+        # Latest-intent fallback validation rejects strategy jobs from a stale
+        # follower-network epoch. Keep this HF-006 fixture inside the active
+        # epoch while still placing the job ahead of other queued test work.
+        await db.execute(
+            text(
+                "UPDATE users SET execution_network = :network, "
+                "network_started_at = now() - interval '10 minutes' "
+                "WHERE id = :user_id"
+            ),
+            {'network': settings.follower_network, 'user_id': user_id},
+        )
         db.add(
             CopyJob(
                 id=job_id,
@@ -103,6 +114,9 @@ async def test_terminal_database_fallback_replays_repair_accounting_without_repu
                     'master_position': '1',
                     'master_leverage': 5,
                     'master_snapshot_started_order': 20,
+                    'master_intent_order': 20,
+                    'master_network': settings.master_network,
+                    'follower_network': settings.follower_network,
                 },
             )
         )

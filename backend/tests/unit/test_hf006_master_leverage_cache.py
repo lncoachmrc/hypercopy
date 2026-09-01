@@ -545,3 +545,34 @@ async def test_watcher_keeps_fail_closed_when_live_and_shared_leverage_are_missi
     assert captured['master_is_cross'] is None
     assert captured['master_equity'] == Decimal('1000')
     assert all('master-leverage-missing' not in key for key in redis.zsets)
+
+
+@pytest.mark.asyncio
+async def test_watcher_replay_persists_history_without_creating_copy_jobs(monkeypatch):
+    watcher = object.__new__(Watcher)
+    fills = [
+        {'coin': 'BTC', 'time': 101, 'sz': '1', 'px': '100', 'startPosition': '0'},
+        {'coin': 'BTC', 'time': 102, 'sz': '1', 'px': '101', 'startPosition': '1'},
+    ]
+
+    class FakeMasterAdapter:
+        async def user_fills_by_time(self, _address, cursor):
+            assert cursor == 100
+            return fills
+
+    watcher.hl = FakeMasterAdapter()
+    observed = []
+
+    async def checkpoint(_db):
+        return 100
+
+    async def process_fill(fill, *, create_copy_jobs=True):
+        observed.append((fill['time'], create_copy_jobs))
+
+    monkeypatch.setattr(watcher_module, 'SessionLocal', lambda: DummySession())
+    monkeypatch.setattr(watcher_module, '_checkpoint', checkpoint)
+    monkeypatch.setattr(watcher, 'process_fill', process_fill)
+
+    await watcher.replay()
+
+    assert observed == [(101, False), (102, False)]

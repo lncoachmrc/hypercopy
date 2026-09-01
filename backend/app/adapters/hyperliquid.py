@@ -62,6 +62,10 @@ class PositionConfig:
     is_cross: bool
 
 
+class MainnetWriterFenceError(RuntimeError):
+    """Definitive local rejection before any MAINNET signed exchange action."""
+
+
 def deterministic_cloid(copy_job_id: str, attempt_kind: str) -> str:
     return '0x' + hashlib.blake2b(f'{copy_job_id}:{attempt_kind}'.encode(), digest_size=16).hexdigest()
 
@@ -196,6 +200,20 @@ class HyperliquidAdapter:
             else None
         )
 
+    def _assert_mainnet_writer_authorized(self) -> None:
+        """Fail closed unless this runtime is the designated MAINNET writer."""
+        if self.network != 'mainnet':
+            return
+        expected = settings.TRAXION_MAINNET_WRITER_ENVIRONMENT_ID.strip()
+        actual = settings.RAILWAY_ENVIRONMENT_ID.strip()
+        if expected and actual and actual == expected:
+            return
+        environment_name = settings.RAILWAY_ENVIRONMENT_NAME.strip() or '<unknown>'
+        raise MainnetWriterFenceError(
+            'MAINNET single-writer fence blocked signed action '
+            f'(environment={environment_name}). NO EXCHANGE ACTION WAS SENT.'
+        )
+
     async def _metric_incr(self, name: str) -> None:
         try:
             if self.limiter is not None:
@@ -247,19 +265,18 @@ class HyperliquidAdapter:
         *args,
         before_submit: Callable[[], Awaitable[None]] | None = None,
     ):
-        """Run one signed SDK action under signer serialization and address cadence.
+        """Run one signed SDK action under serialization, cadence and writer fencing.
 
         A lightweight pre-wait happens outside the signer lock. The authoritative
         cadence reservation is then performed from the worker thread that is
         about to invoke the synchronous SDK function, eliminating thread-pool
         queue time between reservation and actual exchange invocation. An optional
         action-specific authorization callback runs after every asynchronous
-        submission wait and immediately before the synchronous SDK call. Calls
-        that install that callback use a per-call worker so callback reads that
-        themselves use ``asyncio.to_thread`` cannot starve the shared default
-        executor. Strategy orders and sensitive admin actions may install this
-        final authorization fence. The signer lock remains held through
-        reservation, signing, network I/O and result classification.
+        submission wait. After that callback, the common MAINNET single-writer
+        check is the last synchronous authorization step immediately before the
+        SDK function. It applies even when an action has no action-specific
+        callback. The signer lock remains held through reservation, signing,
+        network I/O and result classification.
         """
 
         if self.address_limits is not None:
@@ -287,6 +304,10 @@ class HyperliquidAdapter:
             if self.address_limits is not None or before_submit is not None:
                 preparation = asyncio.run_coroutine_threadsafe(_prepare_actual_submission(), loop)
                 preparation.result()
+            # This common fence deliberately lives in the same synchronous worker
+            # frame as the SDK call, after every async wait/authorization. No
+            # exchange signing or submission can happen between this check and func.
+            self._assert_mainnet_writer_authorized()
             return func(*args)
 
         # Any action with a final authorization callback gets a dedicated
@@ -597,43 +618,43 @@ class HyperliquidAdapter:
         exchange = self._exchange(local, account_address)
 
         async def _authorize_strategy_order() -> None:
-            evidence = await current_strategy_intent_for_cloid(
-                cloid=cloid,
-                follower_network=self.network,
-                asset=asset,
-            )
-            if evidence is None:
-                # Administrative/emergency actions such as CLOSE_ALL deliberately
-                # keep their independent execution semantics.
-                return
-            master_address = settings.HYPERLIQUID_MASTER_ADDRESS
-            if not master_address:
-                raise StrategyIntentAuthorizationError(
-                    'Master source address is unavailable at order authorization'
-                )
-            master_hl = (
-                self
-                if self.network == settings.master_network
-                else HyperliquidAdapter(self.limiter, network=settings.master_network)
-            )
             try:
+                evidence = await current_strategy_intent_for_cloid(
+                    cloid=cloid,
+                    follower_network=self.network,
+                    asset=asset,
+                )
+                if evidence is None:
+                    # Administrative/emergency actions such as CLOSE_ALL deliberately
+                    # keep their independent execution semantics.
+                    return
+                master_address = settings.HYPERLIQUID_MASTER_ADDRESS
+                if not master_address:
+                    raise StrategyIntentAuthorizationError(
+                        'Master source address is unavailable at order authorization'
+                    )
+                master_hl = (
+                    self
+                    if self.network == settings.master_network
+                    else HyperliquidAdapter(self.limiter, network=settings.master_network)
+                )
                 fresh_master_state = await master_hl.user_state(
                     master_address,
                     priority=Priority.ORDER,
                 )
+                fresh_position = master_position_from_state(fresh_master_state, asset)
+                if fresh_position != evidence.source_master_position:
+                    raise StrategyIntentSuperseded(
+                        f'Source master position moved from {evidence.source_master_position} '
+                        f'to {fresh_position} before order submission'
+                    )
             except StrategyIntentAuthorizationError:
                 raise
             except Exception as exc:
                 raise StrategyIntentAuthorizationError(
-                    f'Fresh master state unavailable before order submission: {type(exc).__name__}: {exc}'
+                    f'Strategy authorization unavailable before order submission: '
+                    f'{type(exc).__name__}: {exc}'
                 ) from exc
-
-            fresh_position = master_position_from_state(fresh_master_state, asset)
-            if fresh_position != evidence.source_master_position:
-                raise StrategyIntentSuperseded(
-                    f'Source master position moved from {evidence.source_master_position} '
-                    f'to {fresh_position} before order submission'
-                )
 
         def _submit():
             exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
@@ -648,6 +669,21 @@ class HyperliquidAdapter:
                 local.address,
                 _submit,
                 before_submit=_authorize_strategy_order,
+            )
+        except MainnetWriterFenceError as exc:
+            # The boundary check runs in the same synchronous worker frame as
+            # exchange.order and before it. This is a definitive local rejection,
+            # never an ambiguous Hyperliquid result.
+            return OrderOutcome(
+                'CANCELED',
+                reason=str(exc),
+                raw={
+                    'status': 'mainnetWriterFenceBlocked',
+                    'reason': str(exc),
+                    'asset': asset,
+                    'network': self.network,
+                    'exchange_action_sent': False,
+                },
             )
         except StrategyIntentAuthorizationError as exc:
             # The callback runs as the last awaited step inside the signer lock,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -28,6 +28,7 @@ async def persist_master_fill_and_jobs(
     db: AsyncSession, *, fill: dict[str, Any], master_equity: Decimal,
     fencing_token: int, correlation_id: str, source_network: str | None = None,
     master_leverage: int | None = None, master_is_cross: bool | None = None,
+    create_copy_jobs: bool = True,
 ) -> tuple[MasterEvent | None, list[CopyJob]]:
     lease = (await db.execute(text("SELECT fencing_token, expires_at FROM watcher_lease WHERE name='master-watcher' FOR SHARE"))).first()
     if lease is None or int(lease[0]) != fencing_token or lease[1] <= datetime.now(UTC):
@@ -58,6 +59,19 @@ async def persist_master_fill_and_jobs(
     )
     db.add(event)
     await db.flush()
+
+    # Historical replay restores the durable master-event audit trail, but it
+    # must never replay intermediate portfolio states into follower accounts.
+    # Use the exchange event time as defense in depth: a fill replayed now must
+    # not look fresh merely because its CopyJob would receive a new created_at.
+    historical_event = event.event_ts <= (
+        datetime.now(UTC) - timedelta(seconds=settings.STRATEGY_JOB_MAX_AGE_SECONDS)
+    )
+    # The periodic/activation reconciler independently converges each follower
+    # from fresh exchange truth to one current target per asset.
+    if not create_copy_jobs or historical_event:
+        await db.commit()
+        return event, []
 
     master_intent_order = None
     try:
