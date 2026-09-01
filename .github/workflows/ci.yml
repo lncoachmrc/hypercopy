@@ -35,7 +35,7 @@ jobs:
             backend/app/services/reconcile.py \
             backend/app/workers/execution_worker.py \
             backend/app/workers/watcher.py
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: repository-tree-${{ env.REPOSITORY_TREE_SHA }}
           path: REPOSITORY_TREE.generated.txt
