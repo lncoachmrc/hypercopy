@@ -208,6 +208,15 @@ def test_stale_intent_pre_submit_cancel_requires_fresh_reconciliation() -> None:
     assert decision.retry_policy is ActionRetryPolicy.RECONCILE
 
 
+def test_mainnet_writer_fence_cancel_requires_fresh_reconciliation() -> None:
+    decision = classify_action_error(
+        'MAINNET single-writer fence blocked signed action '
+        '(environment=production-candidate). NO EXCHANGE ACTION WAS SENT.'
+    )
+    assert decision.error_class is ActionErrorClass.TRANSIENT
+    assert decision.retry_policy is ActionRetryPolicy.RECONCILE
+
+
 def test_paused_followers_do_not_receive_realtime_event_fanout() -> None:
     source = inspect.getsource(copy_service.persist_master_fill_and_jobs)
     assert "u.copy_state IN ('ACTIVE', 'SHADOW')" in source
