@@ -72,6 +72,88 @@ def _safe_ambiguity_reduction(real: Decimal, desired_target: Decimal) -> bool:
     return desired_target == 0 or real * desired_target > 0
 
 
+def _risk_limited_reconcile_plan(
+    *,
+    user_id,
+    asset: str,
+    master_pos: Decimal,
+    master_mark: Decimal,
+    master_equity: Decimal,
+    follower_equity: Decimal,
+    unmanaged_margin: Decimal,
+    real: Decimal,
+    multiplier: Decimal,
+    follower_mark: Decimal,
+    free_margin: Decimal,
+    risk: RiskProfile,
+    entitlement_data: dict,
+    risk_state: RiskState | None,
+    allowed_asset: bool,
+    current_total_exposure: Decimal,
+    current_open_positions: int,
+    spec,
+) -> tuple[Decimal, Decimal, bool] | None:
+    """Return executable size plus conservative in-batch capacity reservation."""
+    if master_equity <= 0 or master_mark <= 0 or follower_mark <= 0:
+        return None
+
+    effective_risk = resolve_effective_risk(
+        risk,
+        entitlement_data,
+        exchange_max_leverage=spec.max_leverage,
+    )
+    sizing = plan(
+        MasterExposure(asset, master_pos, master_mark, master_equity),
+        FollowerState(str(user_id), follower_equity, unmanaged_margin, real, multiplier),
+        spec,
+        min_notional=risk.min_notional,
+        follower_mark_price=follower_mark,
+    )
+    current_asset_exposure = abs(real) * follower_mark
+    decision = evaluate(
+        sizing,
+        RiskContext(
+            close_only=risk.close_only,
+            asset_allowed=allowed_asset,
+            drawdown_halt=bool(risk_state and risk_state.state == RiskHalt.DRAWDOWN_HALT),
+            daily_loss_halt=bool(risk_state and risk_state.state == RiskHalt.DAILY_LOSS_HALT),
+            near_liquidation=bool(risk_state and risk_state.near_liquidation),
+            current_total_exposure=current_total_exposure,
+            current_asset_exposure=current_asset_exposure,
+            free_margin=max(free_margin, Decimal(0)),
+            account_equity=max(follower_equity, Decimal(0)),
+            current_leverage=(
+                current_total_exposure / follower_equity
+                if follower_equity > 0
+                else Decimal(999)
+            ),
+            open_positions=current_open_positions,
+            is_new_market=real == 0,
+            max_notional_per_trade=effective_risk.max_notional_per_trade,
+            max_total_exposure=effective_risk.max_total_exposure,
+            max_asset_exposure=effective_risk.max_asset_exposure,
+            max_leverage=effective_risk.max_leverage,
+            max_positions=effective_risk.max_positions,
+        ),
+    )
+    if decision.action not in {RiskAction.ALLOW, RiskAction.TRIM} or not decision.plan.actionable:
+        return None
+
+    submitted_size = round_size(decision.plan.order_size, spec.sz_decimals)
+    additional_exposure = Decimal(0)
+    opens_new_market = False
+
+    if decision.plan.secondary is not None and decision.plan.secondary.actionable:
+        secondary_size = round_size(decision.plan.secondary.order_size, spec.sz_decimals)
+        secondary_exposure = secondary_size * follower_mark
+        additional_exposure = max(secondary_exposure - current_asset_exposure, Decimal(0))
+    elif not decision.plan.reduce_only:
+        additional_exposure = submitted_size * follower_mark
+        opens_new_market = real == 0
+
+    return submitted_size, additional_exposure, opens_new_market
+
+
 def _risk_limited_submitted_size(
     *,
     user_id,
@@ -93,50 +175,27 @@ def _risk_limited_submitted_size(
     current_open_positions: int,
     spec,
 ) -> Decimal | None:
-    if master_equity <= 0 or master_mark <= 0 or follower_mark <= 0:
-        return None
-
-    effective_risk = resolve_effective_risk(
-        risk,
-        entitlement_data,
-        exchange_max_leverage=spec.max_leverage,
+    limited = _risk_limited_reconcile_plan(
+        user_id=user_id,
+        asset=asset,
+        master_pos=master_pos,
+        master_mark=master_mark,
+        master_equity=master_equity,
+        follower_equity=follower_equity,
+        unmanaged_margin=unmanaged_margin,
+        real=real,
+        multiplier=multiplier,
+        follower_mark=follower_mark,
+        free_margin=free_margin,
+        risk=risk,
+        entitlement_data=entitlement_data,
+        risk_state=risk_state,
+        allowed_asset=allowed_asset,
+        current_total_exposure=current_total_exposure,
+        current_open_positions=current_open_positions,
+        spec=spec,
     )
-    sizing = plan(
-        MasterExposure(asset, master_pos, master_mark, master_equity),
-        FollowerState(str(user_id), follower_equity, unmanaged_margin, real, multiplier),
-        spec,
-        min_notional=risk.min_notional,
-        follower_mark_price=follower_mark,
-    )
-    decision = evaluate(
-        sizing,
-        RiskContext(
-            close_only=risk.close_only,
-            asset_allowed=allowed_asset,
-            drawdown_halt=bool(risk_state and risk_state.state == RiskHalt.DRAWDOWN_HALT),
-            daily_loss_halt=bool(risk_state and risk_state.state == RiskHalt.DAILY_LOSS_HALT),
-            near_liquidation=bool(risk_state and risk_state.near_liquidation),
-            current_total_exposure=current_total_exposure,
-            current_asset_exposure=abs(real) * follower_mark,
-            free_margin=max(free_margin, Decimal(0)),
-            account_equity=max(follower_equity, Decimal(0)),
-            current_leverage=(
-                current_total_exposure / follower_equity
-                if follower_equity > 0
-                else Decimal(999)
-            ),
-            open_positions=current_open_positions,
-            is_new_market=real == 0,
-            max_notional_per_trade=effective_risk.max_notional_per_trade,
-            max_total_exposure=effective_risk.max_total_exposure,
-            max_asset_exposure=effective_risk.max_asset_exposure,
-            max_leverage=effective_risk.max_leverage,
-            max_positions=effective_risk.max_positions,
-        ),
-    )
-    if decision.action not in {RiskAction.ALLOW, RiskAction.TRIM} or not decision.plan.actionable:
-        return None
-    return round_size(decision.plan.order_size, spec.sz_decimals)
+    return None if limited is None else limited[0]
 
 
 async def _liquidity_backoff_seconds(db: AsyncSession, user_id, asset: str, started_at: datetime) -> int:
@@ -447,6 +506,7 @@ async def _reconcile_user_locked(
         assets = set(master_positions) | set(real_positions) | set(ledger_by_asset)
         discrepancies = []
         liquidity_backoffs = []
+        planned_jobs: list[dict] = []
         multiplier = effective_risk.multiplier if effective_risk else Decimal(1)
         min_notional = max(risk.min_notional if risk else EXCHANGE_MIN_NOTIONAL, EXCHANGE_MIN_NOTIONAL)
         managed_assets = {x.asset for x in ledger_rows if x.managed} | {
@@ -463,8 +523,10 @@ async def _reconcile_user_locked(
         current_open_positions = len([
             name for name in managed_assets if real_positions.get(name, Decimal(0)) != 0
         ])
+        reserved_total_exposure = current_total_exposure
+        reserved_open_positions = current_open_positions
 
-        for asset in assets:
+        for asset in sorted(assets):
             real = real_positions.get(asset, Decimal(0))
             ledger = ledger_by_asset.get(asset)
             follower_mark = Decimal(str(follower_mids.get(asset, '0') or '0'))
@@ -502,7 +564,7 @@ async def _reconcile_user_locked(
             ledger.follower_leverage = follower_config.leverage if real != 0 and follower_config else None
             ledger.follower_is_cross = follower_config.is_cross if real != 0 and follower_config else None
 
-            if not create_jobs or user.copy_state == CopyState.PAUSED:
+            if user.copy_state == CopyState.PAUSED:
                 continue
 
             has_live_ambiguity = asset in live_ambiguity_assets
@@ -560,11 +622,12 @@ async def _reconcile_user_locked(
                 continue
 
             submitted_size = None
+            risk_plan = None
             if drift_notional >= min_notional and risk:
                 try:
                     if spec is None:
                         spec = await hl.asset_spec(asset)
-                    submitted_size = _risk_limited_submitted_size(
+                    risk_plan = _risk_limited_reconcile_plan(
                         user_id=user.id,
                         asset=asset,
                         master_pos=master_pos * ai_factor,
@@ -580,12 +643,28 @@ async def _reconcile_user_locked(
                         entitlement_data=ent,
                         risk_state=risk_state,
                         allowed_asset=allowed_asset,
-                        current_total_exposure=current_total_exposure,
-                        current_open_positions=current_open_positions,
+                        current_total_exposure=reserved_total_exposure,
+                        current_open_positions=reserved_open_positions,
                         spec=spec,
                     )
+                    submitted_size = None if risk_plan is None else risk_plan[0]
                 except Exception:
+                    risk_plan = None
                     submitted_size = None
+
+            increasing_exposure = (
+                real == 0 and desired_target != 0
+                or real * desired_target > 0 and abs(desired_target) > abs(real)
+            )
+            reversal = real != 0 and desired_target != 0 and real * desired_target < 0
+            if (
+                user.copy_state == CopyState.ACTIVE
+                and risk
+                and drift_notional >= min_notional
+                and (increasing_exposure or reversal)
+                and risk_plan is None
+            ):
+                continue
 
             if drift_notional >= min_notional and await _terminal_action_rejection_blocks_unchanged_intent(
                 db,
@@ -599,15 +678,20 @@ async def _reconcile_user_locked(
             ):
                 continue
 
-            increasing_exposure = (
-                real == 0 and desired_target != 0
-                or real * desired_target > 0 and abs(desired_target) > abs(real)
-            )
             if user.copy_state == CopyState.ACTIVE and increasing_exposure and drift_notional >= min_notional:
                 wait_seconds = await _liquidity_backoff_seconds(db, user.id, asset, network_state.started_at)
                 if wait_seconds > 0:
                     liquidity_backoffs.append({'asset': asset, 'seconds': wait_seconds})
                     continue
+
+            reserved_additional_exposure = Decimal(0)
+            opens_new_market = False
+            if risk_plan is not None:
+                reserved_additional_exposure = risk_plan[1]
+                opens_new_market = risk_plan[2]
+                reserved_total_exposure += reserved_additional_exposure
+                if opens_new_market:
+                    reserved_open_positions += 1
 
             context = {
                 'master_position': str(master_pos),
@@ -625,6 +709,10 @@ async def _reconcile_user_locked(
                 'selected_max_positions': risk.max_positions if risk else None,
                 'effective_max_positions': effective_risk.max_positions if effective_risk else None,
                 'entitlement_plan': ent.get('commercial_plan') or ent.get('plan'),
+                'reconcile_risk_submitted_size': str(submitted_size) if submitted_size is not None else None,
+                'reconcile_reserved_additional_exposure': str(reserved_additional_exposure),
+                'reconcile_reserved_total_exposure': str(reserved_total_exposure),
+                'reconcile_reserved_open_positions': reserved_open_positions,
             }
             if master_snapshot_started_order is not None:
                 context['master_snapshot_started_order'] = master_snapshot_started_order
@@ -642,6 +730,17 @@ async def _reconcile_user_locked(
                     and drift_notional < min_notional
                     and not ambiguity_safe_reduction
                 )
+
+            planned_jobs.append({
+                'asset': asset,
+                'submitted_size': str(submitted_size) if submitted_size is not None else None,
+                'reserved_additional_exposure': str(reserved_additional_exposure),
+                'reserved_total_exposure': str(reserved_total_exposure),
+                'reserved_open_positions': reserved_open_positions,
+            })
+
+            if not create_jobs:
+                continue
 
             db.add(CopyJob(
                 user_id=user.id,
@@ -674,10 +773,16 @@ async def _reconcile_user_locked(
             'entitlement_plan': ent.get('commercial_plan') or ent.get('plan'),
             'entitled': bool(ent.get('entitled')),
         }
-        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'network': network, 'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created, 'ai_mode': ai_policy.effective_mode, 'ai_execution_factor': str(ai_factor), **effective_summary}; run.finished_at = datetime.now(UTC)
-        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'network': network, 'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created, 'ai_mode': ai_policy.effective_mode, 'ai_execution_factor': str(ai_factor), **effective_summary})
+        batch_summary = {
+            'jobs_planned': len(planned_jobs),
+            'planned_jobs': planned_jobs,
+            'reserved_total_exposure': str(reserved_total_exposure),
+            'reserved_open_positions': reserved_open_positions,
+        }
+        run.status = 'OK'; run.discrepancy_type = 'DRIFT' if discrepancies else 'NONE'; run.before = {'discrepancies': discrepancies}; run.after = {'network': network, 'equity': str(equity), 'free_margin': str(free_margin), 'unmanaged_margin': str(unmanaged_margin), 'fills_synced': synced_fills, 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created, 'ai_mode': ai_policy.effective_mode, 'ai_execution_factor': str(ai_factor), **effective_summary, **batch_summary}; run.finished_at = datetime.now(UTC)
+        await audit(db, action='RECONCILIATION_COMPLETED', subject_id=user.id, after={'network': network, 'discrepancies': discrepancies, 'account_mode': account_mode, 'equity': str(equity), 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created, 'jobs_planned': len(planned_jobs), 'reserved_total_exposure': str(reserved_total_exposure), 'reserved_open_positions': reserved_open_positions, 'ai_mode': ai_policy.effective_mode, 'ai_execution_factor': str(ai_factor), **effective_summary})
         await db.commit()
-        return {'status': 'OK', 'network': network, 'discrepancies': discrepancies, 'equity': str(equity), 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created, 'ai_mode': ai_policy.effective_mode, 'ai_execution_factor': str(ai_factor), **effective_summary}
+        return {'status': 'OK', 'network': network, 'discrepancies': discrepancies, 'equity': str(equity), 'account_mode': account_mode, 'liquidity_backoffs': liquidity_backoffs, 'jobs_created': jobs_created, 'ai_mode': ai_policy.effective_mode, 'ai_execution_factor': str(ai_factor), **effective_summary, **batch_summary}
     except Exception as exc:
         run.status = 'FAILED'; run.error = f'{type(exc).__name__}: {exc}'; run.finished_at = datetime.now(UTC); await db.commit(); raise
 
