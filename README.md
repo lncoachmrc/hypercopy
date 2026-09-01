@@ -56,7 +56,7 @@ Every external order is preceded by a durable `Execution(SUBMITTING)` row and a 
 
 Users authenticate by wallet signature. The session is held in an HttpOnly cookie; CSRF is enforced on mutations. Trading uses a named Hyperliquid API/agent wallet; the main wallet private key is rejected. Credentials use envelope encryption: a random per-record DEK encrypts the agent key with AES-256-GCM and AAD bound to user/account identity. Local/test environments can wrap DEKs with a Railway environment KEK; production mainnet requires the external KMS provider shipped here (`aws_kms`), with decrypt permission granted only to `execution-worker`.
 
-Mainnet requires all three independent gates: `HYPERLIQUID_NETWORK=mainnet`, `ENABLE_LIVE_TRADING=true`, and PostgreSQL `system_flags.live_trading=true` set explicitly by a SUPERADMIN.
+Mainnet requires four independent gates: `HYPERLIQUID_NETWORK=mainnet`, `ENABLE_LIVE_TRADING=true`, PostgreSQL `system_flags.live_trading=true` set explicitly by a SUPERADMIN, and a matching Railway writer identity (`RAILWAY_ENVIRONMENT_ID == TRAXION_MAINNET_WRITER_ENVIRONMENT_ID`). The writer identity is also enforced at the common signed-action boundary immediately before the Hyperliquid SDK call, so a missing or mismatched environment fails closed without sending an exchange action. TESTNET is unaffected by this environment fence.
 
 ## Repository
 

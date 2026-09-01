@@ -105,6 +105,9 @@ HL_RATE_BUDGET_PER_MIN=1200
 HL_ORDER_EXPIRES_AFTER_MS=15000
 HL_AGENT_NAME=hypercopy
 ENABLE_LIVE_TRADING=false
+# Set only where signed MAINNET actions are authorized. Railway injects
+# RAILWAY_ENVIRONMENT_ID/RAILWAY_ENVIRONMENT_NAME automatically at runtime.
+TRAXION_MAINNET_WRITER_ENVIRONMENT_ID=<designated Railway Environment ID>
 DEFAULT_SHADOW_MODE=true
 
 SESSION_SECRET=<Railway secret, 48+ random bytes/chars>
@@ -130,6 +133,8 @@ METRICS_TOKEN=<random secret>
 ```
 
 `SESSION_SECRET`, Stripe secret/webhook, KMS credentials e signing credentials non vanno in GitHub Actions.
+
+`TRAXION_MAINNET_WRITER_ENVIRONMENT_ID` è una designazione esplicita, non una lease e non un valore derivato da Redis/PostgreSQL. `RAILWAY_ENVIRONMENT_ID` e `RAILWAY_ENVIRONMENT_NAME` sono identità runtime fornite da Railway e non devono essere sovrascritte manualmente. Se un servizio può eseguire signed MAINNET actions, il valore designato deve coincidere con l'Environment ID effettivo del runtime. Non configurare un secondo environment come writer dello stesso account.
 
 ## 8. KMS — variabili per servizio
 
@@ -248,6 +253,8 @@ Parte da 1. Scala a N solo dopo test del rate budget reale. Ogni replica usa `RA
 
 Non scalare pensando di ottenere automaticamente più throughput Hyperliquid: il rate limiter è condiviso proprio perché il budget outbound va governato globalmente.
 
+La serializzazione per signer dentro un environment non sostituisce il single-writer fence tra environment. Prima di scalare o clonare un worker verificare sempre che il runtime appartenga all'unico Railway Environment designato per signed MAINNET actions.
+
 ## 15. Staging
 
 Consigliato prima della produzione:
@@ -261,13 +268,18 @@ Consigliato prima della produzione:
 
 Promuovere in production solo dopo P1/P2. Mainnet execute richiede P3.
 
-## 16. Mainnet activation — triplo gate
+## 16. Mainnet activation — quadruplo gate + writer fence
 
 Per inviare ordini mainnet devono essere vere tutte le condizioni:
 
 1. `HYPERLIQUID_NETWORK=mainnet`
 2. `ENABLE_LIVE_TRADING=true`
 3. `system_flags.live_trading=true` in PostgreSQL, abilitato via endpoint SUPERADMIN con conferma `ENABLE MAINNET`.
+4. `RAILWAY_ENVIRONMENT_ID == TRAXION_MAINNET_WRITER_ENVIRONMENT_ID`, con entrambi i valori non vuoti.
+
+In `APP_ENV=production`, il punto 4 viene validato anche all'avvio quando `ENABLE_LIVE_TRADING=true`: un ID mancante o diverso impedisce lo startup. Indipendentemente dalla validazione iniziale, ogni signed action MAINNET viene ricontrollata dentro `HyperliquidAdapter._signed_call()` immediatamente prima della funzione SDK che firma/invia l'azione. Il mismatch è fail-closed e non viene classificato come risultato exchange ambiguo. TESTNET non è bloccato dal writer fence.
+
+Prima di qualsiasi attivazione verificare nel runtime Railway l'`RAILWAY_ENVIRONMENT_ID` effettivo e confrontarlo con la designazione esplicita. Redis e PostgreSQL non sono autorità del writer tra environment.
 
 Procedura consigliata:
 
@@ -332,4 +344,6 @@ Non fare downgrade distruttivo mentre vecchio/nuovo deployment possono coesister
 [ ] PITR restore drill completato
 [ ] rollback provato
 [ ] mainnet shadow report approvato
+[ ] TRAXION_MAINNET_WRITER_ENVIRONMENT_ID impostato solo sull'environment designato
+[ ] RAILWAY_ENVIRONMENT_ID runtime verificato uguale al writer designato prima di MAINNET
 ```

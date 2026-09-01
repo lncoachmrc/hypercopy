@@ -90,6 +90,14 @@ class Settings(BaseSettings):
     TRAXION_KEK_PUBLIC_KEY_B64: str = ''
     TRAXION_KEK_PRIVATE_KEY_B64: str = ''
 
+    # Environment-identity authority for the MAINNET single-writer fence.
+    # Railway injects RAILWAY_ENVIRONMENT_ID/NAME at runtime. The designated
+    # writer ID is explicit application configuration and must never rely on a
+    # shared PostgreSQL or Redis instance.
+    TRAXION_MAINNET_WRITER_ENVIRONMENT_ID: str = ''
+    RAILWAY_ENVIRONMENT_ID: str = ''
+    RAILWAY_ENVIRONMENT_NAME: str = ''
+
     STRIPE_SECRET_KEY: str = ''
     STRIPE_WEBHOOK_SECRET: str = ''
 
@@ -141,6 +149,15 @@ class Settings(BaseSettings):
     def normalize_address(cls, value: str) -> str:
         return value.lower().strip()
 
+    @field_validator(
+        'TRAXION_MAINNET_WRITER_ENVIRONMENT_ID',
+        'RAILWAY_ENVIRONMENT_ID',
+        'RAILWAY_ENVIRONMENT_NAME',
+    )
+    @classmethod
+    def normalize_environment_identity(cls, value: str) -> str:
+        return value.strip()
+
     @model_validator(mode='after')
     def production_safety(self) -> 'Settings':
         if self.APP_ENV == 'production':
@@ -148,6 +165,16 @@ class Settings(BaseSettings):
                 raise ValueError('SESSION_SECRET must be a strong production secret')
             if self.ENABLE_LIVE_TRADING and self.KEK_PROVIDER == 'env':
                 raise ValueError('Mainnet live execution requires aws_kms or local_rsa credential wrapping')
+            if self.ENABLE_LIVE_TRADING and (
+                not self.TRAXION_MAINNET_WRITER_ENVIRONMENT_ID
+                or not self.RAILWAY_ENVIRONMENT_ID
+                or self.RAILWAY_ENVIRONMENT_ID != self.TRAXION_MAINNET_WRITER_ENVIRONMENT_ID
+            ):
+                raise ValueError(
+                    'MAINNET single-writer fence failed: ENABLE_LIVE_TRADING=True requires '
+                    'TRAXION_MAINNET_WRITER_ENVIRONMENT_ID and RAILWAY_ENVIRONMENT_ID to be set '
+                    'and equal'
+                )
         if self.SESSION_TTL_SECONDS <= 0:
             raise ValueError('SESSION_TTL_SECONDS must be positive')
         if self.SESSION_REFRESH_TTL_SECONDS <= self.SESSION_TTL_SECONDS:

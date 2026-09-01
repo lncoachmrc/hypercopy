@@ -8,6 +8,9 @@ from app.core.config import Settings, settings
 from app.core.crypto import EnvelopeCrypto
 
 
+_TEST_WRITER_ENVIRONMENT_ID = '00000000-0000-0000-0000-000000000001'
+
+
 def _rsa_pair(bits: int = 3072) -> tuple[str, str]:
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=bits)
     private_pem = private_key.private_bytes(
@@ -83,6 +86,8 @@ def test_production_live_accepts_local_rsa_provider():
         SESSION_SECRET='s' * 32,
         ENABLE_LIVE_TRADING=True,
         KEK_PROVIDER='local_rsa',
+        TRAXION_MAINNET_WRITER_ENVIRONMENT_ID=_TEST_WRITER_ENVIRONMENT_ID,
+        RAILWAY_ENVIRONMENT_ID=_TEST_WRITER_ENVIRONMENT_ID,
     )
     assert cfg.KEK_PROVIDER == 'local_rsa'
 
