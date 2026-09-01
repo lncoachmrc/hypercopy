@@ -623,6 +623,7 @@ async def _reconcile_user_locked(
 
             submitted_size = None
             risk_plan = None
+            risk_plan_evaluated = False
             if drift_notional >= min_notional and risk:
                 try:
                     if spec is None:
@@ -647,6 +648,7 @@ async def _reconcile_user_locked(
                         current_open_positions=reserved_open_positions,
                         spec=spec,
                     )
+                    risk_plan_evaluated = True
                     submitted_size = None if risk_plan is None else risk_plan[0]
                 except Exception:
                     risk_plan = None
@@ -662,6 +664,7 @@ async def _reconcile_user_locked(
                 and risk
                 and drift_notional >= min_notional
                 and (increasing_exposure or reversal)
+                and risk_plan_evaluated
                 and risk_plan is None
             ):
                 continue
