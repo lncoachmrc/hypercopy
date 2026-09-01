@@ -20,7 +20,11 @@ Use production frontend/API custom domains under the same registrable domain (fo
 
 ## Mainnet fail-closed gates
 
-All must be true: the user's execution network is `mainnet`; Railway variable `ENABLE_LIVE_TRADING=true`; PostgreSQL flag `live_trading` is enabled by an authenticated SUPERADMIN confirmation. Presence of a key alone can never activate mainnet.
+All must be true before MAINNET can execute: the user's execution network is `mainnet`; Railway variable `ENABLE_LIVE_TRADING=true`; PostgreSQL flag `live_trading` is enabled by an authenticated SUPERADMIN confirmation; and the runtime Railway environment is the designated MAINNET writer (`RAILWAY_ENVIRONMENT_ID == TRAXION_MAINNET_WRITER_ENVIRONMENT_ID`, with both IDs non-empty). Presence of a key alone can never activate mainnet.
+
+The environment fence has two independent enforcement points. Production configuration fails startup when live trading is enabled without a matching writer identity. In addition, every MAINNET signed Hyperliquid action passes through `HyperliquidAdapter._signed_call()`, where the writer identity is checked again as the final synchronous authorization step immediately before the SDK function that signs/submits the action. Missing or mismatched IDs fail closed with definitive pre-submit evidence that no exchange action was sent. TESTNET actions bypass this environment fence.
+
+`RAILWAY_ENVIRONMENT_ID` and `RAILWAY_ENVIRONMENT_NAME` are Railway runtime identity variables. Do not use Redis or PostgreSQL as the authority for choosing the MAINNET writer, because separate Railway environments can legitimately have independent data services while still targeting the same external wallet.
 
 ## Secrets
 
