@@ -63,8 +63,16 @@ async def test_mainnet_matching_designated_writer_allows_signed_action(monkeypat
         (WRITER_ENV, OTHER_ENV),
         ("", WRITER_ENV),
         (WRITER_ENV, ""),
+        ("   ", WRITER_ENV),
+        (WRITER_ENV, "   "),
     ],
-    ids=["environment-mismatch", "missing-designated-writer", "missing-railway-environment"],
+    ids=[
+        "environment-mismatch",
+        "missing-designated-writer",
+        "missing-railway-environment",
+        "blank-designated-writer",
+        "blank-railway-environment",
+    ],
 )
 async def test_mainnet_invalid_writer_identity_fails_closed_before_sdk_call(monkeypatch, expected: str, actual: str):
     _set_writer_identity(monkeypatch, expected=expected, actual=actual)
@@ -193,19 +201,23 @@ async def test_mainnet_fence_blocks_close_all_style_ioc_before_exchange_order(mo
     monkeypatch.setattr(adapter, "_exchange", lambda _local, _account: exchange)
     monkeypatch.setattr("app.services.strategy_intents.current_strategy_intent_for_cloid", no_strategy_intent)
 
-    with pytest.raises(MainnetWriterFenceError, match="NO EXCHANGE ACTION WAS SENT"):
-        await adapter.place_ioc(
-            account_address="0x" + "22" * 20,
-            private_key=account.key.hex(),
-            asset="BTC",
-            is_buy=False,
-            size=Decimal("0.01"),
-            mark_price=Decimal("100000"),
-            slippage_bps=25,
-            reduce_only=True,
-            cloid="0x" + "33" * 16,
-        )
+    outcome = await adapter.place_ioc(
+        account_address="0x" + "22" * 20,
+        private_key=account.key.hex(),
+        asset="BTC",
+        is_buy=False,
+        size=Decimal("0.01"),
+        mark_price=Decimal("100000"),
+        slippage_bps=25,
+        reduce_only=True,
+        cloid="0x" + "33" * 16,
+    )
 
+    assert outcome.state == "CANCELED"
+    assert "NO EXCHANGE ACTION WAS SENT" in (outcome.reason or "")
+    assert outcome.raw is not None
+    assert outcome.raw["status"] == "mainnetWriterFenceBlocked"
+    assert outcome.raw["exchange_action_sent"] is False
     assert exchange.order_calls == 0
 
 
@@ -260,8 +272,16 @@ def test_production_live_startup_accepts_matching_writer_environment():
         (WRITER_ENV, OTHER_ENV),
         ("", WRITER_ENV),
         (WRITER_ENV, ""),
+        ("   ", WRITER_ENV),
+        (WRITER_ENV, "   "),
     ],
-    ids=["environment-mismatch", "missing-designated-writer", "missing-railway-environment"],
+    ids=[
+        "environment-mismatch",
+        "missing-designated-writer",
+        "missing-railway-environment",
+        "blank-designated-writer",
+        "blank-railway-environment",
+    ],
 )
 def test_production_live_startup_rejects_invalid_writer_environment(expected: str, actual: str):
     with pytest.raises(ValueError, match="MAINNET single-writer fence failed"):
