@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 from starlette.requests import Request
 
@@ -25,27 +27,49 @@ def _request(
     *,
     client_host: str,
     forwarded_for: str | None = None,
+    real_ip: str | None = None,
     session_cookie: str | None = None,
+    method: str = "GET",
+    path: str = "/api/v1/test",
+    json_body: dict | None = None,
 ) -> Request:
     headers: list[tuple[bytes, bytes]] = []
     if forwarded_for is not None:
         headers.append((b"x-forwarded-for", forwarded_for.encode("ascii")))
+    if real_ip is not None:
+        headers.append((b"x-real-ip", real_ip.encode("ascii")))
     if session_cookie is not None:
         cookie = f"{settings.SESSION_COOKIE_NAME}={session_cookie}"
         headers.append((b"cookie", cookie.encode("ascii")))
+
+    body = b""
+    if json_body is not None:
+        body = json.dumps(json_body).encode("utf-8")
+        headers.append((b"content-type", b"application/json"))
+
+    delivered = False
+
+    async def receive() -> dict:
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
     return Request(
         {
             "type": "http",
             "http_version": "1.1",
-            "method": "GET",
+            "method": method,
             "scheme": "https",
-            "path": "/api/v1/test",
-            "raw_path": b"/api/v1/test",
+            "path": path,
+            "raw_path": path.encode("ascii"),
             "query_string": b"",
             "headers": headers,
             "client": (client_host, 50000),
             "server": ("testserver", 443),
-        }
+        },
+        receive=receive,
     )
 
 
@@ -66,18 +90,47 @@ async def test_scoped_rate_limit_uses_rightmost_untrusted_forwarded_hop(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_scoped_rate_limit_prefers_railway_real_ip_from_trusted_peer(monkeypatch: pytest.MonkeyPatch) -> None:
+    redis = _FakeRedis()
+    monkeypatch.setattr(deps, "redis_client", lambda: redis)
+    request = _request(
+        client_host="100.64.0.16",
+        real_ip="198.51.100.42",
+        forwarded_for="198.51.100.77, 203.0.113.9",
+    )
+
+    await deps.scoped_rate_limit(request, "auth-challenge", 10, 300)
+
+    assert any(":198.51.100.42:" in key for key in redis.incr_keys)
+
+
+@pytest.mark.asyncio
 async def test_scoped_rate_limit_ignores_forwarded_chain_from_untrusted_peer(monkeypatch: pytest.MonkeyPatch) -> None:
     redis = _FakeRedis()
     monkeypatch.setattr(deps, "redis_client", lambda: redis)
     request = _request(
         client_host="203.0.113.44",
         forwarded_for="198.51.100.99",
+        real_ip="198.51.100.88",
     )
 
     await deps.scoped_rate_limit(request, "auth-challenge", 10, 300)
 
     assert any(":203.0.113.44:" in key for key in redis.incr_keys)
     assert all("198.51.100.99" not in key for key in redis.incr_keys)
+    assert all("198.51.100.88" not in key for key in redis.incr_keys)
+
+
+def test_normalize_request_client_updates_downstream_request_client() -> None:
+    request = _request(
+        client_host="10.208.202.255",
+        real_ip="198.51.100.42",
+    )
+
+    deps.normalize_request_client(request)
+
+    assert request.client is not None
+    assert request.client.host == "198.51.100.42"
 
 
 @pytest.mark.asyncio
@@ -93,6 +146,25 @@ async def test_scoped_rate_limit_supports_wallet_identifier_independent_of_ip(mo
         300,
         identifier="0x1111111111111111111111111111111111111111",
     )
+
+    assert any(
+        "auth-challenge-wallet:0x1111111111111111111111111111111111111111:" in key
+        for key in redis.incr_keys
+    )
+
+
+@pytest.mark.asyncio
+async def test_global_api_rate_limit_adds_wallet_budget_for_challenge(monkeypatch: pytest.MonkeyPatch) -> None:
+    redis = _FakeRedis()
+    monkeypatch.setattr(deps, "redis_client", lambda: redis)
+    request = _request(
+        client_host="203.0.113.44",
+        method="POST",
+        path="/api/v1/auth/challenge",
+        json_body={"address": "0x1111111111111111111111111111111111111111"},
+    )
+
+    await deps.api_rate_limit(request)
 
     assert any(
         "auth-challenge-wallet:0x1111111111111111111111111111111111111111:" in key
