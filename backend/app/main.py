@@ -9,6 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import text
 
+from app.adapters.ratelimit import Budget, WeightedRateLimiter
+from app.api.deps import normalize_request_client
 from app.api.health import router as health_router
 from app.api.router import api_router
 from app.core.config import settings
@@ -16,7 +18,6 @@ from app.core.errors import HyperCopyError
 from app.core.logging import configure_logging, correlation_id_var, get_logger
 from app.core.origins import browser_origins
 from app.db.redis import redis_client
-from app.adapters.ratelimit import Budget, WeightedRateLimiter
 from app.db.session import SessionLocal
 from app.services.master_leverage_cache import master_leverage_metric_snapshot
 from app.services.metrics import system_snapshot
@@ -37,6 +38,9 @@ app.include_router(api_router)
 
 @app.middleware('http')
 async def security_and_correlation(request:Request,call_next):
+    # Normalize client attribution before rate-limit dependencies and audit code
+    # read request.client. Forwarding headers are trusted only for Railway peers.
+    normalize_request_client(request)
     cid=request.headers.get('X-Correlation-ID') or uuid.uuid4().hex
     token=correlation_id_var.set(cid)
     try:
