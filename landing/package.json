@@ -37,6 +37,9 @@
     "vite": "8.2.1",
     "wrangler": "4.124.0"
   },
+  "overrides": {
+    "fast-uri": "3.1.6"
+  },
   "type": "module",
   "displayName": "TRAXION \u2014 Sito Ufficiale"
 }
