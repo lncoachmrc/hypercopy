@@ -64,3 +64,17 @@ test("does not shift authenticated-activity proof onto the consumer", async () =
   assert.doesNotMatch(termsIt, /salvo prova di compromissione o errore del servizio/i);
   assert.doesNotMatch(termsEs, /salvo prueba de compromiso o error del servicio/i);
 });
+
+test("makes each terms route authoritative for its legal locale", async () => {
+  const controller = await readSource("../app/LanguageSelector.tsx");
+
+  assert.match(controller, /function termsRouteLanguage\(pathname:string\)/);
+  assert.match(controller, /if\(normalized===["']\/terms\/es["']\)return ["']es["']/);
+  assert.match(controller, /if\(normalized===["']\/terms["']\)return ["']it["']/);
+  assert.match(controller, /const routeLanguage=termsRouteLanguage\(window\.location\.pathname\)/);
+  assert.match(controller, /persistLanguageSelection\(routeLanguage\)/);
+  assert.match(controller, /document\.documentElement\.lang=htmlLocaleByLanguage\[routeLanguage\]/);
+  assert.match(controller, /const translateCleanup=routeLanguage\?\(\)=>\{\}:initAutoTranslate\(\)/);
+  assert.match(controller, /if\(!routeLanguage&&language===["']en["']\)/);
+  assert.match(controller, /else if\(!routeLanguage&&language===["']es["']\)/);
+});
