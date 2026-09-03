@@ -20,6 +20,7 @@ from app.services.queue import (
 from app.services.strategy_intents import STRATEGY_ORIGINS, prepare_strategy_job_for_publish
 from app.workers.execution_worker import Worker, stop
 
+settings.validate_for_service('execution-worker')
 log = get_logger(__name__)
 
 
