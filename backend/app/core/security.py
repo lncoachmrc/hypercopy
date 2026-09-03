@@ -105,4 +105,9 @@ def hash_refresh_token(token: str) -> str:
 def hash_ip(ip: str | None) -> str | None:
     if not ip:
         return None
-    return hashlib.sha256((settings.SESSION_SECRET[:16] + ip).encode()).hexdigest()
+    digest = hmac.new(
+        settings.audit_ip_hash_key_bytes(),
+        b'traxion:audit-ip:v2:' + ip.encode(),
+        hashlib.sha256,
+    ).digest()
+    return 'v2:' + base64.urlsafe_b64encode(digest).rstrip(b'=').decode()
