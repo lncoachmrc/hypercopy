@@ -197,7 +197,7 @@ async def test_refresh_consumer_reads_prefixed_production_refresh_cookie(monkeyp
     async def _no_rate_limit(*_args, **_kwargs):
         return None
 
-    monkeypatch.setattr(auth, 'refresh_cookie_name', lambda: refresh_name)
+    monkeypatch.setattr(auth, 'refresh_cookie_name', lambda **_kwargs: refresh_name)
     monkeypatch.setattr(auth, 'scoped_rate_limit', _no_rate_limit)
     monkeypatch.setattr(auth, 'redis_client', lambda: fake_redis)
 
@@ -218,7 +218,7 @@ async def test_refresh_consumer_reads_prefixed_production_refresh_cookie(monkeyp
 async def test_logout_consumer_recognizes_prefixed_refresh_when_explicitly_supplied(monkeypatch):
     refresh_name = f'__Secure-{settings.SESSION_REFRESH_COOKIE_NAME}'
     fake_redis = _FakeRedis()
-    monkeypatch.setattr(auth, 'refresh_cookie_name', lambda: refresh_name)
+    monkeypatch.setattr(auth, 'refresh_cookie_name', lambda **_kwargs: refresh_name)
     monkeypatch.setattr(auth, 'redis_client', lambda: fake_redis)
 
     request = _request(
