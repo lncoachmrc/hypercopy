@@ -8,6 +8,10 @@ export const metadata: Metadata = {
   robots: { index: true, follow: true },
   alternates: {
     canonical: "https://traxion.lucianonovello.com/terms/",
+    languages: {
+      "it-IT": "https://traxion.lucianonovello.com/terms/",
+      "es-ES": "https://traxion.lucianonovello.com/terms/es/",
+    },
   },
 };
 
@@ -17,6 +21,7 @@ export default function TermsAndConditionsPage() {
       <header className={styles.header}>
         <div className={styles.headerInner}>
           <a className={styles.brand} href="/">TRAXION</a>
+          <a className={styles.back} href="/terms/es/">Español</a>
           <a className={styles.back} href="/">← Torna al sito</a>
         </div>
       </header>
@@ -50,8 +55,7 @@ export default function TermsAndConditionsPage() {
             <p>
               Utilizzando il servizio o acquistando un piano, l’utente accetta i Termini nella versione resa
               disponibile prima della conclusione del contratto. Quando l’utente agisce come consumatore, restano
-              in ogni caso applicabili tutti i diritti inderogabili previsti dalla normativa di tutela dei
-              consumatori.
+              applicabili tutti i diritti inderogabili previsti dalla normativa di tutela dei consumatori.
             </p>
           </section>
 
@@ -80,14 +84,14 @@ export default function TermsAndConditionsPage() {
           <section className={styles.section}>
             <h2>4. Requisiti di utilizzo</h2>
             <p>
-              L’utente persona fisica deve avere almeno 18 anni e piena capacità di concludere il contratto.
-              Chi utilizza TRAXION per conto di una società o altra organizzazione dichiara di avere il potere di
+              L’utente persona fisica deve avere almeno 18 anni e piena capacità di concludere il contratto. Chi
+              utilizza TRAXION per conto di una società o altra organizzazione dichiara di avere il potere di
               vincolare tale soggetto ai presenti Termini.
             </p>
             <p>
-              L’utente deve inoltre verificare che l’uso di TRAXION, Hyperliquid, asset digitali e perpetual sia
-              consentito nella propria giurisdizione e deve rispettare le condizioni applicabili dei servizi terzi
-              utilizzati. TRAXION può non essere disponibile in tutte le giurisdizioni.
+              L’utente deve verificare che l’uso di TRAXION, Hyperliquid, asset digitali e perpetual sia consentito
+              nella propria giurisdizione e deve rispettare le condizioni applicabili dei servizi terzi utilizzati.
+              TRAXION può non essere disponibile in tutte le giurisdizioni.
             </p>
           </section>
 
@@ -137,9 +141,10 @@ export default function TermsAndConditionsPage() {
             <h2>8. Autenticazione e sicurezza dell’account</h2>
             <p>
               L’accesso può avvenire tramite firma crittografica del wallet e sessioni applicative. L’utente deve
-              proteggere il dispositivo, il browser, il wallet e ogni altro strumento usato per accedere al
-              servizio. Attività effettuate attraverso un accesso validamente autenticato possono essere attribuite
-              all’account dell’utente salvo prova di compromissione o errore del servizio.
+              proteggere il dispositivo, il browser, il wallet e ogni altro strumento usato per accedere al servizio.
+              I registri tecnici di autenticazione e attività possono essere utilizzati come elementi di verifica
+              dei fatti, senza modificare le regole legali sull’onere della prova né i diritti inderogabili del
+              consumatore.
             </p>
           </section>
 
@@ -192,7 +197,7 @@ export default function TermsAndConditionsPage() {
               <li>aggirare controlli di sicurezza, limiti operativi o restrizioni di accesso;</li>
               <li>interferire con il funzionamento del servizio o tentare accessi non autorizzati;</li>
               <li>utilizzare credenziali o account di terzi senza autorizzazione;</li>
-              <li>copiarne o sfruttarne il software, i contenuti o i sistemi oltre quanto consentito dalla legge o dai presenti Termini.</li>
+              <li>copiarne o sfruttarne software, contenuti o sistemi oltre quanto consentito dalla legge o dai presenti Termini.</li>
             </ul>
           </section>
 
@@ -218,9 +223,9 @@ export default function TermsAndConditionsPage() {
               quelli mostrati all’utente prima della conferma dell’acquisto.
             </p>
             <p>
-              Gli importi visualizzati nel checkout prevalgono su eventuali informazioni commerciali precedenti in
-              caso di aggiornamento del catalogo. Eventuali imposte applicabili sono gestite secondo la normativa e
-              le informazioni rese disponibili nel processo di pagamento.
+              In caso di aggiornamento del catalogo, gli importi mostrati nel checkout sono quelli applicabili alla
+              sottoscrizione che l’utente sta per confermare. Eventuali imposte applicabili sono gestite secondo la
+              normativa e le informazioni rese disponibili nel processo di pagamento.
             </p>
           </section>
 
@@ -269,15 +274,32 @@ export default function TermsAndConditionsPage() {
             <p>
               Il diritto può cessare nei casi consentiti dalla legge quando il servizio sia stato completamente
               eseguito dopo previo consenso espresso del consumatore e sua espressa presa d’atto della perdita del
-              diritto. Qualsiasi richiesta di consenso o presa d’atto necessaria deve essere raccolta separatamente
-              nel processo di acquisto.
+              diritto. Qualsiasi consenso o presa d’atto necessario deve essere raccolto separatamente nel processo
+              di acquisto.
             </p>
             <p>
-              Il canale dedicato per l’esercizio del recesso è in corso di completamento e sarà pubblicato in questa
-              pagina e reso disponibile prima della messa in esercizio commerciale definitiva. Resta sempre
-              possibile utilizzare qualsiasi altro mezzo inequivoco ammesso dalla legge una volta pubblicati i dati
-              di contatto del Fornitore.
+              Il canale dedicato per l’esercizio del recesso è in corso di completamento e sarà pubblicato prima
+              della messa in esercizio commerciale definitiva. Una volta pubblicati i dati del Fornitore, resta
+              possibile utilizzare qualsiasi dichiarazione inequivoca ammessa dalla legge.
             </p>
+            <h3>Modulo tipo di recesso</h3>
+            <p>
+              Il consumatore può utilizzare il seguente modello per comunicare il recesso. Non è obbligatorio usare
+              esattamente questo modulo quando la dichiarazione trasmessa è comunque inequivoca.
+            </p>
+            <p><strong>Destinatario:</strong> Fornitore di TRAXION — dati identificativi, domicilio professionale e canale di contatto in corso di completamento.</p>
+            <p>
+              Con la presente comunico/comunichiamo il recesso dal mio/nostro contratto di prestazione del servizio
+              TRAXION concluso a distanza.
+            </p>
+            <ul>
+              <li>Data di conclusione del contratto: ____________________</li>
+              <li>Nome del/dei consumatore/i: ____________________</li>
+              <li>Indirizzo del/dei consumatore/i: ____________________</li>
+              <li>Wallet o identificativo account, se necessario per individuare il contratto: ____________________</li>
+              <li>Data della comunicazione: ____________________</li>
+              <li>Firma del/dei consumatore/i, solo se il modulo è presentato su carta: ____________________</li>
+            </ul>
           </section>
 
           <section className={styles.section}>
@@ -407,7 +429,8 @@ export default function TermsAndConditionsPage() {
             <p>
               A conclusione del procedimento deve essere fornita una conferma elettronica dell’acquisto o
               dell’attivazione. La lingua contrattuale è quella della versione dei Termini resa disponibile e
-              accettata nel relativo processo di acquisto.
+              accettata nel relativo processo di acquisto. La versione in castigliano resta disponibile per i
+              consumatori che contrattano in Spagna.
             </p>
           </section>
 
