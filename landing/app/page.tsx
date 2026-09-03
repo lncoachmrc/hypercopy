@@ -5,6 +5,7 @@ import {
   HYPERLIQUID_API_WALLET_URL,
   HYPERLIQUID_REFERRAL_URL,
   PRIVACY_POLICY_URL,
+  TERMS_URL,
   TRAXION_APP_URL,
   traxionAsset,
 } from "./config";
@@ -546,7 +547,7 @@ export default function Home() {
           </div>
           <div className="footer-pending" aria-label="Informazioni legali">
             <a href={PRIVACY_POLICY_URL}>Privacy Policy</a>
-            <span>Termini e condizioni — in preparazione</span>
+            <a href={TERMS_URL}>Termini e Condizioni</a>
             <span>Contatto privacy — in aggiornamento</span>
           </div>
         </div>
