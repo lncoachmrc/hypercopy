@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import select, text
 
+from app.core.config import settings
 from app.core.logging import configure_logging, get_logger
 from app.db.redis import redis_client
 from app.db.schema import assert_schema
@@ -15,6 +16,7 @@ from app.db.session import SessionLocal, engine
 from app.models.entities import MasterEvent
 from app.services.ai_intelligence import read_ai_intelligence, refresh_ai_intelligence
 
+settings.validate_for_service('ai-intelligence-worker')
 configure_logging(); log=get_logger(__name__)
 stop=asyncio.Event()
 
