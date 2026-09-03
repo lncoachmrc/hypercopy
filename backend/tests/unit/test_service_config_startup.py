@@ -50,8 +50,9 @@ def test_production_worker_startup_does_not_require_session_secret(module: str) 
     assert result.returncode == 0, result.stderr
 
 
-def test_production_api_startup_requires_strong_session_secret() -> None:
-    result = _import_module('app.main')
+@pytest.mark.parametrize('session_secret', [None, 'too-short'])
+def test_production_api_startup_requires_strong_session_secret(session_secret: str | None) -> None:
+    result = _import_module('app.main', session_secret=session_secret)
 
     assert result.returncode != 0
     assert 'SESSION_SECRET must be a strong production secret' in result.stderr
