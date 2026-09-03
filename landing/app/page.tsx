@@ -2,11 +2,9 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
-  CONTACT_EMAIL,
   HYPERLIQUID_API_WALLET_URL,
   HYPERLIQUID_REFERRAL_URL,
   PRIVACY_POLICY_URL,
-  TERMS_URL,
   TRAXION_APP_URL,
   traxionAsset,
 } from "./config";
