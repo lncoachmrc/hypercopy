@@ -1,0 +1,97 @@
+name: F06A Apply cookie hardening
+
+on:
+  push:
+    branches: [security/f06a-cookie-hardening]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: security/f06a-cookie-hardening
+      - name: Apply deterministic F-06A edits
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_exact(path: str, old: str, new: str, count: int | None = None) -> None:
+              p = Path(path)
+              text = p.read_text()
+              found = text.count(old)
+              expected = count if count is not None else 1
+              if found != expected:
+                  raise SystemExit(f'{path}: expected {expected} occurrence(s), found {found}: {old!r}')
+              p.write_text(text.replace(old, new, expected))
+
+          auth = 'backend/app/api/auth.py'
+          replace_exact(
+              auth,
+              'from app.core.config import settings\nfrom app.core.security import (',
+              "from app.core.config import settings\nfrom app.core.cookies import (\n    REFRESH_COOKIE_PATH,\n    cookie_secure,\n    csrf_cookie_name,\n    refresh_cookie_name,\n    session_cookie_name,\n)\nfrom app.core.security import (",
+          )
+          replace_exact(
+              auth,
+              "def _secure_cookie() -> bool:\n    return settings.APP_ENV != 'development'",
+              "def _secure_cookie() -> bool:\n    return cookie_secure()",
+          )
+          replace_exact(auth, '        settings.SESSION_COOKIE_NAME,\n        token,', '        session_cookie_name(secure=secure),\n        token,')
+          replace_exact(auth, '        settings.CSRF_COOKIE_NAME,\n        csrf,', '        csrf_cookie_name(secure=secure),\n        csrf,')
+          replace_exact(
+              auth,
+              "def _set_refresh_cookie(response: Response, token: str, max_age: int) -> None:\n    response.set_cookie(\n        settings.SESSION_REFRESH_COOKIE_NAME,\n        token,\n        max_age=max_age,\n        httponly=True,\n        secure=_secure_cookie(),\n        samesite='lax',\n        path='/',\n    )",
+              "def _set_refresh_cookie(response: Response, token: str, max_age: int) -> None:\n    secure = _secure_cookie()\n    response.set_cookie(\n        refresh_cookie_name(secure=secure),\n        token,\n        max_age=max_age,\n        httponly=True,\n        secure=secure,\n        samesite='lax',\n        path=REFRESH_COOKIE_PATH,\n    )",
+          )
+          replace_exact(
+              auth,
+              "def _clear_session_cookies(response: Response) -> None:\n    secure = _secure_cookie()\n    response.delete_cookie(settings.SESSION_COOKIE_NAME, path='/', secure=secure, httponly=True, samesite='lax')\n    response.delete_cookie(settings.CSRF_COOKIE_NAME, path='/', secure=secure, httponly=False, samesite='lax')\n    response.delete_cookie(settings.SESSION_REFRESH_COOKIE_NAME, path='/', secure=secure, httponly=True, samesite='lax')",
+              "def _clear_session_cookies(response: Response) -> None:\n    secure = _secure_cookie()\n    response.delete_cookie(session_cookie_name(secure=secure), path='/', secure=secure, httponly=True, samesite='lax')\n    response.delete_cookie(csrf_cookie_name(secure=secure), path='/', secure=secure, httponly=False, samesite='lax')\n    response.delete_cookie(\n        refresh_cookie_name(secure=secure),\n        path=REFRESH_COOKIE_PATH,\n        secure=secure,\n        httponly=True,\n        samesite='lax',\n    )",
+          )
+          replace_exact(
+              auth,
+              'request.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME)',
+              'request.cookies.get(refresh_cookie_name())',
+              count=2,
+          )
+
+          deps = 'backend/app/api/deps.py'
+          replace_exact(
+              deps,
+              'from app.core.config import settings\nfrom app.core.security import decode_session_token, normalize_address',
+              'from app.core.config import settings\nfrom app.core.cookies import csrf_cookie_name, session_cookie_name\nfrom app.core.security import decode_session_token, normalize_address',
+          )
+          replace_exact(deps, 'request.cookies.get(settings.SESSION_COOKIE_NAME)', 'request.cookies.get(session_cookie_name())', count=2)
+          replace_exact(deps, "request.cookies.get(settings.CSRF_COOKIE_NAME, '')", "request.cookies.get(csrf_cookie_name(), '')")
+
+          ws = 'backend/app/api/ws.py'
+          replace_exact(
+              ws,
+              'from app.core.config import settings\nfrom app.core.origins import is_allowed_browser_origin',
+              'from app.core.config import settings\nfrom app.core.cookies import session_cookie_name\nfrom app.core.origins import is_allowed_browser_origin',
+          )
+          replace_exact(ws, 'ws.cookies.get(settings.SESSION_COOKIE_NAME)', 'ws.cookies.get(session_cookie_name())')
+
+          integration = 'backend/tests/integration/test_auth_refresh.py'
+          replace_exact(
+              integration,
+              'from app.core.config import settings\nfrom app.core.security import hash_refresh_token',
+              'from app.core.config import settings\nfrom app.core.cookies import REFRESH_COOKIE_PATH\nfrom app.core.security import hash_refresh_token',
+          )
+          replace_exact(integration, "COOKIE_PATH = '/'", 'COOKIE_PATH = REFRESH_COOKIE_PATH')
+          PY
+      - name: Commit hardening edits
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/app/api/auth.py backend/app/api/deps.py backend/app/api/ws.py backend/tests/integration/test_auth_refresh.py
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "fix: harden auth cookie names and refresh scope"
+          git push origin HEAD:security/f06a-cookie-hardening
