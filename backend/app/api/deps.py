@@ -10,6 +10,7 @@ from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.cookies import csrf_cookie_name, session_cookie_name
 from app.core.security import decode_session_token, normalize_address
 from app.db.redis import redis_client
 from app.db.session import get_db
@@ -82,7 +83,7 @@ def normalize_request_client(request: Request) -> None:
 
 
 async def session_claims(request: Request) -> dict:
-    token = request.cookies.get(settings.SESSION_COOKIE_NAME)
+    token = request.cookies.get(session_cookie_name())
     if not token:
         raise HTTPException(401, 'Authentication required')
     try:
@@ -113,7 +114,7 @@ async def require_csrf(
 ) -> None:
     if request.method in {'GET', 'HEAD', 'OPTIONS'}:
         return
-    cookie = request.cookies.get(settings.CSRF_COOKIE_NAME, '')
+    cookie = request.cookies.get(csrf_cookie_name(), '')
     expected = str(claims.get('csrf', ''))
     if x_requested_with != 'HyperCopy' or not cookie or not x_csrf_token:
         raise HTTPException(403, 'CSRF protection failed')
@@ -173,7 +174,7 @@ async def _auth_wallet_rate_limit(request: Request) -> None:
 
 
 async def _session_rate_limit(request: Request, redis) -> None:
-    token = request.cookies.get(settings.SESSION_COOKIE_NAME)
+    token = request.cookies.get(session_cookie_name())
     if not token:
         return
     try:
