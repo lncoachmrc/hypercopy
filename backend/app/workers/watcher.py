@@ -25,6 +25,7 @@ from app.services.copy import persist_master_fill_and_jobs
 from app.services.master_leverage_cache import cache_master_configs, cached_master_config
 from app.services.queue import publish_job
 
+settings.validate_for_service('master-watcher')
 configure_logging(); log=get_logger(__name__)
 stop=asyncio.Event()
 
