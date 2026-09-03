@@ -23,6 +23,7 @@ from app.db.session import SessionLocal
 from app.services.master_leverage_cache import master_leverage_metric_snapshot
 from app.services.metrics import system_snapshot
 
+settings.validate_for_service('api')
 configure_logging()
 log=get_logger(__name__)
 app=FastAPI(
