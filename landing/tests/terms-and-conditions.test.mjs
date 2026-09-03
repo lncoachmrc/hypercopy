@@ -27,3 +27,40 @@ test("publishes terms at /terms/ and links them from the landing footer", async 
   assert.match(terms, /Dati identificativi completi del fornitore in corso di completamento/);
   assert.doesNotMatch(terms, /\[NOME|\[NIF|\[EMAIL|\[DA INSERIRE/);
 });
+
+test("publishes a Spanish consumer terms version and cross-links both languages", async () => {
+  const termsIt = await readSource("../app/terms/page.tsx");
+  const termsEs = await readSource("../app/terms/es/page.tsx");
+
+  assert.match(termsIt, /href=["']\/terms\/es\/["']/);
+  assert.match(termsIt, /Español/);
+  assert.match(termsEs, /Términos y Condiciones/);
+  assert.match(termsEs, /consumidor/i);
+  assert.match(termsEs, /14 días/);
+  assert.match(termsEs, /Hyperliquid/);
+  assert.match(termsEs, /Stripe/);
+  assert.match(termsEs, /href=["']\/terms\/["']/);
+  assert.match(termsEs, /Italiano/);
+  assert.match(termsEs, /Domicilio profesional/i);
+  assert.doesNotMatch(termsEs, /\[NOMBRE|\[NIF|\[EMAIL|\[POR INSERTAR/);
+});
+
+test("includes the model withdrawal notice and form in Italian and Spanish", async () => {
+  const termsIt = await readSource("../app/terms/page.tsx");
+  const termsEs = await readSource("../app/terms/es/page.tsx");
+
+  assert.match(termsIt, /Modulo tipo di recesso/);
+  assert.match(termsIt, /Con la presente comunico\/comunichiamo il recesso/);
+  assert.match(termsIt, /Nome del\/dei consumatore\/i/);
+  assert.match(termsEs, /Modelo de formulario de desistimiento/);
+  assert.match(termsEs, /Por la presente comunico\/comunicamos que desisto\/desistimos/);
+  assert.match(termsEs, /Nombre del\/de los consumidor\/es/);
+});
+
+test("does not shift authenticated-activity proof onto the consumer", async () => {
+  const termsIt = await readSource("../app/terms/page.tsx");
+  const termsEs = await readSource("../app/terms/es/page.tsx");
+
+  assert.doesNotMatch(termsIt, /salvo prova di compromissione o errore del servizio/i);
+  assert.doesNotMatch(termsEs, /salvo prueba de compromiso o error del servicio/i);
+});
