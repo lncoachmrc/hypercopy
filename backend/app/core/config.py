@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 from functools import lru_cache
 from typing import Literal
 
@@ -9,6 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Network = Literal['testnet', 'mainnet']
 ServiceRole = Literal['api', 'master-watcher', 'execution-worker', 'ai-intelligence-worker']
+DEVELOPMENT_AUDIT_IP_HASH_KEY_B64 = 'ZGV2ZWxvcG1lbnQtb25seS1hdWRpdC1pcC1rZXkhISE='
 
 
 class Settings(BaseSettings):
@@ -63,6 +66,10 @@ class Settings(BaseSettings):
     DEFAULT_SHADOW_MODE: bool = True
 
     SESSION_SECRET: str = 'development-only-change-me'
+    # Dedicated pseudonymization key for audit IPs. The checked-in value is
+    # development-only and production API startup rejects it. Runtime values
+    # must be independently generated and sealed; workers do not require it.
+    AUDIT_IP_HASH_KEY_B64: str = DEVELOPMENT_AUDIT_IP_HASH_KEY_B64
     # Short-lived access JWT. Browser renewal happens through the independent
     # rotating HttpOnly refresh credential below, so wallet signatures are not
     # requested every hour.
@@ -198,13 +205,24 @@ class Settings(BaseSettings):
             raise ValueError('STRATEGY_JOB_MAX_AGE_SECONDS must be positive')
         return self
 
+    def audit_ip_hash_key_bytes(self) -> bytes:
+        try:
+            key = base64.b64decode(self.AUDIT_IP_HASH_KEY_B64, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError('AUDIT_IP_HASH_KEY_B64 must decode to at least 32 bytes') from None
+        if len(key) < 32:
+            raise ValueError('AUDIT_IP_HASH_KEY_B64 must decode to at least 32 bytes')
+        return key
+
     def validate_for_service(self, service: ServiceRole) -> None:
         if self.APP_ENV != 'production':
             return
-        if service == 'api' and (
-            self.SESSION_SECRET == 'development-only-change-me' or len(self.SESSION_SECRET) < 32
-        ):
-            raise ValueError('SESSION_SECRET must be a strong production secret')
+        if service == 'api':
+            if self.SESSION_SECRET == 'development-only-change-me' or len(self.SESSION_SECRET) < 32:
+                raise ValueError('SESSION_SECRET must be a strong production secret')
+            if self.AUDIT_IP_HASH_KEY_B64 == DEVELOPMENT_AUDIT_IP_HASH_KEY_B64:
+                raise ValueError('AUDIT_IP_HASH_KEY_B64 must decode to at least 32 bytes')
+            self.audit_ip_hash_key_bytes()
 
     @property
     def admin_addresses(self) -> set[str]:
