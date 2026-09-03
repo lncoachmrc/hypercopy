@@ -231,7 +231,17 @@ class Settings(BaseSettings):
                 raise ValueError(
                     'AUDIT_IP_HASH_KEY_B64 must be an independent Base64 key decoding to at least 32 bytes'
                 )
-            self.audit_ip_hash_key_bytes()
+            audit_key = self.audit_ip_hash_key_bytes()
+            try:
+                session_secret_decoded = base64.b64decode(self.SESSION_SECRET, validate=True)
+            except (binascii.Error, ValueError):
+                session_secret_decoded = None
+            if (
+                self.AUDIT_IP_HASH_KEY_B64 == self.SESSION_SECRET
+                or audit_key == self.SESSION_SECRET.encode()
+                or session_secret_decoded == audit_key
+            ):
+                raise ValueError('AUDIT_IP_HASH_KEY_B64 must be independent from SESSION_SECRET')
 
     @property
     def admin_addresses(self) -> set[str]:
