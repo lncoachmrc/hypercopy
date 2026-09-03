@@ -1,0 +1,36 @@
+name: F04 Refresh frontend lockfile
+
+on:
+  push:
+    branches: [security/f04-react-router-upgrade]
+
+permissions:
+  contents: write
+
+jobs:
+  refresh-lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: security/f04-react-router-upgrade
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Refresh package-lock.json
+        run: |
+          cd frontend
+          npm install --package-lock-only --ignore-scripts
+      - name: Commit refreshed lockfile
+        run: |
+          if git diff --quiet -- frontend/package-lock.json; then
+            echo "package-lock.json already synchronized"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add frontend/package-lock.json
+          git commit -m "chore: refresh frontend lockfile for React Router 7.18.3"
+          git push origin HEAD:security/f04-react-router-upgrade
