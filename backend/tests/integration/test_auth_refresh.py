@@ -6,6 +6,7 @@ from eth_account import Account
 from eth_account.messages import encode_defunct
 
 from app.core.config import settings
+from app.core.cookies import REFRESH_COOKIE_PATH
 from app.core.security import hash_refresh_token
 from app.db.redis import redis_client
 from app.db.session import engine
@@ -15,7 +16,7 @@ from app.main import app
 pytestmark = pytest.mark.skipif(os.getenv('RUN_INTEGRATION') != '1', reason='integration tests disabled')
 AUTH = '/api/v1/auth'
 COOKIE_DOMAIN = 'traxion.test'
-COOKIE_PATH = '/'
+COOKIE_PATH = REFRESH_COOKIE_PATH
 
 
 def _set_refresh_cookie(client: httpx.AsyncClient, token: str) -> None:

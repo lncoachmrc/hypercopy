@@ -11,6 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import current_user, require_csrf, scoped_rate_limit, session_claims
 from app.core.config import settings
+from app.core.cookies import (
+    REFRESH_COOKIE_PATH,
+    cookie_secure,
+    csrf_cookie_name,
+    refresh_cookie_name,
+    session_cookie_name,
+)
 from app.core.security import (
     build_signin_message,
     create_refresh_token,
@@ -35,7 +42,7 @@ _REFRESH_DENY_PREFIX = 'session:refresh-deny:'
 
 
 def _secure_cookie() -> bool:
-    return settings.APP_ENV != 'development'
+    return cookie_secure()
 
 
 def _refresh_key(token: str) -> str:
@@ -72,7 +79,7 @@ def _session_out(user: User, entitlements: dict, csrf: str) -> SessionOut:
 def _set_access_cookies(response: Response, token: str, csrf: str) -> None:
     secure = _secure_cookie()
     response.set_cookie(
-        settings.SESSION_COOKIE_NAME,
+        session_cookie_name(secure=secure),
         token,
         max_age=settings.SESSION_TTL_SECONDS,
         httponly=True,
@@ -81,7 +88,7 @@ def _set_access_cookies(response: Response, token: str, csrf: str) -> None:
         path='/',
     )
     response.set_cookie(
-        settings.CSRF_COOKIE_NAME,
+        csrf_cookie_name(secure=secure),
         csrf,
         max_age=settings.SESSION_TTL_SECONDS,
         httponly=False,
@@ -92,22 +99,29 @@ def _set_access_cookies(response: Response, token: str, csrf: str) -> None:
 
 
 def _set_refresh_cookie(response: Response, token: str, max_age: int) -> None:
+    secure = _secure_cookie()
     response.set_cookie(
-        settings.SESSION_REFRESH_COOKIE_NAME,
+        refresh_cookie_name(secure=secure),
         token,
         max_age=max_age,
         httponly=True,
-        secure=_secure_cookie(),
+        secure=secure,
         samesite='lax',
-        path='/',
+        path=REFRESH_COOKIE_PATH,
     )
 
 
 def _clear_session_cookies(response: Response) -> None:
     secure = _secure_cookie()
-    response.delete_cookie(settings.SESSION_COOKIE_NAME, path='/', secure=secure, httponly=True, samesite='lax')
-    response.delete_cookie(settings.CSRF_COOKIE_NAME, path='/', secure=secure, httponly=False, samesite='lax')
-    response.delete_cookie(settings.SESSION_REFRESH_COOKIE_NAME, path='/', secure=secure, httponly=True, samesite='lax')
+    response.delete_cookie(session_cookie_name(secure=secure), path='/', secure=secure, httponly=True, samesite='lax')
+    response.delete_cookie(csrf_cookie_name(secure=secure), path='/', secure=secure, httponly=False, samesite='lax')
+    response.delete_cookie(
+        refresh_cookie_name(secure=secure),
+        path=REFRESH_COOKIE_PATH,
+        secure=secure,
+        httponly=True,
+        samesite='lax',
+    )
 
 
 async def _store_refresh_token(token: str, user: User, *, absolute_exp: int, session_id: str) -> int:
@@ -269,7 +283,7 @@ async def refresh(request: Request, response: Response, db: AsyncSession = Depen
     if request.headers.get('x-requested-with') != 'HyperCopy':
         raise HTTPException(403, 'Refresh protection failed')
 
-    refresh_token = request.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME)
+    refresh_token = request.cookies.get(refresh_cookie_name())
     if not refresh_token:
         raise HTTPException(401, 'Refresh session required')
 
@@ -335,7 +349,7 @@ async def logout(request: Request, response: Response, claims: dict = Depends(se
         family_ttl = max(session_exp - now_ts, 1) if session_exp else settings.SESSION_REFRESH_TTL_SECONDS
         await redis.setex(_refresh_deny_key(session_id), family_ttl, '1')
 
-    refresh_token = request.cookies.get(settings.SESSION_REFRESH_COOKIE_NAME)
+    refresh_token = request.cookies.get(refresh_cookie_name())
     if refresh_token:
         await redis.delete(_refresh_key(refresh_token))
     _clear_session_cookies(response)
