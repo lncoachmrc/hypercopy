@@ -4,7 +4,7 @@ import {useEffect,useRef,useState} from "react";
 import {createPortal} from "react-dom";
 import {initAutoTranslate} from "./autoTranslate";
 import {TRAXION_APP_URL} from "./config";
-import {changeLanguage,detectLanguage,initLanguage,languageLabels,SUPPORTED_LANGUAGES,tr,withLanguageQuery,type Language} from "./i18n";
+import {changeLanguage,detectLanguage,htmlLocaleByLanguage,initLanguage,languageLabels,persistLanguageSelection,SUPPORTED_LANGUAGES,tr,withLanguageQuery,type Language} from "./i18n";
 import {restoreLanguageViewport} from "./language-scroll";
 
 function GlobeIcon(){return <svg aria-hidden="true" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.4 2.5 3.6 5.5 3.6 9S14.4 18.5 12 21c-2.4-2.5-3.6-5.5-3.6-9S9.6 5.5 12 3Z"/></svg>}
@@ -20,18 +20,39 @@ function localizeAppLinks(){
   });
 }
 
+function termsRouteLanguage(pathname:string):Language|null{
+  const normalized=pathname.replace(/\/+$/g,"")||"/";
+  if(normalized==="/terms/es")return "es";
+  if(normalized==="/terms")return "it";
+  return null;
+}
+
+function clearLanguageQuery(){
+  if(typeof window==="undefined")return;
+  const url=new URL(window.location.href);
+  if(!url.searchParams.has("lang"))return;
+  url.searchParams.delete("lang");
+  window.history.replaceState(window.history.state,"",`${url.pathname}${url.search}${url.hash}`);
+}
+
 export function LanguageController(){
   useEffect(()=>{
-    const language=initLanguage();
-    if(language==="en"){
+    const routeLanguage=termsRouteLanguage(window.location.pathname);
+    const language=routeLanguage??initLanguage();
+    if(routeLanguage){
+      persistLanguageSelection(routeLanguage);
+      document.documentElement.lang=htmlLocaleByLanguage[routeLanguage];
+      clearLanguageQuery();
+    }
+    if(!routeLanguage&&language==="en"){
       document.title="TRAXION | Hybrid intelligence. Deterministic execution.";
       document.querySelector('meta[name="description"]')?.setAttribute("content","TRAXION connects human analysis, Capital Intelligence AI, Risk Engine and disciplined execution on Hyperliquid.");
-    }else if(language==="es"){
+    }else if(!routeLanguage&&language==="es"){
       document.title="TRAXION | Inteligencia híbrida. Ejecución determinista.";
       document.querySelector('meta[name="description"]')?.setAttribute("content","TRAXION conecta análisis humano, Capital Intelligence AI, Risk Engine y ejecución disciplinada en Hyperliquid.");
     }
     localizeAppLinks();
-    const translateCleanup=initAutoTranslate();
+    const translateCleanup=routeLanguage?()=>{}:initAutoTranslate();
     // Restore after translation has been scheduled. The restore helper retries while
     // dynamic portals (performance chart, whitepaper assets) settle their layout.
     const scrollCleanup=restoreLanguageViewport();
