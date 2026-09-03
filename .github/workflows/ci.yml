@@ -114,7 +114,7 @@ jobs:
       - run: npm run test:wallet-login
       - run: npm run typecheck
       - run: npm run build
-      - run: npm audit --audit-level=high
+      - run: npm audit --audit-level=moderate
 
   landing:
     runs-on: ubuntu-latest
