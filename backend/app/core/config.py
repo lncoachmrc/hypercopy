@@ -8,6 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 Network = Literal['testnet', 'mainnet']
+ServiceRole = Literal['api', 'master-watcher', 'execution-worker', 'ai-intelligence-worker']
 
 
 class Settings(BaseSettings):
@@ -161,8 +162,6 @@ class Settings(BaseSettings):
     @model_validator(mode='after')
     def production_safety(self) -> 'Settings':
         if self.APP_ENV == 'production':
-            if self.SESSION_SECRET == 'development-only-change-me' or len(self.SESSION_SECRET) < 32:
-                raise ValueError('SESSION_SECRET must be a strong production secret')
             if self.ENABLE_LIVE_TRADING and self.KEK_PROVIDER == 'env':
                 raise ValueError('Mainnet live execution requires aws_kms or local_rsa credential wrapping')
             if self.ENABLE_LIVE_TRADING and (
@@ -198,6 +197,14 @@ class Settings(BaseSettings):
         if self.STRATEGY_JOB_MAX_AGE_SECONDS <= 0:
             raise ValueError('STRATEGY_JOB_MAX_AGE_SECONDS must be positive')
         return self
+
+    def validate_for_service(self, service: ServiceRole) -> None:
+        if self.APP_ENV != 'production':
+            return
+        if service == 'api' and (
+            self.SESSION_SECRET == 'development-only-change-me' or len(self.SESSION_SECRET) < 32
+        ):
+            raise ValueError('SESSION_SECRET must be a strong production secret')
 
     @property
     def admin_addresses(self) -> set[str]:
