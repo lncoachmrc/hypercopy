@@ -546,7 +546,11 @@ export default function Home() {
             <a href={HYPERLIQUID_REFERRAL_URL} target="_blank" rel="sponsored noopener noreferrer">Hyperliquid — referral DIGITALEMPOWER</a>
             <a href={HYPERLIQUID_API_WALLET_URL} target="_blank" rel="noopener noreferrer">Gestisci API Wallet</a>
           </div>
-          <div className="footer-pending" aria-label="Informazioni legali da configurare"><span>{PRIVACY_POLICY_URL}</span><span>{TERMS_URL}</span><span>{CONTACT_EMAIL}</span></div>
+          <div className="footer-pending" aria-label="Informazioni legali">
+            <a href={PRIVACY_POLICY_URL}>Privacy Policy</a>
+            <span>Termini e condizioni — in preparazione</span>
+            <span>Contatto privacy — in aggiornamento</span>
+          </div>
         </div>
         <div className="shell footer-disclaimer">
           <p>TRAXION è uno strumento tecnologico e non fornisce consulenza finanziaria, raccomandazioni personalizzate, sollecitazioni all’investimento o promesse di rendimento. Il trading di asset digitali e perpetual comporta un rischio elevato e può determinare la perdita parziale o totale del capitale. TRAXION è un progetto indipendente e non è affiliato, approvato o sponsorizzato da Hyperliquid.</p>
