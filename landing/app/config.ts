@@ -16,5 +16,5 @@ export const traxionAsset = (path: string) =>
 export const TRAXION_CANONICAL_URL =
   process.env.NEXT_PUBLIC_TRAXION_CANONICAL_URL ?? "[DOMINIO DEFINITIVO]";
 export const PRIVACY_POLICY_URL = "/privacy/";
-export const TERMS_URL = "[URL TERMINI E CONDIZIONI]";
+export const TERMS_URL = "/terms/";
 export const CONTACT_EMAIL = "[EMAIL CONTATTO]";
