@@ -1,0 +1,37 @@
+name: Refresh fast-uri lockfile
+
+on:
+  push:
+    branches:
+      - security/fast-uri-3.1.6
+
+permissions:
+  contents: write
+
+jobs:
+  refresh-lock:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: landing/package-lock.json
+      - name: Refresh package lock only
+        working-directory: landing
+        run: npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+      - name: Verify patched fast-uri is locked
+        run: node -e "const p=require('./landing/package-lock.json'); if(p.packages?.['node_modules/fast-uri']?.version!=='3.1.6') process.exit(1)"
+      - name: Commit lockfile refresh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add landing/package-lock.json
+          if git diff --cached --quiet; then
+            echo 'Lockfile already synchronized.'
+          else
+            git commit -m 'security: refresh lockfile for fast-uri 3.1.6'
+            git push origin HEAD:security/fast-uri-3.1.6
+          fi
