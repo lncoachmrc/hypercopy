@@ -95,6 +95,27 @@ def test_production_api_startup_requires_strong_audit_ip_hash_key(audit_ip_hash_
     assert 'AUDIT_IP_HASH_KEY_B64 must be an independent Base64 key decoding to at least 32 bytes' in result.stderr
 
 
+@pytest.mark.parametrize(
+    ('session_secret', 'audit_ip_hash_key_b64'),
+    [
+        (_VALID_AUDIT_IP_HASH_KEY_B64, _VALID_AUDIT_IP_HASH_KEY_B64),
+        ('a' * 32, _VALID_AUDIT_IP_HASH_KEY_B64),
+    ],
+)
+def test_production_api_rejects_reused_session_and_audit_key_material(
+    session_secret: str,
+    audit_ip_hash_key_b64: str,
+) -> None:
+    result = _import_module(
+        'app.main',
+        session_secret=session_secret,
+        audit_ip_hash_key_b64=audit_ip_hash_key_b64,
+    )
+
+    assert result.returncode != 0
+    assert 'AUDIT_IP_HASH_KEY_B64 must be independent from SESSION_SECRET' in result.stderr
+
+
 def test_production_api_startup_accepts_strong_api_secrets() -> None:
     result = _import_module('app.main', session_secret='s' * 48)
 
