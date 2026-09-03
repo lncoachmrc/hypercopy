@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # Deployment trigger: reload shared P0 latest-intent safety modules in Railway staging.
 
+import hmac
 import uuid
 
 from fastapi import FastAPI, Request
@@ -24,7 +25,13 @@ from app.services.metrics import system_snapshot
 
 configure_logging()
 log=get_logger(__name__)
-app=FastAPI(title='HyperCopy API',version=settings.APP_VERSION,docs_url='/docs' if settings.APP_ENV!='production' else None,redoc_url=None)
+app=FastAPI(
+    title='HyperCopy API',
+    version=settings.APP_VERSION,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(browser_origins(settings.PUBLIC_APP_URL)),
@@ -69,7 +76,9 @@ async def unhandled(request:Request,exc:Exception):
 
 @app.get('/metrics',include_in_schema=False)
 async def metrics(request:Request):
-    if settings.APP_ENV=='production' and (not settings.METRICS_TOKEN or request.headers.get('X-Metrics-Token')!=settings.METRICS_TOKEN):
+    expected_token=settings.METRICS_TOKEN
+    supplied_token=request.headers.get('X-Metrics-Token','')
+    if not expected_token or not hmac.compare_digest(supplied_token,expected_token):
         return PlainTextResponse('not found',status_code=404)
     rate = {}
     try:
