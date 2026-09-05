@@ -190,10 +190,16 @@ class HyperliquidAdapter:
             skip_ws=True,
             meta={'universe': []},
             spot_meta={'universe': [], 'tokens': []},
+            timeout=10.0,
         )
         self._specs: dict[str, tuple[float, AssetSpec]] = {}
         self._perp_meta: Meta | None = None
         self._abstraction_cache: dict[str, tuple[float, str]] = {}
+        # Reconciliation/diagnostic reads may be deferred briefly after an
+        # exchange-level 429. ORDER, MASTER_STATE and METADATA remain available
+        # so the circuit breaker cannot starve the execution hot path.
+        self._read_cooldown_seconds = 30.0
+        self._read_cooldown_until = 0.0
         self.address_limits = (
             AddressActionTracker(limiter._redis, self.network)
             if limiter is not None
@@ -355,24 +361,61 @@ class HyperliquidAdapter:
         await self.limiter.acquire(weight, priority, timeout=timeout)
 
     async def _read(self, func, *args, weight: int, priority: Priority, timeout: int | float):
-        """Retry only idempotent Hyperliquid reads, accounting for every try.
+        """Retry only bounded, idempotent Hyperliquid reads.
 
-        Exchange actions never pass through this helper. Each retry acquires its
-        own weighted budget before issuing another HTTP request, so resilience
-        cannot silently exceed the shared IP quota.
+        The rate-limiter wait and the synchronous SDK call have independent
+        deadlines. Exchange actions never pass through this helper. A 429 on
+        reconciliation/diagnostic traffic opens a short local circuit breaker;
+        order-critical lanes stay available.
         """
-        attempts = settings.HL_SAFE_READ_RETRIES
+        attempts = max(int(settings.HL_SAFE_READ_RETRIES), 1)
+        cooldown_priorities = {Priority.RECONCILE, Priority.DIAGNOSTIC}
         for attempt in range(attempts):
+            if priority in cooldown_priorities:
+                remaining = self._read_cooldown_until - time.monotonic()
+                if remaining > 0:
+                    await self._metric_incr('hl_read_cooldown_skip_count')
+                    raise RuntimeError(
+                        f'Hyperliquid read cooldown active for {remaining:.1f}s after rate limit'
+                    )
+
             await self._acquire(weight, priority, timeout=timeout)
             try:
-                return await self._call(func, *args)
+                return await asyncio.wait_for(
+                    self._call(func, *args),
+                    timeout=float(timeout),
+                )
+            except TimeoutError as exc:
+                await self._metric_incr('hl_read_timeout_count')
+                log.warning(
+                    'Hyperliquid read timed out',
+                    extra={'event_code': 'HL_READ_TIMEOUT', 'network': self.network},
+                )
+                if attempt + 1 >= attempts:
+                    raise TimeoutError(
+                        f'Hyperliquid read timed out after {float(timeout):g}s'
+                    ) from exc
             except Exception as exc:
+                if is_exchange_rate_limit_error(exc) and priority in cooldown_priorities:
+                    self._read_cooldown_until = max(
+                        self._read_cooldown_until,
+                        time.monotonic() + self._read_cooldown_seconds,
+                    )
+                    await self._metric_incr('hl_read_cooldown_activated_count')
+                    log.warning(
+                        'Hyperliquid low-priority read cooldown activated',
+                        extra={
+                            'event_code': 'HL_READ_RATE_LIMIT_COOLDOWN',
+                            'network': self.network,
+                        },
+                    )
                 if attempt + 1 >= attempts or not _transient_read_error(exc):
                     raise
-                await self._metric_incr('hl_safe_read_retry_count')
-                delay = settings.HL_SAFE_READ_BACKOFF_SECONDS * (2 ** attempt)
-                if delay > 0:
-                    await asyncio.sleep(delay)
+
+            await self._metric_incr('hl_safe_read_retry_count')
+            delay = settings.HL_SAFE_READ_BACKOFF_SECONDS * (2 ** attempt)
+            if delay > 0:
+                await asyncio.sleep(delay)
         raise RuntimeError('unreachable Hyperliquid read retry state')
 
     async def user_state(self, address: str, *, priority: Priority = Priority.RECONCILE) -> dict:
@@ -450,15 +493,13 @@ class HyperliquidAdapter:
             unrealized_pnl=unrealized_pnl,
         )
 
-    async def mids(self) -> dict[str, str]:
+    async def mids(self, *, priority: Priority = Priority.ORDER) -> dict[str, str]:
         # allMids is shared market data used directly on the follower order hot
-        # path. It is not master account state. Charging it to MASTER_STATE let
-        # normal follower sizing consume the capacity reserved for verified
-        # master equity/positions/leverage. Keep it in the ORDER lane instead;
-        # reconciliation only calls it a handful of times per cycle.
+        # path, where ORDER remains the default. Reconciliation passes its own
+        # lane explicitly so maintenance cannot consume order-path capacity.
         return await self._read(
             self.info.all_mids,
-            weight=WEIGHT_CHEAP_INFO, priority=Priority.ORDER, timeout=10,
+            weight=WEIGHT_CHEAP_INFO, priority=priority, timeout=10,
         )
 
     async def extra_agents(self, account: str) -> list[dict]:

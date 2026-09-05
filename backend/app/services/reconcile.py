@@ -802,9 +802,16 @@ async def reconcile_active_users(
     source_snapshot = await source_hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS, priority=Priority.MASTER_STATE)
     mp = _positions(source_snapshot.perp_state)
     me = source_snapshot.account_value
-    source_mids = observed_master_mids(await source_hl.mids(), source_snapshot_started_order)
+    source_mids = observed_master_mids(
+        await source_hl.mids(priority=Priority.RECONCILE),
+        source_snapshot_started_order,
+    )
     source_configs = position_configs(source_snapshot.perp_state)
-    follower_mids = source_mids if source_hl.network == hl.network else await hl.mids()
+    follower_mids = (
+        source_mids
+        if source_hl.network == hl.network
+        else await hl.mids(priority=Priority.RECONCILE)
+    )
     query = select(User).join(TradingAccount, TradingAccount.user_id == User.id).where(
         User.state == UserState.ACTIVE,
         User.copy_state.in_([CopyState.ACTIVE, CopyState.SHADOW, CopyState.PAUSED]),
