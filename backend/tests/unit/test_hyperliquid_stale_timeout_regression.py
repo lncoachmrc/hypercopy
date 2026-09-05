@@ -31,7 +31,7 @@ async def test_safe_read_timeout_covers_hung_sdk_call(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_non_order_reads_enter_local_cooldown_after_429(monkeypatch):
+async def test_reconcile_reads_enter_local_cooldown_after_429(monkeypatch):
     monkeypatch.setattr('app.adapters.hyperliquid.Info', MagicMock())
     monkeypatch.setattr('app.adapters.hyperliquid.settings.HL_SAFE_READ_RETRIES', 1)
     adapter = HyperliquidAdapter(None, network='testnet')
@@ -105,21 +105,39 @@ async def test_mids_can_use_reconcile_lane(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reconcile_deadline_returns_control_when_cycle_hangs():
+async def test_rate_limited_reconcile_failure_skips_observability_fallback():
+    worker = object.__new__(Worker)
+    worker._refresh_follower_observability = AsyncMock(return_value=1)
+
+    refreshed = await worker._fallback_observability_after_reconcile_failure(
+        object(),
+        'mainnet',
+        RuntimeError('429 Too Many Requests'),
+    )
+
+    assert refreshed == 0
+    worker._refresh_follower_observability.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_deadline_returns_control_and_allows_next_cycle():
     worker = object.__new__(Worker)
     blocker = asyncio.Event()
     calls = 0
 
-    async def hung_reconcile():
+    async def reconcile():
         nonlocal calls
         calls += 1
-        await blocker.wait()
+        if calls == 1:
+            await blocker.wait()
 
-    worker.run_reconcile_if_leader = hung_reconcile
+    worker.run_reconcile_if_leader = reconcile
 
     started = time.monotonic()
-    completed = await worker._run_reconcile_with_deadline(timeout=0.02)
+    first_completed = await worker._run_reconcile_with_deadline(timeout=0.02)
+    second_completed = await worker._run_reconcile_with_deadline(timeout=0.02)
 
-    assert completed is False
-    assert calls == 1
+    assert first_completed is False
+    assert second_completed is True
+    assert calls == 2
     assert time.monotonic() - started < 0.15
