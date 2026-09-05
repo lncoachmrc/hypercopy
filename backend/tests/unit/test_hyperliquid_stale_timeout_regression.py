@@ -9,6 +9,15 @@ from app.adapters.ratelimit import Priority
 from app.workers.execution_worker import Worker
 
 
+def test_info_client_has_real_http_timeout(monkeypatch):
+    constructor = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr('app.adapters.hyperliquid.Info', constructor)
+
+    HyperliquidAdapter(None, network='testnet')
+
+    assert constructor.call_args.kwargs['timeout'] == 10.0
+
+
 @pytest.mark.asyncio
 async def test_safe_read_timeout_covers_hung_sdk_call(monkeypatch):
     monkeypatch.setattr('app.adapters.hyperliquid.Info', MagicMock())
