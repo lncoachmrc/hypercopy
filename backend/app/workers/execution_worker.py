@@ -8,6 +8,7 @@ from decimal import Decimal
 
 from sqlalchemy import select, text
 
+from app.adapters.address_ratelimit import is_exchange_rate_limit_error
 from app.adapters.hyperliquid import HyperliquidAdapter, position_configs
 from app.adapters.ratelimit import Budget, Priority, WeightedRateLimiter
 from app.core.config import Network, settings
@@ -573,6 +574,20 @@ class Worker:
                         if ack: await self.redis.xack(settings.STREAM_NAME,settings.STREAM_GROUP,message_id)
             except Exception: log.exception('Worker consume loop failed'); await asyncio.sleep(2)
 
+    async def _run_reconcile_with_deadline(self, timeout: float | None = None) -> bool:
+        if timeout is None:
+            interval = float(settings.RECONCILE_INTERVAL_SECONDS)
+            timeout = max(5.0, min(45.0, interval * 0.75))
+        try:
+            await asyncio.wait_for(self.run_reconcile_if_leader(), timeout=float(timeout))
+            return True
+        except TimeoutError:
+            log.error(
+                f'Reconciliation cycle timed out after {float(timeout):g}s',
+                extra={'event_code': 'RECONCILIATION_TIMEOUT'},
+            )
+            return False
+
     async def maintenance(self):
         while not stop.is_set():
             try:
@@ -582,7 +597,7 @@ class Worker:
                     await repair_stream(self.redis,db)
                     await monitor_credential_expiry(db, self.redis)
 
-                await self.run_reconcile_if_leader()
+                await self._run_reconcile_with_deadline()
 
                 async with SessionLocal() as db:
                     await repair_stream(self.redis,db)
@@ -600,7 +615,7 @@ class Worker:
         """
         follower_hl=self.follower_hl(network)
         try:
-            mids=await follower_hl.mids()
+            mids=await follower_hl.mids(priority=Priority.RECONCILE)
         except Exception:
             mids={}
             log.warning('Follower mids unavailable during observability refresh', extra={'network': network}, exc_info=True)
@@ -683,6 +698,40 @@ class Worker:
                 )
         return refreshed
 
+    async def _fallback_observability_after_reconcile_failure(
+        self,
+        db,
+        network: Network,
+        exc: Exception,
+    ) -> int:
+        error_info = (type(exc), exc, exc.__traceback__)
+        if is_exchange_rate_limit_error(exc):
+            log.warning(
+                'Follower observability refresh deferred after Hyperliquid rate limit',
+                extra={
+                    'event_code': 'FOLLOWER_OBSERVABILITY_RATE_LIMIT_DEFERRED',
+                    'master_network': settings.master_network,
+                    'follower_network': network,
+                },
+                exc_info=error_info,
+            )
+            return 0
+
+        log.warning(
+            'Full reconciliation failed; refreshing follower observability only',
+            extra={
+                'master_network': settings.master_network,
+                'follower_network': network,
+            },
+            exc_info=error_info,
+        )
+        refreshed = await self._refresh_follower_observability(db, network)
+        log.info(
+            'Follower observability refresh completed',
+            extra={'follower_network': network, 'users_refreshed': refreshed},
+        )
+        return refreshed
+
     async def run_reconcile_if_leader(self):
         async with engine.connect() as conn:
             acquired=bool((await conn.execute(text("SELECT pg_try_advisory_lock(hashtext('hypercopy:reconciler'))"))).scalar_one())
@@ -718,17 +767,10 @@ class Worker:
                             await reconcile_active_users(
                                 db,follower_hl,master_hl=self.master_hl,
                             )
-                        except Exception:
+                        except Exception as exc:
                             await db.rollback()
-                            log.warning(
-                                'Full reconciliation failed; refreshing follower observability only',
-                                extra={'master_network':settings.master_network,'follower_network':network},
-                                exc_info=True,
-                            )
-                            refreshed=await self._refresh_follower_observability(db,network)
-                            log.info(
-                                'Follower observability refresh completed',
-                                extra={'follower_network':network,'users_refreshed':refreshed},
+                            await self._fallback_observability_after_reconcile_failure(
+                                db, network, exc
                             )
             finally:
                 await conn.execute(text("SELECT pg_advisory_unlock(hashtext('hypercopy:reconciler'))")); await conn.commit()
