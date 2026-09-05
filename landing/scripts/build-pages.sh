@@ -14,6 +14,7 @@ rm -rf "${output_dir}"
 cd "${project_root}"
 GITHUB_PAGES=true \
 NEXT_PUBLIC_TRAXION_CANONICAL_URL=https://traxion.lucianonovello.com/ \
+NEXT_PUBLIC_TRAXION_API_URL=https://api.traxion.lucianonovello.com \
   ./node_modules/.bin/next build
 
 test -f "${output_dir}/index.html"
