@@ -1,0 +1,50 @@
+name: Apply Hyperliquid stale-data fix
+
+on:
+  push:
+    branches: [fix/hyperliquid-stale-timeouts]
+    paths:
+      - scripts/apply_hl_stale_fix.py
+      - .github/workflows/apply-hl-stale-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/hyperliquid-stale-timeouts
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply exact guarded replacements
+        run: python scripts/apply_hl_stale_fix.py
+      - name: Verify patch shape
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          changed="$(git diff --name-only | sort)"
+          expected="$(printf '%s\n' \
+            backend/app/adapters/hyperliquid.py \
+            backend/app/services/reconcile.py \
+            backend/app/workers/execution_worker.py | sort)"
+          test "$changed" = "$expected"
+          python -m compileall -q backend/app
+      - name: Commit remediation to isolated branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            backend/app/adapters/hyperliquid.py \
+            backend/app/services/reconcile.py \
+            backend/app/workers/execution_worker.py
+          git commit -m 'fix: bound Hyperliquid reads and reconciliation cycles'
+          git push origin HEAD:fix/hyperliquid-stale-timeouts
