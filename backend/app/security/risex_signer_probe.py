@@ -8,7 +8,6 @@ from app.core.config import Network
 
 
 ProbeVerdict = Literal['PASS', 'FAIL', 'UNKNOWN']
-PermissionEvidenceSource = Literal['onchain', 'api', 'none']
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,7 +19,14 @@ class CapabilityCheck:
 
 @dataclass(frozen=True, slots=True)
 class RISExSignerCapabilityEvidence:
-    """Public security evidence only; never contains a private key or signature."""
+    """Public security evidence only; never contains a private key or signature.
+
+    ``onchain_perps_only_scope`` is deliberately semantic rather than a provider
+    permission label. ``True`` means independent inspection of the exact deployed
+    authorization path proves this registered signer can authorize only perpetual
+    execution actions. ``False`` means the signer can authorize a broader class of
+    actions. ``None`` means that proof has not been established.
+    """
 
     network: Network
     account: str
@@ -31,8 +37,7 @@ class RISExSignerCapabilityEvidence:
     session_active: bool | None
     session_account: str | None
     session_expiration: int | None
-    permission_evidence_source: PermissionEvidenceSource
-    permissions: frozenset[str] | None
+    onchain_perps_only_scope: bool | None
     perps_order_succeeded: bool | None
     fund_movement_rejected: bool | None
     withdrawal_rejected: bool | None
@@ -92,21 +97,6 @@ def _optional_str(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _permissions_from_row(row: dict[str, Any]) -> tuple[PermissionEvidenceSource, frozenset[str] | None]:
-    raw = row.get('permissions')
-    if isinstance(raw, str) and raw.strip():
-        return 'api', frozenset({raw.strip()})
-    if isinstance(raw, (list, tuple, set, frozenset)):
-        values = frozenset(value.strip() for value in raw if isinstance(value, str) and value.strip())
-        if values:
-            return 'api', values
-
-    raw_single = row.get('permission')
-    if isinstance(raw_single, str) and raw_single.strip():
-        return 'api', frozenset({raw_single.strip()})
-    return 'none', None
-
-
 async def collect_public_signer_evidence(
     transport: RISExTransport,
     *,
@@ -114,7 +104,13 @@ async def collect_public_signer_evidence(
     account: str,
     signer: str,
 ) -> RISExSignerCapabilityEvidence:
-    """Collect public/read-only RISEx evidence without signing or mutating anything."""
+    """Collect public/read-only RISEx evidence without signing or mutating anything.
+
+    Provider-supplied ``permission``/``permissions`` labels are intentionally not
+    consumed. The current official registration contract described by RISEx does
+    not expose a granular permission field, so least-privilege scope must be
+    established independently from the deployed authorization path.
+    """
 
     domain = await _read_json(transport, '/v1/auth/eip712-domain')
     system = await _read_json(transport, '/v1/system/config')
@@ -156,12 +152,9 @@ async def collect_public_signer_evidence(
     if matching_signer is None:
         session_account = None
         session_expiration = None
-        permission_source: PermissionEvidenceSource = 'none'
-        permissions = None
     else:
         session_account = _optional_str(matching_signer.get('account'))
         session_expiration = _optional_int(matching_signer.get('expiration'))
-        permission_source, permissions = _permissions_from_row(matching_signer)
 
     return RISExSignerCapabilityEvidence(
         network=network,
@@ -173,8 +166,7 @@ async def collect_public_signer_evidence(
         session_active=session_active,
         session_account=session_account,
         session_expiration=session_expiration,
-        permission_evidence_source=permission_source,
-        permissions=permissions,
+        onchain_perps_only_scope=None,
         perps_order_succeeded=None,
         fund_movement_rejected=None,
         withdrawal_rejected=None,
@@ -223,61 +215,23 @@ def _expiration_check(evidence: RISExSignerCapabilityEvidence, *, now: int) -> C
     return CapabilityCheck('session_expiration', 'PASS', 'Session signer is not expired')
 
 
-def _permission_check(evidence: RISExSignerCapabilityEvidence) -> CapabilityCheck:
-    if evidence.permissions is None:
+def _authorization_scope_check(evidence: RISExSignerCapabilityEvidence) -> CapabilityCheck:
+    if evidence.onchain_perps_only_scope is None:
         return CapabilityCheck(
-            'least_privilege_permissions',
+            'onchain_authorization_scope',
             'UNKNOWN',
-            'No explicit signer permission set is available',
+            'Exact deployed authorization path has not been proven perps-only on-chain',
         )
-
-    permissions = {value.strip().upper().replace('-', '_').replace(' ', '_') for value in evidence.permissions}
-    dangerous = {
-        'ALL',
-        'MOVE_FUNDS',
-        'MOVE_FUND',
-        'MOVEFUND',
-        'TRANSFER',
-        'TRANSFERS',
-        'WITHDRAW',
-        'WITHDRAWAL',
-        'WITHDRAWALS',
-        'SPOT',
-    }
-    present_dangerous = sorted(permissions & dangerous)
-    if present_dangerous:
+    if evidence.onchain_perps_only_scope is False:
         return CapabilityCheck(
-            'least_privilege_permissions',
+            'onchain_authorization_scope',
             'FAIL',
-            f"Signer exposes forbidden permissions: {', '.join(present_dangerous)}",
+            'Registered signer authorization scope is broader than perpetual execution',
         )
-
-    if evidence.permission_evidence_source != 'onchain':
-        return CapabilityCheck(
-            'least_privilege_permissions',
-            'UNKNOWN',
-            'Permission evidence is not independently verified on-chain',
-        )
-
-    if 'PERPS' not in permissions:
-        return CapabilityCheck(
-            'least_privilege_permissions',
-            'FAIL',
-            'On-chain permission evidence does not include PERPS',
-        )
-
-    unknown = sorted(permissions - {'PERPS'})
-    if unknown:
-        return CapabilityCheck(
-            'least_privilege_permissions',
-            'UNKNOWN',
-            f"Unclassified on-chain permissions require review: {', '.join(unknown)}",
-        )
-
     return CapabilityCheck(
-        'least_privilege_permissions',
+        'onchain_authorization_scope',
         'PASS',
-        'On-chain permission evidence is restricted to PERPS',
+        'Exact deployed authorization path proves the registered signer is perps-only',
     )
 
 
@@ -298,7 +252,7 @@ def evaluate_signer_capabilities(
         ),
         _account_binding_check(evidence),
         _expiration_check(evidence, now=now),
-        _permission_check(evidence),
+        _authorization_scope_check(evidence),
         _bool_check(
             'perps_positive_test',
             evidence.perps_order_succeeded,
