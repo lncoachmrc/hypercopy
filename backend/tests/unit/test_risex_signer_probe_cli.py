@@ -57,8 +57,7 @@ def test_cli_payload_is_json_safe_and_does_not_enable_writes() -> None:
         session_active=True,
         session_account='0x1111111111111111111111111111111111111111',
         session_expiration=now + 3600,
-        permission_evidence_source='api',
-        permissions=frozenset({'PERPS'}),
+        onchain_perps_only_scope=None,
         perps_order_succeeded=None,
         fund_movement_rejected=None,
         withdrawal_rejected=None,
@@ -71,7 +70,8 @@ def test_cli_payload_is_json_safe_and_does_not_enable_writes() -> None:
 
     assert payload['verdict'] == 'UNKNOWN'
     assert payload['security_gate_passed'] is False
-    assert payload['evidence']['permissions'] == ['PERPS']
+    assert payload['evidence']['onchain_perps_only_scope'] is None
+    assert 'permissions' not in payload['evidence']
     rendered = str(payload).lower()
     assert 'private_key' not in rendered
     assert 'seed' not in rendered
