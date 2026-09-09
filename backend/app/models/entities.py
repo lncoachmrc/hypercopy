@@ -220,6 +220,9 @@ class CopyJob(BaseUuid, Base):
     __tablename__ = 'copy_jobs'
     master_event_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey('master_events.id', ondelete='SET NULL'))
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'), index=True)
+    execution_epoch_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey('execution_epochs.id', ondelete='SET NULL'), index=True)
+    execution_provider: Mapped[str | None] = mapped_column(String(24))
+    execution_network: Mapped[str | None] = mapped_column(String(16))
     asset: Mapped[str] = mapped_column(String(24), nullable=False)
     origin: Mapped[str] = mapped_column(String(24), default='EVENT')
     state: Mapped[JobState] = mapped_column(Enum(JobState, name='job_state_enum', native_enum=False, length=32), default=JobState.QUEUED, index=True)
@@ -236,6 +239,7 @@ class CopyJob(BaseUuid, Base):
     __table_args__ = (
         UniqueConstraint('master_event_id', 'user_id', name='uq_job_master_user'),
         Index('ix_jobs_state_created', 'state', 'created_at'),
+        Index('ix_copy_jobs_execution_destination', 'execution_provider', 'execution_network'),
     )
 
 
@@ -243,6 +247,9 @@ class Execution(BaseUuid, Base):
     __tablename__ = 'executions'
     copy_job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('copy_jobs.id', ondelete='CASCADE'))
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'), index=True)
+    execution_epoch_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey('execution_epochs.id', ondelete='SET NULL'), index=True)
+    execution_provider: Mapped[str | None] = mapped_column(String(24))
+    execution_network: Mapped[str | None] = mapped_column(String(16))
     attempt_kind: Mapped[str] = mapped_column(String(1), default='o')
     cloid: Mapped[str] = mapped_column(String(34), unique=True, nullable=False)
     state: Mapped[ExecutionState] = mapped_column(Enum(ExecutionState, name='execution_state_enum', native_enum=False, length=32), default=ExecutionState.SUBMITTING, index=True)
@@ -258,7 +265,10 @@ class Execution(BaseUuid, Base):
     response: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    __table_args__ = (UniqueConstraint('copy_job_id', 'attempt_kind', name='uq_execution_job_kind'),)
+    __table_args__ = (
+        UniqueConstraint('copy_job_id', 'attempt_kind', name='uq_execution_job_kind'),
+        Index('ix_executions_execution_destination', 'execution_provider', 'execution_network'),
+    )
 
 
 class Fill(BaseUuid, Base):
