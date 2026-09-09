@@ -70,3 +70,41 @@ async def test_risex_http_transport_rejects_non_object_json() -> None:
         )
         with pytest.raises(ProviderReadUnavailable, match='JSON object'):
             await transport.get_json('/v1/system/config')
+
+
+def test_risex_readonly_transport_rejects_authorized_client() -> None:
+    from app.adapters.risex_http import RISExReadOnlyHTTPTransport
+
+    client = httpx.AsyncClient(
+        headers={'Authorization': 'Bearer intentionally-not-a-real-token'},
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+    )
+    try:
+        with pytest.raises(ValueError, match='pre-authenticated'):
+            RISExReadOnlyHTTPTransport(
+                base_url='https://api.testnet.rise.trade',
+                client=client,
+            )
+    finally:
+        import asyncio
+
+        asyncio.run(client.aclose())
+
+
+def test_risex_readonly_transport_rejects_cookie_bearing_client() -> None:
+    from app.adapters.risex_http import RISExReadOnlyHTTPTransport
+
+    client = httpx.AsyncClient(
+        cookies={'session': 'intentionally-not-a-real-session'},
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={})),
+    )
+    try:
+        with pytest.raises(ValueError, match='pre-authenticated'):
+            RISExReadOnlyHTTPTransport(
+                base_url='https://api.testnet.rise.trade',
+                client=client,
+            )
+    finally:
+        import asyncio
+
+        asyncio.run(client.aclose())
