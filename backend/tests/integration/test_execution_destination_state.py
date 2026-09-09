@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import text
 
-from app.db.session import SessionLocal
+from app.db.session import SessionLocal, engine
 from app.services.execution_destination import user_destination_state
 from app.services.networking import user_network_state
 
@@ -17,7 +17,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.asyncio(loop_scope='module')
+@pytest.mark.asyncio
 async def test_active_epoch_is_single_source_for_provider_and_network():
     user_id = uuid.uuid4()
     epoch_id = uuid.uuid4()
@@ -77,9 +77,10 @@ async def test_active_epoch_is_single_source_for_provider_and_network():
             )
             await db.execute(text('DELETE FROM users WHERE id = :user_id'), {'user_id': user_id})
             await db.commit()
+    await engine.dispose()
 
 
-@pytest.mark.asyncio(loop_scope='module')
+@pytest.mark.asyncio
 async def test_network_compatibility_bootstraps_missing_destination_epoch_once():
     user_id = uuid.uuid4()
     wallet = '0x' + uuid.uuid4().hex[:40]
@@ -137,3 +138,4 @@ async def test_network_compatibility_bootstraps_missing_destination_epoch_once()
             )
             await db.execute(text('DELETE FROM users WHERE id = :user_id'), {'user_id': user_id})
             await db.commit()
+    await engine.dispose()
