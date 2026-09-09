@@ -80,6 +80,94 @@ async def user_destination_state(db: AsyncSession, user_id: uuid.UUID) -> UserDe
     )
 
 
+async def bootstrap_user_destination_epoch(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+) -> UserDestinationState:
+    """Materialize the epoch for a legacy/incomplete user without changing its destination.
+
+    This compatibility path is deliberately narrow: it is valid only when the user has
+    no active epoch at all. Existing epoch corruption, closure, or provider/network
+    divergence continues to fail closed through ``user_destination_state``.
+    """
+    row = (
+        await db.execute(
+            text(
+                """
+                SELECT
+                    u.active_execution_epoch_id,
+                    u.execution_provider,
+                    u.execution_network,
+                    u.network_started_at,
+                    ta.account_address,
+                    sc.key_version AS credential_version
+                FROM users u
+                LEFT JOIN trading_accounts ta
+                  ON ta.user_id = u.id
+                LEFT JOIN signing_credentials sc
+                  ON sc.trading_account_id = ta.id
+                WHERE u.id = :user_id
+                FOR UPDATE OF u
+                """
+            ),
+            {'user_id': user_id},
+        )
+    ).mappings().one_or_none()
+    if not row:
+        raise RuntimeError('User destination state is unavailable')
+
+    # A concurrent caller may have created the epoch while this transaction waited
+    # on the user-row lock. In that case, validate and return the canonical state.
+    if row['active_execution_epoch_id'] is not None:
+        return await user_destination_state(db, user_id)
+
+    provider = _provider(row['execution_provider'])
+    network = _network(row['execution_network'])
+    started_at = row['network_started_at'] or datetime.now(UTC)
+    epoch_id = uuid.uuid4()
+
+    await db.execute(
+        text(
+            """
+            INSERT INTO execution_epochs (
+                id, user_id, provider, network, account_address,
+                credential_version, started_at, ended_at
+            ) VALUES (
+                :epoch_id, :user_id, :provider, :network, :account_address,
+                :credential_version, :started_at, NULL
+            )
+            """
+        ),
+        {
+            'epoch_id': epoch_id,
+            'user_id': user_id,
+            'provider': provider,
+            'network': network,
+            'account_address': row['account_address'],
+            'credential_version': row['credential_version'],
+            'started_at': started_at,
+        },
+    )
+    await db.execute(
+        text(
+            """
+            UPDATE users
+            SET active_execution_epoch_id = :epoch_id
+            WHERE id = :user_id
+              AND active_execution_epoch_id IS NULL
+            """
+        ),
+        {'epoch_id': epoch_id, 'user_id': user_id},
+    )
+
+    return UserDestinationState(
+        provider=provider,
+        network=network,
+        epoch_id=epoch_id,
+        started_at=started_at,
+    )
+
+
 async def set_user_destination(
     db: AsyncSession,
     user_id: uuid.UUID,
