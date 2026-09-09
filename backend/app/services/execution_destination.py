@@ -102,6 +102,69 @@ async def job_matches_active_destination(db: AsyncSession, job: CopyJob) -> bool
     )
 
 
+async def bind_job_to_active_destination(db: AsyncSession, job: CopyJob) -> bool:
+    """Bind a legacy/unbound job only when its origin in the current epoch is provable.
+
+    New destination-aware jobs may already carry the immutable binding; those are
+    validated without mutation. For historical rows that predate this schema, we
+    infer Hyperliquid only when the job was created at or after the current epoch
+    started and its persisted follower-network evidence still agrees. Any partial
+    binding, provider switch, network switch, or older job fails closed.
+    """
+    present = (
+        job.execution_epoch_id is not None,
+        job.execution_provider is not None,
+        job.execution_network is not None,
+    )
+    if all(present):
+        return await job_matches_active_destination(db, job)
+    if any(present):
+        return False
+
+    await db.flush()
+    try:
+        destination = await user_destination_state(db, job.user_id)
+    except RuntimeError as exc:
+        if str(exc) != 'User has no active execution destination epoch':
+            return False
+        try:
+            destination = await bootstrap_user_destination_epoch(db, job.user_id)
+        except RuntimeError:
+            return False
+
+    if job.created_at is None:
+        await db.refresh(job, attribute_names=['created_at'])
+    if job.created_at is None or job.created_at < destination.started_at:
+        return False
+
+    ctx = dict(job.context or {})
+    raw_network = str(ctx.get('follower_network') or '').lower()
+    if raw_network and raw_network != destination.network:
+        return False
+
+    raw_provider = str(ctx.get('execution_provider') or '').lower()
+    if raw_provider:
+        if raw_provider != destination.provider:
+            return False
+    elif destination.provider != 'hyperliquid':
+        # Pre-RISEx jobs did not persist provider evidence. Never infer a new
+        # provider from an old unbound row merely because it is active today.
+        return False
+
+    job.execution_epoch_id = destination.epoch_id
+    job.execution_provider = destination.provider
+    job.execution_network = destination.network
+    job.context = {
+        **ctx,
+        'execution_epoch_id': str(destination.epoch_id),
+        'execution_provider': destination.provider,
+        'execution_network': destination.network,
+        'provider_market': str(ctx.get('provider_market') or job.asset),
+    }
+    await db.flush()
+    return True
+
+
 async def bootstrap_user_destination_epoch(
     db: AsyncSession,
     user_id: uuid.UUID,
