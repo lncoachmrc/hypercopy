@@ -1,5 +1,4 @@
 from decimal import Decimal
-from types import SimpleNamespace
 
 import pytest
 
@@ -86,13 +85,7 @@ def test_below_minimum_preserves_target_and_sends_nothing():
 def test_provider_market_can_define_minimum_below_hyperliquid_floor():
     master = MasterExposure('BTC', D('0.05'), D('100'), D('100'))
     follower = FollowerState('u', D('100'))
-    provider_spec = SimpleNamespace(
-        name='BTC',
-        sz_decimals=2,
-        max_leverage=20,
-        only_isolated=False,
-        min_notional=D('1'),
-    )
+    provider_spec = AssetSpec('BTC', 2, 20, min_notional=D('1'))
 
     result = plan(master, follower, provider_spec, min_notional=D('1'))
 
