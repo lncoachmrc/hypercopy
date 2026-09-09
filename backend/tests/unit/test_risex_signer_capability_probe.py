@@ -18,8 +18,7 @@ def _evidence(**overrides):
         'session_active': True,
         'session_account': '0x1111111111111111111111111111111111111111',
         'session_expiration': int(time()) + 3600,
-        'permission_evidence_source': 'onchain',
-        'permissions': frozenset({'PERPS'}),
+        'onchain_perps_only_scope': True,
         'perps_order_succeeded': True,
         'fund_movement_rejected': True,
         'withdrawal_rejected': True,
@@ -40,30 +39,32 @@ def test_capability_probe_pass_requires_all_security_evidence() -> None:
     assert all(check.verdict == 'PASS' for check in report.checks)
 
 
-def test_capability_probe_is_unknown_without_onchain_permission_proof() -> None:
+def test_capability_probe_is_unknown_without_onchain_scope_proof() -> None:
     from app.security.risex_signer_probe import evaluate_signer_capabilities
 
     report = evaluate_signer_capabilities(
-        _evidence(permission_evidence_source='none', permissions=None),
+        _evidence(onchain_perps_only_scope=None),
         now=int(time()),
     )
 
     assert report.verdict == 'UNKNOWN'
     assert report.security_gate_passed is False
-    permission_check = next(check for check in report.checks if check.name == 'least_privilege_permissions')
-    assert permission_check.verdict == 'UNKNOWN'
+    scope_check = next(check for check in report.checks if check.name == 'onchain_authorization_scope')
+    assert scope_check.verdict == 'UNKNOWN'
 
 
-def test_capability_probe_fails_if_fund_movement_permission_exists() -> None:
+def test_capability_probe_fails_if_onchain_scope_is_not_perps_only() -> None:
     from app.security.risex_signer_probe import evaluate_signer_capabilities
 
     report = evaluate_signer_capabilities(
-        _evidence(permissions=frozenset({'PERPS', 'MOVE_FUNDS'})),
+        _evidence(onchain_perps_only_scope=False),
         now=int(time()),
     )
 
     assert report.verdict == 'FAIL'
     assert report.security_gate_passed is False
+    scope_check = next(check for check in report.checks if check.name == 'onchain_authorization_scope')
+    assert scope_check.verdict == 'FAIL'
 
 
 def test_capability_probe_fails_if_operatorhub_bypass_is_reachable() -> None:
