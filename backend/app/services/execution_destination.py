@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.base import ExecutionProvider
 from app.core.config import Network
+from app.models.entities import CopyJob
 
 _ALLOWED_PROVIDERS = {'hyperliquid', 'risex'}
 _ALLOWED_NETWORKS = {'testnet', 'mainnet'}
@@ -77,6 +78,27 @@ async def user_destination_state(db: AsyncSession, user_id: uuid.UUID) -> UserDe
         network=network,
         epoch_id=row['active_execution_epoch_id'],
         started_at=row['started_at'],
+    )
+
+
+async def job_matches_active_destination(db: AsyncSession, job: CopyJob) -> bool:
+    """Fail closed unless a job is bound to the user's exact active destination epoch."""
+    if (
+        job.execution_epoch_id is None
+        or job.execution_provider is None
+        or job.execution_network is None
+    ):
+        return False
+    try:
+        destination = await user_destination_state(db, job.user_id)
+        provider = _provider(job.execution_provider)
+        network = _network(job.execution_network)
+    except RuntimeError:
+        return False
+    return (
+        job.execution_epoch_id == destination.epoch_id
+        and provider == destination.provider
+        and network == destination.network
     )
 
 
