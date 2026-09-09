@@ -26,8 +26,9 @@ from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from enum import Enum
 
-# VERIFIED (Hyperliquid docs, exchange endpoint error responses):
-#   "Order must have minimum value of $10."
+# Hyperliquid's current perpetual minimum. Keep this as the compatibility
+# default for existing AssetSpec callers; other providers must supply their
+# own market minimum instead of inheriting it as a universal exchange rule.
 EXCHANGE_MIN_NOTIONAL = Decimal("10")
 
 # VERIFIED (Hyperliquid docs, meta.universe): perp prices carry at most
@@ -49,12 +50,13 @@ class OrderIntent(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class AssetSpec:
-    """Exchange constraints for one perpetual market, read from `meta`."""
+    """Execution constraints for one perpetual market."""
 
     name: str
     sz_decimals: int
     max_leverage: int
     only_isolated: bool = False
+    min_notional: Decimal = EXCHANGE_MIN_NOTIONAL
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,7 +169,7 @@ def compute_target(
     The master mark measures the master's notional/equity ratio. The follower
     mark converts that target notional into follower units. They are usually
     almost identical, but must be distinct when source and destination are on
-    different Hyperliquid networks (for example mainnet master -> testnet follower).
+    different networks or providers.
     """
     follower_mark = follower_mark_price if follower_mark_price is not None else master.mark_price
     if master.mark_price <= 0 or follower_mark <= 0 or follower.eligible_equity <= 0:
@@ -228,7 +230,7 @@ def plan(
         order_size = round_size(abs(current), spec.sz_decimals)
         notional = order_size * price
 
-    floor = max(min_notional, EXCHANGE_MIN_NOTIONAL)
+    floor = max(min_notional, spec.min_notional)
     if order_size <= 0:
         return SizingResult(
             asset=master.asset, intent=OrderIntent.NONE, target_size=target,
@@ -273,7 +275,7 @@ def _plan_reversal(
     """Split a sign change into close-then-open using the follower market price."""
     close_size = round_size(abs(current), spec.sz_decimals)
     open_size = round_size(abs(target), spec.sz_decimals)
-    floor = max(min_notional, EXCHANGE_MIN_NOTIONAL)
+    floor = max(min_notional, spec.min_notional)
 
     secondary: SizingResult | None = None
     if open_size > 0 and open_size * price >= floor:
