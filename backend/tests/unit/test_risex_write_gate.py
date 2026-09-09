@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 
@@ -14,6 +16,20 @@ class NoNetworkTransport:
     async def post_json(self, path: str, *, json: dict | None = None) -> dict:
         self.calls.append(('POST', path))
         raise AssertionError('write gate must fail before network I/O')
+
+
+def test_risex_provider_allows_only_registered_signer_permit_auth_mode() -> None:
+    from app.adapters.risex import RISExAdapter
+
+    assert RISExAdapter.authorization_mode == 'registered_signer_permit'
+
+    init_params = {name.lower() for name in inspect.signature(RISExAdapter.__init__).parameters}
+    forbidden_fragments = ('jwt', 'bearer', 'token', 'operatorhub', 'api_key', 'cookie')
+    assert not any(
+        fragment in param
+        for param in init_params
+        for fragment in forbidden_fragments
+    )
 
 
 @pytest.mark.asyncio
