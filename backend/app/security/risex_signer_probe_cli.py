@@ -56,7 +56,6 @@ def report_payload(
     evidence: RISExSignerCapabilityEvidence,
     report: RISExSignerCapabilityReport,
 ) -> dict[str, Any]:
-    permissions = sorted(evidence.permissions) if evidence.permissions is not None else None
     return {
         'verdict': report.verdict,
         'security_gate_passed': report.security_gate_passed,
@@ -70,8 +69,7 @@ def report_payload(
             'session_active': evidence.session_active,
             'session_account': evidence.session_account,
             'session_expiration': evidence.session_expiration,
-            'permission_evidence_source': evidence.permission_evidence_source,
-            'permissions': permissions,
+            'onchain_perps_only_scope': evidence.onchain_perps_only_scope,
             'perps_order_succeeded': evidence.perps_order_succeeded,
             'fund_movement_rejected': evidence.fund_movement_rejected,
             'withdrawal_rejected': evidence.withdrawal_rejected,
