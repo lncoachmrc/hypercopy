@@ -77,3 +77,64 @@ async def test_active_epoch_is_single_source_for_provider_and_network():
             )
             await db.execute(text('DELETE FROM users WHERE id = :user_id'), {'user_id': user_id})
             await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_network_compatibility_bootstraps_missing_destination_epoch_once():
+    user_id = uuid.uuid4()
+    wallet = '0x' + uuid.uuid4().hex[:40]
+    started_at = datetime.now(UTC)
+
+    async with SessionLocal() as db:
+        try:
+            await db.execute(
+                text(
+                    """
+                    INSERT INTO users (
+                        id, auth_wallet, role, state, copy_state, manual_trade_policy,
+                        execution_network, network_started_at, execution_provider,
+                        created_at, updated_at
+                    ) VALUES (
+                        :user_id, :wallet, 'USER', 'ACTIVE', 'SHADOW', 'COEXIST',
+                        'mainnet', :started_at, 'hyperliquid', :started_at, :started_at
+                    )
+                    """
+                ),
+                {'user_id': user_id, 'wallet': wallet, 'started_at': started_at},
+            )
+            await db.commit()
+
+            network = await user_network_state(db, user_id)
+            destination = await user_destination_state(db, user_id)
+            second = await user_network_state(db, user_id)
+
+            assert network.network == 'mainnet'
+            assert destination.provider == 'hyperliquid'
+            assert destination.network == 'mainnet'
+            assert destination.epoch_id == second_epoch_id(second, destination)
+
+            active = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT count(*)
+                        FROM execution_epochs
+                        WHERE user_id = :user_id AND ended_at IS NULL
+                        """
+                    ),
+                    {'user_id': user_id},
+                )
+            ).scalar_one()
+            assert active == 1
+        finally:
+            await db.execute(
+                text('UPDATE users SET active_execution_epoch_id = NULL WHERE id = :user_id'),
+                {'user_id': user_id},
+            )
+            await db.execute(text('DELETE FROM users WHERE id = :user_id'), {'user_id': user_id})
+            await db.commit()
+
+
+def second_epoch_id(second, destination):
+    assert second.network == destination.network
+    return destination.epoch_id
