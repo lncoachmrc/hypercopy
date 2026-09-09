@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, NoReturn
+from typing import Any, ClassVar, NoReturn
 
 import httpx
 
@@ -31,6 +31,8 @@ class RISExReadOnlyHTTPTransport:
     headers or cookies. This prevents the public evidence collector from silently
     inheriting a JWT/OperatorHub session or other ambient credential.
     """
+
+    public_read_only: ClassVar[bool] = True
 
     def __init__(
         self,
