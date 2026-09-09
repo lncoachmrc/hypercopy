@@ -6,6 +6,8 @@ from app.adapters.risex_types import ProviderReadUnavailable
 
 
 class FakeTransport:
+    public_read_only = True
+
     def __init__(self, responses: dict[str, dict]):
         self.responses = responses
         self.get_calls: list[tuple[str, dict | None]] = []
@@ -136,4 +138,24 @@ async def test_public_signer_evidence_read_failure_is_explicit() -> None:
             signer=signer,
         )
 
+    assert transport.post_calls == []
+
+
+@pytest.mark.asyncio
+async def test_public_evidence_collector_rejects_transport_without_readonly_marker() -> None:
+    from app.security.risex_signer_probe import collect_public_signer_evidence
+
+    class UnsafeTransport(FakeTransport):
+        public_read_only = False
+
+    transport = UnsafeTransport({})
+    with pytest.raises(ProviderReadUnavailable, match='public read-only transport'):
+        await collect_public_signer_evidence(
+            transport,
+            network='testnet',
+            account='0x1111111111111111111111111111111111111111',
+            signer='0x2222222222222222222222222222222222222222',
+        )
+
+    assert transport.get_calls == []
     assert transport.post_calls == []
