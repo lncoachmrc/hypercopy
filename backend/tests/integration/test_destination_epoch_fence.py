@@ -4,10 +4,10 @@ import os
 import uuid
 
 import pytest
+from sqlalchemy import text
 
 from app.db.session import SessionLocal, engine
-from app.models.entities import CopyJob, User
-from app.models.enums import CopyState, JobState, UserState
+from app.models.entities import CopyJob, CopyState, JobState, User, UserState
 from app.services.execution_destination import set_user_destination
 
 pytestmark = pytest.mark.skipif(
@@ -84,14 +84,9 @@ async def test_job_from_previous_epoch_is_stale_even_when_provider_and_network_m
         finally:
             await db.rollback()
             await db.execute(
-                __import__('sqlalchemy').text(
-                    'UPDATE users SET active_execution_epoch_id = NULL WHERE id = :user_id'
-                ),
+                text('UPDATE users SET active_execution_epoch_id = NULL WHERE id = :user_id'),
                 {'user_id': user_id},
             )
-            await db.execute(
-                __import__('sqlalchemy').text('DELETE FROM users WHERE id = :user_id'),
-                {'user_id': user_id},
-            )
+            await db.execute(text('DELETE FROM users WHERE id = :user_id'), {'user_id': user_id})
             await db.commit()
     await engine.dispose()
