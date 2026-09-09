@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
+from app.adapters.risex_types import ProviderReadUnavailable, RISExTransport
 from app.core.config import Network
 
 
@@ -54,6 +55,132 @@ def _is_address(value: str | None) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _unwrap_data(payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload.get('data')
+    if isinstance(data, dict):
+        return data
+    return payload
+
+
+async def _read_json(
+    transport: RISExTransport,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        payload = await transport.get_json(path, params=params)
+    except Exception as exc:
+        raise ProviderReadUnavailable(f'RISEx read failed at {path}: {exc}') from exc
+    if not isinstance(payload, dict):
+        raise ProviderReadUnavailable(f'RISEx read returned a non-object payload at {path}')
+    return _unwrap_data(payload)
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_str(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _permissions_from_row(row: dict[str, Any]) -> tuple[PermissionEvidenceSource, frozenset[str] | None]:
+    raw = row.get('permissions')
+    if isinstance(raw, str) and raw.strip():
+        return 'api', frozenset({raw.strip()})
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        values = frozenset(value.strip() for value in raw if isinstance(value, str) and value.strip())
+        if values:
+            return 'api', values
+
+    raw_single = row.get('permission')
+    if isinstance(raw_single, str) and raw_single.strip():
+        return 'api', frozenset({raw_single.strip()})
+    return 'none', None
+
+
+async def collect_public_signer_evidence(
+    transport: RISExTransport,
+    *,
+    network: Network,
+    account: str,
+    signer: str,
+) -> RISExSignerCapabilityEvidence:
+    """Collect public/read-only RISEx evidence without signing or mutating anything."""
+
+    domain = await _read_json(transport, '/v1/auth/eip712-domain')
+    system = await _read_json(transport, '/v1/system/config')
+    status = await _read_json(
+        transport,
+        '/v1/auth/session-key-status',
+        params={'account': account, 'signer': signer},
+    )
+    signers = await _read_json(
+        transport,
+        '/v1/auth/signers',
+        params={'account': account},
+    )
+
+    chain_id = _optional_int(domain.get('chain_id', domain.get('chainId')))
+    auth_contract = _optional_str(
+        domain.get('verifying_contract', domain.get('verifyingContract'))
+    )
+
+    addresses = system.get('addresses')
+    router = _optional_str(addresses.get('router')) if isinstance(addresses, dict) else None
+    if router is None:
+        router = _optional_str(system.get('router'))
+
+    explicit_active = status.get('active')
+    session_active = explicit_active if isinstance(explicit_active, bool) else None
+
+    matching_signer: dict[str, Any] | None = None
+    raw_signers = signers.get('signers')
+    if isinstance(raw_signers, list):
+        for row in raw_signers:
+            if not isinstance(row, dict):
+                continue
+            row_signer = row.get('signer')
+            if isinstance(row_signer, str) and row_signer.lower() == signer.lower():
+                matching_signer = row
+                break
+
+    if matching_signer is None:
+        session_account = None
+        session_expiration = None
+        permission_source: PermissionEvidenceSource = 'none'
+        permissions = None
+    else:
+        session_account = _optional_str(matching_signer.get('account'))
+        session_expiration = _optional_int(matching_signer.get('expiration'))
+        permission_source, permissions = _permissions_from_row(matching_signer)
+
+    return RISExSignerCapabilityEvidence(
+        network=network,
+        account=account,
+        signer=signer,
+        chain_id=chain_id,
+        auth_contract=auth_contract,
+        router=router,
+        session_active=session_active,
+        session_account=session_account,
+        session_expiration=session_expiration,
+        permission_evidence_source=permission_source,
+        permissions=permissions,
+        perps_order_succeeded=None,
+        fund_movement_rejected=None,
+        withdrawal_rejected=None,
+        post_revoke_order_rejected=None,
+        operatorhub_bypass_disabled=None,
+    )
 
 
 def _bool_check(name: str, value: bool | None, *, pass_detail: str, fail_detail: str) -> CapabilityCheck:
