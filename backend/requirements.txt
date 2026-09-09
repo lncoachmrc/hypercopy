@@ -14,3 +14,4 @@ websockets==16.1.1
 stripe==15.5.1
 boto3==1.43.75
 python-multipart==0.0.32
+httpx==0.28.1
