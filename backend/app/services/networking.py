@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import Network, settings
+from app.core.config import Network
+from app.services.execution_destination import set_user_destination, user_destination_state
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,23 +16,23 @@ class UserNetworkState:
 
 
 async def user_network_state(db: AsyncSession, user_id) -> UserNetworkState:
-    row = (await db.execute(
-        text("SELECT execution_network, network_started_at FROM users WHERE id = :user_id"),
-        {"user_id": user_id},
-    )).one_or_none()
-    if not row:
-        raise RuntimeError("User network state is unavailable")
-    raw = str(row[0] or settings.follower_network).lower()
-    if raw not in {"testnet", "mainnet"}:
-        raise RuntimeError(f"Unsupported user execution network: {raw}")
-    started_at = row[1] or datetime.now(UTC)
-    return UserNetworkState(network=raw, started_at=started_at)  # type: ignore[arg-type]
+    destination = await user_destination_state(db, user_id)
+    return UserNetworkState(network=destination.network, started_at=destination.started_at)
 
 
 async def set_user_network(db: AsyncSession, user_id, network: Network) -> UserNetworkState:
-    now = datetime.now(UTC)
-    await db.execute(
-        text("UPDATE users SET execution_network = :network, network_started_at = :started_at, updated_at = :started_at WHERE id = :user_id"),
-        {"network": network, "started_at": now, "user_id": user_id},
+    try:
+        current = await user_destination_state(db, user_id)
+        provider = current.provider
+    except RuntimeError as exc:
+        if str(exc) != 'User has no active execution destination epoch':
+            raise
+        provider = 'hyperliquid'
+
+    destination = await set_user_destination(
+        db,
+        user_id,
+        provider=provider,
+        network=network,
     )
-    return UserNetworkState(network=network, started_at=now)
+    return UserNetworkState(network=destination.network, started_at=destination.started_at)
