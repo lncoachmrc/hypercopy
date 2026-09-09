@@ -16,6 +16,7 @@ from app.services.queue import (
     ensure_group,
     expire_stale_strategy_jobs,
     mark_hf006_repair_pending,
+    prepare_job_destination_for_execution,
 )
 from app.services.strategy_intents import STRATEGY_ORIGINS, prepare_strategy_job_for_publish
 from app.workers.execution_worker import Worker, stop
@@ -59,6 +60,9 @@ class ResilientExecutionWorker(Worker):
                 ).scalar_one_or_none()
                 if job is None:
                     return None
+                if not await prepare_job_destination_for_execution(db, job):
+                    await db.commit()
+                    continue
                 if job.origin not in STRATEGY_ORIGINS:
                     break
                 if await prepare_strategy_job_for_publish(db, job):
