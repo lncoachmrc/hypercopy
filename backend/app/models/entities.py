@@ -89,7 +89,22 @@ class User(BaseUuid, Timestamped, Base):
     display_name: Mapped[str | None] = mapped_column(String(80))
     email: Mapped[str | None] = mapped_column(String(255))
     shadow_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    execution_provider: Mapped[str] = mapped_column(String(24), default='hyperliquid', server_default='hyperliquid', nullable=False, index=True)
+    active_execution_epoch_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey('execution_epochs.id', ondelete='SET NULL'), index=True)
     trading_account: Mapped['TradingAccount | None'] = relationship(back_populates='user', uselist=False, cascade='all, delete-orphan')
+
+
+class ExecutionEpoch(BaseUuid, Base):
+    __tablename__ = 'execution_epochs'
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'), index=True, nullable=False)
+    provider: Mapped[str] = mapped_column(String(24), nullable=False)
+    network: Mapped[str] = mapped_column(String(16), nullable=False)
+    account_address: Mapped[str | None] = mapped_column(String(128))
+    credential_version: Mapped[int | None] = mapped_column(Integer)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    __table_args__ = (Index('ix_execution_epochs_provider_network', 'provider', 'network'),)
 
 
 class AuthNonce(BaseUuid, Base):
