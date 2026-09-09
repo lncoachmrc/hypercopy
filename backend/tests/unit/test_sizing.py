@@ -1,4 +1,5 @@
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -80,6 +81,23 @@ def test_below_minimum_preserves_target_and_sends_nothing():
     assert r.order_size == 0
     assert r.target_size != 0
     assert 'stays on target' in (r.reason or '')
+
+
+def test_provider_market_can_define_minimum_below_hyperliquid_floor():
+    master = MasterExposure('BTC', D('0.05'), D('100'), D('100'))
+    follower = FollowerState('u', D('100'))
+    provider_spec = SimpleNamespace(
+        name='BTC',
+        sz_decimals=2,
+        max_leverage=20,
+        only_isolated=False,
+        min_notional=D('1'),
+    )
+
+    result = plan(master, follower, provider_spec, min_notional=D('1'))
+
+    assert result.actionable
+    assert result.notional == D('5.00')
 
 
 def test_unmanaged_margin_reduces_eligible_equity():
