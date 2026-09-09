@@ -15,7 +15,24 @@ class ProviderDataMalformed(ProviderReadUnavailable):
     """Provider returned data that cannot be safely normalized."""
 
 
-class RISExTransport(Protocol):
-    async def get_json(self, path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]: ...
+class RISExReadTransport(Protocol):
+    async def get_json(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def post_json(self, path: str, *, json: dict[str, Any] | None = None) -> dict[str, Any]: ...
+
+class RISExPublicReadTransport(RISExReadTransport, Protocol):
+    @property
+    def public_read_only(self) -> bool: ...
+
+
+class RISExTransport(RISExReadTransport, Protocol):
+    async def post_json(
+        self,
+        path: str,
+        *,
+        json: dict[str, Any] | None = None,
+    ) -> dict[str, Any]: ...
