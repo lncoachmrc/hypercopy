@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from app.adapters.risex_types import ProviderReadUnavailable, RISExTransport
+from app.adapters.risex_types import ProviderReadUnavailable, RISExPublicReadTransport
 from app.core.config import Network
 
 
@@ -70,7 +70,7 @@ def _unwrap_data(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _read_json(
-    transport: RISExTransport,
+    transport: RISExPublicReadTransport,
     path: str,
     *,
     params: dict[str, Any] | None = None,
@@ -98,7 +98,7 @@ def _optional_str(value: object) -> str | None:
 
 
 async def collect_public_signer_evidence(
-    transport: RISExTransport,
+    transport: RISExPublicReadTransport,
     *,
     network: Network,
     account: str,
@@ -111,6 +111,11 @@ async def collect_public_signer_evidence(
     not expose a granular permission field, so least-privilege scope must be
     established independently from the deployed authorization path.
     """
+
+    if getattr(transport, 'public_read_only', False) is not True:
+        raise ProviderReadUnavailable(
+            'RISEx public evidence collection requires a public read-only transport'
+        )
 
     domain = await _read_json(transport, '/v1/auth/eip712-domain')
     system = await _read_json(transport, '/v1/system/config')
