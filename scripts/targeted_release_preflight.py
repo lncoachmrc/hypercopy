@@ -45,6 +45,7 @@ EXPECTED_MIGRATIONS = {
     '0009_user_execution_network.py',
     '0010_user_plan_discounts.py',
     '0011_execution_destination_epochs.py',
+    '0012_bind_execution_epoch.py',
 }
 
 missing = [path for path in REQUIRED_FILES if not (root / path).exists()]
