@@ -50,6 +50,7 @@ async def test_collect_public_signer_evidence_uses_get_only_and_stays_unknown() 
                         'account': account,
                         'expiration': 2_000_000_000,
                         'status': 1,
+                        # Provider-supplied permission labels are deliberately ignored.
                         'permissions': ['PERPS'],
                     }
                 ]
@@ -70,8 +71,7 @@ async def test_collect_public_signer_evidence_uses_get_only_and_stays_unknown() 
     assert evidence.session_active is True
     assert evidence.session_account == account
     assert evidence.session_expiration == 2_000_000_000
-    assert evidence.permission_evidence_source == 'api'
-    assert evidence.permissions == frozenset({'PERPS'})
+    assert evidence.onchain_perps_only_scope is None
     assert evidence.perps_order_succeeded is None
     assert evidence.fund_movement_rejected is None
     assert evidence.withdrawal_rejected is None
@@ -88,6 +88,8 @@ async def test_collect_public_signer_evidence_uses_get_only_and_stays_unknown() 
     report = evaluate_signer_capabilities(evidence, now=1_900_000_000)
     assert report.verdict == 'UNKNOWN'
     assert report.security_gate_passed is False
+    scope_check = next(check for check in report.checks if check.name == 'onchain_authorization_scope')
+    assert scope_check.verdict == 'UNKNOWN'
 
 
 @pytest.mark.asyncio
@@ -113,8 +115,7 @@ async def test_numeric_session_status_is_not_guessed_as_active() -> None:
     assert evidence.session_active is None
     assert evidence.session_account is None
     assert evidence.session_expiration is None
-    assert evidence.permission_evidence_source == 'none'
-    assert evidence.permissions is None
+    assert evidence.onchain_perps_only_scope is None
 
 
 @pytest.mark.asyncio
