@@ -1,6 +1,6 @@
 """add execution provider and destination epochs
 
-Revision ID: 0011_execution_destination_epochs
+Revision ID: 0011_execution_epochs
 Revises: 0010_user_plan_discounts
 """
 from __future__ import annotations
@@ -11,7 +11,7 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-revision = "0011_execution_destination_epochs"
+revision = "0011_execution_epochs"
 down_revision = "0010_user_plan_discounts"
 branch_labels = None
 depends_on = None
