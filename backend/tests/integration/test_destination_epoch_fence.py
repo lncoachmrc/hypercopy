@@ -1,0 +1,97 @@
+from __future__ import annotations
+
+import os
+import uuid
+
+import pytest
+
+from app.db.session import SessionLocal, engine
+from app.models.entities import CopyJob, User
+from app.models.enums import CopyState, JobState, UserState
+from app.services.execution_destination import set_user_destination
+
+pytestmark = pytest.mark.skipif(
+    os.getenv('RUN_INTEGRATION') != '1',
+    reason='requires CI PostgreSQL',
+)
+
+
+@pytest.mark.asyncio
+async def test_job_from_previous_epoch_is_stale_even_when_provider_and_network_match():
+    assert hasattr(CopyJob, 'execution_epoch_id')
+    assert hasattr(CopyJob, 'execution_provider')
+    assert hasattr(CopyJob, 'execution_network')
+
+    from app.services.execution_destination import job_matches_active_destination
+
+    user_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    wallet = '0x' + uuid.uuid4().hex + '00000000'
+
+    async with SessionLocal() as db:
+        try:
+            db.add(
+                User(
+                    id=user_id,
+                    auth_wallet=wallet,
+                    state=UserState.ACTIVE,
+                    copy_state=CopyState.PAUSED,
+                )
+            )
+            await db.flush()
+
+            first = await set_user_destination(
+                db,
+                user_id,
+                provider='hyperliquid',
+                network='testnet',
+            )
+            job = CopyJob(
+                id=job_id,
+                user_id=user_id,
+                asset='BTC',
+                origin='RECONCILE',
+                state=JobState.QUEUED,
+                correlation_id=uuid.uuid4().hex,
+                execution_epoch_id=first.epoch_id,
+                execution_provider=first.provider,
+                execution_network=first.network,
+                context={'follower_network': first.network},
+            )
+            db.add(job)
+            await db.commit()
+
+            assert await job_matches_active_destination(db, job) is True
+
+            second = await set_user_destination(
+                db,
+                user_id,
+                provider='hyperliquid',
+                network='mainnet',
+            )
+            third = await set_user_destination(
+                db,
+                user_id,
+                provider='hyperliquid',
+                network='testnet',
+            )
+            assert first.epoch_id != second.epoch_id
+            assert first.epoch_id != third.epoch_id
+            assert third.provider == first.provider
+            assert third.network == first.network
+
+            assert await job_matches_active_destination(db, job) is False
+        finally:
+            await db.rollback()
+            await db.execute(
+                __import__('sqlalchemy').text(
+                    'UPDATE users SET active_execution_epoch_id = NULL WHERE id = :user_id'
+                ),
+                {'user_id': user_id},
+            )
+            await db.execute(
+                __import__('sqlalchemy').text('DELETE FROM users WHERE id = :user_id'),
+                {'user_id': user_id},
+            )
+            await db.commit()
+    await engine.dispose()
