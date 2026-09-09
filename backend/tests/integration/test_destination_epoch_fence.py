@@ -16,6 +16,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+async def _cleanup_user(db, user_id: uuid.UUID) -> None:
+    await db.rollback()
+    await db.execute(
+        text('UPDATE users SET active_execution_epoch_id = NULL WHERE id = :user_id'),
+        {'user_id': user_id},
+    )
+    await db.execute(text('DELETE FROM users WHERE id = :user_id'), {'user_id': user_id})
+    await db.commit()
+
+
 @pytest.mark.asyncio
 async def test_job_from_previous_epoch_is_stale_even_when_provider_and_network_match():
     assert hasattr(CopyJob, 'execution_epoch_id')
@@ -82,11 +92,79 @@ async def test_job_from_previous_epoch_is_stale_even_when_provider_and_network_m
 
             assert await job_matches_active_destination(db, job) is False
         finally:
-            await db.rollback()
-            await db.execute(
-                text('UPDATE users SET active_execution_epoch_id = NULL WHERE id = :user_id'),
-                {'user_id': user_id},
+            await _cleanup_user(db, user_id)
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_unbound_hyperliquid_job_binds_only_inside_current_epoch():
+    from app.services.execution_destination import bind_job_to_active_destination
+
+    user_id = uuid.uuid4()
+    wallet = '0x' + uuid.uuid4().hex + '00000000'
+
+    async with SessionLocal() as db:
+        try:
+            db.add(
+                User(
+                    id=user_id,
+                    auth_wallet=wallet,
+                    state=UserState.ACTIVE,
+                    copy_state=CopyState.PAUSED,
+                )
             )
-            await db.execute(text('DELETE FROM users WHERE id = :user_id'), {'user_id': user_id})
+            await db.flush()
+            first = await set_user_destination(
+                db,
+                user_id,
+                provider='hyperliquid',
+                network='testnet',
+            )
+
+            current_job = CopyJob(
+                user_id=user_id,
+                asset='BTC',
+                origin='CLOSE_ALL',
+                state=JobState.QUEUED,
+                correlation_id=uuid.uuid4().hex,
+                context={'follower_network': 'testnet', 'explicit_close': True},
+            )
+            stale_job = CopyJob(
+                user_id=user_id,
+                asset='ETH',
+                origin='RECONCILE',
+                state=JobState.QUEUED,
+                correlation_id=uuid.uuid4().hex,
+                context={'follower_network': 'testnet'},
+            )
+            db.add_all([current_job, stale_job])
             await db.commit()
+
+            assert await bind_job_to_active_destination(db, current_job) is True
+            assert current_job.execution_epoch_id == first.epoch_id
+            assert current_job.execution_provider == 'hyperliquid'
+            assert current_job.execution_network == 'testnet'
+            assert (current_job.context or {}).get('execution_epoch_id') == str(first.epoch_id)
+            assert (current_job.context or {}).get('provider_market') == 'BTC'
+
+            await set_user_destination(
+                db,
+                user_id,
+                provider='hyperliquid',
+                network='mainnet',
+            )
+            current = await set_user_destination(
+                db,
+                user_id,
+                provider='hyperliquid',
+                network='testnet',
+            )
+            assert current.epoch_id != first.epoch_id
+
+            assert await bind_job_to_active_destination(db, stale_job) is False
+            assert stale_job.execution_epoch_id is None
+            assert stale_job.execution_provider is None
+            assert stale_job.execution_network is None
+        finally:
+            await _cleanup_user(db, user_id)
     await engine.dispose()
