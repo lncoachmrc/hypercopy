@@ -24,6 +24,7 @@ from app.services.strategy_intents import STRATEGY_ORIGINS, prepare_strategy_job
 _HF006_REPAIR_PENDING = 'hf006_repair_pending'
 _HF006_REPAIR_ACCOUNTED_ORDER = 'hf006_repair_accounted_order'
 _DESTINATION_STALE_REASON = 'Stale or unbound execution destination epoch; fresh reconciliation/action required'
+_PROVIDER_WRITES_DISABLED_REASON = 'Execution provider is not enabled for writes'
 
 
 async def ensure_group(redis: Redis) -> None:
@@ -36,16 +37,25 @@ async def ensure_group(redis: Redis) -> None:
 
 async def prepare_job_destination_for_execution(db: AsyncSession, job: CopyJob) -> bool:
     """Bind/validate a job before it can enter either execution delivery path."""
-    if await bind_job_to_active_destination(db, job):
-        return True
-    job.state = JobState.SKIPPED
-    job.last_error = _DESTINATION_STALE_REASON
-    job.owner = None
-    job.locked_until = None
-    job.next_attempt_at = None
-    job.enqueued_at = None
-    await db.flush()
-    return False
+    if not await bind_job_to_active_destination(db, job):
+        job.state = JobState.SKIPPED
+        job.last_error = _DESTINATION_STALE_REASON
+        job.owner = None
+        job.locked_until = None
+        job.next_attempt_at = None
+        job.enqueued_at = None
+        await db.flush()
+        return False
+    if job.execution_provider != 'hyperliquid':
+        job.state = JobState.SKIPPED
+        job.last_error = _PROVIDER_WRITES_DISABLED_REASON
+        job.owner = None
+        job.locked_until = None
+        job.next_attempt_at = None
+        job.enqueued_at = None
+        await db.flush()
+        return False
+    return True
 
 
 async def publish_job(redis: Redis, db: AsyncSession, job: CopyJob) -> None:
