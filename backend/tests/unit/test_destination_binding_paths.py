@@ -19,13 +19,16 @@ def test_every_publish_and_database_fallback_path_requires_destination_binding()
 
 
 def test_worker_rejects_non_hyperliquid_provider_before_claim_or_adapter_routing() -> None:
-    source = inspect.getsource(execution_worker.Worker.handle_job_id)
-    provider_guard = "if raw.execution_provider != 'hyperliquid':"
+    guard_source = inspect.getsource(queue_service.prepare_job_destination_for_execution)
+    worker_source = inspect.getsource(execution_worker.Worker.handle_job_id)
 
-    assert provider_guard in source
-    assert source.index(provider_guard) < source.index('job=await claim_job')
-    assert source.index(provider_guard) < source.index('self.follower_hl(network)')
-    assert 'Execution provider is not enabled for writes' in source
+    assert "if job.execution_provider != 'hyperliquid':" in guard_source
+    assert 'Execution provider is not enabled for writes' in guard_source
+
+    delivery_guard = 'prepare_job_destination_for_execution(db, raw)'
+    assert delivery_guard in worker_source
+    assert worker_source.index(delivery_guard) < worker_source.index('job=await claim_job')
+    assert worker_source.index(delivery_guard) < worker_source.index('self.follower_hl(network)')
 
 
 def test_processing_rechecks_exact_epoch_after_claim() -> None:
