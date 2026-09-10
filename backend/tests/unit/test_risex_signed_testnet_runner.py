@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -201,6 +202,46 @@ async def test_runner_collects_same_block_expiration_evidence_and_blocks_post_un
     assert [params for method, params in rpc.calls if method == 'eth_getBlockByNumber'] == [
         [BLOCK, False]
     ]
+
+
+@pytest.mark.asyncio
+async def test_runner_never_allows_post_from_authorization_readiness_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.security import risex_signed_testnet_runner as runner
+
+    _patch_credential_loader(monkeypatch, runner)
+    real_collector = runner.collect_authorization_session_evidence
+
+    async def collector_with_proven_scope(*args: Any, **kwargs: Any) -> Any:
+        evidence = await real_collector(*args, **kwargs)
+        return replace(evidence, perps_only_scope=True)
+
+    monkeypatch.setattr(
+        runner,
+        'collect_authorization_session_evidence',
+        collector_with_proven_scope,
+    )
+    report = await runner.run_signed_testnet_readiness(
+        env={
+            'RISEX_TESTNET_ACCOUNT_ADDRESS': ACCOUNT,
+            'RISEX_TESTNET_SIGNER_PRIVATE_KEY': 'injected-test-secret',
+        },
+        api=FakeAPI(),
+        rpc=FakeRPC(),
+        network='testnet',
+        explicit_approval=True,
+        disposable_account_asserted=True,
+        dedicated_signer_asserted=True,
+        operatorhub_bypass_disabled=True,
+        expected_fingerprint=await _expected_fingerprint(),
+    )
+
+    assert report.verdict == 'PASS'
+    assert report.perps_only_scope is True
+    assert report.post_allowed is False
+    assert report.full_security_gate_passed is False
+    assert report.writes_enabled is False
 
 
 @pytest.mark.asyncio
