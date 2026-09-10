@@ -3,7 +3,8 @@
 **Date:** 2026-09-09  
 **Project:** TRAXION  
 **Scope:** RISEx follower execution authorization  
-**Current gate state:** `BLOCKED / UNKNOWN`
+**Deployment identity preflight:** `PASS` on reviewed RISEx testnet pin  
+**Full security gate:** `BLOCKED / UNKNOWN`
 
 ## Purpose
 
@@ -13,23 +14,15 @@ This document defines the evidence required to move the RISEx write gate from `U
 
 ## Current Evidence Limitation
 
-As of 2026-09-09, the official RISEx signer-registration reference documents:
+The official RISEx signer-registration reference documents account, signer, message, expiration, bitmap nonce state, account/signer EIP-712 signatures and an optional label. It does not document a client-selected granular permission/scope field such as `PERPS` during registration. Therefore TRAXION does not infer least privilege from an API field named `permission` or `permissions`.
 
-- `account`;
-- `signer`;
-- `message`;
-- `expiration`;
-- bitmap nonce state;
-- account and signer EIP-712 signatures;
-- optional label.
-
-It does **not** document a granular permission/scope field such as `PERPS` during signer registration. Therefore TRAXION must not infer least privilege from an API field named `permission` or `permissions`, even if such a label appears in a runtime response.
+The deployed testnet Authorization contract has now been behaviorally verified to expose `hasPermission(address,address,uint8)`, and the public RISE integration checks permission ID `2` as `Perps` after signer registration. This is meaningful evidence for the contract model, but it is not yet proof that a real registered signer lacks every fund-movement capability.
 
 The official order flow uses a separate EIP-712 `VerifyWitness` containing `account`, `target`, `hash`, bitmap nonce state and deadline. For perpetual orders, `target` is the runtime `RISExUniversalRouter` and the action hash is built from a perps-specific selector such as `RISE_PERPS_PLACE_ORDER_V1`.
 
-This means the security question is the **effective scope of the deployed authorization path**, not the presence of a provider-defined permission label. The Phase 4 gate must prove from the exact deployed contracts that a registered signer cannot authorize a non-perpetual/fund-movement action through the router or another supported target.
+The security question is therefore the **effective scope of the deployed authorization path**. The Phase 4 gate must prove from the exact deployed contracts and controlled testnet behavior that a registered signer cannot authorize a non-perpetual/fund-movement action through the router or another supported target.
 
-RISEx order documentation also exposes a JWT/OperatorHub authorization route in addition to signer/permit flows. Therefore the TRAXION trading worker must be proven unable to use any authorization path that bypasses the dedicated signer.
+RISEx order documentation also exposes a JWT/OperatorHub authorization route in addition to signer/permit flows. The TRAXION trading worker is therefore constrained to the `registered_signer_permit` authorization mode and must remain unable to use JWT/OperatorHub as a bypass.
 
 Relevant public references:
 
@@ -38,17 +31,78 @@ Relevant public references:
 - `https://developer.rise.trade/reference/javascripttypescript`
 - `https://developer.rise.trade/reference/general-information`
 
+## Pinned Runtime Deployment Preflight
+
+TRAXION now has a permanent testnet-only deployment identity preflight that runs before any future signer-security test can be considered.
+
+Reviewed testnet deployment fingerprint:
+
+`764412dd3ebb2ecb2b2878e3318bce39e9593cbd32108ebefa90e20161722e2f`
+
+The canonical fingerprint covers:
+
+- network;
+- chain ID;
+- EIP-712 domain name/version;
+- Authorization proxy address and runtime-code hash;
+- Authorization EIP-1967 implementation address and runtime-code hash;
+- Router proxy address and runtime-code hash;
+- Router EIP-1967 implementation address and runtime-code hash.
+
+The observed block number is evidence metadata and is excluded from the fingerprint. ABI-verification status is also excluded because deployment identity and full ABI/source provenance are separate checks.
+
+The permanent collector performs only:
+
+- HTTP `GET /v1/auth/eip712-domain`;
+- HTTP `GET /v1/system/config`;
+- JSON-RPC `eth_chainId`;
+- JSON-RPC `eth_blockNumber`;
+- JSON-RPC `eth_getCode`;
+- JSON-RPC `eth_getStorageAt`.
+
+All proxy/implementation reads are pinned to the same observed block. The RPC transport rejects every method outside that explicit allowlist before network I/O. It therefore cannot submit a transaction or execute an arbitrary `eth_call`.
+
+Run from the repository root:
+
+```bash
+python scripts/risex_deployment_preflight.py
+```
+
+The CLI is testnet-only. It offers no private-key, signature, token, bearer, JWT, API-key or OperatorHub input.
+
+Preflight semantics:
+
+- exact identity + code fingerprint match → `PASS` for **deployment identity only**;
+- address/implementation/code drift → `FAIL` and remain blocked;
+- incomplete/malformed/unavailable evidence → `UNKNOWN` and remain blocked.
+
+Live permanent-preflight verification on 2026-09-10, GitHub Actions run `34502155535`, observed block `53969018`:
+
+- chain identity: `PASS`;
+- Authorization identity: `PASS`;
+- Router identity: `PASS`;
+- Authorization proxy/implementation code: `PASS`;
+- Router proxy/implementation code: `PASS`;
+- deployment fingerprint: `PASS`;
+- `deployment_identity_verified = true`;
+- `writes_enabled = false`;
+- `full_security_gate_passed = false`.
+
+A deployment identity `PASS` is a prerequisite, not authorization to write. Any RISEx contract upgrade changes the fingerprint and forces review/re-pinning before subsequent security work.
+
+The retained evidence is in `docs/security/risex-testnet-runtime-evidence-2026-09-10.md`.
+
 ## Verdict Semantics
 
 ### PASS
 
-`PASS` is allowed only when every required check is explicitly proven:
+Full signer-security `PASS` is allowed only when every required check is explicitly proven:
 
 1. **Deployment identity**
+   - permanent pinned deployment preflight is `PASS`;
    - chain ID is known;
-   - the runtime Authorization/verifying contract is identified;
-   - the runtime router is identified;
-   - evidence corresponds to the exact deployment being tested.
+   - runtime Authorization/verifying contract and Router are identified;
+   - proxy implementation and runtime code match the reviewed deployment.
 
 2. **Session state**
    - signer is active;
@@ -56,8 +110,8 @@ Relevant public references:
    - signer is not expired.
 
 3. **On-chain authorization scope proof**
-   - the exact deployed Authorization contract/router path is independently inspected;
-   - the effective scope for the registered signer is proven to permit perpetual execution only;
+   - exact deployed Authorization contract/router path is independently inspected;
+   - effective scope for the registered signer is proven to permit the intended perpetual execution;
    - no supported target/action path lets that signer authorize transfer, withdrawal, collateral movement, spot movement or another fund-moving action;
    - provider/API permission labels are not accepted as independent proof.
 
@@ -74,18 +128,19 @@ Relevant public references:
    - after signer revocation, a new perpetual action using that signer is rejected.
 
 8. **Authorization-path isolation**
-   - the TRAXION trading worker cannot use JWT/OperatorHub or another route to bypass the dedicated signer.
+   - TRAXION trading worker cannot use JWT/OperatorHub or another route to bypass the dedicated signer.
 
 ### FAIL
 
-Any proven unsafe condition makes the gate `FAIL`, including:
+Any proven unsafe condition makes the full gate `FAIL`, including:
 
+- deployment fingerprint drift that has not been reviewed/re-pinned;
 - signer inactive or revoked when expected active;
 - signer bound to another account;
 - signer expired;
-- the deployed authorization path gives the registered signer broader-than-perps authority;
+- deployed authorization path gives the registered signer broader-than-perps authority;
 - a fund-moving target/action can be authorized by the same signer;
-- the controlled perpetual action fails;
+- controlled perpetual action fails;
 - fund movement or withdrawal is not rejected by RISEx authorization;
 - an order still succeeds after revocation;
 - an alternate JWT/OperatorHub bypass remains reachable from the trading worker.
@@ -94,9 +149,9 @@ Any proven unsafe condition makes the gate `FAIL`, including:
 
 Missing or ambiguous evidence is `UNKNOWN`, never `PASS`. Examples:
 
+- deployment preflight cannot acquire complete same-run evidence;
 - numeric signer status with no documented semantic mapping;
 - API-provided `permission`/`permissions` labels without independent contract proof;
-- missing contract/deployment identity;
 - inability to establish the effective target/action scope of `VerifyWitness` for a registered signer;
 - behavioral positive/negative tests not yet run;
 - inability to prove that the worker cannot use an alternate authorization path;
@@ -104,9 +159,9 @@ Missing or ambiguous evidence is `UNKNOWN`, never `PASS`. Examples:
 
 `UNKNOWN` keeps the RISEx write gate blocked.
 
-## Implemented Public Read-Only Probe
+## Implemented Public Read-Only Signer Probe
 
-The current probe collects only public evidence with HTTP `GET` requests:
+The signer probe collects only public evidence with HTTP `GET` requests:
 
 - `/v1/auth/eip712-domain`
 - `/v1/system/config`
@@ -115,7 +170,7 @@ The current probe collects only public evidence with HTTP `GET` requests:
 
 The HTTP transport rejects every `POST` locally before network I/O. The RISEx adapter independently rejects all mutating methods while `writes_enabled` remains statically `False`.
 
-The public collector deliberately ignores any provider-supplied `permission` or `permissions` label. It reports `onchain_perps_only_scope = null` until a separate independent on-chain inspection proves the effective scope of the exact deployment.
+The public collector deliberately ignores any provider-supplied `permission` or `permissions` label. It reports `onchain_perps_only_scope = null` until a separate independent on-chain inspection plus controlled signer behavior proves the effective scope of the exact deployment.
 
 Run from the repository root using only public addresses:
 
@@ -126,67 +181,39 @@ python scripts/risex_signer_probe.py \
   --signer 0x2222222222222222222222222222222222222222
 ```
 
-Optional public API override:
-
-```bash
-python scripts/risex_signer_probe.py \
-  --network testnet \
-  --account 0x1111111111111111111111111111111111111111 \
-  --signer 0x2222222222222222222222222222222222222222 \
-  --base-url https://api.testnet.rise.trade
-```
-
 The command intentionally has no private-key, seed, password, token or signature option.
 
-Exit codes:
+Exit codes for security probe/preflight commands:
 
 - `0`: `PASS`
 - `1`: `FAIL`
 - `2`: `UNKNOWN` or provider read unavailable
 
-With public API evidence alone, the expected safe result is `UNKNOWN` because on-chain authorization-scope proof and controlled behavioral tests are intentionally not supplied by the read-only collector.
+With public signer API evidence alone, the expected safe signer-gate result is `UNKNOWN` because controlled on-chain scope and behavioral tests are intentionally not supplied by the read-only collector.
 
 ## Evidence Report Rules
 
-A retained security-evidence report may contain only public/non-secret material such as:
+A retained security-evidence report may contain only public/non-secret material such as network/chain ID, account address, signer public address, contract identities/code hashes, expiration/status evidence, independently derived authorization-scope results, future controlled testnet transaction hashes/revert reasons, probe verdicts and exact TRAXION/RISEx versions.
 
-- network and chain ID;
-- account address;
-- signer public address;
-- Authorization/verifying contract and router addresses;
-- expiration/status evidence;
-- independently derived on-chain authorization-scope result;
-- transaction hashes or decoded revert reasons from future controlled Phase 4 tests;
-- probe verdict and per-check results;
-- exact TRAXION commit and exact RISEx deployment tested.
+It must never contain seed phrases, main-wallet private keys, signer private keys, reusable signature material, session cookies/tokens, bearer/JWT authorization or other secrets.
 
-It must never contain:
+## Separate Authorization Required Before Any Signed Test
 
-- seed phrase;
-- main-wallet private key;
-- signer private key;
-- reusable signature material;
-- session cookie/token;
-- authorization bearer/JWT;
-- other secrets.
+The current foundation and deployment preflight do not register a signer, persist a RISEx signer private key, place/cancel an order, update leverage, move funds or perform a withdrawal.
 
-## Separate Phase 4 Required Before Any Signed Test
+Controlled signed testnet verification remains a separate safety boundary. Before executing it, the plan must:
 
-The current foundation does not register a signer, persist a RISEx signer private key, place/cancel an order, update leverage, move funds or perform a withdrawal.
-
-A separate Phase 4 plan/PR is required to perform controlled signed testnet verification. That plan must:
-
-1. identify the exact RISEx testnet Authorization contract, router and action-scope mechanism;
+1. start from a pinned deployment identity `PASS`;
 2. define a disposable dedicated test account/signer and rollback/revoke procedure;
-3. prove from the exact deployment whether the signer is effectively perps-only;
-4. map all supported `VerifyWitness` targets/action families relevant to fund movement;
+3. prove from the exact deployment whether permission ID `2` and the surrounding Authorization/Router design provide the required scope;
+4. map supported `VerifyWitness` targets/action families relevant to fund movement;
 5. perform the positive perpetual test;
 6. perform negative fund-movement and withdrawal tests;
 7. revoke the signer and prove post-revoke rejection;
-8. prove that JWT/OperatorHub cannot be used by the TRAXION trading worker;
+8. prove JWT/OperatorHub remains unreachable from the TRAXION trading worker;
 9. retain only sanitized evidence;
 10. require explicit authorization before executing any signed test.
 
-If the deployed contract model provides a registered signer with broader-than-perps authority, the correct gate result is `FAIL`; TRAXION must not work around that by trusting application-side intent filtering alone.
+If the deployed contract model provides a registered signer with broader-than-acceptable authority, the correct gate result is `FAIL`; TRAXION must not work around that by trusting application-side intent filtering alone.
 
-Even a successful testnet `PASS` does not authorize mainnet. The complete evidence gate must be repeated against the exact RISEx mainnet deployment before any mainnet approval can be considered.
+Even a successful testnet full-gate `PASS` does not authorize mainnet. The complete evidence gate must be repeated against the exact RISEx mainnet deployment before any mainnet approval can be considered.
