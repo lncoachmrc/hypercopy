@@ -46,7 +46,7 @@ class RISExSignedTestnetReadinessReport:
     perps_permission_id: int
     perps_permission: bool
     perps_only_scope: bool | None
-    post_allowed: bool
+    post_allowed: Literal[False]
     full_security_gate_passed: Literal[False] = False
     writes_enabled: Literal[False] = False
 
@@ -149,5 +149,5 @@ async def run_signed_testnet_readiness(
         perps_permission_id=PERPS_PERMISSION_ID,
         perps_permission=authorization.perps_permission,
         perps_only_scope=authorization.perps_only_scope,
-        post_allowed=verdict == 'PASS',
+        post_allowed=False,
     )
