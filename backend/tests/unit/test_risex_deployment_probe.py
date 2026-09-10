@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from app.security.risex_deployment_preflight import (
+    canonical_deployment_fingerprint,
+    evaluate_pinned_deployment_preflight,
+)
 from app.security.risex_deployment_probe import (
     ContractDeploymentEvidence,
     RISExDeploymentEvidence,
-    canonical_deployment_fingerprint,
-    evaluate_pinned_deployment_preflight,
     evaluate_runtime_deployment,
 )
 
