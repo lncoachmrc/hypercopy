@@ -37,6 +37,11 @@ class RISExSignedTestnetReadinessReport:
     signer_address: str
     authorization_address: str
     router_address: str
+    observed_block_timestamp: int
+    session_expiration: int
+    session_permission_bitmap: int
+    stored_session_status_code: int
+    session_not_expired: bool
     session_active: bool | None
     perps_permission_id: int
     perps_permission: bool
@@ -135,6 +140,11 @@ async def run_signed_testnet_readiness(
         signer_address=credential.signer_address,
         authorization_address=deployment.domain_verifying_contract,
         router_address=deployment.system_router,
+        observed_block_timestamp=authorization.block_timestamp,
+        session_expiration=authorization.session_expiration,
+        session_permission_bitmap=authorization.session_permission_bitmap,
+        stored_session_status_code=authorization.stored_status_code,
+        session_not_expired=authorization.session_not_expired,
         session_active=authorization.session_active,
         perps_permission_id=PERPS_PERMISSION_ID,
         perps_permission=authorization.perps_permission,
