@@ -22,9 +22,14 @@ def _word(value: int) -> str:
 class FakeRPC:
     public_read_only = True
 
-    def __init__(self, *, status: int = 1, perps: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        status: int = 1,
+        permissions: dict[int, bool] | None = None,
+    ) -> None:
         self.status = status
-        self.perps = perps
+        self.permissions = permissions or {1: False, 2: True, 3: False, 4: False}
         self.calls: list[tuple[str, list[object]]] = []
 
     async def call(self, method: str, params: list[object]) -> object:
@@ -38,12 +43,13 @@ class FakeRPC:
         if data.startswith('0xdd962cb2'):
             return _word(self.status)
         if data.startswith('0xed82f4b8'):
-            return _word(1 if self.perps else 0)
+            permission_id = int(data[-64:], 16)
+            return _word(1 if self.permissions.get(permission_id, False) else 0)
         raise AssertionError(data)
 
 
 @pytest.mark.asyncio
-async def test_collects_authorized_perps_permission_without_claiming_perps_only() -> None:
+async def test_collects_full_permission_matrix_without_claiming_final_perps_only() -> None:
     from app.security.risex_authorization_session import collect_authorization_session_evidence
 
     rpc = FakeRPC()
@@ -57,16 +63,45 @@ async def test_collects_authorized_perps_permission_without_claiming_perps_only(
 
     assert evidence.status_code == 1
     assert evidence.session_active is True
-    assert evidence.perps_permission is True
+    assert evidence.all_permission_id == 1
+    assert evidence.all_permission is False
     assert evidence.perps_permission_id == 2
+    assert evidence.perps_permission is True
+    assert evidence.spot_permission_id == 3
+    assert evidence.spot_permission is False
+    assert evidence.move_fund_permission_id == 4
+    assert evidence.move_fund_permission is False
     assert evidence.perps_only_scope is None
-    assert [method for method, _params in rpc.calls] == ['eth_call', 'eth_call']
+    assert [method for method, _params in rpc.calls] == ['eth_call'] * 5
 
     status_data = str(rpc.calls[0][1][0]['data'])  # type: ignore[index]
-    permission_data = str(rpc.calls[1][1][0]['data'])  # type: ignore[index]
     assert status_data.startswith('0xdd962cb2')
-    assert permission_data.startswith('0xed82f4b8')
-    assert permission_data.endswith((2).to_bytes(32, 'big').hex())
+    for index, permission_id in enumerate((1, 2, 3, 4), start=1):
+        permission_data = str(rpc.calls[index][1][0]['data'])  # type: ignore[index]
+        assert permission_data.startswith('0xed82f4b8')
+        assert permission_data.endswith(permission_id.to_bytes(32, 'big').hex())
+        assert rpc.calls[index][1][1] == BLOCK
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('dangerous_permission_id', [1, 3, 4])
+async def test_broader_permissions_are_definitively_not_perps_only(
+    dangerous_permission_id: int,
+) -> None:
+    from app.security.risex_authorization_session import collect_authorization_session_evidence
+
+    permissions = {1: False, 2: True, 3: False, 4: False}
+    permissions[dangerous_permission_id] = True
+    evidence = await collect_authorization_session_evidence(
+        FakeRPC(permissions=permissions),
+        authorization_address=AUTH,
+        account=ACCOUNT,
+        signer=SIGNER,
+        block_tag=BLOCK,
+    )
+
+    assert evidence.perps_permission is True
+    assert evidence.perps_only_scope is False
 
 
 @pytest.mark.asyncio
@@ -92,7 +127,8 @@ async def test_malformed_boolean_permission_fails_closed() -> None:
         async def call(self, method: str, params: list[object]) -> object:
             call = params[0]
             assert isinstance(call, dict)
-            if str(call['data']).startswith('0xed82f4b8'):
+            data = str(call['data'])
+            if data.startswith('0xed82f4b8') and int(data[-64:], 16) == 4:
                 return _word(2)
             return await super().call(method, params)
 
