@@ -11,16 +11,23 @@ from app.security.risex_deployment_runtime import collect_runtime_deployment_evi
 
 CHAIN_ID = 11155931
 BLOCK = '0x1234'
+BLOCK_TIMESTAMP = 1_800_000_000
+EXPIRATION = BLOCK_TIMESTAMP + 3_600
 AUTH = '0x' + ('aa' * 20)
 AUTH_IMPL = '0x' + ('ab' * 20)
 ROUTER = '0x' + ('bb' * 20)
 ROUTER_IMPL = '0x' + ('bc' * 20)
 ACCOUNT = '0x' + ('11' * 20)
 SIGNER = '0x' + ('22' * 20)
+SESSION_KEYS_SELECTOR = '0x96ade1f9'
 
 
 def _word(value: int) -> str:
     return '0x' + value.to_bytes(32, 'big').hex()
+
+
+def _tuple_words(*values: int) -> str:
+    return '0x' + ''.join(value.to_bytes(32, 'big').hex() for value in values)
 
 
 def _implementation_slot(address: str) -> str:
@@ -57,9 +64,17 @@ class FakeRPC:
         *,
         status: int = 1,
         permissions: dict[int, bool] | None = None,
+        expiration: int = EXPIRATION,
+        permission_bitmap: int = 0x1234,
+        stored_status: int = 1,
+        block_timestamp: int = BLOCK_TIMESTAMP,
     ) -> None:
         self.status = status
         self.permissions = permissions or {1: False, 2: True, 3: False, 4: False}
+        self.expiration = expiration
+        self.permission_bitmap = permission_bitmap
+        self.stored_status = stored_status
+        self.block_timestamp = block_timestamp
         self.calls: list[tuple[str, list[object]]] = []
 
     async def call(self, method: str, params: list[object]) -> object:
@@ -84,11 +99,17 @@ class FakeRPC:
             if address == ROUTER.lower():
                 return _implementation_slot(ROUTER_IMPL)
             raise AssertionError(address)
+        if method == 'eth_getBlockByNumber':
+            assert params == [BLOCK, False]
+            return {'number': BLOCK, 'timestamp': hex(self.block_timestamp)}
         if method == 'eth_call':
             call = params[0]
             assert isinstance(call, dict)
             assert call['to'] == AUTH
+            assert params[1] == BLOCK
             data = str(call['data'])
+            if data.startswith(SESSION_KEYS_SELECTOR):
+                return _tuple_words(self.expiration, self.permission_bitmap, self.stored_status)
             if data.startswith('0xdd962cb2'):
                 return _word(self.status)
             if data.startswith('0xed82f4b8'):
@@ -117,11 +138,16 @@ def _patch_credential_loader(monkeypatch: pytest.MonkeyPatch, runner: Any) -> No
     )
 
 
-async def _run(monkeypatch: pytest.MonkeyPatch, *, permissions: dict[int, bool]) -> Any:
+async def _run(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    permissions: dict[int, bool],
+    expiration: int = EXPIRATION,
+) -> Any:
     from app.security import risex_signed_testnet_runner as runner
 
     _patch_credential_loader(monkeypatch, runner)
-    rpc = FakeRPC(status=1, permissions=permissions)
+    rpc = FakeRPC(status=1, permissions=permissions, expiration=expiration)
     report = await runner.run_signed_testnet_readiness(
         env={
             'RISEX_TESTNET_ACCOUNT_ADDRESS': ACCOUNT,
@@ -140,7 +166,7 @@ async def _run(monkeypatch: pytest.MonkeyPatch, *, permissions: dict[int, bool])
 
 
 @pytest.mark.asyncio
-async def test_runner_collects_same_block_signer_evidence_and_blocks_post_until_scope_is_proven(
+async def test_runner_collects_same_block_expiration_evidence_and_blocks_post_until_scope_is_proven(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report, rpc = await _run(
@@ -151,6 +177,11 @@ async def test_runner_collects_same_block_signer_evidence_and_blocks_post_until_
     assert report.deployment_verdict == 'PASS'
     assert report.deployment_identity_verified is True
     assert report.block_tag == BLOCK
+    assert report.observed_block_timestamp == BLOCK_TIMESTAMP
+    assert report.session_expiration == EXPIRATION
+    assert report.session_permission_bitmap == 0x1234
+    assert report.stored_session_status_code == 1
+    assert report.session_not_expired is True
     assert report.session_active is True
     assert report.perps_permission_id == 2
     assert report.perps_permission is True
@@ -166,7 +197,28 @@ async def test_runner_collects_same_block_signer_evidence_and_blocks_post_until_
         for method, params in rpc.calls
         if method == 'eth_call'
     ]
-    assert eth_call_blocks == [BLOCK] * 5
+    assert eth_call_blocks == [BLOCK] * 6
+    assert [params for method, params in rpc.calls if method == 'eth_getBlockByNumber'] == [
+        [BLOCK, False]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runner_fails_when_authorized_signer_is_expired_at_observed_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report, _rpc = await _run(
+        monkeypatch,
+        permissions={1: False, 2: True, 3: False, 4: False},
+        expiration=BLOCK_TIMESTAMP,
+    )
+
+    assert report.session_not_expired is False
+    assert report.session_active is False
+    assert report.verdict == 'FAIL'
+    assert report.post_allowed is False
+    assert report.full_security_gate_passed is False
+    assert report.writes_enabled is False
 
 
 @pytest.mark.asyncio
