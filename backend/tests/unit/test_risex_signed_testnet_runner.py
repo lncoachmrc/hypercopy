@@ -52,9 +52,14 @@ class FakeAPI:
 class FakeRPC:
     public_read_only = True
 
-    def __init__(self, *, status: int = 1, perps: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        status: int = 1,
+        permissions: dict[int, bool] | None = None,
+    ) -> None:
         self.status = status
-        self.perps = perps
+        self.permissions = permissions or {1: False, 2: True, 3: False, 4: False}
         self.calls: list[tuple[str, list[object]]] = []
 
     async def call(self, method: str, params: list[object]) -> object:
@@ -87,7 +92,8 @@ class FakeRPC:
             if data.startswith('0xdd962cb2'):
                 return _word(self.status)
             if data.startswith('0xed82f4b8'):
-                return _word(1 if self.perps else 0)
+                permission_id = int(data[-64:], 16)
+                return _word(1 if self.permissions.get(permission_id, False) else 0)
             raise AssertionError(data)
         raise AssertionError(method)
 
@@ -103,19 +109,19 @@ async def _expected_fingerprint() -> str:
     return fingerprint
 
 
-@pytest.mark.asyncio
-async def test_runner_collects_same_block_signer_evidence_and_blocks_post_until_scope_is_proven(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from app.security import risex_signed_testnet_runner as runner
-
+def _patch_credential_loader(monkeypatch: pytest.MonkeyPatch, runner: Any) -> None:
     monkeypatch.setattr(
         runner,
         'load_testnet_signer_credential',
         lambda _env: SimpleNamespace(account_address=ACCOUNT, signer_address=SIGNER),
     )
 
-    rpc = FakeRPC(status=1, perps=True)
+
+async def _run(monkeypatch: pytest.MonkeyPatch, *, permissions: dict[int, bool]) -> Any:
+    from app.security import risex_signed_testnet_runner as runner
+
+    _patch_credential_loader(monkeypatch, runner)
+    rpc = FakeRPC(status=1, permissions=permissions)
     report = await runner.run_signed_testnet_readiness(
         env={
             'RISEX_TESTNET_ACCOUNT_ADDRESS': ACCOUNT,
@@ -129,6 +135,17 @@ async def test_runner_collects_same_block_signer_evidence_and_blocks_post_until_
         dedicated_signer_asserted=True,
         operatorhub_bypass_disabled=True,
         expected_fingerprint=await _expected_fingerprint(),
+    )
+    return report, rpc
+
+
+@pytest.mark.asyncio
+async def test_runner_collects_same_block_signer_evidence_and_blocks_post_until_scope_is_proven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report, rpc = await _run(
+        monkeypatch,
+        permissions={1: False, 2: True, 3: False, 4: False},
     )
 
     assert report.deployment_verdict == 'PASS'
@@ -149,4 +166,20 @@ async def test_runner_collects_same_block_signer_evidence_and_blocks_post_until_
         for method, params in rpc.calls
         if method == 'eth_call'
     ]
-    assert eth_call_blocks == [BLOCK, BLOCK]
+    assert eth_call_blocks == [BLOCK] * 5
+
+
+@pytest.mark.asyncio
+async def test_runner_fails_when_signer_still_has_default_all_permission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report, _rpc = await _run(
+        monkeypatch,
+        permissions={1: True, 2: True, 3: False, 4: False},
+    )
+
+    assert report.perps_only_scope is False
+    assert report.verdict == 'FAIL'
+    assert report.post_allowed is False
+    assert report.full_security_gate_passed is False
+    assert report.writes_enabled is False
