@@ -3,13 +3,14 @@
 **Project:** TRAXION  
 **Scope:** read-only RISEx Phase 4 deployment identity  
 **Write authorization:** none  
-**Security gate:** `UNKNOWN / BLOCKED`
+**Deployment identity preflight:** `PASS`  
+**Full security gate:** `UNKNOWN / BLOCKED`
 
 ## Purpose
 
 This record preserves the read-only evidence used to identify the exact RISEx testnet deployment before any signed test is considered. It is intentionally separate from application configuration and does not enable RISEx writes.
 
-Full public contract addresses are retained in the referenced GitHub Actions diagnostic logs. This document uses shortened addresses plus cryptographic fingerprints so the repository does not treat deployment addresses as credentials or runtime configuration.
+Full public contract addresses are retained in the referenced GitHub Actions diagnostic logs and are emitted by the permanent read-only preflight. The historical sections below use shortened addresses plus cryptographic fingerprints so deployment identities are not treated as credentials or hand-maintained runtime configuration.
 
 ## Live evidence source
 
@@ -17,14 +18,49 @@ The same-run probes queried:
 
 - `GET https://api.testnet.rise.trade/v1/auth/eip712-domain`
 - `GET https://api.testnet.rise.trade/v1/system/config`
-- RISE testnet JSON-RPC read methods only (`eth_chainId`, `eth_blockNumber`, `eth_getCode`, `eth_getStorageAt`, `eth_call`)
+- RISE testnet JSON-RPC read methods only (`eth_chainId`, `eth_blockNumber`, `eth_getCode`, `eth_getStorageAt`)
 
-Diagnostic CI runs:
+Earlier diagnostic evidence also used read-only `eth_call` to prove the critical Authorization interface behavior.
+
+Evidence CI runs:
 
 - GitHub Actions run `34446451396`: Authorization ABI behavioral evidence
 - GitHub Actions run `34446652741`: implementation runtime hashes and Solidity metadata check
+- GitHub Actions run `34502155535`: permanent pinned deployment preflight live verification
 
-The temporary network diagnostic test used to collect this evidence was removed immediately afterwards and is not part of the permanent test suite.
+All temporary network diagnostic tests were removed immediately after evidence capture and are not part of the permanent test suite.
+
+## Permanent pinned deployment preflight — PASS
+
+The permanent TRAXION preflight was executed against the live RISEx testnet deployment through GitHub Actions run `34502155535` on 2026-09-10.
+
+Observed block: `53969018`.
+
+All deployment-identity checks returned `PASS`:
+
+- API/RPC chain identity matched;
+- EIP-712 `verifyingContract`, `system.auth` and Authorization code evidence matched;
+- `system.router` matched the Router code evidence;
+- Authorization proxy and EIP-1967 implementation both had the reviewed runtime bytecode;
+- Router proxy and EIP-1967 implementation both had the reviewed runtime bytecode;
+- observed canonical fingerprint matched the reviewed pin.
+
+Expected fingerprint:
+
+`764412dd3ebb2ecb2b2878e3318bce39e9593cbd32108ebefa90e20161722e2f`
+
+Observed fingerprint:
+
+`764412dd3ebb2ecb2b2878e3318bce39e9593cbd32108ebefa90e20161722e2f`
+
+Permanent preflight result:
+
+- `verdict = PASS`
+- `deployment_identity_verified = true`
+- `writes_enabled = false`
+- `full_security_gate_passed = false`
+
+This `PASS` applies only to the pinned deployment identity. It does not prove the complete ABI/source provenance or the least-privilege capability of a registered signer.
 
 ## Deployment identity observed
 
@@ -60,11 +96,13 @@ Router implementation:
 - runtime bytes: `20742`
 - keccak256: `0x6a0791ef13de50d862ee1e2462e3037f2694d695622b5de58de0e6259ce434e9`
 
-Canonical deployment fingerprint used by the TRAXION preflight design:
+Canonical deployment fingerprint used by the TRAXION preflight:
 
 `sha256:764412dd3ebb2ecb2b2878e3318bce39e9593cbd32108ebefa90e20161722e2f`
 
-The fingerprint covers network, chain ID, EIP-712 domain name/version, Authorization proxy/implementation identities and runtime code hashes, and Router proxy/implementation identities and runtime code hashes. The block number is evidence metadata and is deliberately excluded so a later read of the unchanged deployment can match the same fingerprint.
+The fingerprint covers network, chain ID, EIP-712 domain name/version, Authorization proxy/implementation identities and runtime code hashes, and Router proxy/implementation identities and runtime code hashes. The block number and ABI-verification status are deliberately excluded so a later read of the unchanged deployment produces the same identity fingerprint.
+
+Any address, proxy implementation or runtime-code change therefore changes the fingerprint and returns the preflight to a blocked state until the new deployment is reviewed and explicitly re-pinned.
 
 ## Authorization interface behavioral evidence
 
@@ -89,10 +127,17 @@ Block explorer source/ABI verification was not available for the observed Author
 
 Therefore:
 
-- runtime deployment identity: **proven for the observed run**;
+- pinned runtime deployment identity: **PASS**;
 - critical Authorization interface compatibility: **proven behaviorally**;
 - complete ABI/source provenance: **UNKNOWN**;
 - signer perps-only/no-fund-movement capability: **UNKNOWN**;
-- RISEx write gate: **BLOCKED**.
+- full RISEx security gate: **BLOCKED**;
+- RISEx writes: **disabled**.
 
-Any contract upgrade or deployment fingerprint mismatch must return the deployment preflight to a blocked state until the new deployment is reviewed and re-pinned.
+Run the permanent deployment check from the repository root with:
+
+```bash
+python scripts/risex_deployment_preflight.py
+```
+
+The command is testnet-only, uses public/read-only API and RPC evidence, and contains no signer secret or transaction path.
