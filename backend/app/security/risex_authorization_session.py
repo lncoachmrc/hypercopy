@@ -9,7 +9,10 @@ from app.adapters.risex_types import ProviderDataMalformed, ProviderReadUnavaila
 GET_SESSION_KEY_STATUS_SELECTOR = '0xdd962cb2'
 HAS_PERMISSION_SELECTOR = '0xed82f4b8'
 AUTHORIZED_STATUS_ID = 1
+ALL_PERMISSION_ID = 1
 PERPS_PERMISSION_ID = 2
+SPOT_PERMISSION_ID = 3
+MOVE_FUND_PERMISSION_ID = 4
 
 
 class PublicRPCTransport(Protocol):
@@ -27,8 +30,14 @@ class RISExAuthorizationSessionEvidence:
     block_tag: str
     status_code: int
     session_active: bool | None
+    all_permission_id: int
+    all_permission: bool
     perps_permission_id: int
     perps_permission: bool
+    spot_permission_id: int
+    spot_permission: bool
+    move_fund_permission_id: int
+    move_fund_permission: bool
     perps_only_scope: bool | None
 
 
@@ -71,6 +80,32 @@ def _decode_bool(value: object, *, field: str) -> bool:
     return decoded == 1
 
 
+async def _collect_permission(
+    rpc: PublicRPCTransport,
+    *,
+    authorization_address: str,
+    account_word: str,
+    signer_word: str,
+    permission_id: int,
+    permission_name: str,
+    block_tag: str,
+) -> bool:
+    permission_data = (
+        HAS_PERMISSION_SELECTOR
+        + account_word
+        + signer_word
+        + _uint_word(permission_id)
+    )
+    permission_raw = await rpc.call(
+        'eth_call',
+        [{'to': authorization_address, 'data': permission_data}, block_tag],
+    )
+    return _decode_bool(
+        permission_raw,
+        field=f'RISEx {permission_name} permission boolean',
+    )
+
+
 async def collect_authorization_session_evidence(
     rpc: PublicRPCTransport,
     *,
@@ -79,7 +114,7 @@ async def collect_authorization_session_evidence(
     signer: str,
     block_tag: str,
 ) -> RISExAuthorizationSessionEvidence:
-    """Read signer status and the proven Perps permission from the pinned Auth contract."""
+    """Read signer status and the relevant permission matrix at one fixed block."""
 
     if getattr(rpc, 'public_read_only', False) is not True:
         raise ProviderReadUnavailable('RISEx signer evidence requires a read-only RPC transport')
@@ -104,17 +139,47 @@ async def collect_authorization_session_evidence(
     else:
         session_active = None
 
-    permission_data = (
-        HAS_PERMISSION_SELECTOR
-        + account_word
-        + signer_word
-        + _uint_word(PERPS_PERMISSION_ID)
+    all_permission = await _collect_permission(
+        rpc,
+        authorization_address=authorization_address,
+        account_word=account_word,
+        signer_word=signer_word,
+        permission_id=ALL_PERMISSION_ID,
+        permission_name='All',
+        block_tag=block_tag,
     )
-    permission_raw = await rpc.call(
-        'eth_call',
-        [{'to': authorization_address, 'data': permission_data}, block_tag],
+    perps_permission = await _collect_permission(
+        rpc,
+        authorization_address=authorization_address,
+        account_word=account_word,
+        signer_word=signer_word,
+        permission_id=PERPS_PERMISSION_ID,
+        permission_name='Perps',
+        block_tag=block_tag,
     )
-    perps_permission = _decode_bool(permission_raw, field='RISEx Perps permission boolean')
+    spot_permission = await _collect_permission(
+        rpc,
+        authorization_address=authorization_address,
+        account_word=account_word,
+        signer_word=signer_word,
+        permission_id=SPOT_PERMISSION_ID,
+        permission_name='Spot',
+        block_tag=block_tag,
+    )
+    move_fund_permission = await _collect_permission(
+        rpc,
+        authorization_address=authorization_address,
+        account_word=account_word,
+        signer_word=signer_word,
+        permission_id=MOVE_FUND_PERMISSION_ID,
+        permission_name='MoveFund',
+        block_tag=block_tag,
+    )
+
+    broader_permission_present = (
+        all_permission or spot_permission or move_fund_permission
+    )
+    perps_only_scope: bool | None = False if broader_permission_present else None
 
     return RISExAuthorizationSessionEvidence(
         authorization_address=authorization_address,
@@ -123,7 +188,13 @@ async def collect_authorization_session_evidence(
         block_tag=block_tag,
         status_code=status_code,
         session_active=session_active,
+        all_permission_id=ALL_PERMISSION_ID,
+        all_permission=all_permission,
         perps_permission_id=PERPS_PERMISSION_ID,
         perps_permission=perps_permission,
-        perps_only_scope=None,
+        spot_permission_id=SPOT_PERMISSION_ID,
+        spot_permission=spot_permission,
+        move_fund_permission_id=MOVE_FUND_PERMISSION_ID,
+        move_fund_permission=move_fund_permission,
+        perps_only_scope=perps_only_scope,
     )
