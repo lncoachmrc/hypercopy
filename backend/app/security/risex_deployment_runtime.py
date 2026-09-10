@@ -28,6 +28,7 @@ _ALLOWED_RPC_METHODS = frozenset(
         'eth_blockNumber',
         'eth_getCode',
         'eth_getStorageAt',
+        'eth_call',
     }
 )
 
