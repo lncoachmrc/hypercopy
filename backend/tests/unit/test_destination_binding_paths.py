@@ -23,7 +23,8 @@ def test_worker_rejects_non_hyperliquid_provider_before_claim_or_adapter_routing
     worker_source = inspect.getsource(execution_worker.Worker.handle_job_id)
 
     assert "if job.execution_provider != 'hyperliquid':" in guard_source
-    assert 'Execution provider is not enabled for writes' in guard_source
+    assert '_PROVIDER_WRITES_DISABLED_REASON' in guard_source
+    assert queue_service._PROVIDER_WRITES_DISABLED_REASON == 'Execution provider is not enabled for writes'
 
     delivery_guard = 'prepare_job_destination_for_execution(db, raw)'
     assert delivery_guard in worker_source
