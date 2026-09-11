@@ -23,6 +23,7 @@ from app.schemas.user import RiskProfileIn, TradingAccountIn, TradingNetworkIn
 from app.services.audit import audit
 from app.services.entitlement import entitlement
 from app.services.execution import live_trading_allowed
+from app.services.execution_destination import close_user_destination_epoch, set_user_destination
 from app.services.master_source_identity import (
     MASTER_SOURCE_FOLLOWER_BLOCK_REASON,
     MASTER_SOURCE_MODE,
@@ -307,6 +308,15 @@ async def link_trading_account(body: TradingAccountIn, request: Request, user: U
     blob = crypto.encrypt(body.agent_private_key, user_id=str(user.id), account_id=str(account.id))
     expires = datetime.fromtimestamp(verification.valid_until/1000, UTC) if verification.valid_until else None
     db.add(SigningCredential(trading_account_id=account.id, ciphertext_b64=blob.ciphertext_b64, nonce_b64=blob.nonce_b64, wrapped_dek_b64=blob.wrapped_dek_b64, wrap_nonce_b64=blob.wrap_nonce_b64, key_provider=blob.key_provider, key_reference=blob.key_reference, key_version=blob.key_version, agent_fingerprint=hashlib.sha256(verification.agent_address.encode()).hexdigest(), expires_at=expires, status=CredentialStatus.ACTIVE))
+    await close_user_destination_epoch(db, user.id)
+    await set_user_destination(
+        db,
+        user.id,
+        provider='hyperliquid',
+        network=network,
+        account_address=account_address,
+        credential_version=blob.key_version,
+    )
     if settings.DEFAULT_SHADOW_MODE and user.copy_state == CopyState.PAUSED:
         user.copy_state = CopyState.SHADOW
         user.shadow_started_at = datetime.now(UTC)
@@ -324,6 +334,7 @@ async def unlink_trading_account(user: User = Depends(current_user), db: AsyncSe
         raise HTTPException(409, 'Close all TRAXION-managed positions before removing the trading credential')
     account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
     if account: await db.delete(account)
+    await close_user_destination_epoch(db, user.id)
     user.copy_state = CopyState.PAUSED
     await audit(db, action='TRADING_ACCOUNT_UNLINKED', actor_id=user.id, subject_id=user.id)
     await db.commit()

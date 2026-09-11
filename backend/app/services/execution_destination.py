@@ -253,6 +253,51 @@ async def bootstrap_user_destination_epoch(
     )
 
 
+async def close_user_destination_epoch(db: AsyncSession, user_id: uuid.UUID) -> None:
+    """Close and detach the user's active destination epoch, if any."""
+    now = datetime.now(UTC)
+    row = (
+        await db.execute(
+            text(
+                """
+                SELECT active_execution_epoch_id
+                FROM users
+                WHERE id = :user_id
+                FOR UPDATE
+                """
+            ),
+            {'user_id': user_id},
+        )
+    ).mappings().one_or_none()
+    if not row:
+        raise RuntimeError('User destination state is unavailable')
+
+    epoch_id = row['active_execution_epoch_id']
+    if epoch_id is None:
+        return
+
+    await db.execute(
+        text(
+            'UPDATE execution_epochs '
+            'SET ended_at = :ended_at '
+            'WHERE id = :epoch_id AND ended_at IS NULL'
+        ),
+        {'ended_at': now, 'epoch_id': epoch_id},
+    )
+    await db.execute(
+        text(
+            """
+            UPDATE users
+            SET active_execution_epoch_id = NULL,
+                updated_at = :updated_at
+            WHERE id = :user_id
+              AND active_execution_epoch_id = :epoch_id
+            """
+        ),
+        {'updated_at': now, 'user_id': user_id, 'epoch_id': epoch_id},
+    )
+
+
 async def set_user_destination(
     db: AsyncSession,
     user_id: uuid.UUID,
@@ -296,20 +341,14 @@ async def set_user_destination(
     current_network = str(row['network'] or '').lower()
     current_open = current_epoch_id is not None and row['ended_at'] is None
 
-    preserved_account = account_address
-    preserved_credential_version = credential_version
-    if current_open and current_provider == provider:
-        if preserved_account is None:
-            preserved_account = row['account_address']
-        if preserved_credential_version is None:
-            preserved_credential_version = row['credential_version']
-
     unchanged = (
         current_open
         and current_provider == provider
         and current_network == network
-        and (account_address is None or account_address == row['account_address'])
-        and (credential_version is None or credential_version == row['credential_version'])
+        and account_address is not None
+        and credential_version is not None
+        and account_address == row['account_address']
+        and credential_version == row['credential_version']
     )
     if unchanged:
         return UserDestinationState(
@@ -343,8 +382,8 @@ async def set_user_destination(
             'user_id': user_id,
             'provider': provider,
             'network': network,
-            'account_address': preserved_account,
-            'credential_version': preserved_credential_version,
+            'account_address': account_address,
+            'credential_version': credential_version,
             'started_at': now,
         },
     )
