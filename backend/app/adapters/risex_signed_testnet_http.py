@@ -4,7 +4,10 @@ from typing import Any
 
 import httpx
 
-from app.security.risex_place_order_request import RISExPreparedPlaceOrderRequest
+from app.security.risex_place_order_request import (
+    RISExPreparedPlaceOrderRequest,
+    prepare_place_order_request,
+)
 from app.security.risex_pre_order_gate import (
     RISExPreOrderProbeGate,
     assert_pre_order_probe_gate_attested,
@@ -85,7 +88,11 @@ class RISExSignedTestnetHTTPTransport:
                 'RISEx signed transport requires a typed place-order request'
             )
 
-        payload = request.json_for_testnet_transport()
+        validated = prepare_place_order_request(
+            order=request.order,
+            permit=request.permit,
+        )
+        payload = validated.json_for_testnet_transport()
         _assert_permit_identity_bound(self._gate, payload)
         return await self._post_json('/v1/orders/place', json=payload)
 
