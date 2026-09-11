@@ -189,10 +189,9 @@ def test_signed_transport_rejects_request_time_client_auth_before_network() -> N
         ),
         trust_env=False,
     )
-    transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
 
     with pytest.raises(SignedTestnetBlocked, match='JWT/OperatorHub|ambient authentication'):
-        asyncio.run(transport.post_place_order(_prepared_request()))
+        RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
     asyncio.run(client.aclose())
 
     assert calls == []
