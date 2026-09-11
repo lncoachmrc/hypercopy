@@ -9,7 +9,7 @@ from sqlalchemy import select, text
 from starlette.requests import Request
 
 from app.api import user as user_api
-from app.db.session import SessionLocal, engine
+from app.db.session import SessionLocal
 from app.models.entities import CopyJob, CopyState, ExecutionEpoch, JobState, User
 from app.schemas.user import TradingAccountIn
 from app.services.execution_destination import job_matches_active_destination, set_user_destination
@@ -111,7 +111,6 @@ async def test_missing_credential_version_rotates_open_epoch() -> None:
             assert second.epoch_id != first.epoch_id
         finally:
             await _cleanup_user(db, user_id)
-    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -140,7 +139,6 @@ async def test_missing_account_address_rotates_open_epoch() -> None:
             assert second.epoch_id != first.epoch_id
         finally:
             await _cleanup_user(db, user_id)
-    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -169,7 +167,6 @@ async def test_exact_identity_reuses_open_epoch() -> None:
             assert second.epoch_id == first.epoch_id
         finally:
             await _cleanup_user(db, user_id)
-    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -209,7 +206,6 @@ async def test_trading_account_replacement_rotates_epoch_and_rejects_queued_job(
             assert await job_matches_active_destination(db, job) is False
         finally:
             await _cleanup_user(db, user_id)
-    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -254,7 +250,6 @@ async def test_trading_account_unlink_closes_epoch_and_rejects_queued_job(monkey
             assert await job_matches_active_destination(db, job) is False
         finally:
             await _cleanup_user(db, user_id)
-    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -278,4 +273,3 @@ async def test_initial_trading_account_link_materializes_epoch_with_credential_i
             assert epoch.credential_version == 1
         finally:
             await _cleanup_user(db, user_id)
-    await engine.dispose()
