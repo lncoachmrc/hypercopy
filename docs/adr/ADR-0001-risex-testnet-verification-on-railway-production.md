@@ -76,3 +76,15 @@ This ADR must be reviewed when any of the following occurs:
 - the project introduces a stronger isolated verification environment with equivalent production topology.
 
 Until this ADR is superseded, **Railway production is the approved environment for RISEx testnet verification, subject to the mitigations above**.
+
+## Revisione
+
+La decisione originale era basata sul presupposto che Railway `production` fosse un ambiente testnet o comunque non operativo. Le verifiche successive sul runtime e sul database production hanno dimostrato che questo presupposto era falso.
+
+Railway `production` è un sistema in esercizio su **mainnet** con capitale reale e stato operativo attivo.
+
+Di conseguenza, le verifiche RISEx **testnet non si eseguono su production**.
+
+La decisione precedente è sostituita dalla seguente: le verifiche RISEx testnet richiedono un servizio temporaneo isolato con `HYPERLIQUID_NETWORK=testnet`, `ENABLE_LIVE_TRADING=false` e un database separato da quello production.
+
+Questa revisione deve essere riesaminata quando tale servizio temporaneo esiste ed è stato verificato. Fino ad allora, production non è un ambiente approvato per le verifiche RISEx testnet.
