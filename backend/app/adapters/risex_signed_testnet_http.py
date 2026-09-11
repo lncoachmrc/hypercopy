@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from time import time
 from typing import Any
 
 import httpx
@@ -13,6 +15,7 @@ from app.security.risex_pre_order_gate import (
     assert_pre_order_probe_gate_attested,
 )
 from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+from app.security.risex_signer_probe import RISExSignerCapabilityEvidence
 
 
 _TESTNET_BASE_URL = 'https://api.testnet.rise.trade'
@@ -27,6 +30,7 @@ _FORBIDDEN_AUTH_HEADERS = frozenset(
         'x-auth-token',
     }
 )
+RISExPreOrderFreshnessProbe = Callable[[], Awaitable[RISExSignerCapabilityEvidence]]
 
 
 def _reject_ambient_auth(client: httpx.AsyncClient) -> None:
@@ -79,6 +83,7 @@ class RISExSignedTestnetHTTPTransport:
         gate: RISExPreOrderProbeGate,
         client: httpx.AsyncClient | None = None,
         timeout_seconds: float = 10.0,
+        freshness_probe: RISExPreOrderFreshnessProbe | None = None,
     ) -> None:
         assert_pre_order_probe_gate_attested(gate)
         if client is not None:
@@ -91,6 +96,7 @@ class RISExSignedTestnetHTTPTransport:
             headers=_SAFE_CLIENT_HEADERS,
         )
         self._owns_client = client is None
+        self._freshness_probe = freshness_probe
 
     async def post_place_order(
         self,
@@ -107,6 +113,19 @@ class RISExSignedTestnetHTTPTransport:
         )
         payload = validated.json_for_testnet_transport()
         _assert_permit_identity_bound(self._gate, payload)
+
+        if self._freshness_probe is None:
+            raise SignedTestnetBlocked(
+                'RISEx signed transport requires fresh session and deployment evidence before POST'
+            )
+        current_evidence = await self._freshness_probe()
+        assert_pre_order_probe_gate_attested(
+            self._gate,
+            now=int(time()),
+            evidence=current_evidence,
+        )
+        _reject_ambient_auth(self._client)
+
         return await self._post_json('/v1/orders/place', json=payload)
 
     async def _post_json(

@@ -30,17 +30,65 @@ class RISExPreOrderProbeGate:
 
     account_address: str
     signer_address: str
+    session_expiration: int = 0
+    deployment_chain_id: int = 0
+    deployment_auth_contract: str = ''
+    deployment_router: str = ''
     order_probe_allowed: Literal[True] = True
     _attestation_seal: object = field(repr=False, compare=False, default=None)
 
 
-def assert_pre_order_probe_gate_attested(gate: RISExPreOrderProbeGate) -> None:
-    """Reject hand-built or stale-looking gate objects before any provider mutation."""
+def assert_pre_order_probe_gate_attested(
+    gate: RISExPreOrderProbeGate,
+    *,
+    now: int | None = None,
+    evidence: RISExSignerCapabilityEvidence | None = None,
+) -> None:
+    """Reject forged or stale gates before any provider mutation.
+
+    Without ``now``/``evidence`` this verifies only the sealed gate structure, which
+    is sufficient at construction time.  Immediately before a provider POST callers
+    must supply both values so session freshness and pinned deployment identity are
+    revalidated against current evidence.
+    """
 
     if not isinstance(gate, RISExPreOrderProbeGate):
         raise SignedTestnetBlocked('RISEx order probe requires an attested pre-order gate')
     if gate._attestation_seal is not _ATTESTATION_SEAL or gate.order_probe_allowed is not True:
         raise SignedTestnetBlocked('RISEx order probe requires an attested pre-order gate')
+
+    if now is None and evidence is None:
+        return
+    if now is None or evidence is None:
+        raise SignedTestnetBlocked('RISEx pre-order gate freshness evidence is incomplete')
+
+    if gate.session_expiration <= now:
+        raise SignedTestnetBlocked('RISEx pre-order gate session is expired')
+    if evidence.network != 'testnet':
+        raise SignedTestnetBlocked('RISEx pre-order freshness evidence must be bound to testnet')
+    if evidence.session_active is not True:
+        raise SignedTestnetBlocked('RISEx session signer is revoked or no longer active')
+    if evidence.session_expiration is None or evidence.session_expiration <= now:
+        raise SignedTestnetBlocked('RISEx session signer is expired or expiration is unavailable')
+    if evidence.session_expiration != gate.session_expiration:
+        raise SignedTestnetBlocked('RISEx session signer lifecycle changed after gate attestation')
+    if (
+        evidence.account.lower() != gate.account_address.lower()
+        or evidence.signer.lower() != gate.signer_address.lower()
+        or evidence.session_account is None
+        or evidence.session_account.lower() != gate.account_address.lower()
+    ):
+        raise SignedTestnetBlocked('RISEx session signer identity changed after gate attestation')
+
+    deployment_matches = (
+        evidence.chain_id == gate.deployment_chain_id
+        and evidence.auth_contract is not None
+        and evidence.router is not None
+        and evidence.auth_contract.lower() == gate.deployment_auth_contract.lower()
+        and evidence.router.lower() == gate.deployment_router.lower()
+    )
+    if not deployment_matches:
+        raise SignedTestnetBlocked('RISEx deployment identity changed after gate attestation')
 
 
 def authorize_pre_order_probe(
@@ -88,6 +136,10 @@ def authorize_pre_order_probe(
     gate = RISExPreOrderProbeGate(
         account_address=evidence.account,
         signer_address=evidence.signer,
+        session_expiration=evidence.session_expiration,
+        deployment_chain_id=evidence.chain_id,
+        deployment_auth_contract=evidence.auth_contract,
+        deployment_router=evidence.router,
         _attestation_seal=_ATTESTATION_SEAL,
     )
     assert_pre_order_probe_gate_attested(gate)
