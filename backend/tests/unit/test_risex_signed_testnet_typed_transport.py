@@ -24,9 +24,8 @@ AUTH = '0x' + ('33' * 20)
 ROUTER = '0x' + ('44' * 20)
 
 
-def _gate():
-    now = int(time())
-    policy = SignedTestnetPolicy(
+def _policy() -> SignedTestnetPolicy:
+    return SignedTestnetPolicy(
         network='testnet',
         explicit_approval=True,
         deployment_verdict='PASS',
@@ -35,7 +34,11 @@ def _gate():
         dedicated_signer_asserted=True,
         operatorhub_bypass_disabled=True,
     )
-    evidence = RISExSignerCapabilityEvidence(
+
+
+def _evidence() -> RISExSignerCapabilityEvidence:
+    now = int(time())
+    return RISExSignerCapabilityEvidence(
         network='testnet',
         account=ACCOUNT,
         signer=SIGNER,
@@ -52,12 +55,25 @@ def _gate():
         post_revoke_order_rejected=None,
         operatorhub_bypass_disabled=True,
     )
+
+
+def _gate(*, evidence: RISExSignerCapabilityEvidence | None = None):
+    now = int(time())
+    current = evidence or _evidence()
     return authorize_pre_order_probe(
-        policy=policy,
-        evidence=evidence,
+        policy=_policy(),
+        evidence=current,
         now=now,
         replay_protection_verified=True,
     )
+
+
+def _attach_freshness_probe(transport, evidence: RISExSignerCapabilityEvidence):
+    async def probe() -> RISExSignerCapabilityEvidence:
+        return evidence
+
+    transport._freshness_probe = probe
+    return transport
 
 
 def _request(*, account: str = ACCOUNT, signer: str = SIGNER):
@@ -89,6 +105,7 @@ def _request(*, account: str = ACCOUNT, signer: str = SIGNER):
 def test_transport_posts_only_typed_place_order_request() -> None:
     from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
 
+    evidence = _evidence()
     calls: list[httpx.Request] = []
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(
@@ -96,7 +113,10 @@ def test_transport_posts_only_typed_place_order_request() -> None:
         ),
         trust_env=False,
     )
-    transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
+    transport = _attach_freshness_probe(
+        RISExSignedTestnetHTTPTransport(gate=_gate(evidence=evidence), client=client),
+        evidence,
+    )
     prepared = _request()
 
     result = asyncio.run(transport.post_place_order(prepared))
@@ -159,6 +179,7 @@ def test_transport_revalidates_hand_built_typed_request_before_network() -> None
     )
     forged = RISExPreparedPlaceOrderRequest(order=changed_order, permit=signed.permit)
 
+    evidence = _evidence()
     calls: list[httpx.Request] = []
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(
@@ -166,7 +187,10 @@ def test_transport_revalidates_hand_built_typed_request_before_network() -> None
         ),
         trust_env=False,
     )
-    transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
+    transport = _attach_freshness_probe(
+        RISExSignedTestnetHTTPTransport(gate=_gate(evidence=evidence), client=client),
+        evidence,
+    )
 
     with pytest.raises(SignedTestnetBlocked, match='action hash'):
         asyncio.run(transport.post_place_order(forged))

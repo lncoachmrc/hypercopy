@@ -69,6 +69,10 @@ def test_pre_order_gate_allows_probe_before_positive_order_and_post_revoke_tests
     assert gate.account_address == ACCOUNT
     assert gate.signer_address == SIGNER
     assert gate.order_probe_allowed is True
+    assert gate.session_expiration > int(time())
+    assert gate.deployment_chain_id == 11155931
+    assert gate.deployment_auth_contract == AUTH
+    assert gate.deployment_router == ROUTER
 
 
 @pytest.mark.parametrize(
