@@ -17,6 +17,7 @@ from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
 
 _TESTNET_BASE_URL = 'https://api.testnet.rise.trade'
 _ALLOWED_POST_PATHS = frozenset({'/v1/orders/place'})
+_SAFE_CLIENT_HEADERS = {'Accept': 'application/json'}
 _FORBIDDEN_AUTH_HEADERS = frozenset(
     {
         'authorization',
@@ -30,7 +31,14 @@ _FORBIDDEN_AUTH_HEADERS = frozenset(
 
 def _reject_ambient_auth(client: httpx.AsyncClient) -> None:
     header_names = {name.lower() for name in client.headers.keys()}
-    if header_names & _FORBIDDEN_AUTH_HEADERS or any(True for _cookie in client.cookies.jar):
+    has_request_hooks = bool(client.event_hooks.get('request'))
+    if (
+        client.auth is not None
+        or client.trust_env
+        or has_request_hooks
+        or header_names & _FORBIDDEN_AUTH_HEADERS
+        or any(True for _cookie in client.cookies.jar)
+    ):
         raise SignedTestnetBlocked(
             'RISEx signed testnet transport rejects JWT/OperatorHub or ambient authentication'
         )
@@ -76,7 +84,12 @@ class RISExSignedTestnetHTTPTransport:
         if client is not None:
             _reject_ambient_auth(client)
         self._gate = gate
-        self._client = client or httpx.AsyncClient(timeout=timeout_seconds)
+        self._client = client or httpx.AsyncClient(
+            timeout=timeout_seconds,
+            trust_env=False,
+            auth=None,
+            headers=_SAFE_CLIENT_HEADERS,
+        )
         self._owns_client = client is None
 
     async def post_place_order(
