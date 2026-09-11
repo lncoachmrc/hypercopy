@@ -137,7 +137,16 @@ def test_signed_transport_requires_attested_pre_order_gate() -> None:
     )
     transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
     result = asyncio.run(
-        transport.post_json('/v1/orders/place', json={'permit': {'signature': 'redacted'}})
+        transport.post_json(
+            '/v1/orders/place',
+            json={
+                'permit': {
+                    'account': ACCOUNT,
+                    'signer': SIGNER,
+                    'signature': 'redacted',
+                }
+            },
+        )
     )
     asyncio.run(client.aclose())
 
