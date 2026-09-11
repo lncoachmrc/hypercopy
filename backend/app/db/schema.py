@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.master_source_identity import quarantine_master_source_jobs
 
-EXPECTED_REVISION='0010_user_plan_discounts'
+EXPECTED_REVISION='0012_destination_fence'
 
 
 async def assert_schema(db:AsyncSession)->None:

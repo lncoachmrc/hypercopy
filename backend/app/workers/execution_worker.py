@@ -36,10 +36,11 @@ from app.services.admin_leverage_sync import (
 from app.services.audit import audit
 from app.services.credentials import monitor_credential_expiry
 from app.services.execution import claim_job, process_job, release_stale_jobs
+from app.services.execution_destination import job_matches_active_destination
 from app.services.execution_resolution import resolve_ambiguous_executions
 from app.services.master_leverage_cache import record_master_leverage_missing
 from app.services.networking import user_network_state
-from app.services.queue import ensure_group, repair_stream
+from app.services.queue import ensure_group, prepare_job_destination_for_execution, repair_stream
 from app.services.reconcile import master_snapshot, reconcile_active_users, reconcile_user
 
 configure_logging(); log=get_logger(__name__); stop=asyncio.Event()
@@ -248,6 +249,14 @@ class Worker:
         user = await db.get(User, job.user_id)
         if not user:
             return await _finish_admin_leverage_job(db, job, JobState.SKIPPED, error='User no longer exists', status_code=404)
+        if not await job_matches_active_destination(db, job) or job.execution_provider != 'hyperliquid':
+            return await _finish_admin_leverage_job(
+                db,
+                job,
+                JobState.SKIPPED,
+                error='Stale or unbound execution destination epoch',
+                status_code=409,
+            )
 
         try:
             expected_network = str(ctx['follower_network']).lower()
@@ -364,6 +373,13 @@ class Worker:
                 await follower_hl.address_limits.reestablish_submission_slot_before_final_authorization(
                     account.account_address
                 )
+            await db.refresh(job, attribute_names=['execution_epoch_id', 'execution_provider', 'execution_network'])
+            if (
+                not await job_matches_active_destination(db, job)
+                or job.execution_provider != 'hyperliquid'
+                or job.execution_network != network
+            ):
+                raise LeverageSyncAuthorizationError(409, 'Stale or unbound execution destination epoch')
             leverage, is_cross, risk_max_leverage = await fresh_position_config_sync_authorization(
                 db,
                 user.id,
@@ -507,6 +523,9 @@ class Worker:
             raw=await db.get(CopyJob,uid)
             if not raw or raw.state in {JobState.DONE,JobState.SKIPPED,JobState.DEAD}: return True
 
+            if not await prepare_job_destination_for_execution(db, raw):
+                await db.commit()
+                return True
             if not _job_matches_current_networks(raw):
                 raw.state=JobState.SKIPPED
                 raw.last_error='Stale job from a different or unversioned Hyperliquid network topology'

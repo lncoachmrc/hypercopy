@@ -82,6 +82,17 @@ def test_below_minimum_preserves_target_and_sends_nothing():
     assert 'stays on target' in (r.reason or '')
 
 
+def test_provider_market_can_define_minimum_below_hyperliquid_floor():
+    master = MasterExposure('BTC', D('0.05'), D('100'), D('100'))
+    follower = FollowerState('u', D('100'))
+    provider_spec = AssetSpec('BTC', 2, 20, min_notional=D('1'))
+
+    result = plan(master, follower, provider_spec, min_notional=D('1'))
+
+    assert result.actionable
+    assert result.notional == D('5.00')
+
+
 def test_unmanaged_margin_reduces_eligible_equity():
     master = MasterExposure('BTC', D('20'), D('60000'), D('1000000'))
     follower = FollowerState('u', D('10000'), D('5000'), D('0'), D('1'))

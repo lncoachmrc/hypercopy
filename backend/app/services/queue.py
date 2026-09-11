@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.entities import CopyJob, JobState, User
+from app.services.execution_destination import bind_job_to_active_destination
 from app.services.master_leverage_cache import (
     publish_master_leverage_repair,
     record_master_leverage_repaired,
@@ -22,6 +23,8 @@ from app.services.strategy_intents import STRATEGY_ORIGINS, prepare_strategy_job
 
 _HF006_REPAIR_PENDING = 'hf006_repair_pending'
 _HF006_REPAIR_ACCOUNTED_ORDER = 'hf006_repair_accounted_order'
+_DESTINATION_STALE_REASON = 'Stale or unbound execution destination epoch; fresh reconciliation/action required'
+_PROVIDER_WRITES_DISABLED_REASON = 'Execution provider is not enabled for writes'
 
 
 async def ensure_group(redis: Redis) -> None:
@@ -30,6 +33,29 @@ async def ensure_group(redis: Redis) -> None:
     except Exception as exc:
         if 'BUSYGROUP' not in str(exc):
             raise
+
+
+async def prepare_job_destination_for_execution(db: AsyncSession, job: CopyJob) -> bool:
+    """Bind/validate a job before it can enter either execution delivery path."""
+    if not await bind_job_to_active_destination(db, job):
+        job.state = JobState.SKIPPED
+        job.last_error = _DESTINATION_STALE_REASON
+        job.owner = None
+        job.locked_until = None
+        job.next_attempt_at = None
+        job.enqueued_at = None
+        await db.flush()
+        return False
+    if job.execution_provider != 'hyperliquid':
+        job.state = JobState.SKIPPED
+        job.last_error = _PROVIDER_WRITES_DISABLED_REASON
+        job.owner = None
+        job.locked_until = None
+        job.next_attempt_at = None
+        job.enqueued_at = None
+        await db.flush()
+        return False
+    return True
 
 
 async def publish_job(redis: Redis, db: AsyncSession, job: CopyJob) -> None:
@@ -42,6 +68,8 @@ async def publish_job(redis: Redis, db: AsyncSession, job: CopyJob) -> None:
         job.next_attempt_at = None
         job.enqueued_at = None
         await db.flush()
+        return
+    if not await prepare_job_destination_for_execution(db, job):
         return
     if job.origin in STRATEGY_ORIGINS and not await prepare_strategy_job_for_publish(db, job):
         return
@@ -228,6 +256,8 @@ async def repair_stream(redis: Redis, db: AsyncSession, limit: int = 500) -> int
     )).scalars().all()
     count = 0
     for job in rows:
+        if not await prepare_job_destination_for_execution(db, job):
+            continue
         if job.origin in STRATEGY_ORIGINS and not await prepare_strategy_job_for_publish(db, job):
             continue
         evidence_order = reconcile_job_repair_evidence(job)

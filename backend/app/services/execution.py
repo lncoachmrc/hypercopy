@@ -24,6 +24,7 @@ from app.models.entities import (
 from app.services.audit import audit
 from app.services.effective_risk import resolve_effective_risk
 from app.services.entitlement import entitlement
+from app.services.execution_destination import job_matches_active_destination
 from app.services.networking import user_network_state
 
 log = get_logger(__name__)
@@ -219,6 +220,11 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
     if not user:
         return await _finish(db, job, JobState.DEAD, 'User no longer exists')
 
+    if not await job_matches_active_destination(db, job):
+        return await _finish(db, job, JobState.SKIPPED, 'Stale or unbound execution destination epoch')
+    if job.execution_provider != 'hyperliquid':
+        return await _finish(db, job, JobState.SKIPPED, 'Execution provider is not enabled for writes')
+
     network_state = await user_network_state(db, user.id)
     network = network_state.network
     ctx = job.context or {}
@@ -357,6 +363,13 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
         })
         return await _finish(db, job, JobState.DONE, 'Shadow mode')
 
+    async def _authorize_destination_write() -> None:
+        await db.refresh(job, attribute_names=['execution_epoch_id', 'execution_provider', 'execution_network'])
+        if not await job_matches_active_destination(db, job):
+            raise RuntimeError('Stale or unbound execution destination epoch')
+        if job.execution_provider != 'hyperliquid':
+            raise RuntimeError('Execution provider is not enabled for writes')
+
     leverage_sync_only = bool(ctx.get('leverage_sync_only'))
     if leverage_sync_only:
         if ctx.get('ambiguity_safe_reduction'):
@@ -378,6 +391,7 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
                     asset=job.asset,
                     leverage=desired_leverage,
                     is_cross=desired_is_cross,
+                    before_submit=_authorize_destination_write,
                 )
             except Exception as exc:
                 return await _retry_or_dead(db, job, f'Leverage synchronization failed: {type(exc).__name__}: {exc}')
@@ -439,6 +453,7 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
                     asset=job.asset,
                     leverage=desired_leverage,
                     is_cross=desired_is_cross,
+                    before_submit=_authorize_destination_write,
                 )
             except Exception as exc:
                 return await _retry_or_dead(db, job, f'Leverage synchronization failed: {type(exc).__name__}: {exc}')
@@ -558,6 +573,9 @@ async def _execute_leg(
     execution = Execution(
         copy_job_id=job.id,
         user_id=user_id,
+        execution_epoch_id=job.execution_epoch_id,
+        execution_provider=job.execution_provider,
+        execution_network=job.execution_network,
         attempt_kind=kind,
         cloid=cloid,
         state=ExecutionState.SUBMITTING,

@@ -19,6 +19,10 @@ from app.models.entities import (
     User,
     UserState,
 )
+from app.services.execution_destination import (
+    bind_job_to_active_destination,
+    bootstrap_user_destination_epoch,
+)
 from app.services.strategy_intents import (
     StrategyIntentAuthorizationError,
     StrategyIntentSuperseded,
@@ -61,6 +65,7 @@ async def _user() -> uuid.UUID:
             ),
             {'user_id': user_id},
         )
+        await bootstrap_user_destination_epoch(db, user_id)
         await db.commit()
     return user_id
 
@@ -89,7 +94,7 @@ async def _add_job(
     job_id = uuid.uuid4()
     cloid = '0x' + uuid.uuid4().hex if with_execution else None
     async with SessionLocal() as db:
-        db.add(CopyJob(
+        job = CopyJob(
             id=job_id,
             user_id=user_id,
             asset='BTC',
@@ -97,12 +102,17 @@ async def _add_job(
             state=JobState.QUEUED,
             correlation_id=uuid.uuid4().hex,
             context=_context(order, position),
-        ))
+        )
+        db.add(job)
         await db.flush()
+        assert await bind_job_to_active_destination(db, job) is True
         if cloid:
             db.add(Execution(
                 copy_job_id=job_id,
                 user_id=user_id,
+                execution_epoch_id=job.execution_epoch_id,
+                execution_provider=job.execution_provider,
+                execution_network=job.execution_network,
                 attempt_kind='o',
                 cloid=cloid,
                 state=ExecutionState.SUBMITTING,

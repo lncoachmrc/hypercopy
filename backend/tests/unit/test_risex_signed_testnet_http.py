@@ -1,0 +1,390 @@
+from __future__ import annotations
+
+import asyncio
+from dataclasses import replace
+from time import time
+
+import httpx
+import pytest
+
+from app.security.risex_order_codec import RISExPlaceOrder, build_place_order_action_hash
+from app.security.risex_place_order_permit import RISExPreparedPlaceOrderPermit
+from app.security.risex_place_order_request import prepare_place_order_request
+from app.security.risex_pre_order_gate import RISExPreOrderProbeGate, authorize_pre_order_probe
+from app.security.risex_signed_testnet_policy import SignedTestnetPolicy
+from app.security.risex_signer_probe import RISExSignerCapabilityEvidence
+
+
+ACCOUNT = '0x' + ('11' * 20)
+SIGNER = '0x' + ('22' * 20)
+AUTH = '0x' + ('33' * 20)
+ROUTER = '0x' + ('44' * 20)
+OTHER_ROUTER = '0x' + ('55' * 20)
+
+
+def _policy(**overrides: object) -> SignedTestnetPolicy:
+    values: dict[str, object] = {
+        'network': 'testnet',
+        'explicit_approval': True,
+        'deployment_verdict': 'PASS',
+        'deployment_identity_verified': True,
+        'disposable_account_asserted': True,
+        'dedicated_signer_asserted': True,
+        'operatorhub_bypass_disabled': True,
+    }
+    values.update(overrides)
+    return SignedTestnetPolicy(**values)  # type: ignore[arg-type]
+
+
+def _evidence(*, now: int | None = None, **overrides: object) -> RISExSignerCapabilityEvidence:
+    observed_now = int(time()) if now is None else now
+    values: dict[str, object] = {
+        'network': 'testnet',
+        'account': ACCOUNT,
+        'signer': SIGNER,
+        'chain_id': 11155931,
+        'auth_contract': AUTH,
+        'router': ROUTER,
+        'session_active': True,
+        'session_account': ACCOUNT,
+        'session_expiration': observed_now + 3600,
+        'onchain_perps_only_scope': True,
+        'perps_order_succeeded': None,
+        'fund_movement_rejected': True,
+        'withdrawal_rejected': True,
+        'post_revoke_order_rejected': None,
+        'operatorhub_bypass_disabled': True,
+    }
+    values.update(overrides)
+    return RISExSignerCapabilityEvidence(**values)  # type: ignore[arg-type]
+
+
+def _gate(*, now: int | None = None, evidence: RISExSignerCapabilityEvidence | None = None) -> RISExPreOrderProbeGate:
+    observed_now = int(time()) if now is None else now
+    current = evidence or _evidence(now=observed_now)
+    return authorize_pre_order_probe(
+        policy=_policy(),
+        evidence=current,
+        now=observed_now,
+        replay_protection_verified=True,
+    )
+
+
+def _attach_freshness_probe(transport, evidence: RISExSignerCapabilityEvidence):
+    async def probe() -> RISExSignerCapabilityEvidence:
+        return evidence
+
+    transport._freshness_probe = probe
+    return transport
+
+
+def _prepared_request(*, account: str = ACCOUNT, signer: str = SIGNER):
+    order = RISExPlaceOrder(
+        market_id=1,
+        size_steps=100,
+        price_ticks=50_000,
+        side=0,
+        post_only=False,
+        reduce_only=False,
+        stp_mode=0,
+        order_type=1,
+        time_in_force=0,
+        client_order_id=7,
+        ttl_units=0,
+    )
+    permit = RISExPreparedPlaceOrderPermit(
+        account_address=account,
+        signer_address=signer,
+        action_hash=build_place_order_action_hash(order),
+        nonce_anchor=43,
+        nonce_bitmap_index=0,
+        deadline=1_800_000_300,
+        _signature=bytes([9]) * 65,
+    )
+    return prepare_place_order_request(order=order, permit=permit)
+
+
+def test_signed_transport_allows_only_typed_permit_order_post() -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+
+    evidence = _evidence()
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={'success': True})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False)
+    transport = _attach_freshness_probe(
+        RISExSignedTestnetHTTPTransport(gate=_gate(evidence=evidence), client=client),
+        evidence,
+    )
+    result = asyncio.run(transport.post_place_order(_prepared_request()))
+    asyncio.run(client.aclose())
+
+    assert result == {'success': True}
+    assert [str(request.url) for request in calls] == [
+        'https://api.testnet.rise.trade/v1/orders/place'
+    ]
+    assert 'authorization' not in calls[0].headers
+
+
+def test_signed_transport_accepts_case_insensitive_gate_identity_match() -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+
+    evidence = _evidence()
+    calls: list[httpx.Request] = []
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
+        ),
+        trust_env=False,
+    )
+    transport = _attach_freshness_probe(
+        RISExSignedTestnetHTTPTransport(gate=_gate(evidence=evidence), client=client),
+        evidence,
+    )
+    prepared = _prepared_request(
+        account=ACCOUNT.upper().replace('0X', '0x'),
+        signer=SIGNER.upper().replace('0X', '0x'),
+    )
+
+    result = asyncio.run(transport.post_place_order(prepared))
+    asyncio.run(client.aclose())
+
+    assert result == {'success': True}
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ('account', 'signer'),
+    [
+        ('0x' + ('55' * 20), SIGNER),
+        (ACCOUNT, '0x' + ('66' * 20)),
+    ],
+)
+def test_signed_transport_rejects_typed_request_identity_not_bound_to_gate_before_network(
+    account: str,
+    signer: str,
+) -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+
+    evidence = _evidence()
+    calls: list[httpx.Request] = []
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
+        ),
+        trust_env=False,
+    )
+    transport = _attach_freshness_probe(
+        RISExSignedTestnetHTTPTransport(gate=_gate(evidence=evidence), client=client),
+        evidence,
+    )
+
+    with pytest.raises(SignedTestnetBlocked, match='permit identity'):
+        asyncio.run(
+            transport.post_place_order(_prepared_request(account=account, signer=signer))
+        )
+    asyncio.run(client.aclose())
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    'header',
+    ['Authorization', 'Proxy-Authorization', 'Cookie', 'X-API-Key', 'X-Auth-Token'],
+)
+def test_signed_transport_rejects_ambient_auth_headers(header: str) -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+
+    client = httpx.AsyncClient(headers={header: 'forbidden'}, trust_env=False)
+    with pytest.raises(SignedTestnetBlocked, match='JWT/OperatorHub|ambient authentication'):
+        RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
+    asyncio.run(client.aclose())
+
+
+def test_signed_transport_rejects_request_time_client_auth_before_network() -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+
+    calls: list[httpx.Request] = []
+    client = httpx.AsyncClient(
+        auth=httpx.BasicAuth('ambient-user', 'ambient-password'),
+        transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
+        ),
+        trust_env=False,
+    )
+
+    with pytest.raises(SignedTestnetBlocked, match='JWT/OperatorHub|ambient authentication'):
+        RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
+    asyncio.run(client.aclose())
+
+    assert calls == []
+
+
+def test_signed_transport_rejects_trust_env_client() -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={'success': True})),
+        trust_env=True,
+    )
+    with pytest.raises(SignedTestnetBlocked, match='JWT/OperatorHub|ambient authentication'):
+        RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
+    asyncio.run(client.aclose())
+
+
+def test_signed_transport_rejects_request_hooks() -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+
+    async def inject_auth(request: httpx.Request) -> None:
+        request.headers['Authorization'] = 'Bearer ambient'
+
+    client = httpx.AsyncClient(
+        event_hooks={'request': [inject_auth]},
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={'success': True})),
+        trust_env=False,
+    )
+    with pytest.raises(SignedTestnetBlocked, match='JWT/OperatorHub|ambient authentication'):
+        RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
+    asyncio.run(client.aclose())
+
+
+def test_signed_transport_rejects_hand_built_unattested_gate() -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+
+    forged_gate = RISExPreOrderProbeGate(
+        account_address=ACCOUNT,
+        signer_address=SIGNER,
+    )
+    with pytest.raises(SignedTestnetBlocked, match='attested pre-order gate'):
+        RISExSignedTestnetHTTPTransport(gate=forged_gate)
+
+
+def test_signed_transport_rejects_gate_that_expires_before_post_without_provider_call() -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+
+    evidence = _evidence(now=0, session_expiration=1)
+    calls: list[httpx.Request] = []
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
+        ),
+        trust_env=False,
+    )
+    transport = _attach_freshness_probe(
+        RISExSignedTestnetHTTPTransport(gate=_gate(now=0, evidence=evidence), client=client),
+        evidence,
+    )
+
+    with pytest.raises(SignedTestnetBlocked, match='expired|fresh'):
+        asyncio.run(transport.post_place_order(_prepared_request()))
+    asyncio.run(client.aclose())
+
+    assert calls == []
+
+
+def test_signed_transport_rejects_session_revoked_before_post_without_provider_call() -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+
+    evidence = _evidence()
+    revoked = replace(evidence, session_active=False)
+    calls: list[httpx.Request] = []
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
+        ),
+        trust_env=False,
+    )
+    transport = _attach_freshness_probe(
+        RISExSignedTestnetHTTPTransport(gate=_gate(evidence=evidence), client=client),
+        revoked,
+    )
+
+    with pytest.raises(SignedTestnetBlocked, match='revoked|active|fresh'):
+        asyncio.run(transport.post_place_order(_prepared_request()))
+    asyncio.run(client.aclose())
+
+    assert calls == []
+
+
+def test_signed_transport_rejects_deployment_change_before_post_without_provider_call() -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+
+    evidence = _evidence()
+    changed = replace(evidence, router=OTHER_ROUTER)
+    calls: list[httpx.Request] = []
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
+        ),
+        trust_env=False,
+    )
+    transport = _attach_freshness_probe(
+        RISExSignedTestnetHTTPTransport(gate=_gate(evidence=evidence), client=client),
+        changed,
+    )
+
+    with pytest.raises(SignedTestnetBlocked, match='deployment|fresh'):
+        asyncio.run(transport.post_place_order(_prepared_request()))
+    asyncio.run(client.aclose())
+
+    assert calls == []
+
+
+def test_signed_transport_rejects_auth_added_after_constructor_without_provider_call() -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+
+    evidence = _evidence()
+    calls: list[httpx.Request] = []
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
+        ),
+        trust_env=False,
+    )
+    transport = _attach_freshness_probe(
+        RISExSignedTestnetHTTPTransport(gate=_gate(evidence=evidence), client=client),
+        evidence,
+    )
+    client.auth = httpx.BasicAuth('late-user', 'late-password')
+
+    with pytest.raises(SignedTestnetBlocked, match='JWT/OperatorHub|ambient authentication'):
+        asyncio.run(transport.post_place_order(_prepared_request()))
+    asyncio.run(client.aclose())
+
+    assert calls == []
+
+
+def test_signed_transport_posts_when_gate_is_fresh_and_deployment_is_unchanged() -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+
+    evidence = _evidence()
+    calls: list[httpx.Request] = []
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
+        ),
+        trust_env=False,
+    )
+    transport = _attach_freshness_probe(
+        RISExSignedTestnetHTTPTransport(gate=_gate(evidence=evidence), client=client),
+        evidence,
+    )
+
+    result = asyncio.run(transport.post_place_order(_prepared_request()))
+    asyncio.run(client.aclose())
+
+    assert result == {'success': True}
+    assert len(calls) == 1

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Network
 from app.db.session import SessionLocal
 from app.models.entities import CopyJob, Execution, JobState
+from app.services.execution_destination import job_matches_active_destination
 from app.services.networking import user_network_state
 
 
@@ -19,7 +20,7 @@ _INTENT_SCAN_LIMIT = 512
 
 
 class StrategyIntentAuthorizationError(RuntimeError):
-    """A strategy order was definitively refused before exchange submission."""
+    """An order was definitively refused before exchange submission."""
 
 
 class StrategyIntentSuperseded(StrategyIntentAuthorizationError):
@@ -232,11 +233,12 @@ async def current_strategy_intent_for_cloid(
     follower_network: Network,
     asset: str,
 ) -> StrategyIntentEvidence | None:
-    """Authorize the durable strategy intent immediately before a signed order.
+    """Authorize the durable execution immediately before a signed order.
 
     The Execution row is committed before Hyperliquid is called, so its CLOID is
-    a durable handle back to the CopyJob. Non-strategy actions such as CLOSE_ALL
-    intentionally return ``None`` and retain their independent emergency path.
+    a durable handle back to the CopyJob. Every order, including emergency
+    CLOSE_ALL, must still belong to the exact active execution destination epoch.
+    Strategy EVENT/RECONCILE jobs receive the additional latest-intent checks.
     """
     async with SessionLocal() as db:
         execution = (await db.execute(
@@ -244,19 +246,36 @@ async def current_strategy_intent_for_cloid(
         )).scalar_one_or_none()
         if execution is None:
             raise StrategyIntentAuthorizationError(
-                'Durable execution evidence is missing before strategy submission'
+                'Durable execution evidence is missing before order submission'
             )
         job = await db.get(CopyJob, execution.copy_job_id)
         if job is None:
             raise StrategyIntentAuthorizationError(
-                'Durable strategy job is missing before exchange submission'
+                'Durable execution job is missing before exchange submission'
             )
-        if job.origin not in STRATEGY_ORIGINS:
-            return None
         if job.asset != asset:
             raise StrategyIntentAuthorizationError(
-                'Strategy intent asset does not match the signed order'
+                'Execution asset does not match the signed order'
             )
+        if not await job_matches_active_destination(db, job):
+            raise StrategyIntentAuthorizationError(
+                'Stale or unbound execution destination epoch'
+            )
+        if job.execution_provider != 'hyperliquid' or job.execution_network != follower_network:
+            raise StrategyIntentAuthorizationError(
+                'Execution destination does not match the Hyperliquid writer'
+            )
+        if (
+            execution.execution_epoch_id != job.execution_epoch_id
+            or execution.execution_provider != job.execution_provider
+            or execution.execution_network != job.execution_network
+        ):
+            raise StrategyIntentAuthorizationError(
+                'Durable execution destination diverges from its job binding'
+            )
+
+        if job.origin not in STRATEGY_ORIGINS:
+            return None
 
         evidence = _job_evidence(job)
         assert evidence is not None

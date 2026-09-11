@@ -31,6 +31,10 @@ from app.models.entities import (
 )
 from app.services import execution
 from app.services.execution import process_job
+from app.services.execution_destination import (
+    bind_job_to_active_destination,
+    bootstrap_user_destination_epoch,
+)
 from app.services.reconcile import reconcile_user
 
 pytestmark = pytest.mark.skipif(
@@ -192,24 +196,28 @@ async def _seed_case():
                 managed=True,
             )
         )
-        db.add(
-            CopyJob(
-                id=job_id,
-                user_id=user_id,
-                asset="BTC",
-                origin="EVENT",
-                state=JobState.PROCESSING,
-                owner="hf007-reversal-partial",
-                attempt_count=1,
-                correlation_id=correlation_id,
-                context={
-                    "master_position": "-1",
-                    "master_equity": "100",
-                    "master_mark_price": "100",
-                    "follower_network": "testnet",
-                },
-            )
+        await db.flush()
+        await bootstrap_user_destination_epoch(db, user_id)
+
+        job = CopyJob(
+            id=job_id,
+            user_id=user_id,
+            asset="BTC",
+            origin="EVENT",
+            state=JobState.PROCESSING,
+            owner="hf007-reversal-partial",
+            attempt_count=1,
+            correlation_id=correlation_id,
+            context={
+                "master_position": "-1",
+                "master_equity": "100",
+                "master_mark_price": "100",
+                "follower_network": "testnet",
+            },
         )
+        db.add(job)
+        await db.flush()
+        assert await bind_job_to_active_destination(db, job) is True
         await db.commit()
 
     return user_id, job_id, correlation_id
