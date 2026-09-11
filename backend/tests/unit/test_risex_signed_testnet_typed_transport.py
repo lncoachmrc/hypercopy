@@ -93,7 +93,8 @@ def test_transport_posts_only_typed_place_order_request() -> None:
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(
             lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
-        )
+        ),
+        trust_env=False,
     )
     transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
     prepared = _request()
@@ -125,7 +126,8 @@ def test_transport_rejects_untyped_request_before_network() -> None:
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(
             lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
-        )
+        ),
+        trust_env=False,
     )
     transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
     untyped: Any = {'permit': {'account': ACCOUNT, 'signer': SIGNER}}
@@ -161,7 +163,8 @@ def test_transport_revalidates_hand_built_typed_request_before_network() -> None
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(
             lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
-        )
+        ),
+        trust_env=False,
     )
     transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
 
