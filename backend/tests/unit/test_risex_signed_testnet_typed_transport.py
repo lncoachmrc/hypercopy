@@ -10,7 +10,10 @@ import pytest
 
 from app.security.risex_order_codec import RISExPlaceOrder, build_place_order_action_hash
 from app.security.risex_place_order_permit import RISExPreparedPlaceOrderPermit
-from app.security.risex_place_order_request import prepare_place_order_request
+from app.security.risex_place_order_request import (
+    RISExPreparedPlaceOrderRequest,
+    prepare_place_order_request,
+)
 from app.security.risex_pre_order_gate import authorize_pre_order_probe
 from app.security.risex_signed_testnet_policy import SignedTestnetPolicy
 from app.security.risex_signer_probe import RISExSignerCapabilityEvidence
@@ -129,6 +132,41 @@ def test_transport_rejects_untyped_request_before_network() -> None:
 
     with pytest.raises(SignedTestnetBlocked, match='typed place-order request'):
         asyncio.run(transport.post_place_order(untyped))
+    asyncio.run(client.aclose())
+
+    assert calls == []
+
+
+def test_transport_revalidates_hand_built_typed_request_before_network() -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+
+    signed = _request()
+    changed_order = RISExPlaceOrder(
+        market_id=signed.order.market_id,
+        size_steps=signed.order.size_steps + 1,
+        price_ticks=signed.order.price_ticks,
+        side=signed.order.side,
+        post_only=signed.order.post_only,
+        reduce_only=signed.order.reduce_only,
+        stp_mode=signed.order.stp_mode,
+        order_type=signed.order.order_type,
+        time_in_force=signed.order.time_in_force,
+        client_order_id=signed.order.client_order_id,
+        ttl_units=signed.order.ttl_units,
+    )
+    forged = RISExPreparedPlaceOrderRequest(order=changed_order, permit=signed.permit)
+
+    calls: list[httpx.Request] = []
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
+        )
+    )
+    transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
+
+    with pytest.raises(SignedTestnetBlocked, match='action hash'):
+        asyncio.run(transport.post_place_order(forged))
     asyncio.run(client.aclose())
 
     assert calls == []
