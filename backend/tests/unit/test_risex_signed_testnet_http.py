@@ -175,6 +175,26 @@ def test_signed_transport_rejects_ambient_auth_headers(header: str) -> None:
     asyncio.run(client.aclose())
 
 
+def test_signed_transport_rejects_request_time_client_auth_before_network() -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+
+    calls: list[httpx.Request] = []
+    client = httpx.AsyncClient(
+        auth=httpx.BasicAuth('ambient-user', 'ambient-password'),
+        transport=httpx.MockTransport(
+            lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
+        ),
+    )
+    transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
+
+    with pytest.raises(SignedTestnetBlocked, match='JWT/OperatorHub|ambient authentication'):
+        asyncio.run(transport.post_place_order(_prepared_request()))
+    asyncio.run(client.aclose())
+
+    assert calls == []
+
+
 def test_signed_transport_rejects_hand_built_unattested_gate() -> None:
     from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
     from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
