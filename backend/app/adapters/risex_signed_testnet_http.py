@@ -32,6 +32,37 @@ def _reject_ambient_auth(client: httpx.AsyncClient) -> None:
         )
 
 
+def _assert_permit_identity_bound(
+    gate: RISExPreOrderProbeGate,
+    payload: dict[str, Any] | None,
+) -> None:
+    if not isinstance(payload, dict):
+        raise SignedTestnetBlocked(
+            'RISEx signed permit identity must match the attested pre-order gate'
+        )
+
+    permit = payload.get('permit')
+    if not isinstance(permit, dict):
+        raise SignedTestnetBlocked(
+            'RISEx signed permit identity must match the attested pre-order gate'
+        )
+
+    account = permit.get('account')
+    signer = permit.get('signer')
+    if not isinstance(account, str) or not isinstance(signer, str):
+        raise SignedTestnetBlocked(
+            'RISEx signed permit identity must match the attested pre-order gate'
+        )
+
+    if (
+        account.lower() != gate.account_address.lower()
+        or signer.lower() != gate.signer_address.lower()
+    ):
+        raise SignedTestnetBlocked(
+            'RISEx signed permit identity must match the attested pre-order gate'
+        )
+
+
 class RISExSignedTestnetHTTPTransport:
     """Narrow transport for an attested permit-signed RISEx testnet order probe."""
 
@@ -58,6 +89,8 @@ class RISExSignedTestnetHTTPTransport:
         normalized_path = '/' + path.lstrip('/')
         if normalized_path not in _ALLOWED_POST_PATHS:
             raise SignedTestnetBlocked('RISEx POST is not an approved signed-testnet endpoint')
+
+        _assert_permit_identity_bound(self._gate, json)
 
         try:
             response = await self._client.post(
