@@ -4,11 +4,11 @@ from typing import Any
 
 import httpx
 
-from app.security.risex_signed_testnet_policy import (
-    SignedTestnetBlocked,
-    SignedTestnetPolicy,
-    assert_signed_testnet_probe_allowed,
+from app.security.risex_pre_order_gate import (
+    RISExPreOrderProbeGate,
+    assert_pre_order_probe_gate_attested,
 )
+from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
 
 
 _TESTNET_BASE_URL = 'https://api.testnet.rise.trade'
@@ -33,18 +33,19 @@ def _reject_ambient_auth(client: httpx.AsyncClient) -> None:
 
 
 class RISExSignedTestnetHTTPTransport:
-    """Narrow transport for an explicitly approved, permit-signed RISEx testnet order probe."""
+    """Narrow transport for an attested permit-signed RISEx testnet order probe."""
 
     def __init__(
         self,
         *,
-        policy: SignedTestnetPolicy,
+        gate: RISExPreOrderProbeGate,
         client: httpx.AsyncClient | None = None,
         timeout_seconds: float = 10.0,
     ) -> None:
-        assert_signed_testnet_probe_allowed(policy)
+        assert_pre_order_probe_gate_attested(gate)
         if client is not None:
             _reject_ambient_auth(client)
+        self._gate = gate
         self._client = client or httpx.AsyncClient(timeout=timeout_seconds)
         self._owns_client = client is None
 
