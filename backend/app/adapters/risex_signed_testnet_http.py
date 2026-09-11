@@ -4,6 +4,7 @@ from typing import Any
 
 import httpx
 
+from app.security.risex_place_order_request import RISExPreparedPlaceOrderRequest
 from app.security.risex_pre_order_gate import (
     RISExPreOrderProbeGate,
     assert_pre_order_probe_gate_attested,
@@ -34,13 +35,8 @@ def _reject_ambient_auth(client: httpx.AsyncClient) -> None:
 
 def _assert_permit_identity_bound(
     gate: RISExPreOrderProbeGate,
-    payload: dict[str, Any] | None,
+    payload: dict[str, Any],
 ) -> None:
-    if not isinstance(payload, dict):
-        raise SignedTestnetBlocked(
-            'RISEx signed permit identity must match the attested pre-order gate'
-        )
-
     permit = payload.get('permit')
     if not isinstance(permit, dict):
         raise SignedTestnetBlocked(
@@ -64,7 +60,7 @@ def _assert_permit_identity_bound(
 
 
 class RISExSignedTestnetHTTPTransport:
-    """Narrow transport for an attested permit-signed RISEx testnet order probe."""
+    """Narrow transport for one attested, typed RISEx testnet Perps order probe."""
 
     def __init__(
         self,
@@ -80,17 +76,28 @@ class RISExSignedTestnetHTTPTransport:
         self._client = client or httpx.AsyncClient(timeout=timeout_seconds)
         self._owns_client = client is None
 
-    async def post_json(
+    async def post_place_order(
+        self,
+        request: RISExPreparedPlaceOrderRequest,
+    ) -> dict[str, Any]:
+        if not isinstance(request, RISExPreparedPlaceOrderRequest):
+            raise SignedTestnetBlocked(
+                'RISEx signed transport requires a typed place-order request'
+            )
+
+        payload = request.json_for_testnet_transport()
+        _assert_permit_identity_bound(self._gate, payload)
+        return await self._post_json('/v1/orders/place', json=payload)
+
+    async def _post_json(
         self,
         path: str,
         *,
-        json: dict[str, Any] | None = None,
+        json: dict[str, Any],
     ) -> dict[str, Any]:
         normalized_path = '/' + path.lstrip('/')
         if normalized_path not in _ALLOWED_POST_PATHS:
             raise SignedTestnetBlocked('RISEx POST is not an approved signed-testnet endpoint')
-
-        _assert_permit_identity_bound(self._gate, json)
 
         try:
             response = await self._client.post(
