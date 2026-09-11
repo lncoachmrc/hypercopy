@@ -6,6 +6,9 @@ from time import time
 import httpx
 import pytest
 
+from app.security.risex_order_codec import RISExPlaceOrder, build_place_order_action_hash
+from app.security.risex_place_order_permit import RISExPreparedPlaceOrderPermit
+from app.security.risex_place_order_request import prepare_place_order_request
 from app.security.risex_pre_order_gate import RISExPreOrderProbeGate, authorize_pre_order_probe
 from app.security.risex_signed_testnet_policy import SignedTestnetPolicy
 from app.security.risex_signer_probe import RISExSignerCapabilityEvidence
@@ -58,17 +61,33 @@ def _gate() -> RISExPreOrderProbeGate:
     )
 
 
-def _order_payload(*, account: str = ACCOUNT, signer: str = SIGNER) -> dict[str, object]:
-    return {
-        'permit': {
-            'account': account,
-            'signer': signer,
-            'signature': 'redacted',
-        }
-    }
+def _prepared_request(*, account: str = ACCOUNT, signer: str = SIGNER):
+    order = RISExPlaceOrder(
+        market_id=1,
+        size_steps=100,
+        price_ticks=50_000,
+        side=0,
+        post_only=False,
+        reduce_only=False,
+        stp_mode=0,
+        order_type=1,
+        time_in_force=0,
+        client_order_id=7,
+        ttl_units=0,
+    )
+    permit = RISExPreparedPlaceOrderPermit(
+        account_address=account,
+        signer_address=signer,
+        action_hash=build_place_order_action_hash(order),
+        nonce_anchor=43,
+        nonce_bitmap_index=0,
+        deadline=1_800_000_300,
+        _signature=bytes([9]) * 65,
+    )
+    return prepare_place_order_request(order=order, permit=permit)
 
 
-def test_signed_transport_allows_only_permit_order_post() -> None:
+def test_signed_transport_allows_only_typed_permit_order_post() -> None:
     from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
 
     calls: list[httpx.Request] = []
@@ -79,13 +98,13 @@ def test_signed_transport_allows_only_permit_order_post() -> None:
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
-    result = asyncio.run(
-        transport.post_json('/v1/orders/place', json=_order_payload())
-    )
+    result = asyncio.run(transport.post_place_order(_prepared_request()))
     asyncio.run(client.aclose())
 
     assert result == {'success': True}
-    assert [str(request.url) for request in calls] == ['https://api.testnet.rise.trade/v1/orders/place']
+    assert [str(request.url) for request in calls] == [
+        'https://api.testnet.rise.trade/v1/orders/place'
+    ]
     assert 'authorization' not in calls[0].headers
 
 
@@ -99,13 +118,12 @@ def test_signed_transport_accepts_case_insensitive_gate_identity_match() -> None
         )
     )
     transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
-
-    result = asyncio.run(
-        transport.post_json(
-            '/v1/orders/place',
-            json=_order_payload(account=ACCOUNT.upper().replace('0X', '0x'), signer=SIGNER.upper().replace('0X', '0x')),
-        )
+    prepared = _prepared_request(
+        account=ACCOUNT.upper().replace('0X', '0x'),
+        signer=SIGNER.upper().replace('0X', '0x'),
     )
+
+    result = asyncio.run(transport.post_place_order(prepared))
     asyncio.run(client.aclose())
 
     assert result == {'success': True}
@@ -113,18 +131,15 @@ def test_signed_transport_accepts_case_insensitive_gate_identity_match() -> None
 
 
 @pytest.mark.parametrize(
-    'payload',
+    ('account', 'signer'),
     [
-        None,
-        {},
-        {'permit': None},
-        {'permit': 'invalid'},
-        {'permit': {'signer': SIGNER, 'signature': 'redacted'}},
-        {'permit': {'account': ACCOUNT, 'signature': 'redacted'}},
+        ('0x' + ('55' * 20), SIGNER),
+        (ACCOUNT, '0x' + ('66' * 20)),
     ],
 )
-def test_signed_transport_rejects_missing_or_malformed_permit_identity_before_network(
-    payload: object,
+def test_signed_transport_rejects_typed_request_identity_not_bound_to_gate_before_network(
+    account: str,
+    signer: str,
 ) -> None:
     from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
     from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
@@ -139,60 +154,8 @@ def test_signed_transport_rejects_missing_or_malformed_permit_identity_before_ne
 
     with pytest.raises(SignedTestnetBlocked, match='permit identity'):
         asyncio.run(
-            transport.post_json('/v1/orders/place', json=payload)  # type: ignore[arg-type]
+            transport.post_place_order(_prepared_request(account=account, signer=signer))
         )
-    asyncio.run(client.aclose())
-
-    assert calls == []
-
-
-@pytest.mark.parametrize(
-    ('field', 'value'),
-    [
-        ('account', '0x' + ('55' * 20)),
-        ('signer', '0x' + ('66' * 20)),
-    ],
-)
-def test_signed_transport_rejects_payload_identity_not_bound_to_gate_before_network(
-    field: str,
-    value: str,
-) -> None:
-    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
-    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
-
-    calls: list[httpx.Request] = []
-    client = httpx.AsyncClient(
-        transport=httpx.MockTransport(
-            lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
-        )
-    )
-    transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
-    payload = _order_payload()
-    permit = payload['permit']
-    assert isinstance(permit, dict)
-    permit[field] = value
-
-    with pytest.raises(SignedTestnetBlocked, match='permit identity'):
-        asyncio.run(transport.post_json('/v1/orders/place', json=payload))
-    asyncio.run(client.aclose())
-
-    assert calls == []
-
-
-def test_signed_transport_rejects_unapproved_post_before_network() -> None:
-    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
-    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
-
-    calls: list[httpx.Request] = []
-    client = httpx.AsyncClient(
-        transport=httpx.MockTransport(
-            lambda request: calls.append(request) or httpx.Response(200)
-        )
-    )
-    transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
-
-    with pytest.raises(SignedTestnetBlocked, match='approved signed-testnet endpoint'):
-        asyncio.run(transport.post_json('/v1/account/deposit', json={'amount': '1'}))
     asyncio.run(client.aclose())
 
     assert calls == []
