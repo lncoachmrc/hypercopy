@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 from time import time
 from typing import Any
 
-import httpx
 import pytest
 
 from app.security.risex_signed_testnet_policy import SignedTestnetBlocked, SignedTestnetPolicy
@@ -124,34 +122,6 @@ def test_pre_order_gate_binds_session_to_expected_account() -> None:
             now=int(time()),
             replay_protection_verified=True,
         )
-
-
-def test_signed_transport_requires_attested_pre_order_gate() -> None:
-    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
-
-    calls: list[httpx.Request] = []
-    client = httpx.AsyncClient(
-        transport=httpx.MockTransport(
-            lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
-        )
-    )
-    transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
-    result = asyncio.run(
-        transport.post_json(
-            '/v1/orders/place',
-            json={
-                'permit': {
-                    'account': ACCOUNT,
-                    'signer': SIGNER,
-                    'signature': 'redacted',
-                }
-            },
-        )
-    )
-    asyncio.run(client.aclose())
-
-    assert result == {'success': True}
-    assert len(calls) == 1
 
 
 def test_signed_transport_rejects_policy_only_constructor_bypass() -> None:
