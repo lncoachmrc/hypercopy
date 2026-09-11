@@ -66,6 +66,7 @@ def _stub_trading_account_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
         del args, kwargs
         return None
 
+    monkeypatch.setattr(user_api.settings, 'HYPERLIQUID_MASTER_ADDRESS', '')
     monkeypatch.setattr(user_api, '_follower_hl', lambda _network: FakeFollower())
     monkeypatch.setattr(
         user_api,
