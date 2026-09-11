@@ -96,7 +96,7 @@ def test_signed_transport_allows_only_typed_permit_order_post() -> None:
         calls.append(request)
         return httpx.Response(200, json={'success': True})
 
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), trust_env=False)
     transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
     result = asyncio.run(transport.post_place_order(_prepared_request()))
     asyncio.run(client.aclose())
@@ -115,7 +115,8 @@ def test_signed_transport_accepts_case_insensitive_gate_identity_match() -> None
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(
             lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
-        )
+        ),
+        trust_env=False,
     )
     transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
     prepared = _prepared_request(
@@ -148,7 +149,8 @@ def test_signed_transport_rejects_typed_request_identity_not_bound_to_gate_befor
     client = httpx.AsyncClient(
         transport=httpx.MockTransport(
             lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
-        )
+        ),
+        trust_env=False,
     )
     transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
 
@@ -169,7 +171,7 @@ def test_signed_transport_rejects_ambient_auth_headers(header: str) -> None:
     from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
     from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
 
-    client = httpx.AsyncClient(headers={header: 'forbidden'})
+    client = httpx.AsyncClient(headers={header: 'forbidden'}, trust_env=False)
     with pytest.raises(SignedTestnetBlocked, match='JWT/OperatorHub|ambient authentication'):
         RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
     asyncio.run(client.aclose())
@@ -185,6 +187,7 @@ def test_signed_transport_rejects_request_time_client_auth_before_network() -> N
         transport=httpx.MockTransport(
             lambda request: calls.append(request) or httpx.Response(200, json={'success': True})
         ),
+        trust_env=False,
     )
     transport = RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
 
@@ -193,6 +196,36 @@ def test_signed_transport_rejects_request_time_client_auth_before_network() -> N
     asyncio.run(client.aclose())
 
     assert calls == []
+
+
+def test_signed_transport_rejects_trust_env_client() -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={'success': True})),
+        trust_env=True,
+    )
+    with pytest.raises(SignedTestnetBlocked, match='JWT/OperatorHub|ambient authentication'):
+        RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
+    asyncio.run(client.aclose())
+
+
+def test_signed_transport_rejects_request_hooks() -> None:
+    from app.adapters.risex_signed_testnet_http import RISExSignedTestnetHTTPTransport
+    from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+
+    async def inject_auth(request: httpx.Request) -> None:
+        request.headers['Authorization'] = 'Bearer ambient'
+
+    client = httpx.AsyncClient(
+        event_hooks={'request': [inject_auth]},
+        transport=httpx.MockTransport(lambda _request: httpx.Response(200, json={'success': True})),
+        trust_env=False,
+    )
+    with pytest.raises(SignedTestnetBlocked, match='JWT/OperatorHub|ambient authentication'):
+        RISExSignedTestnetHTTPTransport(gate=_gate(), client=client)
+    asyncio.run(client.aclose())
 
 
 def test_signed_transport_rejects_hand_built_unattested_gate() -> None:
