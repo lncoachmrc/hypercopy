@@ -134,6 +134,12 @@ Therefore:
 - full RISEx security gate: **BLOCKED**;
 - RISEx writes: **disabled**.
 
+The `complete ABI/source provenance` status remains **UNKNOWN** as an external residual risk. Resolution depends on RISEx publishing or verifying the relevant contract source/ABI on the block explorer; it is not a task this project can complete independently.
+
+Consequently, any future `PASS` on the signer perps-only/no-fund-movement gate will be based on observed behavior of the live interface and provider responses, not on complete source provenance. This is an explicit limitation of the security gate and must remain documented as such.
+
+The `signer perps-only/no-fund-movement capability` status remains **UNKNOWN** and is the next gate. It requires a registered RISEx testnet account/signer pair before the read-only signer probe can evaluate the effective capability boundary.
+
 Run the permanent deployment check from the repository root with:
 
 ```bash
@@ -141,3 +147,29 @@ python scripts/risex_deployment_preflight.py
 ```
 
 The command is testnet-only, uses public/read-only API and RPC evidence, and contains no signer secret or transaction path.
+
+## Re-verification — 2026-09-11
+
+A second read-only deployment verification was executed locally from the workstation with:
+
+```bash
+python3 scripts/risex_deployment_preflight.py
+```
+
+This was a **local execution**, not a GitHub Actions run, so there is no GitHub Actions run ID associated with this evidence.
+
+Observed block: `54066868`  
+Previous observed block: `53969018`  
+Delta: `97850` blocks.
+
+Result:
+
+- `verdict = PASS`
+- deployment checks: `6/6 PASS`
+- expected fingerprint: `764412dd3ebb2ecb2b2878e3318bce39e9593cbd32108ebefa90e20161722e2f`
+- observed fingerprint: `764412dd3ebb2ecb2b2878e3318bce39e9593cbd32108ebefa90e20161722e2f`
+- `deployment_identity_verified = true`
+- `writes_enabled = false`
+- `full_security_gate_passed = false`
+
+This is the first independent confirmation that the pinned deployment fingerprint remains stable across reads separated in time and by `97850` blocks. That stability is consistent with the deliberate exclusion of the block number from the canonical deployment fingerprint: the deployment identity remains unchanged while the chain advances.
