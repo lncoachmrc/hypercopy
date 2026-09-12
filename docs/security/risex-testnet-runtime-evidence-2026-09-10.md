@@ -130,15 +130,15 @@ Therefore:
 - pinned runtime deployment identity: **PASS**;
 - critical Authorization interface compatibility: **proven behaviorally**;
 - complete ABI/source provenance: **UNKNOWN**;
-- signer perps-only/no-fund-movement capability: **UNKNOWN**;
+- signer perps-only/no-fund-movement capability: **FAIL**;
 - full RISEx security gate: **BLOCKED**;
 - RISEx writes: **disabled**.
 
 The `complete ABI/source provenance` status remains **UNKNOWN** as an external residual risk. Resolution depends on RISEx publishing or verifying the relevant contract source/ABI on the block explorer; it is not a task this project can complete independently.
 
-Consequently, any future `PASS` on the signer perps-only/no-fund-movement gate will be based on observed behavior of the live interface and provider responses, not on complete source provenance. This is an explicit limitation of the security gate and must remain documented as such.
+Consequently, any future capability conclusion is based on observed behavior of the live interface and provider responses, not on complete source provenance. This is an explicit limitation of the security gate and must remain documented as such.
 
-The `signer perps-only/no-fund-movement capability` status remains **UNKNOWN** and is the next gate. It requires a registered RISEx testnet account/signer pair before the read-only signer probe can evaluate the effective capability boundary.
+The `signer perps-only/no-fund-movement capability` gate is now **FAIL** based on the registered testnet signer evidence recorded below. The observed Authorization permission bitmap is not least-privilege/perps-only.
 
 Run the permanent deployment check from the repository root with:
 
@@ -173,3 +173,36 @@ Result:
 - `full_security_gate_passed = false`
 
 This is the first independent confirmation that the pinned deployment fingerprint remains stable across reads separated in time and by `97850` blocks. That stability is consistent with the deliberate exclusion of the block number from the canonical deployment fingerprint: the deployment identity remains unchanged while the chain advances.
+
+## Signer capability probe — FAIL
+
+Evidence recorded on 2026-09-12 from the read-only signer capability probe against a registered RISEx testnet account/signer pair.
+
+Observed session state:
+
+- `session_active = true`
+- `status_code = 1`
+- signer expiration corresponds to the registered 30-day session window
+- `perps_permission = true`
+- `session_permission_bitmap = 4294967295`
+- hexadecimal bitmap: `0xFFFFFFFF`
+
+`4294967295` is the maximum value representable by an unsigned 32-bit integer and has all 32 bits set. At the observed Authorization interface level, this signer is therefore not restricted to a perps-only least-privilege permission set.
+
+This is a real gate failure, not a registration failure: the session is active and the perps permission is present, but the observed permission bitmap is fully populated. The evidence does **not** prove that a fund or withdraw action would succeed at another provider layer; it proves that the required perps-only/no-fund-movement restriction is not established by the Authorization permission bitmap and therefore cannot satisfy the TRAXION least-privilege gate.
+
+The observed `registerSigner(address,address,string,uint48,uint8,uint32,bytes)` interface contains a `uint32` parameter that is consistent with the width of the returned permission bitmap. The exact semantic mapping of that parameter and its individual permission bits is not source-proven and remains an open provider question because complete ABI/source provenance is unavailable.
+
+Before any attempt to register a restricted signer, RISEx must clarify:
+
+1. whether the `uint32` argument of `registerSigner` is the permission bitmap and which bit maps to each capability;
+2. whether the API supports registering an API wallet/session signer with a permission bitmap restricted to perpetual trading only.
+
+No assumption such as `1 << 2 = 4` is accepted as configuration evidence until RISEx confirms the permission mapping or equivalent authoritative documentation is available.
+
+Security consequence:
+
+- signer perps-only/no-fund-movement capability: **FAIL**;
+- full RISEx security gate: **BLOCKED**;
+- RISEx writes: **disabled**;
+- automated RISEx execution remains blocked until a least-privilege signer model is proven and the gate is re-run successfully.
