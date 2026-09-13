@@ -8,16 +8,26 @@ from app.core.config import Network
 
 
 ProbeVerdict = Literal['PASS', 'FAIL', 'UNKNOWN']
+CapabilityCheckVerdict = Literal['PASS', 'FAIL', 'UNKNOWN', 'N/A']
 ADR_REFERENCE: Literal['ADR-0002'] = 'ADR-0002'
+ADR_0003_REFERENCE: Literal['ADR-0003'] = 'ADR-0003'
 AUTHORIZATION_CRITERION: Literal['perps_permission_and_fund_movement_path_absent'] = (
     'perps_permission_and_fund_movement_path_absent'
+)
+NEGATIVE_PROBE_NA_REASON = (
+    'ADR-0003: behavioral fund-movement rejection probes are N/A because '
+    'no session-key fund-movement path exists to attempt'
+)
+NEGATIVE_PROBE_UNKNOWN_REASON = (
+    'ADR-0003: behavioral rejection evidence cannot be waived unless '
+    'fund_movement_path_absent is explicitly True'
 )
 
 
 @dataclass(frozen=True, slots=True)
 class CapabilityCheck:
     name: str
-    verdict: ProbeVerdict
+    verdict: CapabilityCheckVerdict
     detail: str
 
 
@@ -195,12 +205,35 @@ async def collect_public_signer_evidence(
     )
 
 
-def _bool_check(name: str, value: bool | None, *, pass_detail: str, fail_detail: str) -> CapabilityCheck:
+def _bool_check(
+    name: str,
+    value: bool | None,
+    *,
+    pass_detail: str,
+    fail_detail: str,
+) -> CapabilityCheck:
     if value is True:
         return CapabilityCheck(name, 'PASS', pass_detail)
     if value is False:
         return CapabilityCheck(name, 'FAIL', fail_detail)
     return CapabilityCheck(name, 'UNKNOWN', 'Required evidence has not been collected')
+
+
+def _conditional_negative_probe_check(
+    name: str,
+    value: bool | None,
+    *,
+    fund_movement_path_absent: bool,
+    pass_detail: str,
+    fail_detail: str,
+) -> CapabilityCheck:
+    if fund_movement_path_absent is True:
+        return CapabilityCheck(name, 'N/A', NEGATIVE_PROBE_NA_REASON)
+    if value is True:
+        return CapabilityCheck(name, 'PASS', pass_detail)
+    if value is False:
+        return CapabilityCheck(name, 'FAIL', fail_detail)
+    return CapabilityCheck(name, 'UNKNOWN', NEGATIVE_PROBE_UNKNOWN_REASON)
 
 
 def _deployment_check(evidence: RISExSignerCapabilityEvidence) -> CapabilityCheck:
@@ -312,15 +345,17 @@ def evaluate_signer_capabilities(
             pass_detail='Controlled perpetual order test succeeded',
             fail_detail='Controlled perpetual order test failed',
         ),
-        _bool_check(
+        _conditional_negative_probe_check(
             'fund_movement_negative_test',
             evidence.fund_movement_rejected,
+            fund_movement_path_absent=evidence.fund_movement_path_absent,
             pass_detail='Fund movement attempt was rejected by RISEx authorization',
             fail_detail='Fund movement was not rejected by RISEx authorization',
         ),
-        _bool_check(
+        _conditional_negative_probe_check(
             'withdrawal_negative_test',
             evidence.withdrawal_rejected,
+            fund_movement_path_absent=evidence.fund_movement_path_absent,
             pass_detail='Withdrawal attempt was rejected by RISEx authorization',
             fail_detail='Withdrawal was not rejected by RISEx authorization',
         ),
@@ -341,7 +376,7 @@ def evaluate_signer_capabilities(
 
     if any(check.verdict == 'FAIL' for check in gate_checks):
         verdict: ProbeVerdict = 'FAIL'
-    elif all(check.verdict == 'PASS' for check in gate_checks):
+    elif all(check.verdict in ('PASS', 'N/A') for check in gate_checks):
         verdict = 'PASS'
     else:
         verdict = 'UNKNOWN'

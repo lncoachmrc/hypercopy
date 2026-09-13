@@ -13,7 +13,10 @@ from app.adapters.risex_types import ProviderReadUnavailable
 from app.core.config import Network
 from app.security.risex_signer_probe import (
     ADR_REFERENCE,
+    ADR_0003_REFERENCE,
     AUTHORIZATION_CRITERION,
+    NEGATIVE_PROBE_NA_REASON,
+    NEGATIVE_PROBE_UNKNOWN_REASON,
     ProbeVerdict,
     RISExSignerCapabilityEvidence,
     RISExSignerCapabilityReport,
@@ -64,6 +67,31 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _negative_probe_payload(
+    value: bool | None,
+    *,
+    fund_movement_path_absent: bool,
+) -> dict[str, Any]:
+    if fund_movement_path_absent is True:
+        status = 'N/A'
+        reason = NEGATIVE_PROBE_NA_REASON
+    elif value is True:
+        status = 'PASS'
+        reason = 'ADR-0003: applicable behavioral rejection evidence was observed'
+    elif value is False:
+        status = 'FAIL'
+        reason = 'ADR-0003: applicable behavioral rejection evidence failed'
+    else:
+        status = 'UNKNOWN'
+        reason = NEGATIVE_PROBE_UNKNOWN_REASON
+    return {
+        'value': value,
+        'status': status,
+        'adr_reference': ADR_0003_REFERENCE,
+        'reason': reason,
+    }
+
+
 def report_payload(
     evidence: RISExSignerCapabilityEvidence,
     report: RISExSignerCapabilityReport,
@@ -87,8 +115,14 @@ def report_payload(
             'perps_permission': evidence.perps_permission,
             'fund_movement_path_absent': evidence.fund_movement_path_absent,
             'perps_order_succeeded': evidence.perps_order_succeeded,
-            'fund_movement_rejected': evidence.fund_movement_rejected,
-            'withdrawal_rejected': evidence.withdrawal_rejected,
+            'fund_movement_rejected': _negative_probe_payload(
+                evidence.fund_movement_rejected,
+                fund_movement_path_absent=evidence.fund_movement_path_absent,
+            ),
+            'withdrawal_rejected': _negative_probe_payload(
+                evidence.withdrawal_rejected,
+                fund_movement_path_absent=evidence.fund_movement_path_absent,
+            ),
             'post_revoke_order_rejected': evidence.post_revoke_order_rejected,
             'operatorhub_bypass_disabled': evidence.operatorhub_bypass_disabled,
         },
