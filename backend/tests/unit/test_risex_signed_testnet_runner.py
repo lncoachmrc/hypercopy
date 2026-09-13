@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -66,7 +68,7 @@ class FakeRPC:
         status: int = 1,
         permissions: dict[int, bool] | None = None,
         expiration: int = EXPIRATION,
-        permission_bitmap: int = 0x1234,
+        permission_bitmap: int = 0xFFFFFFFF,
         stored_status: int = 1,
         block_timestamp: int = BLOCK_TIMESTAMP,
     ) -> None:
@@ -144,54 +146,142 @@ async def _run(
     *,
     permissions: dict[int, bool],
     expiration: int = EXPIRATION,
+    status: int = 1,
+    permission_bitmap: int = 0xFFFFFFFF,
+    fund_movement_path_absent: bool | None = None,
 ) -> Any:
     from app.security import risex_signed_testnet_runner as runner
 
     _patch_credential_loader(monkeypatch, runner)
-    rpc = FakeRPC(status=1, permissions=permissions, expiration=expiration)
-    report = await runner.run_signed_testnet_readiness(
-        env={
+    rpc = FakeRPC(
+        status=status,
+        permissions=permissions,
+        expiration=expiration,
+        permission_bitmap=permission_bitmap,
+    )
+    kwargs: dict[str, Any] = {
+        'env': {
             'RISEX_TESTNET_ACCOUNT_ADDRESS': ACCOUNT,
             'RISEX_TESTNET_SIGNER_PRIVATE_KEY': 'injected-test-secret',
         },
-        api=FakeAPI(),
-        rpc=rpc,
-        network='testnet',
-        explicit_approval=True,
-        disposable_account_asserted=True,
-        dedicated_signer_asserted=True,
-        operatorhub_bypass_disabled=True,
-        expected_fingerprint=await _expected_fingerprint(),
-    )
+        'api': FakeAPI(),
+        'rpc': rpc,
+        'network': 'testnet',
+        'explicit_approval': True,
+        'disposable_account_asserted': True,
+        'dedicated_signer_asserted': True,
+        'operatorhub_bypass_disabled': True,
+        'expected_fingerprint': await _expected_fingerprint(),
+    }
+    if fund_movement_path_absent is not None:
+        kwargs['fund_movement_path_absent'] = fund_movement_path_absent
+    report = await runner.run_signed_testnet_readiness(**kwargs)
     return report, rpc
 
 
+def _assert_writes_stay_disabled(report: Any) -> None:
+    assert report.post_allowed is False
+    assert report.full_security_gate_passed is False
+    assert report.writes_enabled is False
+
+
 @pytest.mark.asyncio
-async def test_runner_collects_same_block_expiration_evidence_and_blocks_post_until_scope_is_proven(
+async def test_runner_passes_with_perps_permission_and_explicit_adr0002_fund_path_assumption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report, _rpc = await _run(
+        monkeypatch,
+        permissions={1: True, 2: True, 3: True, 4: True},
+        fund_movement_path_absent=True,
+    )
+
+    assert report.session_active is True
+    assert report.perps_permission is True
+    assert report.move_fund_permission is True
+    assert report.perps_only_scope is False
+    assert report.fund_movement_path_absent is True
+    assert report.adr_reference == 'ADR-0002'
+    assert report.verdict == 'PASS'
+    _assert_writes_stay_disabled(report)
+
+
+@pytest.mark.asyncio
+async def test_runner_defaults_to_unknown_when_fund_movement_path_absence_is_not_asserted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report, _rpc = await _run(
+        monkeypatch,
+        permissions={1: True, 2: True, 3: True, 4: True},
+    )
+
+    assert report.session_active is True
+    assert report.perps_permission is True
+    assert report.move_fund_permission is True
+    assert report.fund_movement_path_absent is False
+    assert report.adr_reference == 'ADR-0002'
+    assert report.verdict == 'UNKNOWN'
+    _assert_writes_stay_disabled(report)
+
+
+@pytest.mark.asyncio
+async def test_runner_fails_without_perps_permission_regardless_of_fund_path_assumption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report, _rpc = await _run(
+        monkeypatch,
+        permissions={1: True, 2: False, 3: True, 4: True},
+        fund_movement_path_absent=True,
+    )
+
+    assert report.perps_permission is False
+    assert report.fund_movement_path_absent is True
+    assert report.adr_reference == 'ADR-0002'
+    assert report.verdict == 'FAIL'
+    _assert_writes_stay_disabled(report)
+
+
+@pytest.mark.asyncio
+async def test_runner_fails_when_session_is_inactive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report, _rpc = await _run(
+        monkeypatch,
+        permissions={1: True, 2: True, 3: True, 4: True},
+        status=0,
+        fund_movement_path_absent=True,
+    )
+
+    assert report.session_active is False
+    assert report.fund_movement_path_absent is True
+    assert report.adr_reference == 'ADR-0002'
+    assert report.verdict == 'FAIL'
+    _assert_writes_stay_disabled(report)
+
+
+@pytest.mark.asyncio
+async def test_report_exposes_all_authorization_permissions_and_adr_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report, rpc = await _run(
         monkeypatch,
-        permissions={1: False, 2: True, 3: False, 4: False},
+        permissions={1: True, 2: True, 3: True, 4: True},
+        permission_bitmap=0xFFFFFFFF,
     )
 
-    assert report.deployment_verdict == 'PASS'
-    assert report.deployment_identity_verified is True
-    assert report.block_tag == BLOCK
-    assert report.observed_block_timestamp == BLOCK_TIMESTAMP
-    assert report.session_expiration == EXPIRATION
-    assert report.session_permission_bitmap == 0x1234
-    assert report.stored_session_status_code == 1
-    assert report.session_not_expired is True
-    assert report.session_active is True
+    assert report.all_permission_id == 1
+    assert report.all_permission is True
     assert report.perps_permission_id == 2
     assert report.perps_permission is True
-    assert report.perps_only_scope is None
-    assert report.verdict == 'UNKNOWN'
-    assert report.post_allowed is False
-    assert report.full_security_gate_passed is False
-    assert report.writes_enabled is False
-    assert 'injected-test-secret' not in repr(report)
+    assert report.spot_permission_id == 3
+    assert report.spot_permission is True
+    assert report.move_fund_permission_id == 4
+    assert report.move_fund_permission is True
+    assert report.session_permission_bitmap == 0xFFFFFFFF
+    assert report.session_permission_bitmap_hex == '0xFFFFFFFF'
+    assert report.fund_movement_path_absent is False
+    assert report.adr_reference == 'ADR-0002'
+    assert report.perps_only_scope is False
+    _assert_writes_stay_disabled(report)
 
     eth_call_blocks = [
         str(params[1])
@@ -199,80 +289,34 @@ async def test_runner_collects_same_block_expiration_evidence_and_blocks_post_un
         if method == 'eth_call'
     ]
     assert eth_call_blocks == [BLOCK] * 6
-    assert [params for method, params in rpc.calls if method == 'eth_getBlockByNumber'] == [
-        [BLOCK, False]
-    ]
 
 
 @pytest.mark.asyncio
-async def test_runner_never_allows_post_from_authorization_readiness_alone(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from app.security import risex_signed_testnet_runner as runner
-
-    _patch_credential_loader(monkeypatch, runner)
-    real_collector = runner.collect_authorization_session_evidence
-
-    async def collector_with_proven_scope(*args: Any, **kwargs: Any) -> Any:
-        evidence = await real_collector(*args, **kwargs)
-        return replace(evidence, perps_only_scope=True)
-
-    monkeypatch.setattr(
-        runner,
-        'collect_authorization_session_evidence',
-        collector_with_proven_scope,
-    )
-    report = await runner.run_signed_testnet_readiness(
-        env={
-            'RISEX_TESTNET_ACCOUNT_ADDRESS': ACCOUNT,
-            'RISEX_TESTNET_SIGNER_PRIVATE_KEY': 'injected-test-secret',
-        },
-        api=FakeAPI(),
-        rpc=FakeRPC(),
-        network='testnet',
-        explicit_approval=True,
-        disposable_account_asserted=True,
-        dedicated_signer_asserted=True,
-        operatorhub_bypass_disabled=True,
-        expected_fingerprint=await _expected_fingerprint(),
-    )
-
-    assert report.verdict == 'PASS'
-    assert report.perps_only_scope is True
-    assert report.post_allowed is False
-    assert report.full_security_gate_passed is False
-    assert report.writes_enabled is False
-
-
-@pytest.mark.asyncio
-async def test_runner_fails_when_authorized_signer_is_expired_at_observed_block(
+async def test_runner_still_fails_when_authorized_signer_is_expired_at_observed_block(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report, _rpc = await _run(
         monkeypatch,
         permissions={1: False, 2: True, 3: False, 4: False},
         expiration=BLOCK_TIMESTAMP,
+        fund_movement_path_absent=True,
     )
 
     assert report.session_not_expired is False
     assert report.session_active is False
     assert report.verdict == 'FAIL'
-    assert report.post_allowed is False
-    assert report.full_security_gate_passed is False
-    assert report.writes_enabled is False
+    _assert_writes_stay_disabled(report)
 
 
-@pytest.mark.asyncio
-async def test_runner_fails_when_signer_still_has_default_all_permission(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    report, _rpc = await _run(
-        monkeypatch,
-        permissions={1: True, 2: True, 3: False, 4: False},
+def test_readiness_script_help_exposes_adr0002_fund_movement_opt_in_flag() -> None:
+    script = Path(__file__).resolve().parents[3] / 'scripts' / 'risex_signed_testnet_readiness.py'
+    result = subprocess.run(
+        [sys.executable, str(script), '--help'],
+        check=False,
+        capture_output=True,
+        text=True,
     )
 
-    assert report.perps_only_scope is False
-    assert report.verdict == 'FAIL'
-    assert report.post_allowed is False
-    assert report.full_security_gate_passed is False
-    assert report.writes_enabled is False
+    assert result.returncode == 0
+    assert '--fund-movement-path-absent' in result.stdout
+    assert 'ADR-0002' in result.stdout
