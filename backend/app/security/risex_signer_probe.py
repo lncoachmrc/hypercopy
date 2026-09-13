@@ -235,6 +235,30 @@ def _expiration_check(evidence: RISExSignerCapabilityEvidence, *, now: int) -> C
     return CapabilityCheck('session_expiration', 'PASS', 'Session signer is not expired')
 
 
+def _onchain_authorization_scope_diagnostic(
+    evidence: RISExSignerCapabilityEvidence,
+) -> CapabilityCheck:
+    """Report legacy perps-only scope evidence without participating in unlock."""
+
+    if evidence.onchain_perps_only_scope is None:
+        return CapabilityCheck(
+            'onchain_authorization_scope',
+            'UNKNOWN',
+            'Exact deployed authorization path has not been proven perps-only on-chain',
+        )
+    if evidence.onchain_perps_only_scope is False:
+        return CapabilityCheck(
+            'onchain_authorization_scope',
+            'FAIL',
+            'Registered signer authorization scope is broader than perpetual execution',
+        )
+    return CapabilityCheck(
+        'onchain_authorization_scope',
+        'PASS',
+        'Exact deployed authorization path proves the registered signer is perps-only',
+    )
+
+
 def _authorization_scope_check(evidence: RISExSignerCapabilityEvidence) -> CapabilityCheck:
     """Evaluate the ADR-0002 unlock criterion; perps-only scope is diagnostic only."""
 
@@ -270,7 +294,8 @@ def evaluate_signer_capabilities(
 ) -> RISExSignerCapabilityReport:
     """Evaluate evidence only; this function never changes provider runtime state."""
 
-    checks = (
+    diagnostic_scope = _onchain_authorization_scope_diagnostic(evidence)
+    gate_checks = (
         _deployment_check(evidence),
         _bool_check(
             'session_active',
@@ -312,10 +337,11 @@ def evaluate_signer_capabilities(
             fail_detail='JWT/OperatorHub bypass remains reachable from the trading worker',
         ),
     )
+    checks = (*gate_checks[:4], diagnostic_scope, *gate_checks[4:])
 
-    if any(check.verdict == 'FAIL' for check in checks):
+    if any(check.verdict == 'FAIL' for check in gate_checks):
         verdict: ProbeVerdict = 'FAIL'
-    elif all(check.verdict == 'PASS' for check in checks):
+    elif all(check.verdict == 'PASS' for check in gate_checks):
         verdict = 'PASS'
     else:
         verdict = 'UNKNOWN'
