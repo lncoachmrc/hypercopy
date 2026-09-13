@@ -31,6 +31,8 @@ OTHER_ACCOUNT = '0x' + ('33' * 20)
 OTHER_SIGNER = '0x' + ('44' * 20)
 AUTH = '0x' + ('aa' * 20)
 ROUTER = '0x' + ('bb' * 20)
+OTHER_AUTH = '0x' + ('cc' * 20)
+OTHER_ROUTER = '0x' + ('dd' * 20)
 CHAIN_ID = 11155931
 SESSION_EXPIRATION = 4_000_000_000
 FIXED_NOW = 1_900_000_000.0
@@ -151,7 +153,13 @@ def _evidence(
     return RISExSignerCapabilityEvidence(**values)  # type: ignore[arg-type]
 
 
-def _gate(*, account: str = ACCOUNT, signer: str = SIGNER) -> object:
+def _gate(
+    *,
+    account: str = ACCOUNT,
+    signer: str = SIGNER,
+    authorization_address: str = AUTH,
+    router_address: str = ROUTER,
+) -> object:
     policy = SignedTestnetPolicy(
         network='testnet',
         explicit_approval=True,
@@ -163,7 +171,12 @@ def _gate(*, account: str = ACCOUNT, signer: str = SIGNER) -> object:
     )
     return authorize_pre_order_probe(
         policy=policy,
-        evidence=_evidence(account=account, signer=signer),
+        evidence=_evidence(
+            account=account,
+            signer=signer,
+            auth_contract=authorization_address,
+            router=router_address,
+        ),
         now=int(FIXED_NOW),
         replay_protection_verified=True,
     )
@@ -334,6 +347,71 @@ async def test_arm_rejects_readiness_signer_mismatch(monkeypatch: pytest.MonkeyP
         )
 
     assert readiness.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_arm_rejects_readiness_authorization_address_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _orchestration_module()
+    clock = MutableClock(FIXED_NOW)
+    valid = await _genuine_readiness_result(monkeypatch, clock=clock)
+    readiness = AsyncMock(return_value=valid)
+    monkeypatch.setattr(module, 'run_signed_testnet_readiness', readiness)
+
+    with pytest.raises(SignedTestnetBlocked, match='authorization'):
+        await module.arm_risex_signed_testnet_execution(
+            **_arm_kwargs(
+                gate=_gate(authorization_address=OTHER_AUTH),
+                clock=clock,
+            )
+        )
+
+    assert readiness.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_arm_rejects_readiness_router_address_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _orchestration_module()
+    clock = MutableClock(FIXED_NOW)
+    valid = await _genuine_readiness_result(monkeypatch, clock=clock)
+    readiness = AsyncMock(return_value=valid)
+    monkeypatch.setattr(module, 'run_signed_testnet_readiness', readiness)
+
+    with pytest.raises(SignedTestnetBlocked, match='router'):
+        await module.arm_risex_signed_testnet_execution(
+            **_arm_kwargs(
+                gate=_gate(router_address=OTHER_ROUTER),
+                clock=clock,
+            )
+        )
+
+    assert readiness.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_arm_accepts_matching_readiness_deployment_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _orchestration_module()
+    clock = MutableClock(FIXED_NOW)
+    valid = await _genuine_readiness_result(monkeypatch, clock=clock)
+    readiness = AsyncMock(return_value=valid)
+    monkeypatch.setattr(module, 'run_signed_testnet_readiness', readiness)
+
+    session = await module.arm_risex_signed_testnet_execution(
+        **_arm_kwargs(
+            gate=_gate(authorization_address=AUTH, router_address=ROUTER),
+            clock=clock,
+        )
+    )
+    try:
+        assert readiness.await_count == 1
+        assert session.adapter.readiness_attestation is valid.attestation
+    finally:
+        await session._transport.aclose()
 
 
 @pytest.mark.asyncio
