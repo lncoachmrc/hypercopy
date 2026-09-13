@@ -56,7 +56,7 @@ async def _insert_user(*, copy_state: CopyState = CopyState.PAUSED) -> uuid.UUID
 
 async def _bootstrap_hyperliquid(user_id: uuid.UUID):
     async with SessionLocal() as db:
-        destination = await set_user_network(db, user_id, 'testnet')
+        await set_user_network(db, user_id, 'testnet')
         await db.commit()
         return await user_destination_state(db, user_id)
 
@@ -141,8 +141,9 @@ async def test_first_login_destination_default_remains_hyperliquid() -> None:
     user_id = await _insert_user()
     try:
         async with SessionLocal() as db:
-            destination = await set_user_network(db, user_id, settings.follower_network)
+            await set_user_network(db, user_id, settings.follower_network)
             await db.commit()
+            destination = await user_destination_state(db, user_id)
 
         assert destination.provider == 'hyperliquid'
         assert destination.network == settings.follower_network
