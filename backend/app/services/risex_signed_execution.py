@@ -84,6 +84,12 @@ async def arm_risex_signed_testnet_execution(
         signer_address=pre_order_gate.signer_address,
         clock=readiness_clock,
     )
+    if result.report.authorization_address.lower() != pre_order_gate.deployment_auth_contract.lower():
+        raise SignedTestnetBlocked(
+            'RISEx readiness authorization address does not match the pre-order gate'
+        )
+    if result.report.router_address.lower() != pre_order_gate.deployment_router.lower():
+        raise SignedTestnetBlocked('RISEx readiness router address does not match the pre-order gate')
 
     transport = RISExSignedTestnetHTTPTransport(
         gate=pre_order_gate,
