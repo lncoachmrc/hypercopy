@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.hyperliquid import HyperliquidAdapter
@@ -202,20 +202,42 @@ async def trading_network(body: TradingNetworkIn, user: User = Depends(current_u
 @router.put('/trading-provider', dependencies=[Depends(require_csrf)])
 async def trading_provider(body: TradingProviderIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     _require_follower_user(user)
-    current = await user_destination_state(db, user.id)
-    if body.provider == current.provider:
+    try:
+        current = await user_destination_state(db, user.id)
+        current_provider = current.provider
+        current_network = current.network
+        current_epoch_id = current.epoch_id
+    except RuntimeError as exc:
+        if str(exc) != 'User has no active execution destination epoch':
+            raise
+        current_row = (
+            await db.execute(
+                text(
+                    'SELECT execution_provider, execution_network, active_execution_epoch_id '
+                    'FROM users WHERE id = :user_id'
+                ),
+                {'user_id': user.id},
+            )
+        ).mappings().one()
+        if current_row['active_execution_epoch_id'] is not None:
+            raise
+        current_provider = current_row['execution_provider']
+        current_network = current_row['execution_network']
+        current_epoch_id = None
+
+    if body.provider == current_provider:
         return await _serialize_user(db, user)
 
     account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
     risk_state = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
-    removed_api_wallet = current.provider == 'hyperliquid' and account is not None
+    removed_api_wallet = current_provider == 'hyperliquid' and account is not None
 
     try:
         next_destination = await set_user_destination(
             db,
             user.id,
             provider=body.provider,
-            network=current.network,
+            network=current_network,
         )
     except DestinationSwitchBlocked as exc:
         blockers = [
@@ -237,7 +259,7 @@ async def trading_provider(body: TradingProviderIn, user: User = Depends(current
             },
         ) from exc
 
-    if current.provider == 'hyperliquid' and account:
+    if current_provider == 'hyperliquid' and account:
         await db.delete(account)
         await db.flush()
     await db.execute(delete(PositionLedger).where(PositionLedger.user_id == user.id))
@@ -250,14 +272,14 @@ async def trading_provider(body: TradingProviderIn, user: User = Depends(current
         actor_id=user.id,
         subject_id=user.id,
         before={
-            'provider': current.provider,
-            'network': current.network,
-            'epoch_id': str(current.epoch_id),
+            'provider': current_provider,
+            'network': current_network,
+            'epoch_id': str(current_epoch_id) if current_epoch_id is not None else None,
         },
         after={
             'provider': next_destination.provider,
             'network': next_destination.network,
-            'epoch_id': str(next_destination.epoch_id),
+            'epoch_id': str(next_destination.epoch_id) if next_destination.epoch_id is not None else None,
             'previous_api_wallet_removed': removed_api_wallet,
         },
     )
