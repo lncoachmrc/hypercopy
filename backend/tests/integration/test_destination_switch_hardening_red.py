@@ -11,14 +11,22 @@ from app.db.session import SessionLocal, engine
 from app.models.entities import (
     CopyJob,
     CopyState,
+    CredentialStatus,
     Execution,
     ExecutionState,
     JobState,
     PositionLedger,
+    SigningCredential,
+    TradingAccount,
     User,
     UserState,
 )
 from app.services.execution_destination import close_user_destination_epoch, set_user_destination, user_destination_state
+
+_SWITCH_TARGETS = (
+    ('hyperliquid', 'mainnet'),
+    ('risex', 'testnet'),
+)
 
 
 async def _insert_user(*, copy_state: CopyState) -> User:
@@ -51,22 +59,67 @@ async def _destination(user_id: uuid.UUID):
         return await user_destination_state(db, user_id)
 
 
-async def _attempt_network_switch(user_id: uuid.UUID) -> None:
+async def _attempt_destination_switch(
+    user_id: uuid.UUID,
+    *,
+    provider: str,
+    network: str,
+) -> None:
     async with SessionLocal() as db:
         try:
             await set_user_destination(
                 db,
                 user_id,
-                provider='hyperliquid',
-                network='mainnet',
+                provider=provider,  # type: ignore[arg-type]
+                network=network,  # type: ignore[arg-type]
             )
             await db.commit()
         except Exception:
             await db.rollback()
 
 
+async def _activate_hyperliquid_user(user: User):
+    async with SessionLocal() as db:
+        account = TradingAccount(
+            user_id=user.id,
+            account_address=user.auth_wallet.lower(),
+            agent_address='0x' + ('ab' * 20),
+            agent_name='safe-switch-test',
+        )
+        db.add(account)
+        await db.flush()
+        db.add(
+            SigningCredential(
+                trading_account_id=account.id,
+                ciphertext_b64='ciphertext',
+                nonce_b64='nonce',
+                wrapped_dek_b64='wrapped',
+                wrap_nonce_b64='wrapnonce',
+                key_provider='test',
+                key_reference='test-key',
+                key_version=1,
+                agent_fingerprint='f' * 64,
+                status=CredentialStatus.ACTIVE,
+            )
+        )
+        first = await set_user_destination(
+            db,
+            user.id,
+            provider='hyperliquid',
+            network='testnet',
+            account_address=user.auth_wallet.lower(),
+            credential_version=1,
+        )
+        await db.commit()
+        return first
+
+
 @pytest.mark.asyncio
-async def test_direct_network_switch_is_blocked_when_user_is_not_paused() -> None:
+@pytest.mark.parametrize(('target_provider', 'target_network'), _SWITCH_TARGETS)
+async def test_direct_destination_switch_is_blocked_when_user_is_not_paused(
+    target_provider: str,
+    target_network: str,
+) -> None:
     user = await _insert_user(copy_state=CopyState.ACTIVE)
     try:
         async with SessionLocal() as db:
@@ -78,10 +131,15 @@ async def test_direct_network_switch_is_blocked_when_user_is_not_paused() -> Non
             )
             await db.commit()
 
-        await _attempt_network_switch(user.id)
+        await _attempt_destination_switch(
+            user.id,
+            provider=target_provider,
+            network=target_network,
+        )
 
         current = await _destination(user.id)
         assert current.epoch_id == first.epoch_id
+        assert current.provider == 'hyperliquid'
         assert current.network == 'testnet'
     finally:
         await _cleanup_user(user.id)
@@ -155,7 +213,12 @@ async def test_never_activated_user_can_switch_without_provider_read(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('job_state', [JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING])
-async def test_pending_current_epoch_job_state_blocks_direct_network_switch(job_state: JobState) -> None:
+@pytest.mark.parametrize(('target_provider', 'target_network'), _SWITCH_TARGETS)
+async def test_pending_current_epoch_job_state_blocks_direct_destination_switch(
+    job_state: JobState,
+    target_provider: str,
+    target_network: str,
+) -> None:
     user = await _insert_user(copy_state=CopyState.PAUSED)
     try:
         async with SessionLocal() as db:
@@ -180,10 +243,15 @@ async def test_pending_current_epoch_job_state_blocks_direct_network_switch(job_
             )
             await db.commit()
 
-        await _attempt_network_switch(user.id)
+        await _attempt_destination_switch(
+            user.id,
+            provider=target_provider,
+            network=target_network,
+        )
 
         current = await _destination(user.id)
         assert current.epoch_id == first.epoch_id
+        assert current.provider == 'hyperliquid'
         assert current.network == 'testnet'
     finally:
         await _cleanup_user(user.id)
@@ -234,8 +302,11 @@ async def test_terminal_current_epoch_job_allows_network_switch() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('execution_state', [ExecutionState.SUBMITTING, ExecutionState.UNKNOWN])
-async def test_unresolved_current_epoch_execution_blocks_network_switch(
+@pytest.mark.parametrize(('target_provider', 'target_network'), _SWITCH_TARGETS)
+async def test_unresolved_current_epoch_execution_blocks_destination_switch(
     execution_state: ExecutionState,
+    target_provider: str,
+    target_network: str,
 ) -> None:
     user = await _insert_user(copy_state=CopyState.PAUSED)
     try:
@@ -277,10 +348,15 @@ async def test_unresolved_current_epoch_execution_blocks_network_switch(
             )
             await db.commit()
 
-        await _attempt_network_switch(user.id)
+        await _attempt_destination_switch(
+            user.id,
+            provider=target_provider,
+            network=target_network,
+        )
 
         current = await _destination(user.id)
         assert current.epoch_id == first.epoch_id
+        assert current.provider == 'hyperliquid'
         assert current.network == 'testnet'
     finally:
         await _cleanup_user(user.id)
@@ -288,7 +364,11 @@ async def test_unresolved_current_epoch_execution_blocks_network_switch(
 
 
 @pytest.mark.asyncio
-async def test_nonzero_managed_ledger_blocks_direct_network_switch() -> None:
+@pytest.mark.parametrize(('target_provider', 'target_network'), _SWITCH_TARGETS)
+async def test_nonzero_managed_ledger_blocks_direct_destination_switch(
+    target_provider: str,
+    target_network: str,
+) -> None:
     user = await _insert_user(copy_state=CopyState.PAUSED)
     try:
         async with SessionLocal() as db:
@@ -309,8 +389,97 @@ async def test_nonzero_managed_ledger_blocks_direct_network_switch() -> None:
             )
             await db.commit()
 
-        await _attempt_network_switch(user.id)
+        await _attempt_destination_switch(
+            user.id,
+            provider=target_provider,
+            network=target_network,
+        )
 
+        current = await _destination(user.id)
+        assert current.epoch_id == first.epoch_id
+        assert current.provider == 'hyperliquid'
+        assert current.network == 'testnet'
+    finally:
+        await _cleanup_user(user.id)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_provider_nonzero_position_blocks_activated_hyperliquid_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def provider_state(*_args, **_kwargs):
+        return {'assetPositions': [{'position': {'coin': 'BTC', 'szi': '0.01'}}]}
+
+    async def provider_orders(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(HyperliquidAdapter, 'user_state', provider_state)
+    monkeypatch.setattr(HyperliquidAdapter, 'frontend_open_orders', provider_orders)
+
+    user = await _insert_user(copy_state=CopyState.PAUSED)
+    try:
+        first = await _activate_hyperliquid_user(user)
+        await _attempt_destination_switch(user.id, provider='hyperliquid', network='mainnet')
+        current = await _destination(user.id)
+        assert current.epoch_id == first.epoch_id
+        assert current.network == 'testnet'
+    finally:
+        await _cleanup_user(user.id)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_provider_trigger_order_blocks_activated_hyperliquid_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def provider_state(*_args, **_kwargs):
+        return {'assetPositions': []}
+
+    async def provider_orders(*_args, **_kwargs):
+        return [
+            {
+                'coin': 'BTC',
+                'oid': 99,
+                'isTrigger': True,
+                'triggerPx': '61000',
+                'isPositionTpsl': True,
+                'orderType': 'Take Profit Market',
+            }
+        ]
+
+    monkeypatch.setattr(HyperliquidAdapter, 'user_state', provider_state)
+    monkeypatch.setattr(HyperliquidAdapter, 'frontend_open_orders', provider_orders)
+
+    user = await _insert_user(copy_state=CopyState.PAUSED)
+    try:
+        first = await _activate_hyperliquid_user(user)
+        await _attempt_destination_switch(user.id, provider='hyperliquid', network='mainnet')
+        current = await _destination(user.id)
+        assert current.epoch_id == first.epoch_id
+        assert current.network == 'testnet'
+    finally:
+        await _cleanup_user(user.id)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_provider_read_failure_blocks_activated_hyperliquid_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def provider_state(*_args, **_kwargs):
+        raise TimeoutError('provider timeout')
+
+    async def provider_orders(*_args, **_kwargs):
+        raise AssertionError('order read must not run after position read failure')
+
+    monkeypatch.setattr(HyperliquidAdapter, 'user_state', provider_state)
+    monkeypatch.setattr(HyperliquidAdapter, 'frontend_open_orders', provider_orders)
+
+    user = await _insert_user(copy_state=CopyState.PAUSED)
+    try:
+        first = await _activate_hyperliquid_user(user)
+        await _attempt_destination_switch(user.id, provider='hyperliquid', network='mainnet')
         current = await _destination(user.id)
         assert current.epoch_id == first.epoch_id
         assert current.network == 'testnet'
@@ -338,7 +507,7 @@ async def test_closed_activated_epoch_cannot_be_reinterpreted_as_first_bootstrap
             await close_user_destination_epoch(db, user.id)
             await db.commit()
 
-        await _attempt_network_switch(user.id)
+        await _attempt_destination_switch(user.id, provider='hyperliquid', network='mainnet')
 
         async with SessionLocal() as db:
             active_epoch_id = (
