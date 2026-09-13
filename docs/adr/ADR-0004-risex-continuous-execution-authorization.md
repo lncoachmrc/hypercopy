@@ -1,6 +1,6 @@
 # ADR-0004 — RISEx continuous execution authorization
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-09-13
 - **Scope:** TRAXION / RISEx continuous execution-worker authorization lifecycle
 - **Decision owner:** TRAXION project owner
@@ -38,7 +38,7 @@ Therefore the earlier `SIGUSR1` / `SIGUSR2` design is removed: process signals a
 
 The deployed `execution-worker` is currently configured as one Railway replica. The application is nevertheless replica-aware through `replica_identity()` / `RAILWAY_REPLICA_ID` and `WorkerHeartbeat`, so ADR-0004 must define behavior if the service is later scaled or if more than one live replica is observed.
 
-The repository already has PostgreSQL `system_flags` with operator/audit metadata. ADR-0004 uses that existing database-backed control channel for **requests only**. Readiness PASS and the Operational Execution Window remain non-persistent.
+The repository already has PostgreSQL `system_flags`, but that table is structurally level-triggered (`slug`, `enabled`, `value`). Encoding one-shot request identity, target process incarnation, consumption state and monotonic command generation inside its JSON payload would simulate an event model on top of a level-triggered flag. The accepted implementation therefore uses a dedicated additive table, `risex_execution_control`, whose columns directly express the one-shot control model. Readiness PASS and the Operational Execution Window remain non-persistent.
 
 ## What the 300-second readiness TTL protects
 
@@ -125,7 +125,7 @@ The worker publishes the `boot_id` only as telemetry in its own `WorkerHeartbeat
 The `boot_id` must never be loaded from:
 
 - an environment variable;
-- `system_flags`;
+- the `risex_execution_control` table;
 - Redis;
 - a database row;
 - a file;
@@ -141,37 +141,37 @@ Therefore:
 - any request targeted to the previous `boot_id` becomes unusable by the new process;
 - restart cannot silently replay an outstanding ARM request intended for the old process incarnation.
 
-### 4. Concrete arming/disarming mechanism: one-shot `system_flags` request
+### 4. Concrete arming/disarming mechanism: dedicated one-shot control table
 
-The selected control channel is the existing PostgreSQL `system_flags` table.
-
-The fixed control slug is:
+The selected control channel is the dedicated PostgreSQL table:
 
 `risex_execution_control`
 
-The row is a **command mailbox**, not an authorization flag. Its JSON `value` must contain at least:
+The table is a **command log/mailbox**, not an authorization table. Each command is a separate row containing at least:
 
 ```text
-request_id: UUID
+request_id: UUID PRIMARY KEY
 control_generation: integer
 action: ARM | DISARM
 target_worker_id: string
 target_boot_id: UUID
 state: REQUESTED | CONSUMED
 requested_at: timestamp
+requested_by: UUID | null
+reason: text
 consumed_at: timestamp | null
 consumed_by_worker_id: string | null
 consumed_by_boot_id: UUID | null
 supersedes_request_id: UUID | null
 ```
 
-Existing `SystemFlag.updated_by`, `reason`, `created_at` and `updated_at` provide operator identity, reason and audit timestamps.
+Implementation-specific request metadata needed to perform the one-shot readiness attempt may also be stored on the request row, but no readiness PASS, readiness attestation or Operational Execution Window may be stored there.
 
-`enabled` may be used as an implementation convenience to mirror whether a command is pending, but **authorization must never be inferred from `enabled`**. The authoritative request lifecycle is `value.state` plus request/target identity and `control_generation`.
+A new operator command must use a new random `request_id` and a strictly increasing `control_generation` for the same `target_worker_id` + `target_boot_id` incarnation.
 
-A new operator command must use a new random `request_id` and a strictly increasing `control_generation`.
+The design moved from `system_flags` to this dedicated table because `system_flags` is natively level-triggered. Direct columns for request identity, target boot, state and generation express the accepted one-shot model without treating a JSON value as a synthetic event log.
 
-Generation allocation and command creation must be serialized atomically against the same `risex_execution_control` row, using `SELECT ... FOR UPDATE` in one transaction or an equivalent single-statement atomic update. Two concurrent operator commands must never receive the same generation.
+Generation allocation and command creation must be serialized by the same transaction-scoped PostgreSQL advisory lock used by ARM finalization, keyed to the target `worker_id` + `boot_id`. Two concurrent operator commands for the same process incarnation must never receive the same generation.
 
 A normal new ARM command must not silently overwrite another unconsumed `REQUESTED` command. A DISARM is different: it is a higher-priority cancellation command and **must be able to supersede a pending or already-consumed ARM request**, with a new generation and explicit audit correlation to the superseded request. A DISARM must never be rejected merely because an ARM readiness attempt is in flight.
 
@@ -214,7 +214,7 @@ Consumption must be one indivisible database state transition so that two proces
 
 The implementation must use one of these equivalent atomic patterns:
 
-1. `SELECT ... FOR UPDATE` on `risex_execution_control` inside one database transaction, verify all claim predicates while holding the row lock, mutate `REQUESTED -> CONSUMED`, then commit; or
+1. `SELECT ... FOR UPDATE` on the selected `risex_execution_control` request row inside one database transaction, verify all claim predicates while holding the row lock, mutate `REQUESTED -> CONSUMED`, then commit; or
 2. a single conditional `UPDATE ... WHERE state = 'REQUESTED' AND request_id = ... AND control_generation = ... AND target_worker_id = ... AND target_boot_id = ...` and require exactly one affected row.
 
 The claim predicates must include at least:
@@ -301,24 +301,26 @@ Every control command has a monotonic `control_generation`. An ARM attempt captu
 
 A DISARM that is successfully committed to `risex_execution_control` while readiness is in progress therefore cancels the in-flight attempt. If the worker's control loop observes it immediately, it marks the local attempt canceled and increments `authorization_invalidation_epoch`. If the worker does not observe it until readiness returns, the finalization fence below detects the newer generation and rejects the PASS.
 
-After readiness returns PASS, but **before** the readiness attestation is consumed into an Operational Execution Window, the worker must perform a final fail-closed revalidation. It must acquire the same `risex_execution_control` row serialization lock used by the operator endpoint for generation allocation and command creation, and while that serialization boundary is held it must verify all of the following:
+After readiness returns PASS, but **before** the readiness attestation is consumed into an Operational Execution Window, the worker must perform a final fail-closed revalidation. Command creation and ARM finalization must both acquire the same transaction-scoped PostgreSQL advisory lock keyed by `worker_id` + `boot_id`. While that advisory lock is held, finalization must verify all of the following:
 
 - the current `worker_id` and in-memory `boot_id` still match the arm attempt;
-- the current control row still refers to the same ARM `request_id`;
-- the current `control_generation` is exactly the ARM attempt's captured generation;
-- the current action is still `ARM` and its state is `CONSUMED`;
-- no later DISARM or other control command has been committed;
+- the consumed ARM row still refers to the same ARM `request_id`;
+- its `control_generation` is exactly the ARM attempt's captured generation;
+- its action is still `ARM` and its state is `CONSUMED`;
+- no row with a later control generation for the same target worker/boot has been committed;
 - the process-local `authorization_invalidation_epoch` still equals the attempt's snapshot;
 - the security-relevant runtime context fingerprint still matches the attempt's snapshot;
 - the singleton execution-worker invariant still holds;
 - the readiness attestation is still valid and unused.
 
-The operator ARM/DISARM endpoint and this finalization check must serialize on the same database control row. This gives command creation and window finalization an explicit linearization order:
+`SELECT ... FOR UPDATE` on the consumed ARM row is **not sufficient** for this serialization boundary: a concurrent DISARM is a new `INSERT`, so it does not need the ARM row lock. The shared advisory lock is required specifically so a DISARM command creation and ARM finalization cannot pass each other through that gap.
 
-- if a DISARM commits first, its higher generation is observed and the ARM PASS is discarded; **no window opens**;
-- if finalization acquires the serialization boundary first after readiness has completed, it may open the window only after all checks pass; a DISARM serialized after that point is an ordinary post-open DISARM and must close the window through the normal cancellation path.
+The operator ARM/DISARM endpoint and the finalization check therefore serialize on the same advisory-lock namespace. This gives command creation and window finalization an explicit linearization order:
 
-The worker must hold the serialization boundary through the local transition from `ARMING` to `ENABLED`. If the serialization transaction/connection fails before the finalization boundary is safely completed, the result is fail-closed: the attestation is discarded and no window may remain open.
+- if a DISARM acquires the advisory lock and commits first, its higher generation is observed and the ARM PASS is discarded; **no window opens**;
+- if finalization acquires the advisory lock first after readiness has completed, it may open the window only after all checks pass; a DISARM serialized after that point is an ordinary post-open DISARM and must close the window through the normal cancellation path.
+
+The worker must hold the advisory-lock transaction through the local transition from `ARMING` to `ENABLED`. If the serialization transaction/connection fails before the finalization boundary is safely completed, the result is fail-closed: the attestation is discarded and no window may remain open.
 
 A final unlocked `SELECT` followed by later local window creation is forbidden. That would recreate the same check-then-use race.
 
@@ -339,7 +341,7 @@ For ADR-0004, an `execution-worker` heartbeat is **live** only when:
 - `service == 'execution-worker'`; and
 - `now - seen_at <= 180 seconds`.
 
-The worker must publish a heartbeat at least once per normal 60-second operational/maintenance cadence, including promptly after process start. The 180-second live/stale threshold represents three missed 60-second heartbeat opportunities. It is an operational liveness threshold, not freshness of RISEx authorization.
+The actual worker emits heartbeat updates from more than one path. While idle, the consume loop uses a 2000 ms Redis stream block and emits a heartbeat after an empty read, so a healthy idle worker normally updates approximately every two seconds. The maintenance loop separately emits a heartbeat after its work and then sleeps for the configured reconciliation interval, normally 60 seconds. Therefore the 180-second live/stale threshold is deliberately conservative: crossing it means both the fast consume-loop observations and the independent maintenance path have failed to update PostgreSQL, which is consistent with a stopped worker or a worker isolated from the database. It is an operational liveness threshold, not freshness of RISEx authorization.
 
 The singleton invariant must be checked:
 
@@ -354,6 +356,12 @@ If more than one live `execution-worker` heartbeat is observed, RISEx execution 
 If zero live worker heartbeats can be established by the administrative control/read model, the system must not claim an executable authorization state.
 
 Scaling `execution-worker` above one replica therefore requires a new ADR or an explicit revision of ADR-0004 before RISEx signed continuous execution can remain enabled.
+
+#### Control-channel polling latency
+
+The worker checks the control channel in the existing consume loop before each Redis `XREADGROUP`, giving a normal idle ARM/DISARM observation latency of roughly the existing two-second stream block rather than waiting for the maintenance interval. The existing maintenance loop is also a periodic control/invariant path; no second scheduler is introduced.
+
+There is a documented limit: while the consume loop is synchronously processing a long-running job, that consume-loop fast poll does not run. The concurrent maintenance task still provides periodic observation, but the design must not treat polling latency as the final safety boundary. Step 4B, which wires RISEx into job execution, must re-check the process-local window and the relevant final authorization conditions **at the point of use** before entering the existing RISEx per-operation gates/POST path. A prior successful poll is never sufficient authorization for a later RISEx POST.
 
 ### 10. Bind the window to the security-relevant runtime context
 
@@ -580,7 +588,7 @@ A heartbeat is **STALE** when:
 
 `now - WorkerHeartbeat.seen_at > 180 seconds`
 
-The 180-second threshold is three missed 60-second heartbeat opportunities under the required normal worker heartbeat cadence.
+This threshold is intentionally much longer than the normal idle heartbeat path. A healthy idle consume loop normally updates after each approximately two-second empty Redis stream read, while the independent maintenance loop updates after its work and normally sleeps 60 seconds between cycles. A heartbeat older than 180 seconds therefore indicates that **both** ordinary observation paths have failed to update PostgreSQL; operationally, the worker is treated as stopped or database-isolated. The threshold does not imply a fixed 60-second heartbeat scheduler and does not measure RISEx authorization freshness.
 
 When the latest relevant heartbeat is stale, the status endpoint must never present a bare `OPEN`, `ENABLED`, `ARMING` or equivalent current-authorization/current-progress claim as trustworthy current state.
 
@@ -669,8 +677,8 @@ Review must be brought forward immediately if any of the following occurs before
 
 - the execution-worker deployment topology changes materially;
 - `execution-worker` is intentionally scaled beyond one replica;
-- the arming mechanism changes from the explicit one-shot `system_flags` request model;
-- `control_generation`, request-consumption atomicity or arm-finalization serialization semantics change;
+- the arming mechanism changes from the explicit one-shot `risex_execution_control` request model;
+- `control_generation`, request-consumption atomicity or arm-finalization advisory-lock semantics change;
 - any proposal introduces persistence or replay of readiness PASS or Operational Execution Window;
 - the worker heartbeat cadence or 180-second stale threshold changes materially;
 - the readiness attestation TTL or issuance semantics change;
@@ -688,7 +696,7 @@ Review must be brought forward immediately if any of the following occurs before
 - An operator can execute ARM/DISARM through the existing application control plane without requiring Railway container shell/exec access.
 - The durable control record is only a one-shot request; PASS and window remain process-local and non-persistent.
 - Atomic request consumption prevents two processes from claiming the same explicit authorization act.
-- Monotonic control generations plus the finalization fence prevent a readiness PASS from opening a window after a later DISARM or invalidation.
+- Monotonic control generations plus the advisory-lock finalization fence prevent a readiness PASS from opening a window after a later DISARM or invalidation.
 - `ARMING` makes the in-flight authorization attempt explicitly observable without making it authorized.
 - `boot_id` makes restart distinguishable from the targeted operator action and makes old pending requests non-replayable by a new process incarnation.
 - The singleton runtime invariant prevents intermittent per-replica RISEx authorization behavior.
@@ -709,6 +717,7 @@ Review must be brought forward immediately if any of the following occurs before
 - A database/control-plane failure during the final arm fence cancels the arm attempt even after readiness PASS; this is intentional fail-closed behavior.
 - Incorrect classification of an error as reachability-only could delay LOCKED; the conservative rule therefore classifies malformed, ambiguous and authenticity-related failures as LOCKED.
 - Heartbeat telemetry is eventually observed state; after 180 seconds without a fresh heartbeat the administrative view necessarily becomes `UNKNOWN`.
+- During a long-running job the consume-loop fast control poll is unavailable; the maintenance task remains an independent periodic observer, and Step 4B must perform a point-of-use window check before any RISEx POST path.
 
 ## Alternatives considered
 
@@ -730,19 +739,19 @@ Rejected.
 
 It collapses readiness evidence and continuous authorization into one durable fact and weakens the protection provided by a bounded readiness observation.
 
-### Level-triggered database flag such as `risex_armed=true`
+### Level-triggered database flag such as `risex_armed=true` or `system_flags`
 
 Rejected.
 
-A durable boolean would be reread after restart and could automatically re-arm a new process. That merely moves the forbidden persistent authorization pattern from an environment variable into PostgreSQL.
+A durable boolean would be reread after restart and could automatically re-arm a new process. That merely moves the forbidden persistent authorization pattern from an environment variable into PostgreSQL. `system_flags` also models level-triggered state rather than the one-shot request/claim/generation lifecycle required here.
 
-The accepted database use is instead an edge-triggered, request-id-bearing, target-bound one-shot command that becomes permanently `CONSUMED` before readiness runs.
+The accepted database use is a dedicated edge-triggered, request-id-bearing, target-bound one-shot row in `risex_execution_control` that becomes permanently `CONSUMED` before readiness runs.
 
 ### Unlocked final readiness check before window creation
 
 Rejected.
 
-Reading the control row, releasing it, and later opening the process-local window leaves a check-then-use interval in which a DISARM can be accepted and then ignored by the in-flight ARM result. The accepted design serializes operator command creation and ARM finalization on the same control row and treats any mismatch or failure as cancellation.
+Reading the control rows and later opening the process-local window leaves a check-then-use interval in which a DISARM can be accepted and then ignored by the in-flight ARM result. Locking only the consumed ARM row also fails because a DISARM is a new row insert. The accepted design serializes operator command creation and ARM finalization with the same transaction-scoped advisory lock keyed by `worker_id` + `boot_id`, and treats any mismatch or failure as cancellation.
 
 ### Multi-replica process-local windows
 
@@ -772,30 +781,31 @@ This rejection does not apply to the one-shot operator request, monotonic contro
 
 ## Implementation boundary
 
-This ADR PR is decision-only.
+ADR-0004 is accepted together with the Step 4A TDD implementation of the Operational Execution Window.
 
-It must not modify:
+Step 4A implements:
 
-- execution-worker runtime code;
-- readiness code;
-- the adapter or signed transport;
-- gate 1, gate 2 or gate 4;
-- the pre-POST freshness probe;
-- tests or fixtures;
-- Railway configuration;
-- workflow or ruleset configuration;
-- Redis or database models.
+- additive migration `0013_risex_execution_control` containing only the dedicated control table and indexes on that new table;
+- one-shot ARM/DISARM command creation and atomic consumption;
+- process-local `boot_id`, arm attempt and Operational Execution Window state;
+- the shared PostgreSQL advisory-lock finalization fence;
+- runtime singleton verification from live worker heartbeats;
+- heartbeat telemetry and stale-observability rules;
+- SUPERADMIN ARM/DISARM and read-only admin status endpoints.
 
-A separate TDD implementation PR is required. The implementation may use the existing `system_flags` and `worker_heartbeats` schemas and add the dedicated SUPERADMIN/read-only API behavior required by this ADR; any schema change not necessary to those existing structures requires separate review.
+Step 4A does **not** route RISEx jobs through `_process_job_locked()` or otherwise make the new window an execution path. Hyperliquid execution behavior is unchanged. That point-of-use integration is Step 4B and must verify the process-local window immediately before entering the existing RISEx per-operation authorization path; it must not infer authorization from a previous control-channel poll or from heartbeat telemetry.
 
-Following the same lifecycle used for ADR-0003, this ADR remains **Proposed** in the documentation-only PR. The implementation PR may change the status to **Accepted** only in the same reviewed GREEN change that implements and verifies the decision. Acceptance must not be performed by this documentation-only PR.
+The readiness PASS and Operational Execution Window remain non-persistent. PostgreSQL stores only operator requests/consumption acknowledgements and observational telemetry.
 
 ## Related evidence and decisions
 
 - `docs/adr/ADR-0002-risex-session-key-authorization-model.md`
 - `docs/adr/ADR-0003-risex-fund-movement-negative-probe-applicability.md`
 - `docs/superpowers/specs/2026-09-13-risex-signed-execution-orchestration-design.md`
-- `backend/app/models/entities.py` (`SystemFlag`, `WorkerHeartbeat`)
+- `backend/app/models/entities.py` (`RISExExecutionControl`, `WorkerHeartbeat`)
+- `backend/alembic/versions/0013_risex_execution_control.py`
+- `backend/app/services/risex_execution_control.py`
+- `backend/app/services/risex_execution_window.py`
 - `backend/app/api/admin.py`
 - `backend/app/workers/execution_worker.py`
 - `backend/app/security/risex_signed_testnet_runner.py`

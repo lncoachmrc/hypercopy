@@ -808,6 +808,11 @@ class Worker:
             await asyncio.gather(consume, return_exceptions=True)
 
 
+from app.services.risex_execution_worker_extension import install_risex_window as _install_risex_window
+
+_install_risex_window(Worker)
+
+
 async def main():
     loop=asyncio.get_running_loop()
     for s in (signal.SIGTERM,signal.SIGINT):
