@@ -142,6 +142,19 @@ def test_cli_payload_keeps_unknown_distinct_from_na() -> None:
         assert probe['status'] != 'N/A'
 
 
+@pytest.mark.parametrize(('probe_value', 'expected_status'), [(True, 'PASS'), (False, 'FAIL')])
+def test_cli_payload_maps_applicable_negative_probe_results(
+    probe_value: bool,
+    expected_status: str,
+) -> None:
+    payload = _payload(fund_movement_path_absent=False, probe_value=probe_value)
+    for field in ('fund_movement_rejected', 'withdrawal_rejected'):
+        probe = payload['evidence'][field]
+        assert probe['value'] is probe_value
+        assert probe['status'] == expected_status
+        assert probe['adr_reference'] == ADR_0003_REFERENCE
+
+
 def test_cli_address_type_accepts_public_address_and_rejects_private_key_shape() -> None:
     from app.security.risex_signer_probe_cli import public_address
 
