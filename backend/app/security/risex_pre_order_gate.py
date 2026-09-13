@@ -8,7 +8,11 @@ from app.security.risex_signed_testnet_policy import (
     SignedTestnetPolicy,
     assert_signed_testnet_probe_allowed,
 )
-from app.security.risex_signer_probe import RISExSignerCapabilityEvidence
+from app.security.risex_signer_probe import (
+    ADR_REFERENCE,
+    AUTHORIZATION_CRITERION,
+    RISExSignerCapabilityEvidence,
+)
 
 
 _ATTESTATION_SEAL = object()
@@ -35,6 +39,10 @@ class RISExPreOrderProbeGate:
     deployment_auth_contract: str = ''
     deployment_router: str = ''
     order_probe_allowed: Literal[True] = True
+    adr_reference: Literal['ADR-0002'] = ADR_REFERENCE
+    authorization_criterion: Literal['perps_permission_and_fund_movement_path_absent'] = (
+        AUTHORIZATION_CRITERION
+    )
     _attestation_seal: object = field(repr=False, compare=False, default=None)
 
 
@@ -47,7 +55,7 @@ def assert_pre_order_probe_gate_attested(
     """Reject forged or stale gates before any provider mutation.
 
     Without ``now``/``evidence`` this verifies only the sealed gate structure, which
-    is sufficient at construction time.  Immediately before a provider POST callers
+    is sufficient at construction time. Immediately before a provider POST callers
     must supply both values so session freshness and pinned deployment identity are
     revalidated against current evidence.
     """
@@ -100,8 +108,11 @@ def authorize_pre_order_probe(
 ) -> RISExPreOrderProbeGate:
     """Fail closed until every security proof required before the first order is explicit.
 
-    The positive Perps order and post-revocation negative order are deliberately
-    excluded here because they can only be observed after this pre-order gate.
+    ADR-0002 authorizes the pre-order step only when Perps permission and the
+    reviewed absence of a session-key fund-movement path are both explicit.
+    ``onchain_perps_only_scope`` remains diagnostic evidence and is not an unlock
+    condition. Positive Perps order and post-revocation tests remain out of scope
+    because they can only be observed after this pre-order gate.
     """
 
     assert_signed_testnet_probe_allowed(policy)
@@ -122,8 +133,10 @@ def authorize_pre_order_probe(
     if evidence.session_expiration is None or evidence.session_expiration <= now:
         raise SignedTestnetBlocked('RISEx session signer is expired or expiration is unavailable')
 
-    if evidence.onchain_perps_only_scope is not True:
-        raise SignedTestnetBlocked('RISEx Perps-only authorization scope is not proven')
+    if evidence.perps_permission is not True:
+        raise SignedTestnetBlocked('RISEx ADR-0002 Perps permission is not proven')
+    if evidence.fund_movement_path_absent is not True:
+        raise SignedTestnetBlocked('RISEx ADR-0002 fund-movement path absence is not asserted')
     if evidence.fund_movement_rejected is not True:
         raise SignedTestnetBlocked('RISEx fund-movement rejection has not been proven')
     if evidence.withdrawal_rejected is not True:

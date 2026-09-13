@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import fields
 from time import time
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -13,6 +15,8 @@ ACCOUNT = '0x' + ('11' * 20)
 SIGNER = '0x' + ('22' * 20)
 AUTH = '0x' + ('33' * 20)
 ROUTER = '0x' + ('44' * 20)
+ADR_REFERENCE = 'ADR-0002'
+AUTHORIZATION_CRITERION = 'perps_permission_and_fund_movement_path_absent'
 
 
 def _policy(**overrides: object) -> SignedTestnetPolicy:
@@ -41,15 +45,30 @@ def _evidence(**overrides: object) -> RISExSignerCapabilityEvidence:
         'session_active': True,
         'session_account': ACCOUNT,
         'session_expiration': now + 3600,
-        'onchain_perps_only_scope': True,
+        'onchain_perps_only_scope': False,
         'perps_order_succeeded': None,
         'fund_movement_rejected': True,
         'withdrawal_rejected': True,
         'post_revoke_order_rejected': None,
         'operatorhub_bypass_disabled': True,
+        'perps_permission': True,
+        'fund_movement_path_absent': True,
     }
     values.update(overrides)
     return RISExSignerCapabilityEvidence(**values)  # type: ignore[arg-type]
+
+
+def _adr0002_evidence(**overrides: object) -> SimpleNamespace:
+    base = _evidence(onchain_perps_only_scope=False)
+    values = {field.name: getattr(base, field.name) for field in fields(base)}
+    values.update(
+        {
+            'perps_permission': True,
+            'fund_movement_path_absent': True,
+        }
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 def _gate(**evidence_overrides: object):
@@ -58,6 +77,17 @@ def _gate(**evidence_overrides: object):
     return authorize_pre_order_probe(
         policy=_policy(),
         evidence=_evidence(**evidence_overrides),
+        now=int(time()),
+        replay_protection_verified=True,
+    )
+
+
+def _authorize_adr0002(**evidence_overrides: object):
+    from app.security.risex_pre_order_gate import authorize_pre_order_probe
+
+    return authorize_pre_order_probe(
+        policy=_policy(),
+        evidence=_adr0002_evidence(**evidence_overrides),  # type: ignore[arg-type]
         now=int(time()),
         replay_protection_verified=True,
     )
@@ -75,11 +105,42 @@ def test_pre_order_gate_allows_probe_before_positive_order_and_post_revoke_tests
     assert gate.deployment_router == ROUTER
 
 
+def test_pre_order_gate_attests_broad_signer_under_adr0002_criterion() -> None:
+    gate = _authorize_adr0002()
+
+    assert gate.order_probe_allowed is True
+    assert getattr(gate, 'adr_reference', None) == ADR_REFERENCE
+    assert getattr(gate, 'authorization_criterion', None) == AUTHORIZATION_CRITERION
+
+
+def test_pre_order_gate_rejects_without_fund_movement_path_assertion() -> None:
+    with pytest.raises(SignedTestnetBlocked, match='fund-movement path'):
+        _authorize_adr0002(fund_movement_path_absent=False)
+
+
+def test_pre_order_gate_rejects_without_perps_permission_even_with_fund_path_assertion() -> None:
+    with pytest.raises(SignedTestnetBlocked, match='Perps permission'):
+        _authorize_adr0002(perps_permission=False, fund_movement_path_absent=True)
+
+
+@pytest.mark.parametrize(
+    ('field', 'match'),
+    [
+        ('fund_movement_rejected', 'fund-movement rejection'),
+        ('withdrawal_rejected', 'withdrawal rejection'),
+    ],
+)
+def test_pre_order_gate_still_requires_negative_provider_evidence(
+    field: str,
+    match: str,
+) -> None:
+    with pytest.raises(SignedTestnetBlocked, match=match):
+        _authorize_adr0002(**{field: None})
+
+
 @pytest.mark.parametrize(
     ('field', 'value'),
     [
-        ('onchain_perps_only_scope', None),
-        ('onchain_perps_only_scope', False),
         ('fund_movement_rejected', None),
         ('fund_movement_rejected', False),
         ('withdrawal_rejected', None),

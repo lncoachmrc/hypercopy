@@ -48,12 +48,14 @@ def _evidence(*, now: int | None = None, **overrides: object) -> RISExSignerCapa
         'session_active': True,
         'session_account': ACCOUNT,
         'session_expiration': observed_now + 3600,
-        'onchain_perps_only_scope': True,
+        'onchain_perps_only_scope': False,
         'perps_order_succeeded': None,
         'fund_movement_rejected': True,
         'withdrawal_rejected': True,
         'post_revoke_order_rejected': None,
         'operatorhub_bypass_disabled': True,
+        'perps_permission': True,
+        'fund_movement_path_absent': True,
     }
     values.update(overrides)
     return RISExSignerCapabilityEvidence(**values)  # type: ignore[arg-type]

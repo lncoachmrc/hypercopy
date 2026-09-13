@@ -48,12 +48,14 @@ def _evidence() -> RISExSignerCapabilityEvidence:
         session_active=True,
         session_account=ACCOUNT,
         session_expiration=now + 3600,
-        onchain_perps_only_scope=True,
+        onchain_perps_only_scope=False,
         perps_order_succeeded=None,
         fund_movement_rejected=True,
         withdrawal_rejected=True,
         post_revoke_order_rejected=None,
         operatorhub_bypass_disabled=True,
+        perps_permission=True,
+        fund_movement_path_absent=True,
     )
 
 

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import fields
 from time import time
+from types import SimpleNamespace
 
 from app.adapters.risex import RISExAdapter
+
+
+ADR_REFERENCE = 'ADR-0002'
+AUTHORIZATION_CRITERION = 'perps_permission_and_fund_movement_path_absent'
 
 
 def _evidence(**overrides):
@@ -29,49 +35,109 @@ def _evidence(**overrides):
     return RISExSignerCapabilityEvidence(**values)
 
 
-def test_capability_probe_pass_requires_all_security_evidence() -> None:
+def _adr0002_evidence(**overrides) -> SimpleNamespace:
+    base = _evidence(onchain_perps_only_scope=False)
+    values = {field.name: getattr(base, field.name) for field in fields(base)}
+    values.update(
+        {
+            'perps_permission': True,
+            'fund_movement_path_absent': True,
+        }
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _criterion_check(report):
+    return next(
+        (check for check in report.checks if check.name == 'adr0002_authorization_criterion'),
+        None,
+    )
+
+
+def test_capability_evidence_defaults_fund_path_assertion_fail_closed() -> None:
+    evidence = _evidence()
+
+    assert hasattr(evidence, 'perps_permission')
+    assert getattr(evidence, 'fund_movement_path_absent', None) is False
+
+
+def test_capability_probe_passes_broad_signer_under_adr0002_criterion() -> None:
     from app.security.risex_signer_probe import evaluate_signer_capabilities
 
-    report = evaluate_signer_capabilities(_evidence(), now=int(time()))
+    report = evaluate_signer_capabilities(_adr0002_evidence(), now=int(time()))  # type: ignore[arg-type]
 
     assert report.verdict == 'PASS'
     assert report.security_gate_passed is True
-    assert all(check.verdict == 'PASS' for check in report.checks)
+    assert getattr(report, 'adr_reference', None) == ADR_REFERENCE
+    assert getattr(report, 'authorization_criterion', None) == AUTHORIZATION_CRITERION
+    criterion = _criterion_check(report)
+    assert criterion is not None
+    assert criterion.verdict == 'PASS'
 
 
-def test_capability_probe_is_unknown_without_onchain_scope_proof() -> None:
+def test_capability_probe_is_unknown_without_fund_movement_path_assertion() -> None:
     from app.security.risex_signer_probe import evaluate_signer_capabilities
 
     report = evaluate_signer_capabilities(
-        _evidence(onchain_perps_only_scope=None),
+        _adr0002_evidence(fund_movement_path_absent=False),  # type: ignore[arg-type]
         now=int(time()),
     )
 
     assert report.verdict == 'UNKNOWN'
     assert report.security_gate_passed is False
-    scope_check = next(check for check in report.checks if check.name == 'onchain_authorization_scope')
-    assert scope_check.verdict == 'UNKNOWN'
+    criterion = _criterion_check(report)
+    assert criterion is not None
+    assert criterion.verdict == 'UNKNOWN'
 
 
-def test_capability_probe_fails_if_onchain_scope_is_not_perps_only() -> None:
+def test_capability_probe_fails_without_perps_permission_even_with_fund_path_assertion() -> None:
     from app.security.risex_signer_probe import evaluate_signer_capabilities
 
     report = evaluate_signer_capabilities(
-        _evidence(onchain_perps_only_scope=False),
+        _adr0002_evidence(perps_permission=False, fund_movement_path_absent=True),  # type: ignore[arg-type]
         now=int(time()),
     )
 
     assert report.verdict == 'FAIL'
     assert report.security_gate_passed is False
-    scope_check = next(check for check in report.checks if check.name == 'onchain_authorization_scope')
-    assert scope_check.verdict == 'FAIL'
+    criterion = _criterion_check(report)
+    assert criterion is not None
+    assert criterion.verdict == 'FAIL'
+
+
+def test_capability_probe_still_requires_fund_and_withdrawal_negative_evidence() -> None:
+    from app.security.risex_signer_probe import evaluate_signer_capabilities
+
+    for field in ('fund_movement_rejected', 'withdrawal_rejected'):
+        report = evaluate_signer_capabilities(
+            _adr0002_evidence(**{field: None}),  # type: ignore[arg-type]
+            now=int(time()),
+        )
+        assert report.verdict == 'UNKNOWN'
+        assert report.security_gate_passed is False
+        criterion = _criterion_check(report)
+        assert criterion is not None
+        assert criterion.verdict == 'PASS'
+
+
+def test_onchain_perps_only_scope_remains_diagnostic_only() -> None:
+    from app.security.risex_signer_probe import evaluate_signer_capabilities
+
+    report = evaluate_signer_capabilities(
+        _adr0002_evidence(onchain_perps_only_scope=False),  # type: ignore[arg-type]
+        now=int(time()),
+    )
+
+    assert report.verdict == 'PASS'
+    assert report.security_gate_passed is True
 
 
 def test_capability_probe_fails_if_operatorhub_bypass_is_reachable() -> None:
     from app.security.risex_signer_probe import evaluate_signer_capabilities
 
     report = evaluate_signer_capabilities(
-        _evidence(operatorhub_bypass_disabled=False),
+        _adr0002_evidence(operatorhub_bypass_disabled=False),  # type: ignore[arg-type]
         now=int(time()),
     )
 
@@ -88,7 +154,10 @@ def test_capability_probe_fails_inactive_expired_or_wrong_account() -> None:
         {'session_expiration': now - 1},
         {'session_account': '0x5555555555555555555555555555555555555555'},
     ):
-        report = evaluate_signer_capabilities(_evidence(**overrides), now=now)
+        report = evaluate_signer_capabilities(
+            _adr0002_evidence(**overrides),  # type: ignore[arg-type]
+            now=now,
+        )
         assert report.verdict == 'FAIL'
         assert report.security_gate_passed is False
 
@@ -96,7 +165,7 @@ def test_capability_probe_fails_inactive_expired_or_wrong_account() -> None:
 def test_capability_probe_never_enables_risex_writes() -> None:
     from app.security.risex_signer_probe import evaluate_signer_capabilities
 
-    report = evaluate_signer_capabilities(_evidence(), now=int(time()))
+    report = evaluate_signer_capabilities(_adr0002_evidence(), now=int(time()))  # type: ignore[arg-type]
 
     assert report.verdict == 'PASS'
     assert RISExAdapter.writes_enabled is False
