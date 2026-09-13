@@ -19,12 +19,12 @@ from app.db.session import get_db
 from app.engine.sizing import EXCHANGE_MIN_NOTIONAL
 from app.models.entities import CopyJob, CopyState, CredentialStatus, Execution, ExecutionState, JobState, PositionLedger, RiskHalt, RiskProfile, RiskState, SigningCredential, TradingAccount, User
 from app.schemas.trading import ClosePositionsIn
-from app.schemas.user import RiskProfileIn, TradingAccountIn, TradingNetworkIn
+from app.schemas.user import RiskProfileIn, TradingAccountIn, TradingNetworkIn, TradingProviderIn
 from app.services.audit import audit
-from app.services.destination_switch import DestinationSwitchBlocked
+from app.services.destination_switch import DestinationSwitchBlocked, destination_switch_blockers
 from app.services.entitlement import entitlement
 from app.services.execution import live_trading_allowed
-from app.services.execution_destination import close_user_destination_epoch, set_user_destination
+from app.services.execution_destination import close_user_destination_epoch, set_user_destination, user_destination_state
 from app.services.master_source_identity import (
     MASTER_SOURCE_FOLLOWER_BLOCK_REASON,
     MASTER_SOURCE_MODE,
@@ -97,13 +97,20 @@ async def _network_switch_status(db: AsyncSession, user: User, started_at: datet
 
 async def _serialize_user(db: AsyncSession, user: User) -> dict:
     network_state = await user_network_state(db, user.id)
+    destination = await user_destination_state(db, user.id)
     account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
     cred = None
     if account:
         cred = (await db.execute(select(SigningCredential).where(SigningCredential.trading_account_id == account.id))).scalar_one_or_none()
     rs = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
     switch_status = await _network_switch_status(db, user, network_state.started_at)
+    local_destination_blockers = await destination_switch_blockers(db, user.id, destination.epoch_id)
     is_master = is_master_source_user(user)
+    destination_blocker_payload = (
+        [{'code': 'master_source', 'message': MASTER_SOURCE_FOLLOWER_BLOCK_REASON}]
+        if is_master
+        else [{'code': blocker.code, 'message': blocker.message} for blocker in local_destination_blockers]
+    )
     return {
         'id': str(user.id), 'auth_wallet': user.auth_wallet, 'role': user.role.value, 'state': user.state.value,
         'copy_state': user.copy_state.value, 'manual_trade_policy': user.manual_trade_policy.value,
@@ -112,6 +119,10 @@ async def _serialize_user(db: AsyncSession, user: User) -> dict:
         'master_network': settings.master_network,
         'follower_network': network_state.network,
         'network_started_at': network_state.started_at,
+        'execution_provider': destination.provider,
+        'execution_network': destination.network,
+        'destination_switch_ready': False if is_master else not local_destination_blockers,
+        'destination_switch_blockers': destination_blocker_payload,
         'network_switch_ready': False if is_master else switch_status['ready'],
         'network_switch_blockers': ([{'code': 'master_source', 'message': MASTER_SOURCE_FOLLOWER_BLOCK_REASON}] if is_master else switch_status['blockers']),
         'is_master_source': is_master,
@@ -182,6 +193,72 @@ async def trading_network(body: TradingNetworkIn, user: User = Depends(current_u
             'network': next_state.network,
             'started_at': next_state.started_at.isoformat(),
             'previous_api_wallet_removed': removed_agent,
+        },
+    )
+    await db.commit()
+    return await _serialize_user(db, user)
+
+
+@router.put('/trading-provider', dependencies=[Depends(require_csrf)])
+async def trading_provider(body: TradingProviderIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    _require_follower_user(user)
+    current = await user_destination_state(db, user.id)
+    if body.provider == current.provider:
+        return await _serialize_user(db, user)
+
+    account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
+    risk_state = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
+    removed_api_wallet = current.provider == 'hyperliquid' and account is not None
+
+    try:
+        next_destination = await set_user_destination(
+            db,
+            user.id,
+            provider=body.provider,
+            network=current.network,
+        )
+    except DestinationSwitchBlocked as exc:
+        blockers = [
+            {'code': blocker.code, 'message': blocker.message}
+            for blocker in exc.assessment.blockers
+        ]
+        if not blockers:
+            blockers = [{
+                'code': 'destination_unreadable',
+                'message': exc.assessment.reason or 'Current execution destination cannot be verified safely.',
+            }]
+        raise HTTPException(
+            409,
+            detail={
+                'code': 'destination_switch_blocked',
+                'state': exc.assessment.state.value,
+                'reason': exc.assessment.reason,
+                'blockers': blockers,
+            },
+        ) from exc
+
+    if current.provider == 'hyperliquid' and account:
+        await db.delete(account)
+        await db.flush()
+    await db.execute(delete(PositionLedger).where(PositionLedger.user_id == user.id))
+    if risk_state:
+        await db.delete(risk_state)
+
+    await audit(
+        db,
+        action='TRADING_PROVIDER_CHANGED',
+        actor_id=user.id,
+        subject_id=user.id,
+        before={
+            'provider': current.provider,
+            'network': current.network,
+            'epoch_id': str(current.epoch_id),
+        },
+        after={
+            'provider': next_destination.provider,
+            'network': next_destination.network,
+            'epoch_id': str(next_destination.epoch_id),
+            'previous_api_wallet_removed': removed_api_wallet,
         },
     )
     await db.commit()
