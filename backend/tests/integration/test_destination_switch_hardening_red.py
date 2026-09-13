@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select, text
 
+from app.adapters.hyperliquid import HyperliquidAdapter
 from app.db.session import SessionLocal, engine
 from app.models.entities import CopyJob, CopyState, JobState, PositionLedger, User, UserState
 from app.services.execution_destination import close_user_destination_epoch, set_user_destination, user_destination_state
@@ -75,7 +76,14 @@ async def test_direct_network_switch_is_blocked_when_user_is_not_paused() -> Non
 
 
 @pytest.mark.asyncio
-async def test_never_activated_user_can_switch_without_trading_account_or_credentials() -> None:
+async def test_never_activated_user_can_switch_without_provider_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def forbidden_provider_read(*_args, **_kwargs):
+        raise AssertionError('NEVER_ACTIVATED must be proven from DB state before provider I/O')
+
+    monkeypatch.setattr(HyperliquidAdapter, '_read', forbidden_provider_read)
+
     user = await _insert_user(copy_state=CopyState.PAUSED)
     try:
         async with SessionLocal() as db:
