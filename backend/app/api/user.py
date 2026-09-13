@@ -21,6 +21,7 @@ from app.models.entities import CopyJob, CopyState, CredentialStatus, Execution,
 from app.schemas.trading import ClosePositionsIn
 from app.schemas.user import RiskProfileIn, TradingAccountIn, TradingNetworkIn
 from app.services.audit import audit
+from app.services.destination_switch import DestinationSwitchBlocked
 from app.services.entitlement import entitlement
 from app.services.execution import live_trading_allowed
 from app.services.execution_destination import close_user_destination_epoch, set_user_destination
@@ -149,16 +150,28 @@ async def trading_network(body: TradingNetworkIn, user: User = Depends(current_u
 
     account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
     removed_agent = bool(account)
+    risk_state = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
+
+    # The central destination boundary must authorize the old destination while
+    # its account/credential, ledger and risk evidence are still present.
+    try:
+        next_state = await set_user_network(db, user.id, network)
+    except DestinationSwitchBlocked as exc:
+        messages = [blocker.message for blocker in exc.assessment.blockers]
+        detail = ' '.join(messages) if messages else 'Impossibile verificare in sicurezza la destinazione corrente.'
+        raise HTTPException(409, f'Rete non ancora pronta al cambio. {detail}') from exc
+
+    # Destructive local cleanup happens only after the authoritative transition
+    # check succeeds. The entire endpoint remains one DB transaction, so any
+    # later failure rolls the epoch transition and cleanup back together.
     if account:
         await db.delete(account)
         await db.flush()
 
     await db.execute(delete(PositionLedger).where(PositionLedger.user_id == user.id))
-    risk_state = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
     if risk_state:
         await db.delete(risk_state)
 
-    next_state = await set_user_network(db, user.id, network)
     await audit(
         db,
         action='TRADING_NETWORK_CHANGED',
