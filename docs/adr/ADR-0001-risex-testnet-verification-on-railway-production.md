@@ -91,7 +91,9 @@ Questa revisione deve essere riesaminata quando tale servizio temporaneo esiste 
 
 ## Superseded
 
-Questa ADR è superata da `ADR-0002-risex-session-key-authorization-model.md`.
+`ADR-0002-risex-session-key-authorization-model.md` supersede questa ADR **solo limitatamente al presupposto errato secondo cui Railway `production` potesse essere usato come ambiente approvato per la verifica firmata RISEx testnet**.
+
+I requisiti di isolamento derivati dalla revisione di ADR-0001 restano vincolanti e sono riportati attivamente nella sezione **“Environment requirements (carried forward from ADR-0001)”** di ADR-0002. In particolare restano obbligatori: servizio applicativo isolato, database e cache dedicati senza condivisione di code o lock, tutte le reti Hyperliquid su testnet, `ENABLE_LIVE_TRADING=false`, secret generati ex novo e divieto di eseguire verifiche firmate RISEx in ambienti che servono utenti reali.
 
 La decisione originale presupponeva che Railway `production` fosse un ambiente testnet o comunque non operativo. Questo presupposto è stato verificato falso: `ENABLE_LIVE_TRADING=true`, `HYPERLIQUID_NETWORK=mainnet`, il database production conteneva `634` executions, `678` fills e `2139` copy_jobs, l'ultimo evento `COPY_JOB_EXECUTED` osservato era del `2026-09-11 09:50`, ed era presente un utente `ACTIVE` con un execution epoch mainnet aperto.
 
@@ -99,4 +101,4 @@ La decisione originale contraddiceva inoltre il vincolo già registrato nella se
 
 La soluzione adottata è un ambiente di verifica isolato basato sul servizio Railway `api Copy`, con database `Postgres-Svbw` e cache `Redis-ATmb` dedicati, `ENABLE_LIVE_TRADING=false`, reti configurate su testnet e secret generati ex novo per il solo ambiente di test.
 
-ADR-0001 resta conservata integralmente come traccia storica della decisione iniziale, delle assunzioni che la sostenevano e del motivo per cui è stata sostituita.
+ADR-0001 resta conservata integralmente come traccia storica della decisione iniziale, delle assunzioni che la sostenevano e del motivo per cui è stata sostituita. La prosa storica che approvava Railway `production` non è più normativa e non autorizza alcuna verifica firmata su ambienti che servono utenti reali.
