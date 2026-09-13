@@ -1,17 +1,17 @@
 # TRAXION RISEx Provider Selection and Safe-Switch Design
 
 **Date:** 2026-09-13  
-**Status:** draft for owner approval  
+**Status:** approved for implementation planning  
 **Baseline:** `main` at `0db51ba44d4fc2307b62a1069291c59a31d7acd5`  
 **Parent architecture:** `docs/superpowers/specs/2026-09-09-risex-follower-integration-design.md`
 
 ## Goal
 
-Complete the missing Phase 2 provider-selection path so an authenticated follower can explicitly choose `hyperliquid` or `risex` while preserving the execution-epoch model and the original safe-switch semantics.
+Complete the missing Phase 2 provider-selection path so an authenticated follower can explicitly choose `hyperliquid` or `risex` while preserving the immutable execution-epoch model and the original safe-switch semantics.
 
 This work is not an execution-routing change. It creates and protects the destination identity that later execution code consumes. Hyperliquid remains the default provider. Selecting RISEx does not auto-enable trading, does not auto-create a RISEx credential, does not bypass signed-write readiness, and does not route ordinary worker traffic to RISEx.
 
-The immediate test-environment path that must become possible is:
+The immediate isolated-test path that must become possible is:
 
 1. wallet SIWE login on an empty database;
 2. new user is created with the existing default `hyperliquid` provider and configured follower network;
@@ -23,15 +23,15 @@ The immediate test-environment path that must become possible is:
 
 ## Existing architecture that must be preserved
 
-The current repository already provides:
+The repository already provides:
 
 - `users.execution_provider` with default/backfill `hyperliquid`;
 - `users.execution_network` as an independent dimension;
 - immutable `execution_epochs`;
-- `set_user_destination()` as the single function that closes an existing epoch and opens a new one;
+- `set_user_destination()` as the function that closes an existing epoch and opens a new one;
 - immutable job/execution destination binding;
 - stale-epoch rejection at execution time;
-- `PUT /trading-network` with local switch blockers;
+- `PUT /trading-network` with endpoint-local switch blockers;
 - Hyperliquid account-state reads;
 - a sealed RISEx signed-testnet execution path whose write authorization remains independent of provider selection.
 
@@ -53,48 +53,59 @@ The 2026-09-09 architecture requires all of the following before a provider/netw
 
 These are correctness and authorization invariants, not UI checks.
 
+## Current network-switch risk classification
+
+The existing `PUT /trading-network` path is already a production-facing Hyperliquid path. Its current `_network_switch_status()` gate checks local pause state, managed `PositionLedger`, pending jobs and unresolved executions, but it does not prove provider-side flatness and it does not inspect provider open/conditional orders.
+
+Two separate issues must be distinguished:
+
+1. **Cleanup ordering.** The endpoint currently deletes `TradingAccount`, local ledger and `RiskState` before calling `set_user_network()`. These operations occur in the same database transaction, so this ordering is not by itself treated as an independently exploitable committed-data-loss bug under the current implementation. If the later database transition fails before commit, the transaction is expected to roll back.
+2. **Authorization weakness.** The endpoint can currently authorize a network switch based only on local state. If local ledger state diverges from the provider, or if provider-side open/conditional orders exist while local blockers are clear, the safe-switch semantics are weaker than the approved architecture. This weakness exists today; it is not created by provider selection.
+
+Moving the authoritative guard into `set_user_destination()` necessarily changes the existing Hyperliquid network-switch path because `set_user_network()` delegates to `set_user_destination()`. For that reason, the existing path must be hardened in a dedicated backend PR with explicit Hyperliquid non-regression tests before provider selection is added.
+
 ## Decision 1 — the authoritative guard lives inside `set_user_destination()`
 
 ### Problem
 
-Today `_network_switch_status()` protects `PUT /trading-network`, but `set_user_destination()` itself can close the current epoch and open another without checking pause, positions, pending jobs or unresolved executions. A future caller can therefore omit the endpoint-level precheck and still perform the state transition.
+Today `_network_switch_status()` protects `PUT /trading-network`, but `set_user_destination()` itself can close the current epoch and open another without checking pause, positions, pending jobs, unresolved executions or provider-side flat/order state. A future caller can therefore omit the endpoint-level precheck and still perform the state transition.
 
-Provider selection would make that omission reachable from a new application path.
+Provider selection would make that omission reachable from an additional application path.
 
 ### Decision
 
 `set_user_destination()` becomes the authoritative destination-transition boundary.
 
-Whenever the target `provider` or `network` differs from the user's persisted current destination identity, `set_user_destination()` MUST execute the safe-switch guard itself before closing or replacing any epoch.
+Whenever the target `provider` or `network` differs from the user's persisted current destination identity, `set_user_destination()` MUST invoke the safe-switch authorization itself before closing or replacing any epoch.
 
-The guard is not satisfied by a caller-provided boolean such as `safe=True`, and callers do not supply a forgeable `VERIFIED_FLAT` object. `set_user_destination()` owns the classification and invokes the provider verifier itself.
+The guard is not satisfied by a caller-provided boolean such as `safe=True`, and callers do not supply a forgeable `VERIFIED_FLAT` object. The central transition path owns classification and provider verification.
 
 The function MUST distinguish these cases:
 
-1. **Initial materialization** — no previous operational destination has ever existed. The existing Hyperliquid default/bootstrap remains valid without a switch check.
-2. **No-op** — target provider/network equals the current provider/network and the existing destination identity is otherwise unchanged. Return the current state without creating a new epoch.
+1. **Initial materialization** — no previous operational destination has ever existed. Existing Hyperliquid default/bootstrap remains valid without a switch authorization.
+2. **No-op** — target provider/network equals the current destination and no destination identity change is requested. Return the current state without creating a new epoch.
 3. **Provider/network switch** — target provider or network differs. Full safe-switch semantics apply.
-4. **Same-provider credential/account rebind** — provider/network are unchanged but account/credential identity changes. This is not redefined as a provider switch by this work; existing account-link safety behavior remains separate unless the implementation plan finds a direct conflict that must be handled to preserve this design.
+4. **Same-provider credential/account rebind** — provider/network are unchanged but account/credential identity changes. This remains a separate lifecycle operation and MUST NOT accidentally inherit provider/network-switch semantics. Existing Hyperliquid account-link safety must remain covered by dedicated regression tests.
 
 ### Close-before-switch bypass resistance
 
 The guard MUST NOT depend only on `active_execution_epoch_id` being non-null.
 
-If another application path closes the active epoch first, `users.execution_provider` and `users.execution_network` still identify the previous persisted destination. `set_user_destination()` MUST compare the target to those persisted values and inspect prior epoch history. A caller cannot turn a provider/network change into an apparent bootstrap merely by calling `close_user_destination_epoch()` first.
+If another application path closes the active epoch first, `users.execution_provider` and `users.execution_network` still identify the previous persisted destination. `set_user_destination()` MUST compare the target to those persisted values and inspect prior epoch history. A caller cannot turn a provider/network change into apparent bootstrap by calling `close_user_destination_epoch()` first.
 
-An unguarded creation is allowed only for genuine first-time materialization, not for a user with a prior destination history whose target provider/network differs from the persisted identity.
+An unguarded creation is allowed only for genuine first-time materialization, not for a user with prior destination history whose target provider/network differs from the persisted identity.
 
 ### Transaction and freshness ordering
 
-A provider/network switch is rare, so correctness is preferred over minimizing the duration of a single-user transaction.
+A provider/network switch is rare, so correctness takes priority over minimizing the duration of one user's transition transaction.
 
-`set_user_destination()` MUST:
+The central transition MUST:
 
 1. lock/read the user destination identity;
 2. evaluate DB-local blockers;
-3. classify `NEVER_ACTIVATED` or perform the provider-side verification;
-4. re-check DB-local blockers after the provider read and before mutation;
-5. confirm the source epoch/provider/network identity still matches what was verified;
+3. classify `NEVER_ACTIVATED` or perform provider-side verification;
+4. re-check DB-local blockers after provider reads and before mutation;
+5. confirm source epoch/provider/network identity still matches what was verified;
 6. only then close the old epoch and create the new epoch.
 
 No provider write occurs during this process.
@@ -138,7 +149,7 @@ It is valid only when all of the following are true for the user:
 
 Because no provider account was ever bound to an epoch, there is no provider account to query. The absence of an account is positive lifecycle evidence here, not a failed provider read.
 
-The expected empty-database path therefore becomes:
+The expected empty-database path is therefore:
 
 `wallet login -> hyperliquid/testnet epoch with account_address=NULL -> PAUSE -> select risex -> NEVER_ACTIVATED -> new risex/testnet epoch`.
 
@@ -157,39 +168,52 @@ Examples include:
 
 `UNREADABLE` MUST never be mapped to `NEVER_ACTIVATED` or `VERIFIED_FLAT`.
 
-## Decision 3 — close the current safe-switch gap in this PR, fail closed where a provider read does not yet exist
+## Decision 3 — close the safe-switch gap before exposing provider selection
 
-The new endpoint must not be released with the weaker current `_network_switch_status()` semantics as its final authorization boundary.
+Provider selection must not be released while the existing network switch still uses weaker authorization semantics.
 
-This PR therefore closes the semantic gap now rather than deferring the requirement:
+This is implemented in two backend PRs, in order.
 
-### Hyperliquid as previous destination
+### PR A — existing Hyperliquid network-switch hardening
 
-The implementation MUST perform live provider-side verification in this PR.
+Before adding any provider-selection endpoint, harden the existing destination-transition primitive and existing `PUT /trading-network` path.
 
-It must use Hyperliquid account state to prove zero positions and a Hyperliquid open-order read that includes trigger/conditional orders. The existing adapter may gain the minimal read wrapper required for this verification. The switch verifier must treat any read error as `UNREADABLE`.
+PR A MUST include:
 
-The implementation should prefer the Hyperliquid `frontendOpenOrders` semantics because the response identifies trigger/TP/SL orders explicitly; an empty response proves there are no regular or conditional orders represented by that endpoint.
+- central provider/network-switch authorization invoked by `set_user_destination()`;
+- shared DB-local blocker evaluation;
+- three-state source classification;
+- live Hyperliquid position verification;
+- live Hyperliquid open-order verification covering regular and trigger/conditional orders;
+- reordering of `PUT /trading-network` so previous destination evidence is not destroyed before authorization;
+- user-row/source-epoch TOCTOU protection;
+- non-regression tests for existing Hyperliquid account linking, same-provider credential rebind, network switching, epoch fencing and rollback behavior.
 
-### RISEx as previous destination
+PR A MUST NOT add the RISEx provider endpoint or frontend provider selector.
 
-The current repository does not yet expose a complete authenticated/private RISEx account-state + open/conditional-order read path suitable for proving an activated RISEx account flat.
+For Hyperliquid order verification, prefer the SDK/API `frontendOpenOrders` semantics because its response distinguishes trigger/TP/SL orders. Any read failure is `UNREADABLE`.
 
-The provider-selection PR MUST NOT invent or weaken that evidence.
+### RISEx source behavior in the shared guard
 
-Therefore:
+The current repository does not expose a complete authenticated/private RISEx account-state plus open/conditional-order read path suitable for proving an activated RISEx account flat.
 
-- an unactivated RISEx destination may switch via `NEVER_ACTIVATED`;
-- an activated RISEx destination without complete position + order verification is `UNREADABLE` and cannot switch provider/network;
-- enabling `VERIFIED_FLAT` for an activated RISEx destination is a separate read-capability follow-up, not a relaxation in this PR.
+The shared guard therefore treats:
 
-This means the safe-switch contract is complete in this PR even though one provider remains fail-closed for the activated case.
+- a never-activated RISEx destination as eligible for `NEVER_ACTIVATED`;
+- an activated RISEx destination without complete position + order verification as `UNREADABLE`;
+- any future complete RISEx read implementation as a separate follow-up capable of producing `VERIFIED_FLAT`, never as a reason to relax the guard.
 
-## Decision 4 — DB-local blockers move to the shared destination-transition layer
+### PR B — provider-selection backend
 
-The current `_network_switch_status()` logic is useful but endpoint-local and incomplete.
+Only after PR A is merged and verified, add the explicit owner-scoped provider-selection API using the already-hardened destination transition boundary.
 
-A shared destination-switch precheck MUST become the single source for DB-local blockers used by both provider and network changes.
+PR B MUST NOT change the authorization semantics introduced by PR A.
+
+## Decision 4 — DB-local blockers live in the shared destination-transition layer
+
+The current `_network_switch_status()` logic is useful for presentation but endpoint-local and incomplete.
+
+A shared destination-switch precheck becomes the single source for DB-local blockers used by both provider and network changes.
 
 At minimum it checks:
 
@@ -198,11 +222,11 @@ At minimum it checks:
 - no current-epoch `CopyJob` in `QUEUED`, `PROCESSING` or `RETRYING`;
 - no current-epoch `Execution` in unresolved states (`SUBMITTING` or `UNKNOWN`; any later unresolved state added to the model must also be treated as blocking).
 
-The mutation boundary inside `set_user_destination()` re-evaluates these conditions authoritatively. API/UI readiness may reuse the same helper for presentation but cannot substitute for the final check.
+The mutation boundary inside `set_user_destination()` re-evaluates these conditions authoritatively. API readiness reporting may reuse the same helper for presentation but cannot substitute for the final check.
 
 ## Decision 5 — owner-scoped provider endpoint
 
-Add an authenticated endpoint symmetric with the network selector:
+PR B adds:
 
 `PUT /api/v1/trading-provider`
 
@@ -245,56 +269,62 @@ For a provider switch to RISEx before a user-specific RISEx account/credential i
 
 ## Credential and runtime-state cleanup ordering
 
-The previous destination must be verified before destructive local cleanup.
+The previous destination must be authorized before destructive local cleanup.
 
-The current network-switch endpoint deletes the `TradingAccount` and local ledger/risk state before calling `set_user_network()`. The implementation plan MUST reorder that path so the central switch guard can inspect the authoritative previous destination before any account evidence is destroyed.
+The current network-switch endpoint deletes the `TradingAccount` and local ledger/risk state before calling `set_user_network()`. Because the hardening changes an existing production-facing Hyperliquid path, this reordering belongs exclusively to PR A, not to the provider-selection PR.
 
-For provider/network switches:
+PR A ordering is:
 
-- safe-switch verification happens first;
-- epoch transition happens only after verification succeeds;
-- provider-specific credential cleanup and local ledger/risk reset happen after the transition decision within the same database transaction;
-- if any database step fails before commit, the whole local transition rolls back;
+- safe-switch verification first;
+- epoch transition only after verification succeeds;
+- provider-specific credential cleanup and local ledger/risk reset only after the transition decision, inside the same local transaction;
+- any database failure before commit rolls back the local transition;
 - no provider-side write is part of the switch.
 
-Switching away from Hyperliquid removes the old Hyperliquid `TradingAccount`/`SigningCredential` only after the safe-switch decision succeeds. Returning to Hyperliquid requires linking a fresh dedicated API wallet through the existing Hyperliquid account-link flow.
+Switching away from Hyperliquid removes the old Hyperliquid `TradingAccount`/`SigningCredential` only after safe-switch authorization succeeds. Returning to Hyperliquid requires linking a fresh dedicated API wallet through the existing Hyperliquid account-link flow.
 
-## Readiness reporting and UI selection
+## Backend readiness reporting
 
-Phase 2 also requires provider selection to be visible to the user.
-
-`/me` / dashboard serialization should expose at least:
+PR B should expose through `/me` / dashboard serialization at least:
 
 - current `execution_provider`;
 - current `execution_network`;
 - local destination-switch readiness;
 - structured local blockers.
 
-The UI may display local readiness continuously, but it MUST NOT claim the previous destination is provider-verified flat based only on local state.
+Local readiness is not provider-verified flatness. Provider-side flat/order verification happens on the actual switch request because it must be fresh and because continuous provider polling would create unnecessary rate-limit load and stale authorization evidence.
 
-Provider-side flat/order verification happens on the actual switch request because it must be fresh and because polling provider state every few seconds would create unnecessary rate-limit load and stale authorization evidence.
+## UI selection — required Phase 2 follow-up, not part of the first backend PRs
 
-Settings adds an explicit `Hyperliquid / RISEx` provider selector independent from `TESTNET / MAINNET`.
+Phase 2 still requires a visible `Hyperliquid / RISEx` selector independent from `TESTNET / MAINNET`, but frontend work is deliberately deferred until the backend contract is merged and testable independently.
 
-UI behavior:
+The UI is a separate PR after PR B because:
+
+- the first RISEx test order can be reached through the API without UI;
+- the deployed frontend uses a same-origin proxy and is not currently the authoritative end-to-end test surface for isolated `api Copy`;
+- backend and frontend changes remain easier to review independently.
+
+The later UI PR must preserve these rules:
 
 - Hyperliquid remains selected by default for new users;
 - a different provider cannot be selected while local blockers exist;
 - the switch action tells the user that live destination verification is performed at confirmation time;
-- a provider-read failure is shown as a blocked switch, never as flat;
-- selecting RISEx does not present it as trading-ready unless the separate RISEx readiness/signer gates pass;
+- a provider-read failure is shown as blocked, never as flat;
+- selecting RISEx does not present it as trading-ready unless separate RISEx readiness/signer gates pass;
 - existing Hyperliquid API-wallet fields must not be mislabeled as RISEx credentials.
+
+The UI requirement remains part of the Phase 2 architecture; it is deferred in implementation sequence, not removed.
 
 ## Empty-database SIWE path
 
-The isolated `api Copy` service is already configured so wallet SIWE can create the first user on its empty database.
+The isolated `api Copy` service is configured so wallet SIWE can create the first user on its empty database.
 
-The application flow after this work is:
+After PR A + PR B the backend flow is:
 
 1. `POST /api/v1/auth/challenge`;
 2. wallet signs the SIWE message;
 3. `POST /api/v1/auth/verify`;
-4. backend creates `User`, risk rows, trial subscription and the initial destination epoch;
+4. backend creates `User`, risk rows, trial subscription and initial destination epoch;
 5. initial provider remains `hyperliquid` by schema/application default;
 6. configured follower network is used (`testnet` on `api Copy`);
 7. user explicitly pauses;
@@ -305,9 +335,9 @@ No TradingAccount or signing credential is required to classify this initial Hyp
 
 ## Error handling
 
-Use fail-closed 409-class application errors for safe-switch rejection with machine-readable blocker codes suitable for the UI.
+Use fail-closed 409-class application errors for safe-switch rejection with machine-readable blocker codes suitable for later UI use.
 
-Suggested categories:
+Required categories include:
 
 - `pause_required`;
 - `positions_not_flat`;
@@ -322,147 +352,164 @@ Do not include credentials, signatures, private keys or secret-bearing provider 
 
 ## Concurrency and TOCTOU requirements
 
-The design must preserve the same check-then-use discipline already applied to signed RISEx execution.
+The design preserves the same check-then-use discipline already applied to signed RISEx execution.
 
 Required properties:
 
 - switch checks are bound to the exact source provider/network/epoch;
-- the source identity is revalidated immediately before epoch mutation;
+- source identity is revalidated immediately before epoch mutation;
 - DB-local blockers are checked again after provider reads;
 - an old verification result cannot authorize a different source epoch;
 - two concurrent switch requests for the same user serialize through the user-row lock;
-- an old job that races with the switch remains bound to the old epoch and is rejected by existing fences;
+- an old job racing with the switch remains bound to the old epoch and is rejected by existing fences;
 - provider-read failure at any point blocks the switch.
 
-A manual external trade can never be made impossible purely by application locking. The provider verification must therefore be the last external observation before the local transition, with no unrelated network waits inserted after it.
+A manual external trade cannot be made impossible purely by application locking. Provider verification therefore remains the last external observation before the local transition, with no unrelated network waits inserted afterward.
 
-## Scope of the implementation PR
+## Implementation sequence and PR boundaries
 
-Expected in scope:
+### PR A — Hyperliquid destination/network safe-switch hardening
 
-- central destination-switch guard in `set_user_destination()`;
-- shared DB-local switch-precheck helper;
-- three-state source classification;
-- Hyperliquid live position + open/conditional-order verification;
-- fail-closed RISEx activated-source handling until complete private reads exist;
-- `PUT /trading-provider` owner-scoped endpoint and schema;
-- `/me`/dashboard provider + switch-readiness serialization;
-- provider selector in Settings;
-- reordering of current network-switch cleanup so evidence is not deleted before verification;
-- regression tests for existing Hyperliquid defaults, network switching and epoch fences;
-- TDD tests for all new provider-selection and safe-switch cases.
+Backend only.
 
-Explicitly out of scope:
+In scope:
 
-- routing ordinary `execution-worker` jobs to RISEx;
-- changing queue/strategy writer provider restrictions;
-- sending a RISEx order;
-- registering/revoking a RISEx signer;
-- persisting a new user-specific RISEx credential model;
-- RISEx mainnet enablement;
-- `ENABLE_LIVE_TRADING`, database `live_trading`, production/mainnet gates or Railway topology changes;
-- weakening any signed-testnet readiness, nonce, replay or freshness control.
+- `set_user_destination()` authoritative provider/network switch guard;
+- shared DB-local switch blockers;
+- `VERIFIED_FLAT / NEVER_ACTIVATED / UNREADABLE` classification;
+- Hyperliquid live positions + regular/conditional open-order verification;
+- fail-closed activated RISEx source classification where complete reads do not exist;
+- `PUT /trading-network` cleanup reordering;
+- Hyperliquid same-provider account/credential rebind regression coverage;
+- network-switch and epoch-fence non-regression tests.
+
+Out of scope:
+
+- `/trading-provider`;
+- frontend changes;
+- RISEx order routing or writes.
+
+### PR B — RISEx provider-selection backend
+
+Backend only, based on merged PR A.
+
+In scope:
+
+- `PUT /trading-provider` schema and owner-scoped endpoint;
+- explicit provider validation;
+- provider switch preserving current network;
+- `/me`/dashboard `execution_provider` and local readiness/blocker reporting;
+- empty-database `NEVER_ACTIVATED` Hyperliquid -> RISEx path;
+- activated RISEx source remains fail-closed `UNREADABLE`;
+- backend API/integration tests.
+
+Out of scope:
+
+- frontend selector;
+- execution-worker RISEx routing;
+- new RISEx credential persistence;
+- any provider write.
+
+### PR C — provider selector UI
+
+Tracked Phase 2 follow-up after backend verification. It consumes the merged PR B contract and contains frontend/UI tests only plus any narrowly required API client typing.
 
 ## Required TDD acceptance cases
 
-The implementation plan must include RED tests before production changes for at least these cases.
+### PR A RED cases — existing Hyperliquid path
 
-### Defaults and ownership
+- `PAUSED` + provider-side zero positions + zero regular/conditional orders + clean DB blockers allows Hyperliquid network switch;
+- provider non-zero position blocks;
+- regular open order blocks;
+- conditional/trigger order blocks;
+- provider position read failure blocks as `UNREADABLE`;
+- provider order read failure/malformed payload blocks as `UNREADABLE`;
+- local non-zero managed ledger blocks even if provider reports flat;
+- SHADOW and ACTIVE block;
+- `QUEUED`, `PROCESSING` and `RETRYING` jobs each block;
+- `SUBMITTING` and `UNKNOWN` executions each block;
+- blockers are rechecked after provider verification;
+- source epoch/provider/network mismatch after provider verification blocks;
+- direct `set_user_destination()` network switch cannot bypass the central guard;
+- calling `close_user_destination_epoch()` first does not create an unguarded bootstrap;
+- two concurrent switch attempts cannot produce competing active epochs;
+- failed transition does not commit TradingAccount/ledger/risk cleanup;
+- successful network switch closes old epoch, creates a distinct new epoch and preserves old history;
+- existing Hyperliquid `POST /trading-account` same-provider credential/account rebind still functions and is not misclassified as a provider/network switch;
+- stale-epoch job rejection remains intact;
+- default provider remains Hyperliquid.
+
+### PR B RED cases — provider-selection backend
 
 - new SIWE user still starts with provider `hyperliquid`;
-- provider request requires an explicit provider value;
-- provider endpoint operates only on `current_user` and exposes no arbitrary `user_id` target;
-- same-provider request is idempotent and does not create a new epoch;
-- master-source user cannot use follower provider controls.
-
-### `NEVER_ACTIVATED`
-
-- paused user with no TradingAccount, no credential and no epoch account address may switch Hyperliquid -> RISEx;
-- the old epoch is closed and a distinct new epoch is created;
+- provider request requires an explicit `provider` value;
+- endpoint accepts only `hyperliquid | risex`;
+- endpoint exposes no arbitrary `user_id` target and mutates only `current_user`;
+- CSRF remains required;
+- master-source user cannot use follower provider controls;
+- same-provider request is idempotent and creates no new epoch;
+- changing provider preserves current network;
+- paused user with no TradingAccount, no credential and no epoch account address switches Hyperliquid -> RISEx via `NEVER_ACTIVATED`;
+- old epoch is closed and a distinct RISEx epoch is created;
 - old epoch fields remain unchanged;
-- target network is preserved;
-- SHADOW or ACTIVE state blocks the same switch until PAUSED;
 - existence of any historical epoch with non-null `account_address` prevents `NEVER_ACTIVATED` classification;
-- an inconsistent/missing source identity after activation history becomes `UNREADABLE`.
+- inconsistent/missing source identity after activation history is `UNREADABLE`;
+- activated RISEx source without complete provider reads cannot switch;
+- response serialization exposes provider and local switch blockers;
+- provider selection never sends a RISEx write and never auto-resumes trading;
+- queue/worker Hyperliquid-only restrictions remain unchanged.
 
-### `VERIFIED_FLAT`
-
-- provider position read succeeds with all sizes zero and provider order read returns no regular/conditional orders -> switch allowed if all DB-local blockers are clear;
-- any non-zero provider position blocks;
-- any regular open order blocks;
-- any conditional/trigger order blocks;
-- provider position read failure blocks;
-- provider order read failure/malformed payload blocks;
-- local non-zero managed ledger blocks even if provider reports flat;
-- no failed read is converted to flat.
-
-### DB-local blockers
-
-- not PAUSED blocks;
-- pending `QUEUED` job blocks;
-- pending `PROCESSING` job blocks;
-- pending `RETRYING` job blocks;
-- unresolved `SUBMITTING` execution blocks;
-- unresolved `UNKNOWN` execution blocks;
-- blockers are rechecked after provider verification before mutation.
-
-### Central-boundary protection
-
-- direct `set_user_destination()` provider/network switch without satisfying the guard fails;
-- calling `close_user_destination_epoch()` first does not turn a later provider change into an unguarded bootstrap;
-- concurrent switch attempts cannot both create competing active epochs;
-- source epoch mismatch after verification blocks;
-- network-switch API now relies on the same central invariant and cannot bypass provider-side flat/order verification.
-
-### Provider-specific behavior
-
-- active Hyperliquid source can become `VERIFIED_FLAT` only after live position and frontend/open-order reads both succeed;
-- active RISEx source without complete account/order reads is `UNREADABLE` and switching is blocked;
-- never-activated RISEx source can still switch because that state is DB-proven rather than provider-read-derived.
-
-### Non-regression
+### Non-regression across both backend PRs
 
 - Hyperliquid remains the schema/application default;
 - provider and network remain independent dimensions;
-- historical job/execution destination identity is unchanged;
-- stale-epoch job rejection remains intact;
+- historical job/execution destination identity remains immutable;
 - no automatic provider fallback is introduced;
 - no signed RISEx write is reachable from provider selection;
-- existing signed-testnet gates, replay protection and live pre-POST freshness remain unchanged.
+- existing signed-testnet gates, replay protection and live pre-POST freshness remain unchanged;
+- `writes_enabled` and other signed-write compile-time/runtime fences remain unchanged unless separately authorized.
 
 ## Design alternatives considered
 
 ### Endpoint-only guard
 
-Rejected. It reproduces the current weakness: a future caller can call `set_user_destination()` without the endpoint precheck.
+Rejected. It reproduces the current weakness: a future caller can call `set_user_destination()` without endpoint prechecks.
 
-### Caller-supplied `verified_flat=True` / evidence object
+### Caller-supplied `verified_flat=True` or externally constructed authorization evidence
 
-Rejected as the authorization boundary. A caller could accidentally construct or reuse evidence that does not belong to the current epoch. Provider verification must be owned by the central transition path and bound to the source identity.
+Rejected as the authorization boundary. A caller could accidentally construct/reuse evidence for the wrong epoch. Provider verification is owned by the central transition path and bound to source identity.
 
 ### Treat missing account as flat
 
-Rejected. It collapses `NEVER_ACTIVATED` and `UNREADABLE` and recreates the exact ambiguity this design is intended to remove.
+Rejected. It collapses `NEVER_ACTIVATED` and `UNREADABLE` and recreates the ambiguity this design removes.
 
-### Defer provider-side flat/open-order verification to a later PR
+### Defer Hyperliquid provider-side flat/open-order verification until after provider selection
 
-Rejected for Hyperliquid source switching. Exposing provider selection while retaining only local-ledger checks would weaken the approved 2026-09-09 architecture.
+Rejected. The weakness already exists in the network-switch path and provider selection must not widen the number of callers before the invariant is centralized.
 
-For RISEx, the semantics are not deferred: lack of complete reads maps to `UNREADABLE` and blocks. A later RISEx read-capability PR may turn that blocked state into `VERIFIED_FLAT` by adding evidence; it may not relax the gate.
+### Mix network-switch hardening and provider endpoint in one PR
+
+Rejected. The hardening changes an existing production-facing Hyperliquid path. It requires dedicated regression review and must be independently reversible before the new provider-selection API is introduced.
+
+### Mix backend and frontend provider selection
+
+Rejected. Backend behavior is sufficient for isolated API testing and the same-origin production frontend is a separate integration surface. UI remains a required follow-up PR.
 
 ## Acceptance criteria
 
-This design is satisfied only when:
+The design is satisfied only when:
 
-- provider selection is owner-scoped and explicit;
+- PR A independently hardens the existing Hyperliquid network-switch path before provider selection exists;
+- PR B independently adds owner-scoped explicit provider selection on top of the hardened boundary;
 - Hyperliquid remains the default;
 - provider/network switches cannot bypass `set_user_destination()` safeguards;
-- `VERIFIED_FLAT`, `NEVER_ACTIVATED` and `UNREADABLE` are distinct and observable states;
+- `VERIFIED_FLAT`, `NEVER_ACTIVATED` and `UNREADABLE` remain distinct;
 - only `VERIFIED_FLAT` and `NEVER_ACTIVATED` can authorize a switch;
 - provider read errors always block;
 - Hyperliquid active-source switching verifies real positions and regular/conditional orders;
 - activated RISEx source remains fail-closed until complete read evidence exists;
 - every successful provider/network change creates a new epoch;
-- old epoch/history identity is immutable;
+- old epoch/history identity remains immutable;
 - the empty `api Copy` database can progress from wallet login to a legitimate RISEx/testnet epoch without direct SQL or test bypasses;
-- no execution routing or provider write is added by this PR.
+- UI provider selection remains tracked for PR C but is absent from PR A and PR B;
+- no execution routing or provider write is added by these backend PRs.
