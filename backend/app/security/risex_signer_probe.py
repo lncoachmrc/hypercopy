@@ -8,6 +8,10 @@ from app.core.config import Network
 
 
 ProbeVerdict = Literal['PASS', 'FAIL', 'UNKNOWN']
+ADR_REFERENCE: Literal['ADR-0002'] = 'ADR-0002'
+AUTHORIZATION_CRITERION: Literal['perps_permission_and_fund_movement_path_absent'] = (
+    'perps_permission_and_fund_movement_path_absent'
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,11 +25,15 @@ class CapabilityCheck:
 class RISExSignerCapabilityEvidence:
     """Public security evidence only; never contains a private key or signature.
 
-    ``onchain_perps_only_scope`` is deliberately semantic rather than a provider
-    permission label. ``True`` means independent inspection of the exact deployed
-    authorization path proves this registered signer can authorize only perpetual
-    execution actions. ``False`` means the signer can authorize a broader class of
-    actions. ``None`` means that proof has not been established.
+    ``onchain_perps_only_scope`` is retained as diagnostic evidence. It describes
+    whether the independently inspected deployment is perps-only, but ADR-0002 no
+    longer uses it as an unlock criterion. Authorization now requires explicit
+    ``perps_permission`` plus ``fund_movement_path_absent``.
+
+    ``perps_permission`` is ``True`` only when Perps permission is independently
+    established. ``None`` means that proof is unavailable. The reviewed absence of
+    a session-key fund-movement path is an explicit operator assertion and defaults
+    to ``False`` so missing evidence always fails closed.
     """
 
     network: Network
@@ -43,6 +51,8 @@ class RISExSignerCapabilityEvidence:
     withdrawal_rejected: bool | None
     post_revoke_order_rejected: bool | None
     operatorhub_bypass_disabled: bool | None
+    perps_permission: bool | None = None
+    fund_movement_path_absent: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +60,10 @@ class RISExSignerCapabilityReport:
     verdict: ProbeVerdict
     security_gate_passed: bool
     checks: tuple[CapabilityCheck, ...]
+    adr_reference: Literal['ADR-0002'] = ADR_REFERENCE
+    authorization_criterion: Literal['perps_permission_and_fund_movement_path_absent'] = (
+        AUTHORIZATION_CRITERION
+    )
 
 
 def _is_address(value: str | None) -> bool:
@@ -107,9 +121,8 @@ async def collect_public_signer_evidence(
     """Collect public/read-only RISEx evidence without signing or mutating anything.
 
     Provider-supplied ``permission``/``permissions`` labels are intentionally not
-    consumed. The current official registration contract described by RISEx does
-    not expose a granular permission field, so least-privilege scope must be
-    established independently from the deployed authorization path.
+    consumed. The public API collector therefore leaves ``perps_permission``
+    unknown and never asserts ``fund_movement_path_absent`` on the caller's behalf.
     """
 
     if getattr(transport, 'public_read_only', False) is not True:
@@ -177,6 +190,8 @@ async def collect_public_signer_evidence(
         withdrawal_rejected=None,
         post_revoke_order_rejected=None,
         operatorhub_bypass_disabled=None,
+        perps_permission=None,
+        fund_movement_path_absent=False,
     )
 
 
@@ -221,22 +236,30 @@ def _expiration_check(evidence: RISExSignerCapabilityEvidence, *, now: int) -> C
 
 
 def _authorization_scope_check(evidence: RISExSignerCapabilityEvidence) -> CapabilityCheck:
-    if evidence.onchain_perps_only_scope is None:
+    """Evaluate the ADR-0002 unlock criterion; perps-only scope is diagnostic only."""
+
+    if evidence.perps_permission is False:
         return CapabilityCheck(
-            'onchain_authorization_scope',
-            'UNKNOWN',
-            'Exact deployed authorization path has not been proven perps-only on-chain',
-        )
-    if evidence.onchain_perps_only_scope is False:
-        return CapabilityCheck(
-            'onchain_authorization_scope',
+            'adr0002_authorization_criterion',
             'FAIL',
-            'Registered signer authorization scope is broader than perpetual execution',
+            'ADR-0002 requires explicit Perps permission',
+        )
+    if evidence.perps_permission is not True:
+        return CapabilityCheck(
+            'adr0002_authorization_criterion',
+            'UNKNOWN',
+            'ADR-0002 Perps permission has not been independently established',
+        )
+    if evidence.fund_movement_path_absent is not True:
+        return CapabilityCheck(
+            'adr0002_authorization_criterion',
+            'UNKNOWN',
+            'ADR-0002 fund-movement path absence has not been explicitly asserted',
         )
     return CapabilityCheck(
-        'onchain_authorization_scope',
+        'adr0002_authorization_criterion',
         'PASS',
-        'Exact deployed authorization path proves the registered signer is perps-only',
+        'ADR-0002 Perps permission and fund-movement path absence are both explicit',
     )
 
 

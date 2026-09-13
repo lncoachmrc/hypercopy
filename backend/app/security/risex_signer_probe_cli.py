@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import replace
 import json
 import re
 import time
@@ -11,6 +12,8 @@ from app.adapters.risex_http import RISExReadOnlyHTTPTransport
 from app.adapters.risex_types import ProviderReadUnavailable
 from app.core.config import Network
 from app.security.risex_signer_probe import (
+    ADR_REFERENCE,
+    AUTHORIZATION_CRITERION,
     ProbeVerdict,
     RISExSignerCapabilityEvidence,
     RISExSignerCapabilityReport,
@@ -49,6 +52,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help='Optional RISEx API base URL override. Public GET requests only.',
     )
+    parser.add_argument(
+        '--fund-movement-path-absent',
+        action='store_true',
+        default=False,
+        help=(
+            'Explicitly assert the reviewed ADR-0002 assumption that no documented '
+            'session-key fund-movement path exists. Defaults to false.'
+        ),
+    )
     return parser
 
 
@@ -59,6 +71,8 @@ def report_payload(
     return {
         'verdict': report.verdict,
         'security_gate_passed': report.security_gate_passed,
+        'adr_reference': report.adr_reference,
+        'authorization_criterion': report.authorization_criterion,
         'evidence': {
             'network': evidence.network,
             'account': evidence.account,
@@ -70,6 +84,8 @@ def report_payload(
             'session_account': evidence.session_account,
             'session_expiration': evidence.session_expiration,
             'onchain_perps_only_scope': evidence.onchain_perps_only_scope,
+            'perps_permission': evidence.perps_permission,
+            'fund_movement_path_absent': evidence.fund_movement_path_absent,
             'perps_order_succeeded': evidence.perps_order_succeeded,
             'fund_movement_rejected': evidence.fund_movement_rejected,
             'withdrawal_rejected': evidence.withdrawal_rejected,
@@ -106,6 +122,10 @@ async def _run_probe(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             account=args.account,
             signer=args.signer,
         )
+    evidence = replace(
+        evidence,
+        fund_movement_path_absent=bool(args.fund_movement_path_absent),
+    )
     report = evaluate_signer_capabilities(evidence, now=int(time.time()))
     return report_payload(evidence, report), verdict_exit_code(report.verdict)
 
@@ -118,6 +138,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = {
             'verdict': 'UNKNOWN',
             'security_gate_passed': False,
+            'adr_reference': ADR_REFERENCE,
+            'authorization_criterion': AUTHORIZATION_CRITERION,
+            'fund_movement_path_absent': bool(args.fund_movement_path_absent),
             'read_error': str(exc),
             'writes_enabled': False,
         }
