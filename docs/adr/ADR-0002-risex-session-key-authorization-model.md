@@ -4,7 +4,7 @@
 - **Date:** 2026-09-13
 - **Scope:** TRAXION / RISEx session-key authorization and residual-risk gate
 - **Decision owner:** TRAXION project owner
-- **Supersedes:** ADR-0001 for the RISEx verification environment and signer-security decision
+- **Supersedes:** ADR-0001 only with respect to the erroneous premise that Railway `production` was an acceptable RISEx signed-testnet verification environment; the isolation requirement itself remains binding and is carried forward below
 - **Mandatory review date:** 2026-12-13
 
 ## Context
@@ -64,6 +64,19 @@ Based on the documented interfaces reviewed for the pinned integration model:
 Therefore, the current evidence shows **permission granted, but no documented usable fund-movement path from the session key**.
 
 This is an architectural proof bounded by the currently observed and documented interfaces. It is not a behavioral proof that every possible provider path rejects fund movement.
+
+## Environment requirements (carried forward from ADR-0001)
+
+The following isolation controls remain **binding requirements** for every RISEx signed-testnet verification. ADR-0002 does not relax, replace or supersede them:
+
+- the application service used for verification must be isolated and must not be shared with Railway `production` or any environment serving production traffic;
+- the verification environment must use a dedicated database and a dedicated cache, with no sharing of queues, leases, locks or execution state with production;
+- `HYPERLIQUID_NETWORK`, `HYPERLIQUID_MASTER_NETWORK` and `HYPERLIQUID_FOLLOWER_NETWORK` must all be set to `testnet`;
+- `ENABLE_LIVE_TRADING` must be `false`;
+- secrets and credentials used by the verification environment must be generated specifically for that environment and must never be reused from production;
+- no signed RISEx verification may be executed in an environment that serves real users or real-capital execution.
+
+These controls are part of the active ADR decision. The earlier ADR-0001 prose that approved Railway `production` as a verification environment was based on a false operational premise and is superseded only to that extent. The requirement for an isolated verification environment remains in force.
 
 ## Decision
 
