@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import text
 
 import app.api.user as user_api
 import app.schemas.user as user_schemas
@@ -44,11 +44,7 @@ def _wallet() -> str:
 
 async def _insert_user(*, copy_state: CopyState = CopyState.PAUSED) -> uuid.UUID:
     async with SessionLocal() as db:
-        user = User(
-            auth_wallet=_wallet(),
-            state=UserState.ACTIVE,
-            copy_state=copy_state,
-        )
+        user = User(auth_wallet=_wallet(), state=UserState.ACTIVE, copy_state=copy_state)
         db.add(user)
         await db.commit()
         return user.id
@@ -62,14 +58,29 @@ async def _bootstrap_hyperliquid(user_id: uuid.UUID):
 
 
 async def _cleanup_user(user_id: uuid.UUID) -> None:
+    """Delete disposable fixtures unless immutable audit rows reference them."""
     async with SessionLocal() as db:
-        await db.rollback()
-        await db.execute(
-            text('UPDATE users SET active_execution_epoch_id = NULL WHERE id = :user_id'),
-            {'user_id': user_id},
-        )
-        await db.execute(text('DELETE FROM users WHERE id = :user_id'), {'user_id': user_id})
-        await db.commit()
+        audit_ref = (
+            await db.execute(
+                text(
+                    'SELECT 1 FROM audit_logs '
+                    'WHERE actor_id = :user_id OR subject_id = :user_id LIMIT 1'
+                ),
+                {'user_id': user_id},
+            )
+        ).scalar_one_or_none()
+        if audit_ref is None:
+            await db.execute(
+                text('UPDATE users SET active_execution_epoch_id = NULL WHERE id = :user_id'),
+                {'user_id': user_id},
+            )
+            await db.execute(text('DELETE FROM users WHERE id = :user_id'), {'user_id': user_id})
+            await db.commit()
+        else:
+            # Audit rows are append-only and intentionally retain their principal
+            # references. The integration database is ephemeral, so preserving
+            # this random UUID fixture is safer than mutating immutable evidence.
+            await db.rollback()
     await engine.dispose()
 
 
@@ -119,23 +130,6 @@ async def _activate_hyperliquid_user(user_id: uuid.UUID):
         return destination
 
 
-async def _active_epoch_row(db, user_id: uuid.UUID):
-    return (
-        await db.execute(
-            text(
-                """
-                SELECT e.id, e.provider, e.network, e.account_address,
-                       e.credential_version, e.started_at, e.ended_at
-                FROM users u
-                JOIN execution_epochs e ON e.id = u.active_execution_epoch_id
-                WHERE u.id = :user_id
-                """
-            ),
-            {'user_id': user_id},
-        )
-    ).mappings().one()
-
-
 @pytest.mark.asyncio
 async def test_first_login_destination_default_remains_hyperliquid() -> None:
     user_id = await _insert_user()
@@ -144,7 +138,6 @@ async def test_first_login_destination_default_remains_hyperliquid() -> None:
             await set_user_network(db, user_id, settings.follower_network)
             await db.commit()
             destination = await user_destination_state(db, user_id)
-
         assert destination.provider == 'hyperliquid'
         assert destination.network == settings.follower_network
     finally:
@@ -163,7 +156,6 @@ async def test_never_activated_hyperliquid_switches_to_risex_in_new_epoch() -> N
             await db.commit()
 
             payload = await _call_provider(db, user, 'risex')
-
             current = await user_destination_state(db, user_id)
             old = (
                 await db.execute(
@@ -183,13 +175,9 @@ async def test_never_activated_hyperliquid_switches_to_risex_in_new_epoch() -> N
             audit_row = (
                 await db.execute(
                     text(
-                        """
-                        SELECT action, before, after
-                        FROM audit_logs
-                        WHERE actor_id = :user_id AND subject_id = :user_id
-                        ORDER BY ts DESC
-                        LIMIT 1
-                        """
+                        'SELECT action, before, after FROM audit_logs '
+                        'WHERE actor_id = :user_id AND subject_id = :user_id '
+                        'ORDER BY ts DESC LIMIT 1'
                     ),
                     {'user_id': user_id},
                 )
@@ -223,7 +211,6 @@ async def test_provider_selection_is_owner_scoped() -> None:
     try:
         first_a = await _bootstrap_hyperliquid(user_a)
         first_b = await _bootstrap_hyperliquid(user_b)
-
         async with SessionLocal() as db:
             actor = await db.get(User, user_a)
             assert actor is not None
@@ -454,14 +441,13 @@ async def test_activated_risex_source_without_complete_reads_is_fail_closed() ->
     user_id = await _insert_user()
     try:
         await _bootstrap_hyperliquid(user_id)
-        risex_account = _wallet()
         async with SessionLocal() as db:
             risex = await set_user_destination(
                 db,
                 user_id,
                 provider='risex',
                 network='testnet',
-                account_address=risex_account,
+                account_address=_wallet(),
                 credential_version=1,
             )
             await db.commit()
@@ -527,13 +513,8 @@ async def test_pre_switch_terminal_job_is_stale_after_provider_switch() -> None:
             assert user is not None
             await _call_provider(db, user, 'risex')
             assert await job_matches_active_destination(db, job) is False
+            current = await user_destination_state(db, user_id)
 
-        current = await _destination_for_assertion(user_id)
         assert current.provider == 'risex'
     finally:
         await _cleanup_user(user_id)
-
-
-async def _destination_for_assertion(user_id: uuid.UUID):
-    async with SessionLocal() as db:
-        return await user_destination_state(db, user_id)
