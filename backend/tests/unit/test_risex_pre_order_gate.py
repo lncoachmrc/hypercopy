@@ -147,6 +147,15 @@ def test_pre_order_gate_rejects_none_negative_probes_when_fund_path_is_not_absen
         )
 
 
+def test_pre_order_gate_rejects_when_fund_path_assertion_is_uncertain() -> None:
+    with pytest.raises(SignedTestnetBlocked, match='fund-movement path'):
+        _authorize_adr0002(
+            fund_movement_path_absent=None,
+            fund_movement_rejected=None,
+            withdrawal_rejected=None,
+        )
+
+
 def test_pre_order_gate_rejects_when_fund_path_assertion_is_omitted() -> None:
     from app.security.risex_pre_order_gate import authorize_pre_order_probe
 
