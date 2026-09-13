@@ -1,6 +1,6 @@
 # ADR-0003 — RISEx fund-movement negative-probe applicability
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-09-13
 - **Scope:** TRAXION / RISEx pre-order security gate and fund-movement negative evidence
 - **Decision owner:** TRAXION project owner

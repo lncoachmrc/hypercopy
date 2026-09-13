@@ -16,6 +16,7 @@ SIGNER = '0x' + ('22' * 20)
 AUTH = '0x' + ('33' * 20)
 ROUTER = '0x' + ('44' * 20)
 ADR_REFERENCE = 'ADR-0002'
+ADR_0003_REFERENCE = 'ADR-0003'
 AUTHORIZATION_CRITERION = 'perps_permission_and_fund_movement_path_absent'
 
 
@@ -58,15 +59,32 @@ def _evidence(**overrides: object) -> RISExSignerCapabilityEvidence:
     return RISExSignerCapabilityEvidence(**values)  # type: ignore[arg-type]
 
 
+def _evidence_without_explicit_fund_path_assertion() -> RISExSignerCapabilityEvidence:
+    now = int(time())
+    return RISExSignerCapabilityEvidence(
+        network='testnet',
+        account=ACCOUNT,
+        signer=SIGNER,
+        chain_id=11155931,
+        auth_contract=AUTH,
+        router=ROUTER,
+        session_active=True,
+        session_account=ACCOUNT,
+        session_expiration=now + 3600,
+        onchain_perps_only_scope=False,
+        perps_order_succeeded=None,
+        fund_movement_rejected=None,
+        withdrawal_rejected=None,
+        post_revoke_order_rejected=None,
+        operatorhub_bypass_disabled=True,
+        perps_permission=True,
+    )
+
+
 def _adr0002_evidence(**overrides: object) -> SimpleNamespace:
     base = _evidence(onchain_perps_only_scope=False)
     values = {field.name: getattr(base, field.name) for field in fields(base)}
-    values.update(
-        {
-            'perps_permission': True,
-            'fund_movement_path_absent': True,
-        }
-    )
+    values.update({'perps_permission': True, 'fund_movement_path_absent': True})
     values.update(overrides)
     return SimpleNamespace(**values)
 
@@ -95,7 +113,6 @@ def _authorize_adr0002(**evidence_overrides: object):
 
 def test_pre_order_gate_allows_probe_before_positive_order_and_post_revoke_tests() -> None:
     gate = _gate(perps_order_succeeded=None, post_revoke_order_rejected=None)
-
     assert gate.account_address == ACCOUNT
     assert gate.signer_address == SIGNER
     assert gate.order_probe_allowed is True
@@ -107,48 +124,75 @@ def test_pre_order_gate_allows_probe_before_positive_order_and_post_revoke_tests
 
 def test_pre_order_gate_attests_broad_signer_under_adr0002_criterion() -> None:
     gate = _authorize_adr0002()
-
     assert gate.order_probe_allowed is True
     assert getattr(gate, 'adr_reference', None) == ADR_REFERENCE
     assert getattr(gate, 'authorization_criterion', None) == AUTHORIZATION_CRITERION
 
 
-def test_pre_order_gate_rejects_without_fund_movement_path_assertion() -> None:
+def test_pre_order_gate_allows_none_negative_probes_when_fund_path_is_absent() -> None:
+    gate = _authorize_adr0002(
+        fund_movement_path_absent=True,
+        fund_movement_rejected=None,
+        withdrawal_rejected=None,
+    )
+    assert gate.order_probe_allowed is True
+
+
+def test_pre_order_gate_rejects_none_negative_probes_when_fund_path_is_not_absent() -> None:
     with pytest.raises(SignedTestnetBlocked, match='fund-movement path'):
-        _authorize_adr0002(fund_movement_path_absent=False)
+        _authorize_adr0002(
+            fund_movement_path_absent=False,
+            fund_movement_rejected=None,
+            withdrawal_rejected=None,
+        )
+
+
+def test_pre_order_gate_rejects_when_fund_path_assertion_is_uncertain() -> None:
+    with pytest.raises(SignedTestnetBlocked, match='fund-movement path'):
+        _authorize_adr0002(
+            fund_movement_path_absent=None,
+            fund_movement_rejected=None,
+            withdrawal_rejected=None,
+        )
+
+
+def test_pre_order_gate_rejects_when_fund_path_assertion_is_omitted() -> None:
+    from app.security.risex_pre_order_gate import authorize_pre_order_probe
+
+    with pytest.raises(SignedTestnetBlocked, match='fund-movement path'):
+        authorize_pre_order_probe(
+            policy=_policy(),
+            evidence=_evidence_without_explicit_fund_path_assertion(),
+            now=int(time()),
+            replay_protection_verified=True,
+        )
 
 
 def test_pre_order_gate_rejects_without_perps_permission_even_with_fund_path_assertion() -> None:
     with pytest.raises(SignedTestnetBlocked, match='Perps permission'):
-        _authorize_adr0002(perps_permission=False, fund_movement_path_absent=True)
+        _authorize_adr0002(
+            perps_permission=False,
+            fund_movement_path_absent=True,
+            fund_movement_rejected=None,
+            withdrawal_rejected=None,
+        )
 
 
-@pytest.mark.parametrize(
-    ('field', 'match'),
-    [
-        ('fund_movement_rejected', 'fund-movement rejection'),
-        ('withdrawal_rejected', 'withdrawal rejection'),
-    ],
-)
-def test_pre_order_gate_still_requires_negative_provider_evidence(
-    field: str,
-    match: str,
-) -> None:
-    with pytest.raises(SignedTestnetBlocked, match=match):
-        _authorize_adr0002(**{field: None})
+def test_pre_order_gate_records_negative_probes_as_na_under_adr0003() -> None:
+    gate = _authorize_adr0002(
+        fund_movement_path_absent=True,
+        fund_movement_rejected=None,
+        withdrawal_rejected=None,
+    )
+    assert getattr(gate, 'negative_probe_adr_reference', None) == ADR_0003_REFERENCE
+    assert getattr(gate, 'fund_movement_rejected_probe_status', None) == 'N/A'
+    assert getattr(gate, 'withdrawal_rejected_probe_status', None) == 'N/A'
+    reason = getattr(gate, 'negative_probe_reason', '')
+    assert ADR_0003_REFERENCE in reason
+    assert 'no session-key fund-movement path' in reason.lower()
 
 
-@pytest.mark.parametrize(
-    ('field', 'value'),
-    [
-        ('fund_movement_rejected', None),
-        ('fund_movement_rejected', False),
-        ('withdrawal_rejected', None),
-        ('withdrawal_rejected', False),
-        ('session_active', None),
-        ('session_active', False),
-    ],
-)
+@pytest.mark.parametrize(('field', 'value'), [('session_active', None), ('session_active', False)])
 def test_pre_order_gate_fails_closed_without_required_provider_evidence(
     field: str,
     value: object,

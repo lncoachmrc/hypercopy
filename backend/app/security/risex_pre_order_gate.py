@@ -10,7 +10,9 @@ from app.security.risex_signed_testnet_policy import (
 )
 from app.security.risex_signer_probe import (
     ADR_REFERENCE,
+    ADR_0003_REFERENCE,
     AUTHORIZATION_CRITERION,
+    NEGATIVE_PROBE_NA_REASON,
     RISExSignerCapabilityEvidence,
 )
 
@@ -43,6 +45,10 @@ class RISExPreOrderProbeGate:
     authorization_criterion: Literal['perps_permission_and_fund_movement_path_absent'] = (
         AUTHORIZATION_CRITERION
     )
+    negative_probe_adr_reference: Literal['ADR-0003'] = ADR_0003_REFERENCE
+    fund_movement_rejected_probe_status: Literal['N/A'] = 'N/A'
+    withdrawal_rejected_probe_status: Literal['N/A'] = 'N/A'
+    negative_probe_reason: str = NEGATIVE_PROBE_NA_REASON
     _attestation_seal: object = field(repr=False, compare=False, default=None)
 
 
@@ -110,9 +116,9 @@ def authorize_pre_order_probe(
 
     ADR-0002 authorizes the pre-order step only when Perps permission and the
     reviewed absence of a session-key fund-movement path are both explicit.
-    ``onchain_perps_only_scope`` remains diagnostic evidence and is not an unlock
-    condition. Positive Perps order and post-revocation tests remain out of scope
-    because they can only be observed after this pre-order gate.
+    ADR-0003 makes the behavioral fund-movement rejection probes not applicable
+    while that explicit path-absence assertion remains valid. The behavioral
+    evidence values are never synthesized as ``True``.
     """
 
     assert_signed_testnet_probe_allowed(policy)
@@ -137,10 +143,6 @@ def authorize_pre_order_probe(
         raise SignedTestnetBlocked('RISEx ADR-0002 Perps permission is not proven')
     if evidence.fund_movement_path_absent is not True:
         raise SignedTestnetBlocked('RISEx ADR-0002 fund-movement path absence is not asserted')
-    if evidence.fund_movement_rejected is not True:
-        raise SignedTestnetBlocked('RISEx fund-movement rejection has not been proven')
-    if evidence.withdrawal_rejected is not True:
-        raise SignedTestnetBlocked('RISEx withdrawal rejection has not been proven')
     if evidence.operatorhub_bypass_disabled is not True:
         raise SignedTestnetBlocked('RISEx JWT/OperatorHub bypass must remain disabled')
     if replay_protection_verified is not True:
@@ -153,6 +155,10 @@ def authorize_pre_order_probe(
         deployment_chain_id=evidence.chain_id,
         deployment_auth_contract=evidence.auth_contract,
         deployment_router=evidence.router,
+        negative_probe_adr_reference=ADR_0003_REFERENCE,
+        fund_movement_rejected_probe_status='N/A',
+        withdrawal_rejected_probe_status='N/A',
+        negative_probe_reason=NEGATIVE_PROBE_NA_REASON,
         _attestation_seal=_ATTESTATION_SEAL,
     )
     assert_pre_order_probe_gate_attested(gate)
