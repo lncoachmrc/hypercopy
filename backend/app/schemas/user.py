@@ -22,6 +22,10 @@ class TradingNetworkIn(BaseModel):
     network: Literal['testnet', 'mainnet']
 
 
+class TradingProviderIn(BaseModel):
+    provider: Literal['hyperliquid', 'risex']
+
+
 class TradingAccountIn(BaseModel):
     # The follower account is always the authenticated Web3 wallet. During the
     # frontend rollout we still accept the legacy account_address field, but the
