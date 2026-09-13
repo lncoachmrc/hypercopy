@@ -19,7 +19,7 @@ from app.security.risex_place_order_request import (
     RISExPreparedPlaceOrderRequest,
     prepare_place_order_request,
 )
-from app.security.risex_pre_order_gate import authorize_pre_order_probe
+from app.security.risex_pre_order_gate import RISExPreOrderProbeGate, authorize_pre_order_probe
 from app.security.risex_signed_testnet_policy import SignedTestnetBlocked, SignedTestnetPolicy
 from app.security.risex_signed_testnet_runner import RISExSignedTestnetReadinessResult
 from app.security.risex_signer_probe import RISExSignerCapabilityEvidence
@@ -241,7 +241,14 @@ def _arm_kwargs(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('invalid_gate', [None, object()])
+@pytest.mark.parametrize(
+    'invalid_gate',
+    [
+        None,
+        object(),
+        RISExPreOrderProbeGate(account_address=ACCOUNT, signer_address=SIGNER),
+    ],
+)
 async def test_arm_requires_attested_pre_order_gate_before_readiness(
     monkeypatch: pytest.MonkeyPatch,
     invalid_gate: object,
@@ -353,6 +360,53 @@ async def test_successful_arm_runs_readiness_once_and_returns_exact_dependencies
 
 
 @pytest.mark.asyncio
+async def test_arm_forwards_every_readiness_input_without_hard_coding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _orchestration_module()
+    clock = MutableClock(FIXED_NOW)
+    valid = await _genuine_readiness_result(monkeypatch, clock=clock)
+    failed = RISExSignedTestnetReadinessResult(
+        report=replace(valid.report, verdict='FAIL'),
+        attestation=None,
+    )
+    readiness = AsyncMock(return_value=failed)
+    monkeypatch.setattr(module, 'run_signed_testnet_readiness', readiness)
+
+    env = {'sentinel': 'credential-environment'}
+    api = object()
+    rpc = object()
+    gate = _gate()
+    kwargs = _arm_kwargs(gate=gate, clock=clock)
+    kwargs.update(
+        env=env,
+        api=api,
+        rpc=rpc,
+        explicit_approval=False,
+        disposable_account_asserted=False,
+        dedicated_signer_asserted=False,
+        operatorhub_bypass_disabled=False,
+        fund_movement_path_absent=False,
+    )
+
+    with pytest.raises(SignedTestnetBlocked):
+        await module.arm_risex_signed_testnet_execution(**kwargs)
+
+    readiness.assert_awaited_once_with(
+        env=env,
+        api=api,
+        rpc=rpc,
+        network='testnet',
+        explicit_approval=False,
+        disposable_account_asserted=False,
+        dedicated_signer_asserted=False,
+        operatorhub_bypass_disabled=False,
+        fund_movement_path_absent=False,
+        clock=clock,
+    )
+
+
+@pytest.mark.asyncio
 async def test_expired_session_never_refreshes_readiness_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -412,6 +466,7 @@ async def test_armed_session_still_runs_pre_post_freshness_probe(
         async with session:
             with pytest.raises(ProviderWriteDisabled, match='cause 4'):
                 await session.adapter.place_ioc(db=object(), job=_job(), request=_request())
+        assert client.is_closed is False
     finally:
         await client.aclose()
 
