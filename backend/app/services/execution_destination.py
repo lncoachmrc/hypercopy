@@ -10,6 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.adapters.base import ExecutionProvider
 from app.core.config import Network
 from app.models.entities import CopyJob
+from app.services.destination_switch import (
+    DestinationLifecycleState,
+    DestinationSwitchAssessment,
+    DestinationSwitchBlocked,
+    DestinationSwitchBlocker,
+    assess_destination_switch,
+    destination_switch_blockers,
+)
 
 _ALLOWED_PROVIDERS = {'hyperliquid', 'risex'}
 _ALLOWED_NETWORKS = {'testnet', 'mainnet'}
@@ -35,6 +43,24 @@ def _network(value: object) -> Network:
     if raw not in _ALLOWED_NETWORKS:
         raise RuntimeError(f'Unsupported user execution network: {raw}')
     return raw  # type: ignore[return-value]
+
+
+def _blocked_assessment(
+    *,
+    source_epoch_id: uuid.UUID | None,
+    provider: ExecutionProvider,
+    network: Network,
+    blockers: tuple[DestinationSwitchBlocker, ...] = (),
+    reason: str,
+) -> DestinationSwitchAssessment:
+    return DestinationSwitchAssessment(
+        state=DestinationLifecycleState.UNREADABLE,
+        source_epoch_id=source_epoch_id,
+        provider=provider,
+        network=network,
+        blockers=blockers,
+        reason=reason,
+    )
 
 
 async def user_destination_state(db: AsyncSession, user_id: uuid.UUID) -> UserDestinationState:
@@ -298,6 +324,24 @@ async def close_user_destination_epoch(db: AsyncSession, user_id: uuid.UUID) -> 
     )
 
 
+async def _latest_destination_epoch(db: AsyncSession, user_id: uuid.UUID):
+    return (
+        await db.execute(
+            text(
+                """
+                SELECT id, provider, network, account_address, credential_version,
+                       started_at, ended_at
+                FROM execution_epochs
+                WHERE user_id = :user_id
+                ORDER BY started_at DESC, created_at DESC
+                LIMIT 1
+                """
+            ),
+            {'user_id': user_id},
+        )
+    ).mappings().one_or_none()
+
+
 async def set_user_destination(
     db: AsyncSession,
     user_id: uuid.UUID,
@@ -309,16 +353,17 @@ async def set_user_destination(
 ) -> UserDestinationState:
     provider = _provider(provider)
     network = _network(network)
-    now = datetime.now(UTC)
 
     row = (
         await db.execute(
             text(
                 """
                 SELECT
+                    u.execution_provider AS user_provider,
+                    u.execution_network AS user_network,
                     u.active_execution_epoch_id,
-                    e.provider,
-                    e.network,
+                    e.provider AS epoch_provider,
+                    e.network AS epoch_network,
                     e.account_address,
                     e.credential_version,
                     e.started_at,
@@ -336,9 +381,11 @@ async def set_user_destination(
     if not row:
         raise RuntimeError('User destination state is unavailable')
 
+    persisted_provider = _provider(row['user_provider'])
+    persisted_network = _network(row['user_network'])
     current_epoch_id = row['active_execution_epoch_id']
-    current_provider = str(row['provider'] or '').lower()
-    current_network = str(row['network'] or '').lower()
+    current_provider = str(row['epoch_provider'] or '').lower()
+    current_network = str(row['epoch_network'] or '').lower()
     current_open = current_epoch_id is not None and row['ended_at'] is None
 
     unchanged = (
@@ -357,6 +404,84 @@ async def set_user_destination(
             epoch_id=current_epoch_id,
             started_at=row['started_at'],
         )
+
+    latest_epoch = None
+    if current_epoch_id is None:
+        latest_epoch = await _latest_destination_epoch(db, user_id)
+    source_epoch_id = current_epoch_id or (latest_epoch['id'] if latest_epoch else None)
+    has_destination_history = source_epoch_id is not None
+    is_switch = has_destination_history and (
+        persisted_provider != provider or persisted_network != network
+    )
+
+    if is_switch:
+        assessment = await assess_destination_switch(
+            db,
+            user_id,
+            source_epoch_id=source_epoch_id,
+            provider=persisted_provider,
+            network=persisted_network,
+        )
+        if (
+            assessment.state
+            not in {
+                DestinationLifecycleState.VERIFIED_FLAT,
+                DestinationLifecycleState.NEVER_ACTIVATED,
+            }
+            or assessment.blockers
+        ):
+            raise DestinationSwitchBlocked(assessment)
+
+        # Provider reads can take time. Re-check mutable local evidence after the
+        # read and before any epoch mutation so a newly queued job/execution or
+        # position drift cannot race the switch.
+        fresh_blockers = await destination_switch_blockers(db, user_id, source_epoch_id)
+        if fresh_blockers:
+            raise DestinationSwitchBlocked(
+                _blocked_assessment(
+                    source_epoch_id=source_epoch_id,
+                    provider=persisted_provider,
+                    network=persisted_network,
+                    blockers=fresh_blockers,
+                    reason='Destination switch prerequisites changed during verification.',
+                )
+            )
+
+        fresh_identity = (
+            await db.execute(
+                text(
+                    """
+                    SELECT execution_provider, execution_network, active_execution_epoch_id
+                    FROM users
+                    WHERE id = :user_id
+                    """
+                ),
+                {'user_id': user_id},
+            )
+        ).mappings().one()
+        if (
+            _provider(fresh_identity['execution_provider']) != persisted_provider
+            or _network(fresh_identity['execution_network']) != persisted_network
+            or fresh_identity['active_execution_epoch_id'] != current_epoch_id
+        ):
+            raise DestinationSwitchBlocked(
+                _blocked_assessment(
+                    source_epoch_id=source_epoch_id,
+                    provider=persisted_provider,
+                    network=persisted_network,
+                    blockers=(
+                        DestinationSwitchBlocker(
+                            'source_identity_changed',
+                            'Source destination identity changed during verification.',
+                        ),
+                    ),
+                    reason='Source destination identity changed during verification.',
+                )
+            )
+
+    # Timestamp the new epoch only after every potentially slow live read and
+    # authorization step has completed.
+    now = datetime.now(UTC)
 
     if current_open:
         await db.execute(

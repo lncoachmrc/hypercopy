@@ -73,6 +73,8 @@ async def test_job_from_previous_epoch_is_stale_even_when_provider_and_network_m
                 await db.commit()
 
                 assert await job_matches_active_destination(db, job) is True
+                job.state = JobState.SKIPPED
+                await db.commit()
 
                 second = await set_user_destination(
                     db,
@@ -154,6 +156,8 @@ async def test_unbound_hyperliquid_job_binds_only_inside_current_epoch():
                 assert current_job.execution_network == 'testnet'
                 assert (current_job.context or {}).get('execution_epoch_id') == str(first.epoch_id)
                 assert (current_job.context or {}).get('provider_market') == 'BTC'
+                current_job.state = JobState.SKIPPED
+                await db.commit()
 
                 await set_user_destination(
                     db,

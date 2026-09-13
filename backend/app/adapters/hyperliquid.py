@@ -424,6 +424,23 @@ class HyperliquidAdapter:
             weight=WEIGHT_CHEAP_INFO, priority=priority, timeout=10,
         )
 
+    async def frontend_open_orders(
+        self,
+        address: str,
+        *,
+        priority: Priority = Priority.RECONCILE,
+    ) -> list[dict[str, Any]]:
+        value = await self._read(
+            self.info.frontend_open_orders,
+            address,
+            weight=WEIGHT_CHEAP_INFO,
+            priority=priority,
+            timeout=10,
+        )
+        if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+            raise ValueError('Malformed Hyperliquid frontend open orders response')
+        return value
+
     async def spot_user_state(self, address: str, *, priority: Priority = Priority.RECONCILE) -> dict:
         return await self._read(
             self.info.spot_user_state, address,
