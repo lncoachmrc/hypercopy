@@ -88,3 +88,17 @@ Di conseguenza, le verifiche RISEx **testnet non si eseguono su production**.
 La decisione precedente è sostituita dalla seguente: le verifiche RISEx testnet richiedono un servizio temporaneo isolato con `HYPERLIQUID_NETWORK=testnet`, `ENABLE_LIVE_TRADING=false` e un database separato da quello production.
 
 Questa revisione deve essere riesaminata quando tale servizio temporaneo esiste ed è stato verificato. Fino ad allora, production non è un ambiente approvato per le verifiche RISEx testnet.
+
+## Superseded
+
+`ADR-0002-risex-session-key-authorization-model.md` supersede questa ADR **solo limitatamente al presupposto errato secondo cui Railway `production` potesse essere usato come ambiente approvato per la verifica firmata RISEx testnet**.
+
+I requisiti di isolamento derivati dalla revisione di ADR-0001 restano vincolanti e sono riportati attivamente nella sezione **“Environment requirements (carried forward from ADR-0001)”** di ADR-0002. In particolare restano obbligatori: servizio applicativo isolato, database e cache dedicati senza condivisione di code o lock, tutte le reti Hyperliquid su testnet, `ENABLE_LIVE_TRADING=false`, secret generati ex novo e divieto di eseguire verifiche firmate RISEx in ambienti che servono utenti reali.
+
+La decisione originale presupponeva che Railway `production` fosse un ambiente testnet o comunque non operativo. Questo presupposto è stato verificato falso: `ENABLE_LIVE_TRADING=true`, `HYPERLIQUID_NETWORK=mainnet`, il database production conteneva `634` executions, `678` fills e `2139` copy_jobs, l'ultimo evento `COPY_JOB_EXECUTED` osservato era del `2026-09-11 09:50`, ed era presente un utente `ACTIVE` con un execution epoch mainnet aperto.
+
+La decisione originale contraddiceva inoltre il vincolo già registrato nella sezione **“Railway constraint discovered 2026-09-09”** di `docs/superpowers/specs/2026-09-09-risex-follower-integration-design.md`, che vietava deploy sull'attuale ambiente `production` per le fasi 1–3 e richiedeva un ambiente staging/test isolato prima della validazione runtime. Il vincolo esisteva quindi già nella specifica ed è stato successivamente riscoperto e riconfermato tramite verifica operativa.
+
+La soluzione adottata è un ambiente di verifica isolato basato sul servizio Railway `api Copy`, con database `Postgres-Svbw` e cache `Redis-ATmb` dedicati, `ENABLE_LIVE_TRADING=false`, reti configurate su testnet e secret generati ex novo per il solo ambiente di test.
+
+ADR-0001 resta conservata integralmente come traccia storica della decisione iniziale, delle assunzioni che la sostenevano e del motivo per cui è stata sostituita. La prosa storica che approvava Railway `production` non è più normativa e non autorizza alcuna verifica firmata su ambienti che servono utenti reali.
