@@ -97,7 +97,7 @@ def _exit_code(report: RISExSignedTestnetReadinessReport) -> int:
 async def _run(args: argparse.Namespace) -> tuple[dict[str, object], int]:
     async with RISExReadOnlyHTTPTransport(base_url=args.base_url) as api:
         async with RISExReadOnlyRPCTransport(rpc_url=args.rpc_url) as rpc:
-            report = await run_signed_testnet_readiness(
+            result = await run_signed_testnet_readiness(
                 env=os.environ,
                 api=api,
                 rpc=rpc,
@@ -108,6 +108,7 @@ async def _run(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                 operatorhub_bypass_disabled=args.operatorhub_bypass_disabled,
                 fund_movement_path_absent=args.fund_movement_path_absent,
             )
+    report = result.report
     return asdict(report), _exit_code(report)
 
 

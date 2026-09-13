@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, ClassVar, Literal, NoReturn
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, NoReturn
 
 from app.adapters.risex_types import ProviderWriteDisabled, RISExTransport
 from app.core.config import Network
+
+if TYPE_CHECKING:
+    from app.security.risex_signed_testnet_runner import RISExRuntimeReadinessAttestation
 
 
 _WRITE_DISABLED_REASON = (
@@ -19,9 +22,16 @@ class RISExAdapter:
     )
     writes_enabled: ClassVar[Literal[False]] = False
 
-    def __init__(self, *, network: Network, transport: RISExTransport | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        network: Network,
+        transport: RISExTransport | None = None,
+        readiness_attestation: RISExRuntimeReadinessAttestation | None = None,
+    ) -> None:
         self.network = network
         self.transport = transport
+        self.readiness_attestation = readiness_attestation
 
     @staticmethod
     def _write_disabled() -> NoReturn:

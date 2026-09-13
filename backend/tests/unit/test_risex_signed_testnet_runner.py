@@ -175,8 +175,8 @@ async def _run(
     }
     if fund_movement_path_absent is not None:
         kwargs['fund_movement_path_absent'] = fund_movement_path_absent
-    report = await runner.run_signed_testnet_readiness(**kwargs)
-    return report, rpc
+    result = await runner.run_signed_testnet_readiness(**kwargs)
+    return result.report, rpc
 
 
 def _assert_writes_stay_disabled(report: Any) -> None:
