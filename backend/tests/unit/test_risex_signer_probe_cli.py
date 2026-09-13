@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from time import time
 from types import SimpleNamespace
 
@@ -43,6 +44,80 @@ def test_cli_fund_movement_path_assertion_defaults_false() -> None:
     )
 
     assert getattr(args, 'fund_movement_path_absent', None) is False
+
+
+def test_cli_fund_movement_path_flag_is_propagated_to_evaluator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.security import risex_signer_probe_cli as cli
+    from app.security.risex_signer_probe import (
+        RISExSignerCapabilityEvidence,
+        RISExSignerCapabilityReport,
+    )
+
+    class DummyTransport:
+        def __init__(self, *, base_url: str) -> None:
+            self.base_url = base_url
+
+        async def __aenter__(self) -> DummyTransport:
+            return self
+
+        async def __aexit__(self, _exc_type: object, _exc: object, _tb: object) -> None:
+            return None
+
+    evidence = RISExSignerCapabilityEvidence(
+        network='testnet',
+        account='0x1111111111111111111111111111111111111111',
+        signer='0x2222222222222222222222222222222222222222',
+        chain_id=11155931,
+        auth_contract='0x3333333333333333333333333333333333333333',
+        router='0x4444444444444444444444444444444444444444',
+        session_active=True,
+        session_account='0x1111111111111111111111111111111111111111',
+        session_expiration=int(time()) + 3600,
+        onchain_perps_only_scope=False,
+        perps_order_succeeded=None,
+        fund_movement_rejected=True,
+        withdrawal_rejected=True,
+        post_revoke_order_rejected=None,
+        operatorhub_bypass_disabled=True,
+        perps_permission=True,
+    )
+    observed: dict[str, bool] = {}
+
+    async def fake_collect(_transport: object, **_kwargs: object) -> RISExSignerCapabilityEvidence:
+        return evidence
+
+    def fake_evaluate(
+        current: RISExSignerCapabilityEvidence,
+        *,
+        now: int,
+    ) -> RISExSignerCapabilityReport:
+        del now
+        observed['fund_movement_path_absent'] = current.fund_movement_path_absent
+        return RISExSignerCapabilityReport(
+            verdict='UNKNOWN',
+            security_gate_passed=False,
+            checks=(),
+        )
+
+    monkeypatch.setattr(cli, 'RISExReadOnlyHTTPTransport', DummyTransport)
+    monkeypatch.setattr(cli, 'collect_public_signer_evidence', fake_collect)
+    monkeypatch.setattr(cli, 'evaluate_signer_capabilities', fake_evaluate)
+
+    args = cli.build_parser().parse_args(
+        [
+            '--account',
+            evidence.account,
+            '--signer',
+            evidence.signer,
+            '--fund-movement-path-absent',
+        ]
+    )
+    payload, _exit_code = asyncio.run(cli._run_probe(args))
+
+    assert observed['fund_movement_path_absent'] is True
+    assert payload['evidence']['fund_movement_path_absent'] is True
 
 
 def test_cli_address_type_accepts_public_address_and_rejects_private_key_shape() -> None:
