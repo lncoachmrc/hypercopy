@@ -73,10 +73,12 @@ class RISExRuntimeReadinessAttestation:
 
     Instances are sealed and can only be issued by ``run_signed_testnet_readiness``.
     There is deliberately no public constructor, dict/JSON loader, persistence path,
-    clone path or pickle path. The attestation is a recent-context capability only;
-    it never replaces the mandatory live on-chain freshness probe immediately before
-    the provider POST.
+    clone path or pickle path. The private issuance snapshot binds the seal to the
+    exact public values emitted by the runner, so mutation of a genuine instance is
+    detected during validation.
 
+    The attestation is a recent-context capability only; it never replaces the
+    mandatory live on-chain freshness probe immediately before the provider POST.
     The mandatory regression test
     ``test_08_valid_runtime_attestation_never_bypasses_pre_post_freshness_probe``
     exists specifically to prevent a future change from skipping that pre-POST
@@ -92,6 +94,7 @@ class RISExRuntimeReadinessAttestation:
     issued_at: float
     network: Literal['testnet']
     _attestation_seal: object = field(repr=False, compare=False)
+    _attested_values: tuple[object, ...] = field(repr=False, compare=False)
 
     def __copy__(self) -> None:
         raise TypeError('RISEx runtime readiness attestation cannot be copied')
@@ -131,6 +134,29 @@ def _clock_value(clock: RuntimeClock) -> float:
     return value
 
 
+def _runtime_attested_values(
+    *,
+    verdict: str,
+    fund_movement_path_absent: bool,
+    block_tag: str,
+    account_address: str,
+    signer_address: str,
+    adr_reference: str,
+    issued_at: float,
+    network: str,
+) -> tuple[object, ...]:
+    return (
+        verdict,
+        fund_movement_path_absent,
+        block_tag,
+        account_address,
+        signer_address,
+        adr_reference,
+        issued_at,
+        network,
+    )
+
+
 def assert_runtime_readiness_attested(
     attestation: object,
     *,
@@ -150,6 +176,20 @@ def assert_runtime_readiness_attested(
         raise SignedTestnetBlocked('RISEx runtime readiness requires an attested PASS')
     if getattr(attestation, '_attestation_seal', None) is not _RUNTIME_READINESS_SEAL:
         raise SignedTestnetBlocked('RISEx runtime readiness attestation seal is invalid')
+
+    current_values = _runtime_attested_values(
+        verdict=attestation.verdict,
+        fund_movement_path_absent=attestation.fund_movement_path_absent,
+        block_tag=attestation.block_tag,
+        account_address=attestation.account_address,
+        signer_address=attestation.signer_address,
+        adr_reference=attestation.adr_reference,
+        issued_at=attestation.issued_at,
+        network=attestation.network,
+    )
+    if getattr(attestation, '_attested_values', None) != current_values:
+        raise SignedTestnetBlocked('RISEx runtime readiness attestation was tampered with')
+
     if (
         attestation.verdict != 'PASS'
         or attestation.fund_movement_path_absent is not True
@@ -303,6 +343,16 @@ async def run_signed_testnet_readiness(
     attestation: RISExRuntimeReadinessAttestation | None = None
     if report.verdict == 'PASS' and report.fund_movement_path_absent is True:
         issued_at = _clock_value(clock)
+        attested_values = _runtime_attested_values(
+            verdict='PASS',
+            fund_movement_path_absent=True,
+            block_tag=report.block_tag,
+            account_address=report.account_address,
+            signer_address=report.signer_address,
+            adr_reference=ADR_REFERENCE,
+            issued_at=issued_at,
+            network='testnet',
+        )
         attestation = object.__new__(RISExRuntimeReadinessAttestation)
         object.__setattr__(attestation, 'verdict', 'PASS')
         object.__setattr__(attestation, 'fund_movement_path_absent', True)
@@ -313,6 +363,7 @@ async def run_signed_testnet_readiness(
         object.__setattr__(attestation, 'issued_at', issued_at)
         object.__setattr__(attestation, 'network', 'testnet')
         object.__setattr__(attestation, '_attestation_seal', _RUNTIME_READINESS_SEAL)
+        object.__setattr__(attestation, '_attested_values', attested_values)
         assert_runtime_readiness_attested(
             attestation,
             account_address=report.account_address,
