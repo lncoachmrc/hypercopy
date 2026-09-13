@@ -130,15 +130,15 @@ Therefore:
 - pinned runtime deployment identity: **PASS**;
 - critical Authorization interface compatibility: **proven behaviorally**;
 - complete ABI/source provenance: **UNKNOWN**;
-- signer perps-only/no-fund-movement capability: **UNKNOWN**;
+- signer perps-only/no-fund-movement capability: **FAIL**;
 - full RISEx security gate: **BLOCKED**;
 - RISEx writes: **disabled**.
 
 The `complete ABI/source provenance` status remains **UNKNOWN** as an external residual risk. Resolution depends on RISEx publishing or verifying the relevant contract source/ABI on the block explorer; it is not a task this project can complete independently.
 
-Consequently, any future `PASS` on the signer perps-only/no-fund-movement gate will be based on observed behavior of the live interface and provider responses, not on complete source provenance. This is an explicit limitation of the security gate and must remain documented as such.
+The `signer perps-only/no-fund-movement capability` status is **FAIL** because the registered dashboard-created testnet signer exposes a fully populated permission bitmap and positive `hasPermission` results for `All`, `Perps`, `Spot` and `MoveFund`. The current risk treatment and revised unlock criterion are defined in `docs/adr/ADR-0002-risex-session-key-authorization-model.md`.
 
-The `signer perps-only/no-fund-movement capability` status remains **UNKNOWN** and is the next gate. It requires a registered RISEx testnet account/signer pair before the read-only signer probe can evaluate the effective capability boundary.
+Consequently, any capability conclusion remains bounded by observed runtime behavior, documented interfaces and the residual provenance limitation. Complete source provenance has not been established and must not be inferred from selector compatibility alone.
 
 Run the permanent deployment check from the repository root with:
 
@@ -173,3 +173,48 @@ Result:
 - `full_security_gate_passed = false`
 
 This is the first independent confirmation that the pinned deployment fingerprint remains stable across reads separated in time and by `97850` blocks. That stability is consistent with the deliberate exclusion of the block number from the canonical deployment fingerprint: the deployment identity remains unchanged while the chain advances.
+
+## Signer permission evidence — 2026-09-13
+
+Read-only signer-permission evidence collected on 2026-09-12/13 against the pinned RISEx testnet Authorization deployment.
+
+Deployment evidence:
+
+- Authorization proxy: `0x6DA86F486b5E6536358F5b122dBe184522CA0eE3`
+- `GET /v1/system/config` confirmed the pinned proxy as `system.auth`
+- Authorization implementation: `0x47253b880ec432a32485e30510c8eb6afe721cbc`
+- implementation runtime size: `15558` bytes
+
+Selectors verified present in the runtime bytecode:
+
+- `enablePermission` → `0x77007534`
+- `disablePermission` → `0x06991816`
+- `sessionKeys` → `0x96ade1f9`
+- `getSessionKeyStatus` → `0xdd962cb2`
+- `hasPermission` → `0xed82f4b8`
+- `registerSigner` → `0x8a10cb9e`
+
+Raw state observed for the session key created through the RISEx testnet dashboard:
+
+- `sessionKeys.permissionBitmap = 4294967295`
+- `sessionKeys.permissionBitmap_hex = 0xFFFFFFFF`
+- `sessionKeys.status = 1`
+- `hasPermission(All) = true`
+- `hasPermission(Perps) = true`
+- `hasPermission(Spot) = true`
+- `hasPermission(MoveFund) = true`
+
+Interpretation:
+
+- the signer is active;
+- perpetual-trading permission is present;
+- the observed Authorization state is broader than perps-only and includes `MoveFund`;
+- the RISEx UI statement that API wallets cannot withdraw funds therefore diverges from the Authorization permission state observed on-chain;
+- this evidence proves the permission-model divergence, but does not by itself prove a usable session-key fund-movement path.
+
+Security status:
+
+- signer perps-only/no-fund-movement capability: **FAIL**;
+- full RISEx security gate: **BLOCKED** pending application of the revised authorization model;
+- RISEx writes: **disabled**;
+- residual-risk analysis and the revised unlock criterion are governed by `docs/adr/ADR-0002-risex-session-key-authorization-model.md`.
