@@ -72,7 +72,8 @@ Without a separate continuous-execution authorization mechanism, the system woul
 - a security-relevant configuration, signer, account, network or deployment change being treated as part of the previous authorization epoch;
 - a previously issued readiness attestation being reused to open multiple operational epochs;
 - continuous execution persisting indefinitely without periodic human reaffirmation of intent;
-- multiple worker replicas having inconsistent process-local authorization state and therefore intermittently accepting or rejecting equivalent RISEx work.
+- multiple worker replicas having inconsistent process-local authorization state and therefore intermittently accepting or rejecting equivalent RISEx work;
+- a DISARM or other invalidation arriving while an ARM readiness attempt is in flight and being lost before the eventual PASS is converted into a window.
 
 ADR-0004 addresses those gaps without replacing the per-operation gates or freshness probe.
 
@@ -108,7 +109,8 @@ Opening a later window requires:
 2. atomic one-shot consumption of that request by its intended worker incarnation;
 3. a new signed readiness run;
 4. a new readiness PASS and attestation;
-5. one-shot consumption of that new attestation into the new process-local window.
+5. a final arm-attempt validity fence as defined below;
+6. one-shot consumption of that new attestation into the new process-local window.
 
 No automatic or background rearming is permitted.
 
@@ -151,6 +153,7 @@ The row is a **command mailbox**, not an authorization flag. Its JSON `value` mu
 
 ```text
 request_id: UUID
+control_generation: integer
 action: ARM | DISARM
 target_worker_id: string
 target_boot_id: UUID
@@ -159,15 +162,18 @@ requested_at: timestamp
 consumed_at: timestamp | null
 consumed_by_worker_id: string | null
 consumed_by_boot_id: UUID | null
+supersedes_request_id: UUID | null
 ```
 
 Existing `SystemFlag.updated_by`, `reason`, `created_at` and `updated_at` provide operator identity, reason and audit timestamps.
 
-`enabled` may be used as an implementation convenience to mirror whether a command is pending, but **authorization must never be inferred from `enabled`**. The authoritative request lifecycle is `value.state` plus request/target identity.
+`enabled` may be used as an implementation convenience to mirror whether a command is pending, but **authorization must never be inferred from `enabled`**. The authoritative request lifecycle is `value.state` plus request/target identity and `control_generation`.
 
-A new operator command must use a new random `request_id`.
+A new operator command must use a new random `request_id` and a strictly increasing `control_generation`.
 
-The control path must reject overwriting an unconsumed `REQUESTED` command. A pending command must first be consumed or explicitly superseded through a separately audited operation defined by the implementation; silent replacement is forbidden.
+Generation allocation and command creation must be serialized atomically against the same `risex_execution_control` row, using `SELECT ... FOR UPDATE` in one transaction or an equivalent single-statement atomic update. Two concurrent operator commands must never receive the same generation.
+
+A normal new ARM command must not silently overwrite another unconsumed `REQUESTED` command. A DISARM is different: it is a higher-priority cancellation command and **must be able to supersede a pending or already-consumed ARM request**, with a new generation and explicit audit correlation to the superseded request. A DISARM must never be rejected merely because an ARM readiness attempt is in flight.
 
 ### 5. Operator API for ARM and DISARM
 
@@ -183,14 +189,16 @@ The request must explicitly contain:
 - operator confirmation text appropriate to the action;
 - `reason`.
 
-The endpoint must validate before creating the request that:
+The endpoint must validate before creating an ARM request that:
 
 - the target heartbeat is currently fresh;
 - the supplied `target_worker_id` and `target_boot_id` match the currently reported live process incarnation;
 - exactly one live `execution-worker` replica exists under the singleton rule below;
-- there is no existing unconsumed `REQUESTED` control command.
+- there is no existing unconsumed non-supersedable `REQUESTED` control command.
 
-The endpoint creates a new `request_id`, writes the one-shot `REQUESTED` command and records the operator audit event.
+For DISARM, the endpoint must still validate the target identity when it is observable, but cancellation is fail-closed and has priority over an ARM attempt. If a targeted ARM is `REQUESTED`, `CONSUMED`, or reported as `ARMING`, the DISARM must advance the control generation and supersede/cancel that attempt rather than being blocked by it.
+
+The endpoint creates a new `request_id`, atomically advances `control_generation`, writes the one-shot `REQUESTED` command and records the operator audit event.
 
 The endpoint does **not** run readiness, open a window or claim success merely because the request was persisted.
 
@@ -207,12 +215,13 @@ Consumption must be one indivisible database state transition so that two proces
 The implementation must use one of these equivalent atomic patterns:
 
 1. `SELECT ... FOR UPDATE` on `risex_execution_control` inside one database transaction, verify all claim predicates while holding the row lock, mutate `REQUESTED -> CONSUMED`, then commit; or
-2. a single conditional `UPDATE ... WHERE state = 'REQUESTED' AND request_id = ... AND target_worker_id = ... AND target_boot_id = ...` and require exactly one affected row.
+2. a single conditional `UPDATE ... WHERE state = 'REQUESTED' AND request_id = ... AND control_generation = ... AND target_worker_id = ... AND target_boot_id = ...` and require exactly one affected row.
 
 The claim predicates must include at least:
 
 - `state == REQUESTED`;
 - expected `request_id`;
+- expected `control_generation`;
 - `target_worker_id == self.worker_id`;
 - `target_boot_id == self.boot_id`.
 
@@ -224,36 +233,96 @@ Therefore a crash after command consumption but before readiness completion cann
 
 This is intentional fail-closed behavior.
 
-### 7. ARM request semantics
+### 7. ARM request semantics and observable `ARMING` state
 
 After atomically consuming an ARM request, the targeted worker performs exactly one authorization attempt.
 
-Before readiness can open a window, the worker must verify the singleton precondition and all required readiness prerequisites.
+The worker must create an explicit process-local arm-attempt object containing at least:
+
+```text
+arm_request_id
+arm_control_generation
+arm_started_at
+arm_context_fingerprint
+arm_invalidation_epoch_snapshot
+```
+
+The worker must then transition its reported state to `ARMING` and publish the in-flight attempt through `WorkerHeartbeat.meta` before beginning the network-bound readiness evaluation.
+
+`ARMING` is an observable non-authorized state. While `ARMING`:
+
+- no RISEx provider POST is permitted by virtue of the arm attempt;
+- `authorization_status` must not be `AUTHORIZED`;
+- a targeted DISARM cancels the attempt as defined below;
+- any event that would invalidate or LOCK an existing window must also invalidate the arm attempt.
+
+The process maintains a monotonic, process-local `authorization_invalidation_epoch` for the current boot. Any security-relevant event that would destroy an existing window increments this epoch. The ARM attempt snapshots the epoch before readiness. This epoch is process-local state and must not be reconstructed from persisted telemetry.
+
+Before readiness can eventually open a window, the worker must verify the singleton precondition and all required readiness prerequisites.
 
 If readiness:
 
-- passes, one new readiness attestation may be consumed into one new process-local operational window;
 - fails;
 - times out;
 - raises;
-- cannot establish the singleton precondition; or
-- cannot produce a valid attestation,
+- cannot establish the singleton precondition;
+- cannot produce a valid attestation; or
+- returns PASS but the final arm-attempt validity fence fails,
 
 then the already-consumed ARM request remains consumed and **no window opens**.
 
-A new attempt always requires a new operator ARM request with a new `request_id`.
+A new attempt always requires a new operator ARM request with a new `request_id` and a later `control_generation`.
 
-The worker must not poll a consumed ARM request and must not regenerate readiness from it.
+The worker must not poll a consumed ARM request to regenerate readiness from it.
 
 ### 8. DISARM request semantics
 
-A DISARM request is targeted and consumed through the same atomic mechanism.
+A DISARM request is targeted and consumed through the same atomic one-shot mechanism, but its cancellation effect is broader than closing an existing window.
 
-After atomic consumption, if the request targets the worker's current `worker_id` + `boot_id`, that worker immediately closes any current operational window and transitions to `DISABLED`.
+A DISARM targeted to the worker's current `worker_id` + `boot_id` must:
+
+1. cancel any in-flight `ARMING` attempt for that process incarnation;
+2. invalidate/discard any readiness PASS or attestation produced by that canceled attempt before it can become a window;
+3. close any already-open operational window;
+4. increment the process-local `authorization_invalidation_epoch`; and
+5. transition the process to `DISABLED` unless a stronger fail-closed state such as `LOCKED` already applies.
 
 DISARM does not require readiness.
 
-If the target process has already restarted, its previous window has already been destroyed by the restart boundary. The new process must not consume the old DISARM request because its `boot_id` differs.
+The cancellation requirement applies even when the worker has already atomically consumed the earlier ARM and the network-bound readiness call has not yet returned. There does not need to be an existing window for DISARM to have effect.
+
+If the target process has already restarted, its previous window and arm attempt have already been destroyed by the restart boundary. The new process must not consume the old DISARM request because its `boot_id` differs.
+
+### 8A. In-flight ARM cancellation and finalization fence
+
+This section closes the race where an ARM is consumed, readiness runs for seconds, a DISARM arrives while readiness is in flight, and the eventual PASS would otherwise open a window after the operator requested cancellation.
+
+Every control command has a monotonic `control_generation`. An ARM attempt captures the generation of the ARM request it consumed. **Any later control generation targeted to the same worker/boot invalidates that ARM attempt.** In particular, a later DISARM cancels the attempt whether or not the worker has already processed the DISARM into local state.
+
+A DISARM that is successfully committed to `risex_execution_control` while readiness is in progress therefore cancels the in-flight attempt. If the worker's control loop observes it immediately, it marks the local attempt canceled and increments `authorization_invalidation_epoch`. If the worker does not observe it until readiness returns, the finalization fence below detects the newer generation and rejects the PASS.
+
+After readiness returns PASS, but **before** the readiness attestation is consumed into an Operational Execution Window, the worker must perform a final fail-closed revalidation. It must acquire the same `risex_execution_control` row serialization lock used by the operator endpoint for generation allocation and command creation, and while that serialization boundary is held it must verify all of the following:
+
+- the current `worker_id` and in-memory `boot_id` still match the arm attempt;
+- the current control row still refers to the same ARM `request_id`;
+- the current `control_generation` is exactly the ARM attempt's captured generation;
+- the current action is still `ARM` and its state is `CONSUMED`;
+- no later DISARM or other control command has been committed;
+- the process-local `authorization_invalidation_epoch` still equals the attempt's snapshot;
+- the security-relevant runtime context fingerprint still matches the attempt's snapshot;
+- the singleton execution-worker invariant still holds;
+- the readiness attestation is still valid and unused.
+
+The operator ARM/DISARM endpoint and this finalization check must serialize on the same database control row. This gives command creation and window finalization an explicit linearization order:
+
+- if a DISARM commits first, its higher generation is observed and the ARM PASS is discarded; **no window opens**;
+- if finalization acquires the serialization boundary first after readiness has completed, it may open the window only after all checks pass; a DISARM serialized after that point is an ordinary post-open DISARM and must close the window through the normal cancellation path.
+
+The worker must hold the serialization boundary through the local transition from `ARMING` to `ENABLED`. If the serialization transaction/connection fails before the finalization boundary is safely completed, the result is fail-closed: the attestation is discarded and no window may remain open.
+
+A final unlocked `SELECT` followed by later local window creation is forbidden. That would recreate the same check-then-use race.
+
+Any mismatch, ambiguity, database error, inability to establish the singleton invariant, or evidence of a later invalidation causes the arm attempt to terminate without a window. In doubt, the window does not open.
 
 ### 9. RISEx requires an execution-worker singleton
 
@@ -275,11 +344,12 @@ The worker must publish a heartbeat at least once per normal 60-second operation
 The singleton invariant must be checked:
 
 - before accepting an ARM request at the SUPERADMIN API;
-- by the worker after atomically consuming ARM and before readiness opens a window;
+- by the worker after atomically consuming ARM and before readiness begins;
+- again at the final arm-attempt validity fence before a PASS can open a window;
 - continuously while a window exists, no less often than the normal heartbeat/maintenance cycle; and
 - at the final local authorization check before a RISEx execution attempt may proceed to the existing per-operation gates.
 
-If more than one live `execution-worker` heartbeat is observed, RISEx execution is fail-closed and any existing window must transition to `LOCKED` and be invalidated.
+If more than one live `execution-worker` heartbeat is observed, RISEx execution is fail-closed, any in-flight ARM attempt is invalidated, and any existing window must transition to `LOCKED` and be invalidated.
 
 If zero live worker heartbeats can be established by the administrative control/read model, the system must not claim an executable authorization state.
 
@@ -305,7 +375,7 @@ Its context identity must include at least:
 
 Naturally dynamic per-operation values such as balances, nonces or market state are not part of the window identity when they are already covered by per-operation validation.
 
-Any change or mismatch in a security-relevant context component invalidates the current window.
+Any change or mismatch in a security-relevant context component invalidates the current window and any in-flight ARM attempt.
 
 ### 11. Maximum operational window: 24 hours
 
@@ -381,7 +451,7 @@ If the first trustworthy response after a PAUSED period is negative or ambiguous
 
 ### 14. LOCKED always destroys the current authorization window
 
-A LOCKED transition invalidates the current operational window.
+A LOCKED transition invalidates the current operational window and any in-flight ARM attempt.
 
 The worker must not automatically recover from LOCKED merely because a later probe appears healthy.
 
@@ -392,7 +462,8 @@ Reactivation after LOCKED requires the full explicit cycle:
 3. singleton verification;
 4. new signed readiness run;
 5. new readiness PASS and attestation;
-6. new operational window.
+6. final arm-attempt validity fence;
+7. new operational window.
 
 A configuration fix, provider recovery, replica reduction or positive later probe cannot by itself reopen the previous window.
 
@@ -402,7 +473,7 @@ The execution worker must stop issuing RISEx provider POSTs immediately when any
 
 - no operational window exists;
 - the window reaches its 24-hour maximum;
-- a valid targeted DISARM request is consumed;
+- a valid targeted DISARM request supersedes the current control generation or is consumed;
 - the worker process restarts;
 - the security-relevant context identity changes or no longer matches;
 - the singleton invariant is violated;
@@ -413,17 +484,20 @@ The execution worker must stop issuing RISEx provider POSTs immediately when any
 - a security-negative provider/runtime response is observed;
 - a security-relevant response is ambiguous or cannot be trusted.
 
-A pure reachability failure may place RISEx execution in PAUSED rather than destroying the window, subject to the PAUSED rules above.
+The same invalidation conditions cancel an in-flight `ARMING` attempt before it can open a window.
+
+A pure reachability failure may place an existing window in PAUSED rather than destroying it, subject to the PAUSED rules above. A reachability failure during ARM readiness does not authorize opening a window; the attempt fails closed unless readiness and the finalization fence complete successfully.
 
 Stopping RISEx execution does not require the whole execution-worker process to terminate. Other provider-independent worker responsibilities may continue if their own controls allow it.
 
 ### 16. Restart is a hard authorization boundary
 
-The operational window is process-local and non-persistent.
+The operational window and in-flight arm attempt are process-local and non-persistent.
 
 A process restart or deployment loses:
 
 - the process-local `boot_id`;
+- any arm-attempt object;
 - any unconsumed readiness attestation held only in process memory;
 - the operational window.
 
@@ -445,11 +519,11 @@ Neither readiness PASS nor the operational window may be persisted as authorizat
 
 The following may be persisted because they are not authorization inputs:
 
-- one-shot operator ARM/DISARM request and its consumed acknowledgement;
+- one-shot operator ARM/DISARM request, its monotonic control generation and its consumed acknowledgement;
 - audit records;
-- heartbeat telemetry describing the worker's self-reported process-local state.
+- heartbeat telemetry describing the worker's self-reported process-local state, including the existence of an in-flight arm attempt.
 
-Persisted telemetry must never be accepted by the worker as proof that its own window exists.
+Persisted telemetry must never be accepted by the worker as proof that its own arm attempt or window exists.
 
 ## Observability and read-only status
 
@@ -461,14 +535,19 @@ While running, each `execution-worker` must publish into its own `WorkerHeartbea
 - `seen_at`;
 - current job information as already supported;
 - `meta.boot_id`;
-- `meta.risex.reported_state` = `DISABLED | ENABLED | PAUSED | LOCKED`;
+- `meta.risex.reported_state` = `DISABLED | ARMING | ENABLED | PAUSED | LOCKED`;
+- `meta.risex.arm_request_id` while an ARM attempt is in flight;
+- `meta.risex.arm_control_generation` while an ARM attempt is in flight;
+- `meta.risex.arm_started_at` while an ARM attempt is in flight;
 - `meta.risex.opened_at` when a window exists;
 - `meta.risex.expires_at` when a window exists;
 - `meta.risex.last_transition_at`;
 - `meta.risex.last_transition_reason`;
-- optionally the last consumed control `request_id` for correlation, but never a readiness attestation or reusable authorization token.
+- optionally the last consumed control `request_id` and `control_generation` for correlation, but never a readiness attestation or reusable authorization token.
 
-This is a **read-only mirror of process-local state**. The worker writes it for observability and must never read it back to reconstruct, extend or authorize a window.
+`ARMING` must be published before the network-bound readiness operation begins and cleared/replaced after the attempt succeeds, fails, is canceled, or is invalidated.
+
+This heartbeat is a **read-only mirror of process-local state**. The worker writes it for observability and must never read it back to reconstruct, extend or authorize an arm attempt or window.
 
 ### Read-only administrative endpoint
 
@@ -476,7 +555,7 @@ The implementation must expose:
 
 `GET /admin/risex-execution-status`
 
-The endpoint is read-only and must not arm, disarm, refresh, resume or otherwise mutate the window.
+The endpoint is read-only and must not arm, disarm, refresh, resume or otherwise mutate the arm attempt or window.
 
 For the singleton case it must return at least:
 
@@ -485,12 +564,15 @@ For the singleton case it must return at least:
 - `heartbeat_seen_at`;
 - `heartbeat_age_seconds`;
 - `reported_state`;
+- in-flight `arm_request_id`, `arm_control_generation` and `arm_started_at` when reported state is `ARMING`;
 - `opened_at`;
 - `expires_at`;
 - `remaining_seconds` when determinable;
 - `observability`;
 - `authorization_status`;
-- current control-request metadata sufficient to distinguish `REQUESTED` from `CONSUMED`, including `request_id` and action, without exposing sensitive readiness material.
+- current control-request metadata sufficient to distinguish `REQUESTED` from `CONSUMED`, including `request_id`, `control_generation` and action, without exposing sensitive readiness material.
+
+For a fresh heartbeat with `reported_state == ARMING`, `authorization_status` must be `PENDING`, never `AUTHORIZED`.
 
 ### Mandatory stale-heartbeat rule
 
@@ -500,7 +582,7 @@ A heartbeat is **STALE** when:
 
 The 180-second threshold is three missed 60-second heartbeat opportunities under the required normal worker heartbeat cadence.
 
-When the latest relevant heartbeat is stale, the status endpoint must never present a bare `OPEN`, `ENABLED` or equivalent current-authorization claim.
+When the latest relevant heartbeat is stale, the status endpoint must never present a bare `OPEN`, `ENABLED`, `ARMING` or equivalent current-authorization/current-progress claim as trustworthy current state.
 
 It must report all three concepts separately, for example:
 
@@ -510,9 +592,17 @@ observability: STALE
 authorization_status: UNKNOWN
 ```
 
+or, for an arm attempt last observed in flight:
+
+```text
+reported_state: ARMING
+observability: STALE
+authorization_status: UNKNOWN
+```
+
 `reported_state` means only **the last state the worker reported before observability was lost**.
 
-`authorization_status: UNKNOWN` is mandatory for a stale or missing heartbeat, regardless of whether the persisted telemetry says `ENABLED`, `PAUSED`, `LOCKED` or `DISABLED`.
+`authorization_status: UNKNOWN` is mandatory for a stale or missing heartbeat, regardless of whether the persisted telemetry says `ARMING`, `ENABLED`, `PAUSED`, `LOCKED` or `DISABLED`.
 
 `remaining_seconds` must not be represented as trustworthy current authorization duration when observability is stale; the endpoint may return it as null or clearly label a purely historical/computed value, but it must not imply that the window is still active.
 
@@ -524,7 +614,7 @@ For a fresh heartbeat, the endpoint may report `authorization_status: AUTHORIZED
 - `expires_at` is in the future;
 - no locally known singleton or control-plane blocker.
 
-This API status is observational only. It does not replace the worker's own process-local window check, gate 1, gate 2, gate 4 or the mandatory pre-POST freshness probe.
+This API status is observational only. It does not replace the worker's own process-local window check, the arm finalization fence, gate 1, gate 2, gate 4 or the mandatory pre-POST freshness probe.
 
 If multiple live replicas exist, the endpoint must make the topology conflict explicit and must not collapse the response into one apparently authorized worker. `authorization_status` must be non-authorized/fail-closed for RISEx.
 
@@ -534,14 +624,15 @@ The continuous execution authorization state is interpreted as follows:
 
 | State | Meaning | RISEx POST allowed? | Exit / recovery |
 | --- | --- | --- | --- |
-| `DISABLED` | No valid process-local operational window exists | No | New targeted ARM request -> atomic consume -> readiness PASS -> new window |
+| `DISABLED` | No valid process-local operational window or active arm attempt exists | No | New targeted ARM request -> atomic consume -> `ARMING` |
+| `ARMING` | One consumed ARM is undergoing readiness/finalization; no window exists yet | No | PASS + finalization fence -> `ENABLED`; DISARM/failure/invalidation -> `DISABLED` or `LOCKED` |
 | `ENABLED` | Valid window, matching context, singleton invariant holds; per-operation controls may be evaluated | Only after all existing gates and freshness checks pass | Continues until expiry, DISARM, restart, invalidation, PAUSED or LOCKED |
 | `PAUSED` | Same window exists, but no trustworthy security verdict is obtainable because of pure reachability/availability failure | No | Automatic resume only after a trustworthy positive probe while the same window remains valid and singleton still holds |
-| `LOCKED` | Negative, ambiguous, untrusted security evidence or singleton violation invalidated the window | No | New targeted ARM request + atomic consume + new readiness PASS + new window |
+| `LOCKED` | Negative, ambiguous, untrusted security evidence or singleton violation invalidated the window/attempt | No | New targeted ARM request + atomic consume + new readiness PASS + finalization fence + new window |
 
-Window expiry, explicit DISARM and process restart return the process to `DISABLED`; a security-negative, ambiguous or multi-replica condition produces `LOCKED`.
+Window expiry, explicit DISARM and process restart return the process to `DISABLED`; a security-negative, ambiguous or multi-replica condition produces `LOCKED`. A DISARM during `ARMING` cancels the attempt and prevents its eventual readiness result from opening a window.
 
-Heartbeat telemetry is not a fifth authorization state. A stale heartbeat changes **observability** to `STALE` and the API's `authorization_status` to `UNKNOWN`; it does not reconstruct or mutate process-local state.
+Heartbeat telemetry is not an authorization source. A stale heartbeat changes **observability** to `STALE` and the API's `authorization_status` to `UNKNOWN`; it does not reconstruct or mutate process-local state.
 
 ## Relationship to ADR-0002
 
@@ -551,7 +642,8 @@ ADR-0004 clarifies the runtime meaning of a readiness PASS derived from ADR-0002
 
 - the PASS/attestation is short-lived bootstrap evidence;
 - it is not a self-renewing lease for a continuous worker;
-- after one-shot consumption into an operational window, continuity is governed by the window's explicit operator intent, process/context binding, singleton requirement, hard 24-hour ceiling and the unchanged per-operation controls.
+- after one-shot consumption into an operational window, continuity is governed by the window's explicit operator intent, process/context binding, singleton requirement, hard 24-hour ceiling and the unchanged per-operation controls;
+- a readiness PASS cannot override a later operator DISARM or security invalidation that occurred during the ARM attempt.
 
 To the extent that any downstream implementation or documentation interprets the 300-second readiness TTL as the direct lifetime of continuous RISEx worker authorization, that operational interpretation is superseded by ADR-0004.
 
@@ -578,7 +670,7 @@ Review must be brought forward immediately if any of the following occurs before
 - the execution-worker deployment topology changes materially;
 - `execution-worker` is intentionally scaled beyond one replica;
 - the arming mechanism changes from the explicit one-shot `system_flags` request model;
-- the request-consumption transaction or atomic claim semantics change;
+- `control_generation`, request-consumption atomicity or arm-finalization serialization semantics change;
 - any proposal introduces persistence or replay of readiness PASS or Operational Execution Window;
 - the worker heartbeat cadence or 180-second stale threshold changes materially;
 - the readiness attestation TTL or issuance semantics change;
@@ -596,6 +688,8 @@ Review must be brought forward immediately if any of the following occurs before
 - An operator can execute ARM/DISARM through the existing application control plane without requiring Railway container shell/exec access.
 - The durable control record is only a one-shot request; PASS and window remain process-local and non-persistent.
 - Atomic request consumption prevents two processes from claiming the same explicit authorization act.
+- Monotonic control generations plus the finalization fence prevent a readiness PASS from opening a window after a later DISARM or invalidation.
+- `ARMING` makes the in-flight authorization attempt explicitly observable without making it authorized.
 - `boot_id` makes restart distinguishable from the targeted operator action and makes old pending requests non-replayable by a new process incarnation.
 - The singleton runtime invariant prevents intermittent per-replica RISEx authorization behavior.
 - Restart and security-relevant context changes are hard authorization boundaries.
@@ -608,10 +702,11 @@ Review must be brought forward immediately if any of the following occurs before
 
 - A live singleton worker may remain authorized for up to 24 hours after a valid explicit arm, subject to all unchanged per-operation gates and freshness checks.
 - The current design deliberately does not support RISEx continuous signed execution across multiple execution-worker replicas.
-- PostgreSQL availability is required to deliver and atomically consume ARM/DISARM requests and to verify the heartbeat-based singleton invariant.
+- PostgreSQL availability is required to deliver and atomically consume ARM/DISARM requests, serialize ARM finalization against later control commands and verify the heartbeat-based singleton invariant.
 - A 24-hour bound does not guarantee that a window never crosses a night; it guarantees only a maximum one-day authorization horizon.
 - Process-local authorization means every deployment or restart requires a new explicit ARM/readiness cycle.
 - An ARM request consumed immediately before a process crash is lost by design and must be reissued explicitly.
+- A database/control-plane failure during the final arm fence cancels the arm attempt even after readiness PASS; this is intentional fail-closed behavior.
 - Incorrect classification of an error as reachability-only could delay LOCKED; the conservative rule therefore classifies malformed, ambiguous and authenticity-related failures as LOCKED.
 - Heartbeat telemetry is eventually observed state; after 180 seconds without a fresh heartbeat the administrative view necessarily becomes `UNKNOWN`.
 
@@ -643,6 +738,12 @@ A durable boolean would be reread after restart and could automatically re-arm a
 
 The accepted database use is instead an edge-triggered, request-id-bearing, target-bound one-shot command that becomes permanently `CONSUMED` before readiness runs.
 
+### Unlocked final readiness check before window creation
+
+Rejected.
+
+Reading the control row, releasing it, and later opening the process-local window leaves a check-then-use interval in which a DISARM can be accepted and then ignored by the in-flight ARM result. The accepted design serializes operator command creation and ARM finalization on the same control row and treats any mismatch or failure as cancellation.
+
 ### Multi-replica process-local windows
 
 Rejected for ADR-0004.
@@ -667,7 +768,7 @@ Rejected.
 
 Persistence would survive process restart and would convert a process-bound authorization into replayable shared state, contrary to the fail-closed restart boundary.
 
-This rejection does not apply to the one-shot operator request, consumed acknowledgement, audit log or heartbeat telemetry because none of those may be used as authorization evidence.
+This rejection does not apply to the one-shot operator request, monotonic control generation, consumed acknowledgement, audit log or heartbeat telemetry because none of those may be used as readiness evidence or a persisted execution window.
 
 ## Implementation boundary
 
