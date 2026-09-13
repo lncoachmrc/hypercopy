@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import uuid
 from decimal import Decimal
 
@@ -22,6 +23,11 @@ from app.models.entities import (
     UserState,
 )
 from app.services.execution_destination import close_user_destination_epoch, set_user_destination, user_destination_state
+
+pytestmark = pytest.mark.skipif(
+    os.getenv('RUN_INTEGRATION') != '1',
+    reason='requires CI PostgreSQL',
+)
 
 _SWITCH_TARGETS = (
     ('hyperliquid', 'mainnet'),
