@@ -137,6 +137,29 @@ def test_capability_probe_is_unknown_without_fund_movement_path_assertion() -> N
         assert ADR_0003_REFERENCE in check.detail
 
 
+def test_capability_probe_is_unknown_when_fund_path_assertion_is_uncertain() -> None:
+    from app.security.risex_signer_probe import evaluate_signer_capabilities
+
+    report = evaluate_signer_capabilities(
+        _adr0002_evidence(
+            fund_movement_path_absent=None,
+            fund_movement_rejected=None,
+            withdrawal_rejected=None,
+        ),  # type: ignore[arg-type]
+        now=int(time()),
+    )
+    assert report.verdict == 'UNKNOWN'
+    assert report.security_gate_passed is False
+    criterion = _criterion_check(report)
+    assert criterion is not None
+    assert criterion.verdict == 'UNKNOWN'
+    for name in ('fund_movement_negative_test', 'withdrawal_negative_test'):
+        check = _negative_check(report, name)
+        assert check is not None
+        assert check.verdict == 'UNKNOWN'
+        assert ADR_0003_REFERENCE in check.detail
+
+
 def test_capability_probe_is_unknown_when_fund_path_assertion_is_omitted() -> None:
     from app.security.risex_signer_probe import evaluate_signer_capabilities
 
