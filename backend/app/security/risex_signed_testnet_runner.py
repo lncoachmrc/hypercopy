@@ -6,7 +6,6 @@ from typing import Literal
 
 from app.core.config import Network
 from app.security.risex_authorization_session import (
-    PERPS_PERMISSION_ID,
     RISExAuthorizationSessionEvidence,
     collect_authorization_session_evidence,
 )
@@ -27,6 +26,9 @@ from app.security.risex_signed_testnet_policy import (
 from app.security.risex_testnet_signer import load_testnet_signer_credential
 
 
+ADR_REFERENCE: Literal['ADR-0002'] = 'ADR-0002'
+
+
 @dataclass(frozen=True, slots=True)
 class RISExSignedTestnetReadinessReport:
     verdict: Verdict
@@ -40,28 +42,37 @@ class RISExSignedTestnetReadinessReport:
     observed_block_timestamp: int
     session_expiration: int
     session_permission_bitmap: int
+    session_permission_bitmap_hex: str
     stored_session_status_code: int
     session_not_expired: bool
     session_active: bool | None
+    all_permission_id: int
+    all_permission: bool
     perps_permission_id: int
     perps_permission: bool
+    spot_permission_id: int
+    spot_permission: bool
+    move_fund_permission_id: int
+    move_fund_permission: bool
     perps_only_scope: bool | None
+    fund_movement_path_absent: bool
+    adr_reference: Literal['ADR-0002']
     post_allowed: Literal[False]
     full_security_gate_passed: Literal[False] = False
     writes_enabled: Literal[False] = False
 
 
-def _authorization_verdict(evidence: RISExAuthorizationSessionEvidence) -> Verdict:
-    if (
-        evidence.session_active is False
-        or evidence.perps_permission is False
-        or evidence.perps_only_scope is False
-    ):
+def _authorization_verdict(
+    evidence: RISExAuthorizationSessionEvidence,
+    *,
+    fund_movement_path_absent: bool,
+) -> Verdict:
+    if evidence.session_active is False or evidence.perps_permission is False:
         return 'FAIL'
     if (
         evidence.session_active is True
         and evidence.perps_permission is True
-        and evidence.perps_only_scope is True
+        and fund_movement_path_absent is True
     ):
         return 'PASS'
     return 'UNKNOWN'
@@ -77,9 +88,14 @@ async def run_signed_testnet_readiness(
     disposable_account_asserted: bool,
     dedicated_signer_asserted: bool,
     operatorhub_bypass_disabled: bool,
+    fund_movement_path_absent: bool = False,
     expected_fingerprint: str = PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
 ) -> RISExSignedTestnetReadinessReport:
     """Collect signed-testnet readiness evidence without exposing any provider write path.
+
+    ``perps_only_scope`` remains diagnostic evidence. ADR-0002 readiness instead
+    requires an active session, Perps permission and an explicit assertion that
+    the reviewed session-key fund-movement path remains absent.
 
     The runner intentionally stops at evidence collection. It never constructs the
     signed POST transport and cannot place, cancel, register, revoke, transfer or
@@ -129,7 +145,10 @@ async def run_signed_testnet_readiness(
         signer=credential.signer_address,
         block_tag=block_tag,
     )
-    verdict = _authorization_verdict(authorization)
+    verdict = _authorization_verdict(
+        authorization,
+        fund_movement_path_absent=fund_movement_path_absent,
+    )
 
     return RISExSignedTestnetReadinessReport(
         verdict=verdict,
@@ -143,11 +162,20 @@ async def run_signed_testnet_readiness(
         observed_block_timestamp=authorization.block_timestamp,
         session_expiration=authorization.session_expiration,
         session_permission_bitmap=authorization.session_permission_bitmap,
+        session_permission_bitmap_hex=f'0x{authorization.session_permission_bitmap:08X}',
         stored_session_status_code=authorization.stored_status_code,
         session_not_expired=authorization.session_not_expired,
         session_active=authorization.session_active,
-        perps_permission_id=PERPS_PERMISSION_ID,
+        all_permission_id=authorization.all_permission_id,
+        all_permission=authorization.all_permission,
+        perps_permission_id=authorization.perps_permission_id,
         perps_permission=authorization.perps_permission,
+        spot_permission_id=authorization.spot_permission_id,
+        spot_permission=authorization.spot_permission,
+        move_fund_permission_id=authorization.move_fund_permission_id,
+        move_fund_permission=authorization.move_fund_permission,
         perps_only_scope=authorization.perps_only_scope,
+        fund_movement_path_absent=fund_movement_path_absent,
+        adr_reference=ADR_REFERENCE,
         post_allowed=False,
     )
