@@ -75,7 +75,7 @@ Without a separate continuous-execution authorization mechanism, the system woul
 - multiple worker replicas having inconsistent process-local authorization state and therefore intermittently accepting or rejecting equivalent RISEx work;
 - a DISARM or other invalidation arriving while an ARM readiness attempt is in flight and being lost before the eventual PASS is converted into a window.
 
-ADR-0004 addresses those gaps without replacing the per-operation gates or freshness probe.
+ADR-0004 addresses those gaps without replacing gate 1, gate 2, gate 4 or the mandatory freshness probe. Gate 3 is specialized below because its manual/test and continuous-worker authorization semantics are intentionally different.
 
 ## Decision
 
@@ -113,6 +113,36 @@ Opening a later window requires:
 6. one-shot consumption of that new attestation into the new process-local window.
 
 No automatic or background rearming is permitted.
+
+### 2A. Gate 3 has two explicit, mutually exclusive authorization modes
+
+The shared RISEx order adapter may serve both the short-lived manual/test path and the ADR-0004 continuous execution-worker path, but **each adapter instance must be constructed in exactly one explicit gate-3 authorization mode**. The implementation may choose the concrete type or enum name, but the semantic choice must be explicit at construction time and immutable for the lifetime of that adapter instance.
+
+The two accepted modes are:
+
+1. **Short-lived attestation mode** — used by the existing manual/test signed-execution path. Gate 3 is satisfied only by a currently valid `RISExRuntimeReadinessAttestation` whose account and signer identities match the specific prepared order request. The 300-second TTL remains fully enforced for this mode.
+2. **Continuous operational-window mode** — used only by the continuous `execution-worker` governed by ADR-0004. The readiness attestation is consumed once during ARM/finalization to create the process-local Operational Execution Window. For subsequent orders in that same authorized process/context epoch, gate 3 is satisfied by the current process-local continuous authorization only after the worker re-checks the window and all relevant final local authorization conditions at the point of use.
+
+These modes are mutually exclusive. The adapter must never infer the mode from which fields happen to be present. In particular, the following behavior is forbidden:
+
+> if an attestation is present, use it; otherwise fall back to an Operational Execution Window.
+
+That would make an incorrectly constructed adapter silently select the more permissive continuous path.
+
+Therefore:
+
+- construction without an explicit gate-3 mode is fail-closed;
+- construction or invocation that supplies incompatible authorization material for both modes is fail-closed;
+- a short-lived-mode adapter may not accept an Operational Execution Window as a substitute for an absent or expired attestation;
+- a continuous-mode adapter may not use a leftover readiness attestation as a substitute for a non-authorized window;
+- there is no automatic fallback or runtime switching from one mode to the other;
+- absence, ambiguity or mismatch of the selected mode's required authorization material blocks the order before gate 4 and before any provider POST.
+
+For the continuous mode, an `ENABLED` Operational Execution Window is the gate-3 continuous authorization after the one-shot readiness bootstrap. `DISABLED`, `ARMING`, `PAUSED`, `LOCKED`, an expired window, a restarted process, a context mismatch or a failed final singleton/local-authorization condition does not satisfy gate 3.
+
+This specialization does **not** change gate 1, gate 2, gate 4 or the mandatory freshness probe immediately before provider POST. It also does not weaken the ADR-0004 point-of-use window check, singleton requirement, context/invalidation fences or the 24-hour maximum.
+
+The continuous path must not periodically refresh the original readiness attestation and must not extend its 300-second TTL. A new Operational Execution Window always requires a new explicit ARM request, a new readiness run, a new PASS/attestation and the complete finalization fence.
 
 ### 3. Every worker process gets a fresh process-local `boot_id`
 
@@ -385,6 +415,27 @@ Naturally dynamic per-operation values such as balances, nonces or market state 
 
 Any change or mismatch in a security-relevant context component invalidates the current window and any in-flight ARM attempt.
 
+### 10A. Continuous gate 3 preserves the per-order account/signer binding
+
+The Operational Execution Window's context fingerprint includes the account/owner identity and the session-key public identity used at ARM/finalization. That fingerprint is necessary to bind the window to the runtime context, but **an opaque fingerprint checked only at window creation is not by itself equivalent to the per-order identity binding enforced by the short-lived attestation path**.
+
+The existing short-lived gate 3 validates the readiness attestation against `request.permit.account_address` and `request.permit.signer_address` for the specific prepared order. Continuous mode must preserve an equivalent check on every order.
+
+Therefore the continuous authorization context must retain, in process-local non-persistent form, the exact account identity and signer/session-key public identity authorized when the window was opened, or expose an equivalently immutable process-local representation from which those exact identities can be checked. Storing only a hash that cannot be compared to the request permit is insufficient.
+
+For every continuous-mode `place_ioc` attempt, before gate 4 and before any provider POST, gate 3 must verify all of the following:
+
+- the selected adapter mode is explicitly continuous operational-window mode;
+- the current process-local window remains `ENABLED` after expiry and final local authorization checks;
+- `request.permit.account_address` equals the account identity bound to that current window/authorization context;
+- `request.permit.signer_address` equals the signer/session-key public identity bound to that current window/authorization context.
+
+The expected account/signer identities used by this comparison must come from the same process-local authorization context that produced the window. They must not be reconstructed from `WorkerHeartbeat`, the administrative status read model, a database row, Redis, or another persisted telemetry source.
+
+A permit identity mismatch fails gate 3 before gate 4 and before the provider POST. It is a security-negative mismatch and is handled under the existing fail-closed/LOCKED rules; it must not be downgraded to PAUSED, deferred as an availability condition, or repaired by switching authorization modes.
+
+This preserves the security property introduced by PR #168: continuous execution changes the lifetime carrier of gate-3 authorization, but it does not weaken the binding between the authorized account/signer identity and the specific order request.
+
 ### 11. Maximum operational window: 24 hours
 
 A successfully opened operational window has a hard maximum lifetime of **24 hours**.
@@ -487,6 +538,7 @@ The execution worker must stop issuing RISEx provider POSTs immediately when any
 - the singleton invariant is violated;
 - gate 1 fails;
 - gate 2 fails;
+- gate 3 for the explicitly selected authorization mode fails, including a continuous-mode permit account/signer mismatch;
 - gate 4 fails;
 - the immediate pre-POST freshness probe does not produce the required positive result;
 - a security-negative provider/runtime response is observed;
@@ -634,7 +686,7 @@ The continuous execution authorization state is interpreted as follows:
 | --- | --- | --- | --- |
 | `DISABLED` | No valid process-local operational window or active arm attempt exists | No | New targeted ARM request -> atomic consume -> `ARMING` |
 | `ARMING` | One consumed ARM is undergoing readiness/finalization; no window exists yet | No | PASS + finalization fence -> `ENABLED`; DISARM/failure/invalidation -> `DISABLED` or `LOCKED` |
-| `ENABLED` | Valid window, matching context, singleton invariant holds; per-operation controls may be evaluated | Only after all existing gates and freshness checks pass | Continues until expiry, DISARM, restart, invalidation, PAUSED or LOCKED |
+| `ENABLED` | Valid window, matching context, singleton invariant holds; per-operation controls may be evaluated | Only after the explicitly selected gate-3 mode, per-order permit binding, unchanged gates 1/2/4 and freshness checks pass | Continues until expiry, DISARM, restart, invalidation, PAUSED or LOCKED |
 | `PAUSED` | Same window exists, but no trustworthy security verdict is obtainable because of pure reachability/availability failure | No | Automatic resume only after a trustworthy positive probe while the same window remains valid and singleton still holds |
 | `LOCKED` | Negative, ambiguous, untrusted security evidence or singleton violation invalidated the window/attempt | No | New targeted ARM request + atomic consume + new readiness PASS + finalization fence + new window |
 
@@ -650,7 +702,7 @@ ADR-0004 clarifies the runtime meaning of a readiness PASS derived from ADR-0002
 
 - the PASS/attestation is short-lived bootstrap evidence;
 - it is not a self-renewing lease for a continuous worker;
-- after one-shot consumption into an operational window, continuity is governed by the window's explicit operator intent, process/context binding, singleton requirement, hard 24-hour ceiling and the unchanged per-operation controls;
+- after one-shot consumption into an operational window, continuity is governed by the window's explicit operator intent, process/context binding, singleton requirement, hard 24-hour ceiling, the explicit continuous gate-3 mode and its per-order permit identity binding, plus unchanged gates 1, 2, 4 and the mandatory pre-POST freshness probe;
 - a readiness PASS cannot override a later operator DISARM or security invalidation that occurred during the ARM attempt.
 
 To the extent that any downstream implementation or documentation interprets the 300-second readiness TTL as the direct lifetime of continuous RISEx worker authorization, that operational interpretation is superseded by ADR-0004.
@@ -682,6 +734,7 @@ Review must be brought forward immediately if any of the following occurs before
 - any proposal introduces persistence or replay of readiness PASS or Operational Execution Window;
 - the worker heartbeat cadence or 180-second stale threshold changes materially;
 - the readiness attestation TTL or issuance semantics change;
+- the gate-3 authorization-mode selection, mutual-exclusion rule or per-order account/signer binding changes materially;
 - the pre-POST freshness probe is moved, weakened or removed;
 - gate 1, gate 2 or gate 4 changes materially;
 - the RISEx signer/account/network/deployment identity model changes;
@@ -702,7 +755,8 @@ Review must be brought forward immediately if any of the following occurs before
 - The singleton runtime invariant prevents intermittent per-replica RISEx authorization behavior.
 - Restart and security-relevant context changes are hard authorization boundaries.
 - Human intent is re-established at least once every 24 hours without assuming an eight-hour staffed shift.
-- Per-operation freshness and existing gates remain authoritative at the point of use.
+- Gate 3 is explicit and non-fallback: the short-lived path remains attestation-bound, while the continuous path is window-bound and preserves per-order account/signer identity binding.
+- Per-operation freshness, gates 1, 2 and 4, and the explicitly selected gate-3 mode remain authoritative at the point of use.
 - PAUSED and LOCKED have explicit fail-closed semantics.
 - Stale observability cannot be displayed as current authorization.
 
@@ -738,6 +792,12 @@ Even with a fixed maximum number of renewals, the worker would still be renewing
 Rejected.
 
 It collapses readiness evidence and continuous authorization into one durable fact and weakens the protection provided by a bounded readiness observation.
+
+### Implicit gate-3 fallback between attestation and operational window
+
+Rejected.
+
+The shared adapter class may support both authorization lifecycles, but an instance must be constructed in one explicit, immutable gate-3 mode. Inferring the mode from the presence or absence of an attestation/window would allow a misconfigured adapter to silently change authorization semantics. Missing, ambiguous or conflicting gate-3 mode/material must fail closed; there is no fallback from one mode to the other.
 
 ### Level-triggered database flag such as `risex_armed=true` or `system_flags`
 
