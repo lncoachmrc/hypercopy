@@ -125,7 +125,10 @@ async def test_only_exact_lowercase_true_enables_signed_write_gate(
     invalid_value: str,
 ) -> None:
     monkeypatch.setenv('RISEX_SIGNED_WRITES_ENABLED', invalid_value)
-    adapter = RISExAdapter(network='testnet')
+    adapter = RISExAdapter(
+        network='testnet',
+        gate3_mode='short_lived_attestation',
+    )
 
     with pytest.raises(ProviderWriteDisabled, match='cause 1'):
         await adapter.place_ioc(db=object(), job=_job(), request=_request())
@@ -143,7 +146,10 @@ async def test_active_hyperliquid_epoch_is_rejected_as_cause_2(
         return True
 
     monkeypatch.setattr(risex_module, 'job_matches_active_destination', matcher)
-    adapter = RISExAdapter(network='testnet')
+    adapter = RISExAdapter(
+        network='testnet',
+        gate3_mode='short_lived_attestation',
+    )
 
     with pytest.raises(ProviderWriteDisabled, match='cause 2'):
         await adapter.place_ioc(db=object(), job=_job(provider='hyperliquid'), request=_request())
@@ -164,6 +170,7 @@ async def test_runtime_readiness_account_must_match_specific_order_account(
     attestation = await _runtime_attestation(monkeypatch)
     adapter = RISExAdapter(
         network='testnet',
+        gate3_mode='short_lived_attestation',
         readiness_attestation=attestation,  # type: ignore[arg-type]
     )
 
