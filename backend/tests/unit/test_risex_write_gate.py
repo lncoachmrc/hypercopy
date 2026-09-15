@@ -38,7 +38,11 @@ async def test_every_risex_mutation_fails_locally_before_network_io() -> None:
     from app.adapters.risex_types import ProviderWriteDisabled
 
     transport = NoNetworkTransport()
-    adapter = RISExAdapter(network='testnet', transport=transport)
+    adapter = RISExAdapter(
+        network='testnet',
+        transport=transport,
+        gate3_mode='short_lived_attestation',
+    )
 
     assert adapter.provider == 'risex'
     assert adapter.writes_enabled is False
