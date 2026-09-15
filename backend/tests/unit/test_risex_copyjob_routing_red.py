@@ -17,6 +17,10 @@ from app.workers import execution_worker, resilient_execution_worker
 class _CommitDB:
     def __init__(self) -> None:
         self.commits = 0
+        self.flushes = 0
+
+    async def flush(self) -> None:
+        self.flushes += 1
 
     async def commit(self) -> None:
         self.commits += 1
@@ -38,7 +42,7 @@ async def test_prepare_destination_allows_bound_risex_jobs(monkeypatch: pytest.M
         enqueued_at=None,
     )
 
-    allowed = await queue_service.prepare_job_destination_for_execution(object(), job)
+    allowed = await queue_service.prepare_job_destination_for_execution(_CommitDB(), job)
 
     assert allowed is True
     assert job.state == JobState.QUEUED
@@ -60,13 +64,8 @@ async def test_prepare_destination_still_rejects_unknown_providers(monkeypatch: 
         next_attempt_at=datetime.now(),
         enqueued_at=datetime.now(),
     )
-    db = SimpleNamespace(flush=lambda: None)
 
-    class _DB:
-        async def flush(self) -> None:
-            return None
-
-    allowed = await queue_service.prepare_job_destination_for_execution(_DB(), job)
+    allowed = await queue_service.prepare_job_destination_for_execution(_CommitDB(), job)
 
     assert allowed is False
     assert job.state == JobState.SKIPPED
@@ -156,7 +155,7 @@ async def test_window_unavailable_deferral_preserves_failure_budget() -> None:
     assert db.commits == 1
 
 
-def test_latest_intent_authorization_becomes_provider_aware_for_risex_writer() -> None:
+def test_latest_intent_authorization_becomes_provider_aware() -> None:
     signature = inspect.signature(strategy_intents.current_strategy_intent_for_cloid)
     assert 'execution_provider' in signature.parameters
 
@@ -164,6 +163,8 @@ def test_latest_intent_authorization_becomes_provider_aware_for_risex_writer() -
     assert "job.execution_provider != 'hyperliquid'" not in source
     assert 'job.execution_provider != execution_provider' in source
 
+
+def test_dedicated_risex_writer_reuses_latest_intent_fence() -> None:
     spec = importlib.util.find_spec('app.services.risex_copy_execution')
     assert spec is not None, 'Step 4B requires a dedicated RISEx CopyJob execution service'
     module = importlib.import_module('app.services.risex_copy_execution')
