@@ -32,6 +32,8 @@ ROUTER = '0x' + ('bb' * 20)
 CHAIN_ID = 11155931
 SESSION_EXPIRATION = 4_000_000_000
 FIXED_NOW = 1_900_000_000.0
+SHORT_LIVED_GATE3_MODE = 'short_lived_attestation'
+CONTINUOUS_GATE3_MODE = 'continuous_window'
 
 
 class MutableClock:
@@ -227,7 +229,10 @@ async def test_flag_absent_is_cause_1_and_fails_before_destination_or_transport(
 ) -> None:
     monkeypatch.delenv('RISEX_SIGNED_WRITES_ENABLED', raising=False)
     epoch_calls = await _allow_epoch(monkeypatch)
-    adapter = RISExAdapter(network='testnet')
+    adapter = RISExAdapter(
+        network='testnet',
+        gate3_mode=SHORT_LIVED_GATE3_MODE,
+    )
 
     with pytest.raises(ProviderWriteDisabled, match='cause 1'):
         await adapter.place_ioc(db=object(), job=_job(), request=_request())
@@ -241,7 +246,10 @@ async def test_mainnet_from_active_epoch_is_cause_2_even_when_adapter_network_is
 ) -> None:
     monkeypatch.setenv('RISEX_SIGNED_WRITES_ENABLED', 'true')
     epoch_calls = await _allow_epoch(monkeypatch)
-    adapter = RISExAdapter(network='testnet')
+    adapter = RISExAdapter(
+        network='testnet',
+        gate3_mode=SHORT_LIVED_GATE3_MODE,
+    )
     job = _job(network='mainnet')
 
     with pytest.raises(ProviderWriteDisabled, match='cause 2'):
@@ -256,7 +264,10 @@ async def test_epoch_fence_mismatch_is_cause_2(
 ) -> None:
     monkeypatch.setenv('RISEX_SIGNED_WRITES_ENABLED', 'true')
     epoch_calls = await _allow_epoch(monkeypatch, matches=False)
-    adapter = RISExAdapter(network='mainnet')
+    adapter = RISExAdapter(
+        network='mainnet',
+        gate3_mode=SHORT_LIVED_GATE3_MODE,
+    )
 
     with pytest.raises(ProviderWriteDisabled, match='cause 2'):
         await adapter.place_ioc(db=object(), job=_job(network='testnet'), request=_request())
@@ -270,7 +281,11 @@ async def test_missing_runtime_attestation_is_cause_3(
 ) -> None:
     monkeypatch.setenv('RISEX_SIGNED_WRITES_ENABLED', 'true')
     await _allow_epoch(monkeypatch)
-    adapter = RISExAdapter(network='testnet', readiness_attestation=None)
+    adapter = RISExAdapter(
+        network='testnet',
+        gate3_mode=SHORT_LIVED_GATE3_MODE,
+        readiness_attestation=None,
+    )
 
     with pytest.raises(ProviderWriteDisabled, match='cause 3'):
         await adapter.place_ioc(db=object(), job=_job(), request=_request())
@@ -287,6 +302,7 @@ async def test_expired_runtime_attestation_is_cause_3_and_is_not_regenerated(
     validation_clock = MutableClock(FIXED_NOW + 301)
     adapter = RISExAdapter(
         network='testnet',
+        gate3_mode=SHORT_LIVED_GATE3_MODE,
         readiness_attestation=attestation,  # type: ignore[arg-type]
         readiness_clock=validation_clock,
     )
@@ -304,7 +320,11 @@ async def test_runtime_attestation_signer_mismatch_is_cause_3(
     monkeypatch.setenv('RISEX_SIGNED_WRITES_ENABLED', 'true')
     await _allow_epoch(monkeypatch)
     attestation = await _runtime_attestation(monkeypatch)
-    adapter = RISExAdapter(network='testnet', readiness_attestation=attestation)  # type: ignore[arg-type]
+    adapter = RISExAdapter(
+        network='testnet',
+        gate3_mode=SHORT_LIVED_GATE3_MODE,
+        readiness_attestation=attestation,  # type: ignore[arg-type]
+    )
 
     with pytest.raises(ProviderWriteDisabled, match='cause 3'):
         await adapter.place_ioc(db=object(), job=_job(), request=_request(signer=OTHER_SIGNER))
@@ -327,6 +347,7 @@ async def test_stale_pre_order_gate_is_cause_4_before_http_post(
     transport, client, http_calls = _signed_transport(freshness_probe=stale_probe)
     adapter = RISExAdapter(
         network='mainnet',
+        gate3_mode=SHORT_LIVED_GATE3_MODE,
         transport=transport,  # type: ignore[arg-type]
         readiness_attestation=attestation,  # type: ignore[arg-type]
     )
@@ -366,6 +387,7 @@ async def test_all_conditions_call_signed_post_once_with_coherent_typed_request(
     monkeypatch.setattr(transport, 'post_place_order', counted_post)
     adapter = RISExAdapter(
         network='mainnet',
+        gate3_mode=SHORT_LIVED_GATE3_MODE,
         transport=transport,  # type: ignore[arg-type]
         readiness_attestation=attestation,  # type: ignore[arg-type]
     )
@@ -391,7 +413,10 @@ async def test_all_conditions_call_signed_post_once_with_coherent_typed_request(
 
 @pytest.mark.asyncio
 async def test_other_five_risex_write_methods_remain_provider_write_disabled() -> None:
-    adapter = RISExAdapter(network='testnet')
+    adapter = RISExAdapter(
+        network='testnet',
+        gate3_mode=SHORT_LIVED_GATE3_MODE,
+    )
     methods = (
         adapter.cancel_order,
         adapter.update_leverage,
@@ -421,6 +446,7 @@ async def test_valid_readiness_never_bypasses_transport_freshness_probe(
     transport, client, http_calls = _signed_transport(freshness_probe=stale_probe)
     adapter = RISExAdapter(
         network='testnet',
+        gate3_mode=SHORT_LIVED_GATE3_MODE,
         transport=transport,  # type: ignore[arg-type]
         readiness_attestation=attestation,  # type: ignore[arg-type]
     )
@@ -441,3 +467,78 @@ def test_write_capability_literals_remain_false() -> None:
     assert adapter_hints['writes_enabled'] == ClassVar[Literal[False]]
     assert report_hints['full_security_gate_passed'] == Literal[False]
     assert report_hints['writes_enabled'] == Literal[False]
+
+
+@pytest.mark.asyncio
+async def test_missing_explicit_gate3_mode_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('RISEX_SIGNED_WRITES_ENABLED', 'true')
+    await _allow_epoch(monkeypatch)
+    adapter = RISExAdapter(network='testnet')
+
+    with pytest.raises(ProviderWriteDisabled, match='gate.?3.*mode|authorization mode'):
+        await adapter.place_ioc(db=object(), job=_job(), request=_request())
+
+
+@pytest.mark.asyncio
+async def test_continuous_mode_rejects_leftover_attestation_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attestation = await _runtime_attestation(monkeypatch)
+
+    with pytest.raises(
+        (ValueError, ProviderWriteDisabled),
+        match='incompatible|continuous|attestation|gate.?3',
+    ):
+        RISExAdapter(
+            network='testnet',
+            gate3_mode=CONTINUOUS_GATE3_MODE,
+            readiness_attestation=attestation,  # type: ignore[arg-type]
+        )
+
+
+def test_gate3_mode_is_immutable_after_construction() -> None:
+    adapter = RISExAdapter(
+        network='testnet',
+        gate3_mode=SHORT_LIVED_GATE3_MODE,
+    )
+
+    assert adapter.gate3_mode == SHORT_LIVED_GATE3_MODE
+    with pytest.raises(AttributeError):
+        adapter.gate3_mode = CONTINUOUS_GATE3_MODE
+    assert adapter.gate3_mode == SHORT_LIVED_GATE3_MODE
+
+
+@pytest.mark.asyncio
+async def test_short_lived_attestation_mode_preserves_300_second_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('RISEX_SIGNED_WRITES_ENABLED', 'true')
+    await _allow_epoch(monkeypatch)
+    issued_clock = MutableClock(FIXED_NOW)
+    attestation = await _runtime_attestation(monkeypatch, clock=issued_clock)
+    validation_clock = MutableClock(FIXED_NOW + 300)
+
+    async def fresh_probe() -> RISExSignerCapabilityEvidence:
+        return _evidence()
+
+    transport, client, http_calls = _signed_transport(freshness_probe=fresh_probe)
+    adapter = RISExAdapter(
+        network='testnet',
+        gate3_mode=SHORT_LIVED_GATE3_MODE,
+        transport=transport,  # type: ignore[arg-type]
+        readiness_attestation=attestation,  # type: ignore[arg-type]
+        readiness_clock=validation_clock,
+    )
+    try:
+        assert await adapter.place_ioc(db=object(), job=_job(), request=_request()) == {'success': True}
+        assert len(http_calls) == 1
+
+        validation_clock.value = FIXED_NOW + 300.001
+        with pytest.raises(ProviderWriteDisabled, match='cause 3'):
+            await adapter.place_ioc(db=object(), job=_job(), request=_request())
+    finally:
+        await client.aclose()
+
+    assert len(http_calls) == 1
