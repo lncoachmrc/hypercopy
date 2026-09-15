@@ -436,6 +436,57 @@ A permit identity mismatch fails gate 3 before gate 4 and before the provider PO
 
 This preserves the security property introduced by PR #168: continuous execution changes the lifetime carrier of gate-3 authorization, but it does not weaken the binding between the authorized account/signer identity and the specific order request.
 
+### 10B. Continuous submission is fenced again after freshness and immediately before POST
+
+The pre-gate-4 window check in section 10A is necessary but not sufficient because gate 4 contains an awaited provider freshness probe. A window may expire, be explicitly DISARMED, or be invalidated by a concurrent process-local task while that network call is in flight. A positive freshness result collected after such an invalidation must never authorize a later provider POST.
+
+Every continuous-mode order attempt must therefore create a process-local operation snapshot before entering the awaited freshness probe. The snapshot must bind at least:
+
+- the current `authorization_invalidation_epoch`;
+- the current window/context identity;
+- the account identity bound to the window;
+- the signer/session-key public identity bound to the window; and
+- the permit account/signer identities for the specific request.
+
+The freshness probe must run **without holding the local submission-serialization mutex**, so DISARM, expiry and other invalidation work can proceed while the network call is in flight.
+
+Immediately after a positive freshness probe returns, and **immediately before the provider POST**, the continuous path must acquire a process-local submission-serialization mutex shared with every local transition that can invalidate continuous authorization. While holding that serialization boundary it must revalidate, fail closed, all of the following:
+
+- `expire_if_needed()` has been applied and the window state is still exactly `ENABLED`;
+- the window has not reached `expires_at`;
+- the current `authorization_invalidation_epoch` is exactly equal to the operation snapshot;
+- the security-relevant window/context identity still equals the operation snapshot;
+- `request.permit.account_address` still equals the account identity bound to the current window;
+- `request.permit.signer_address` still equals the signer/session-key public identity bound to the current window;
+- any process-local cancellation marker for that operation is still clear; and
+- all other final local authorization conditions that ADR-0004 requires at point of use still hold.
+
+The final fence and provider submission must have one explicit process-local linearization order relative to DISARM/expiry/LOCK/context-invalidation transitions. No invalidating local transition may interleave between the successful post-freshness fence and the provider submission. A conservative implementation may hold the submission-serialization mutex through the provider POST attempt; an alternative implementation is acceptable only if it provides an equivalent, reviewable serialization boundary proving that the authorization cannot change between the final fence and submission.
+
+The following pattern is explicitly forbidden:
+
+> verify window -> `await` freshness probe -> provider POST
+
+when there is no second local authorization fence after the awaited probe. This is the same class of check-then-use error as the unlocked final `SELECT` before window creation rejected in section 8A: a previously true authorization fact is not authority for a later mutation across an uncontrolled await boundary.
+
+#### In-flight cancellation during freshness
+
+Each continuous order attempt must have a process-local cancellation marker/token bound to the same authorization epoch. A DISARM, window expiry, LOCK transition, context invalidation or equivalent authorization-ending event must invalidate the epoch and mark matching in-flight operation tokens canceled as soon as that event is processed locally.
+
+The implementation should abort/cancel an in-flight freshness probe when the underlying async operation is safely cancellable. Cancellation is a responsiveness mechanism, not the security proof: if the provider/network call cannot be interrupted promptly, the mandatory post-freshness fence still observes the changed epoch/state/token and blocks the POST.
+
+The submission mutex must not be held while the freshness probe is awaited. Therefore a DISARM processed during the probe can invalidate the operation before the probe returns rather than being forced to wait behind the network call.
+
+#### Classification when authorization changes during the probe
+
+Fail-closed behavior is mandatory, but the resulting state follows the cause rather than treating every change as the same security event:
+
+- **explicit DISARM or ordinary hard expiry** is deterministic loss of authorization, not evidence of compromise. No POST is allowed; the operation follows the existing non-authorized/window-unavailable deferral path without consuming the failure budget, and the window remains/ends `DISABLED` according to the existing state rules;
+- **permit account/signer mismatch, security-relevant context mismatch, singleton violation, negative security evidence, or another trusted security-negative invalidation** requires `LOCKED`; no POST and no availability-style deferral is permitted;
+- **an invalidation-epoch change whose cause cannot be established unambiguously** is treated as `LOCKED` under the existing "when in doubt, LOCKED" rule.
+
+This classification preserves the existing ADR semantics that expiry and explicit DISARM return the process to `DISABLED`, while identity/context/security failures destroy authorization as `LOCKED`.
+
 ### 11. Maximum operational window: 24 hours
 
 A successfully opened operational window has a hard maximum lifetime of **24 hours**.
@@ -541,6 +592,8 @@ The execution worker must stop issuing RISEx provider POSTs immediately when any
 - gate 3 for the explicitly selected authorization mode fails, including a continuous-mode permit account/signer mismatch;
 - gate 4 fails;
 - the immediate pre-POST freshness probe does not produce the required positive result;
+- the mandatory post-freshness continuous submission fence in section 10B fails;
+- a process-local cancellation token for the in-flight continuous order has been invalidated;
 - a security-negative provider/runtime response is observed;
 - a security-relevant response is ambiguous or cannot be trusted.
 
@@ -674,7 +727,7 @@ For a fresh heartbeat, the endpoint may report `authorization_status: AUTHORIZED
 - `expires_at` is in the future;
 - no locally known singleton or control-plane blocker.
 
-This API status is observational only. It does not replace the worker's own process-local window check, the arm finalization fence, gate 1, gate 2, gate 4 or the mandatory pre-POST freshness probe.
+This API status is observational only. It does not replace the worker's own process-local window check, the arm finalization fence, gate 1, gate 2, gate 4, the post-freshness submission fence or the mandatory pre-POST freshness probe.
 
 If multiple live replicas exist, the endpoint must make the topology conflict explicit and must not collapse the response into one apparently authorized worker. `authorization_status` must be non-authorized/fail-closed for RISEx.
 
@@ -686,7 +739,7 @@ The continuous execution authorization state is interpreted as follows:
 | --- | --- | --- | --- |
 | `DISABLED` | No valid process-local operational window or active arm attempt exists | No | New targeted ARM request -> atomic consume -> `ARMING` |
 | `ARMING` | One consumed ARM is undergoing readiness/finalization; no window exists yet | No | PASS + finalization fence -> `ENABLED`; DISARM/failure/invalidation -> `DISABLED` or `LOCKED` |
-| `ENABLED` | Valid window, matching context, singleton invariant holds; per-operation controls may be evaluated | Only after the explicitly selected gate-3 mode, per-order permit binding, unchanged gates 1/2/4 and freshness checks pass | Continues until expiry, DISARM, restart, invalidation, PAUSED or LOCKED |
+| `ENABLED` | Valid window, matching context, singleton invariant holds; per-operation controls may be evaluated | Only after the explicitly selected gate-3 mode, per-order permit binding, unchanged gates 1/2/4, positive freshness and the post-freshness submission fence pass | Continues until expiry, DISARM, restart, invalidation, PAUSED or LOCKED |
 | `PAUSED` | Same window exists, but no trustworthy security verdict is obtainable because of pure reachability/availability failure | No | Automatic resume only after a trustworthy positive probe while the same window remains valid and singleton still holds |
 | `LOCKED` | Negative, ambiguous, untrusted security evidence or singleton violation invalidated the window/attempt | No | New targeted ARM request + atomic consume + new readiness PASS + finalization fence + new window |
 
@@ -702,7 +755,7 @@ ADR-0004 clarifies the runtime meaning of a readiness PASS derived from ADR-0002
 
 - the PASS/attestation is short-lived bootstrap evidence;
 - it is not a self-renewing lease for a continuous worker;
-- after one-shot consumption into an operational window, continuity is governed by the window's explicit operator intent, process/context binding, singleton requirement, hard 24-hour ceiling, the explicit continuous gate-3 mode and its per-order permit identity binding, plus unchanged gates 1, 2, 4 and the mandatory pre-POST freshness probe;
+- after one-shot consumption into an operational window, continuity is governed by the window's explicit operator intent, process/context binding, singleton requirement, hard 24-hour ceiling, the explicit continuous gate-3 mode and its per-order permit identity binding, plus unchanged gates 1, 2, 4, the mandatory pre-POST freshness probe and the mandatory post-freshness submission fence;
 - a readiness PASS cannot override a later operator DISARM or security invalidation that occurred during the ARM attempt.
 
 To the extent that any downstream implementation or documentation interprets the 300-second readiness TTL as the direct lifetime of continuous RISEx worker authorization, that operational interpretation is superseded by ADR-0004.
@@ -735,6 +788,7 @@ Review must be brought forward immediately if any of the following occurs before
 - the worker heartbeat cadence or 180-second stale threshold changes materially;
 - the readiness attestation TTL or issuance semantics change;
 - the gate-3 authorization-mode selection, mutual-exclusion rule or per-order account/signer binding changes materially;
+- the post-freshness submission-fence, local serialization or in-flight cancellation semantics change materially;
 - the pre-POST freshness probe is moved, weakened or removed;
 - gate 1, gate 2 or gate 4 changes materially;
 - the RISEx signer/account/network/deployment identity model changes;
@@ -756,6 +810,7 @@ Review must be brought forward immediately if any of the following occurs before
 - Restart and security-relevant context changes are hard authorization boundaries.
 - Human intent is re-established at least once every 24 hours without assuming an eight-hour staffed shift.
 - Gate 3 is explicit and non-fallback: the short-lived path remains attestation-bound, while the continuous path is window-bound and preserves per-order account/signer identity binding.
+- The post-freshness submission fence prevents a positive provider probe from being reused after the local continuous authorization changed while the probe was in flight.
 - Per-operation freshness, gates 1, 2 and 4, and the explicitly selected gate-3 mode remain authoritative at the point of use.
 - PAUSED and LOCKED have explicit fail-closed semantics.
 - Stale observability cannot be displayed as current authorization.
@@ -771,7 +826,8 @@ Review must be brought forward immediately if any of the following occurs before
 - A database/control-plane failure during the final arm fence cancels the arm attempt even after readiness PASS; this is intentional fail-closed behavior.
 - Incorrect classification of an error as reachability-only could delay LOCKED; the conservative rule therefore classifies malformed, ambiguous and authenticity-related failures as LOCKED.
 - Heartbeat telemetry is eventually observed state; after 180 seconds without a fresh heartbeat the administrative view necessarily becomes `UNKNOWN`.
-- During a long-running job the consume-loop fast control poll is unavailable; the maintenance task remains an independent periodic observer, and Step 4B must perform a point-of-use window check before any RISEx POST path.
+- During a long-running job the consume-loop fast control poll is unavailable; the maintenance task remains an independent periodic observer, and Step 4B must perform both the initial point-of-use window check and the post-freshness submission fence before any RISEx POST.
+- An invalidation arriving after the operation has crossed the serialized provider-submission linearization point cannot retroactively unsend a request already being submitted; the serialization rule exists to make that ordering explicit and reviewable.
 
 ## Alternatives considered
 
@@ -798,6 +854,12 @@ It collapses readiness evidence and continuous authorization into one durable fa
 Rejected.
 
 The shared adapter class may support both authorization lifecycles, but an instance must be constructed in one explicit, immutable gate-3 mode. Inferring the mode from the presence or absence of an attestation/window would allow a misconfigured adapter to silently change authorization semantics. Missing, ambiguous or conflicting gate-3 mode/material must fail closed; there is no fallback from one mode to the other.
+
+### Single pre-gate-4 window check with no post-freshness fence
+
+Rejected.
+
+The mandatory freshness probe is an awaited network operation. A window can expire or be invalidated while that await is in flight, so a check performed only before the probe is stale by the time the provider mutation is attempted. Continuous mode therefore requires the section 10B post-freshness fence plus a serialization boundary with local invalidation. The system must never implement `window check -> await freshness -> POST` as sufficient authorization.
 
 ### Level-triggered database flag such as `risex_armed=true` or `system_flags`
 
@@ -853,7 +915,7 @@ Step 4A implements:
 - heartbeat telemetry and stale-observability rules;
 - SUPERADMIN ARM/DISARM and read-only admin status endpoints.
 
-Step 4A does **not** route RISEx jobs through `_process_job_locked()` or otherwise make the new window an execution path. Hyperliquid execution behavior is unchanged. That point-of-use integration is Step 4B and must verify the process-local window immediately before entering the existing RISEx per-operation authorization path; it must not infer authorization from a previous control-channel poll or from heartbeat telemetry.
+Step 4A does **not** route RISEx jobs through `_process_job_locked()` or otherwise make the new window an execution path. Hyperliquid execution behavior is unchanged. That point-of-use integration is Step 4B and must verify the process-local window before entering the existing RISEx per-operation authorization path, must perform the mandatory section 10B post-freshness submission fence immediately before provider POST, and must not infer authorization from a previous control-channel poll or from heartbeat telemetry.
 
 The readiness PASS and Operational Execution Window remain non-persistent. PostgreSQL stores only operator requests/consumption acknowledgements and observational telemetry.
 
