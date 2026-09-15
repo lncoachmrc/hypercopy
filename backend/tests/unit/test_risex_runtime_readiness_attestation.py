@@ -364,7 +364,11 @@ async def test_08_valid_runtime_attestation_never_bypasses_pre_post_freshness_pr
     result = await _run_readiness(monkeypatch)
     attestation = result.attestation
     assert attestation is not None
-    adapter = RISExAdapter(network='testnet', readiness_attestation=attestation)
+    adapter = RISExAdapter(
+        network='testnet',
+        gate3_mode='short_lived_attestation',
+        readiness_attestation=attestation,
+    )
     assert adapter.readiness_attestation is attestation
 
     calls: list[httpx.Request] = []
