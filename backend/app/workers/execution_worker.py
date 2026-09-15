@@ -42,6 +42,11 @@ from app.services.master_leverage_cache import record_master_leverage_missing
 from app.services.networking import user_network_state
 from app.services.queue import ensure_group, prepare_job_destination_for_execution, repair_stream
 from app.services.reconcile import master_snapshot, reconcile_active_users, reconcile_user
+from app.services.risex_execution_window import RISExOperationalWindowController
+from app.services.risex_execution_worker_extension import (
+    _maintain_risex_window_once as maintain_risex_window_once,
+    _poll_risex_control_once as poll_risex_control_once,
+)
 
 configure_logging(); log=get_logger(__name__); stop=asyncio.Event()
 
@@ -165,6 +170,12 @@ class Worker:
         self.master_hl = HyperliquidAdapter(self.limiter, network=settings.master_network)
         self.followers: dict[Network, HyperliquidAdapter] = {}
         self.current_job = None
+        self.boot_id = uuid.uuid4()
+        self.risex_window = RISExOperationalWindowController(
+            worker_id=self.id,
+            boot_id=self.boot_id,
+        )
+        self._risex_arm_task = None
 
     def follower_hl(self, network: Network) -> HyperliquidAdapter:
         adapter = self.followers.get(network)
@@ -177,7 +188,20 @@ class Worker:
         async with SessionLocal() as db:
             hb=await db.get(WorkerHeartbeat,self.id)
             if not hb: hb=WorkerHeartbeat(worker_id=self.id,service='execution-worker'); db.add(hb)
-            hb.seen_at=datetime.now(UTC); hb.current_job_id=self.current_job; await db.commit()
+            hb.seen_at=datetime.now(UTC)
+            hb.current_job_id=self.current_job
+            hb.meta={
+                **(hb.meta or {}),
+                'boot_id': str(self.boot_id),
+                'risex': self.risex_window.telemetry(),
+            }
+            await db.commit()
+
+    async def _poll_risex_control_once(self) -> None:
+        await poll_risex_control_once(self)
+
+    async def _maintain_risex_window_once(self) -> None:
+        await maintain_risex_window_once(self)
 
     async def _run_admin_reconcile(self, db, job: CopyJob) -> str:
         user=await db.get(User,job.user_id)
@@ -584,6 +608,7 @@ class Worker:
         await ensure_group(self.redis)
         while not stop.is_set():
             try:
+                await self._poll_risex_control_once()
                 messages=await self.redis.xreadgroup(settings.STREAM_GROUP,self.id,{settings.STREAM_NAME:'>'},count=1,block=2000)
                 if not messages:
                     await self.heartbeat(); continue
@@ -616,6 +641,8 @@ class Worker:
                     await repair_stream(self.redis,db)
                     await monitor_credential_expiry(db, self.redis)
 
+                await self._poll_risex_control_once()
+                await self._maintain_risex_window_once()
                 await self._run_reconcile_with_deadline()
 
                 async with SessionLocal() as db:
@@ -796,11 +823,16 @@ class Worker:
 
     async def run(self):
         async with SessionLocal() as db: await assert_schema(db)
+        await self.heartbeat()
         log.info('Execution worker networks', extra={'master_network': settings.master_network, 'follower_network_mode': 'per-user'})
         consume=asyncio.create_task(self.consume()); maintenance=asyncio.create_task(self.maintenance())
         await stop.wait()
         maintenance.cancel()
         await asyncio.gather(maintenance, return_exceptions=True)
+        arm_task=self._risex_arm_task
+        if arm_task is not None and not arm_task.done():
+            arm_task.cancel()
+            await asyncio.gather(arm_task, return_exceptions=True)
         try:
             await asyncio.wait_for(consume, timeout=55)
         except asyncio.TimeoutError:

@@ -357,7 +357,6 @@ async def sync_position_config(user_id: uuid.UUID, asset: str, body: AdminAction
     target = await db.get(User, user_id)
     if not target:
         raise HTTPException(404, 'User not found')
-    _require_follower_target(target)
     network_state = await user_network_state(db, target.id)
     network = network_state.network
     expected_confirmation = _position_config_sync_confirmation(network)
@@ -745,3 +744,8 @@ async def resume_system(body: AdminAction, actor: User = Depends(superadmin), db
 async def audit_log(actor: User = Depends(admin), db: AsyncSession = Depends(get_db), limit: int = 100, offset: int = 0):
     rows = (await db.execute(select(AuditLog).order_by(AuditLog.ts.desc()).offset(offset).limit(min(limit, 200)))).scalars().all()
     return [{'id': str(x.id), 'action': x.action, 'actor_id': str(x.actor_id) if x.actor_id else None, 'subject_id': str(x.subject_id) if x.subject_id else None, 'reason': x.reason, 'ts': x.ts, 'before': x.before, 'after': x.after} for x in rows]
+
+
+from app.services.risex_admin_extension import install_risex_admin as _install_risex_admin
+
+_install_risex_admin(router, admin=admin, superadmin=superadmin, require_csrf=require_csrf)
