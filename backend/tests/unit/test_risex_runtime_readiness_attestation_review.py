@@ -85,7 +85,11 @@ async def test_attested_adapter_still_rejects_place_ioc_before_transport_io(
 ) -> None:
     result = await _ready_result(monkeypatch)
     assert result.attestation is not None
-    adapter = RISExAdapter(network='testnet', readiness_attestation=result.attestation)
+    adapter = RISExAdapter(
+        network='testnet',
+        gate3_mode='short_lived_attestation',
+        readiness_attestation=result.attestation,
+    )
 
     with pytest.raises(ProviderWriteDisabled):
         await adapter.place_ioc(asset='BTC', is_buy=True, size='1', price='1')

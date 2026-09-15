@@ -25,6 +25,7 @@ _HF006_REPAIR_PENDING = 'hf006_repair_pending'
 _HF006_REPAIR_ACCOUNTED_ORDER = 'hf006_repair_accounted_order'
 _DESTINATION_STALE_REASON = 'Stale or unbound execution destination epoch; fresh reconciliation/action required'
 _PROVIDER_WRITES_DISABLED_REASON = 'Execution provider is not enabled for writes'
+_SUPPORTED_EXECUTION_PROVIDERS = frozenset({'hyperliquid', 'risex'})
 
 
 async def ensure_group(redis: Redis) -> None:
@@ -46,7 +47,7 @@ async def prepare_job_destination_for_execution(db: AsyncSession, job: CopyJob) 
         job.enqueued_at = None
         await db.flush()
         return False
-    if job.execution_provider != 'hyperliquid':
+    if job.execution_provider not in _SUPPORTED_EXECUTION_PROVIDERS:
         job.state = JobState.SKIPPED
         job.last_error = _PROVIDER_WRITES_DISABLED_REASON
         job.owner = None
