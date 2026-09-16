@@ -100,6 +100,7 @@ async def arm_risex_signed_testnet_execution(
         adapter = RISExAdapter(
             network='testnet',
             transport=transport,
+            gate3_mode='short_lived_attestation',
             readiness_attestation=result.attestation,
             readiness_clock=readiness_clock,
         )
