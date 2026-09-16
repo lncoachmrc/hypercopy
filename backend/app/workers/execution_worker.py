@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 from sqlalchemy import select, text
 
 from app.adapters.address_ratelimit import is_exchange_rate_limit_error
 from app.adapters.hyperliquid import HyperliquidAdapter, position_configs
 from app.adapters.ratelimit import Budget, Priority, WeightedRateLimiter
+from app.adapters.risex import RISExAdapter
+from app.adapters.risex_types import ProviderWriteDisabled
 from app.core.config import Network, settings
 from app.core.crypto import EncryptedCredential, crypto
 from app.core.logging import configure_logging, get_logger
@@ -29,6 +33,7 @@ from app.models.entities import (
     User,
     WorkerHeartbeat,
 )
+from app.security.risex_testnet_signer import load_testnet_signer_credential
 from app.services.admin_leverage_sync import (
     LeverageSyncAuthorizationError,
     fresh_position_config_sync_authorization,
@@ -42,10 +47,13 @@ from app.services.master_leverage_cache import record_master_leverage_missing
 from app.services.networking import user_network_state
 from app.services.queue import ensure_group, prepare_job_destination_for_execution, repair_stream
 from app.services.reconcile import master_snapshot, reconcile_active_users, reconcile_user
-from app.services.risex_execution_window import RISExOperationalWindowController
+from app.services.risex_copy_execution import process_risex_job
+from app.services.risex_execution_window import RISExExecutionState, RISExOperationalWindowController
 from app.services.risex_execution_worker_extension import (
+    _current_context_fingerprint as current_risex_context_fingerprint,
     _maintain_risex_window_once as maintain_risex_window_once,
     _poll_risex_control_once as poll_risex_control_once,
+    _singleton_matches_worker as risex_singleton_matches_worker,
 )
 
 configure_logging(); log=get_logger(__name__); stop=asyncio.Event()
@@ -84,6 +92,19 @@ def _credential_blob(cred: SigningCredential) -> EncryptedCredential:
         cred.key_reference,
         cred.key_version,
     )
+
+
+async def _defer_risex_window_unavailable(db, job: CopyJob, *, window_state: str) -> str:
+    """Return a claimed RISEx job to RETRYING without spending failure budget."""
+    job.state = JobState.RETRYING
+    job.attempt_count = max(0, int(job.attempt_count) - 1)
+    job.last_error = f'RISEx operational window unavailable: {window_state}'
+    job.owner = None
+    job.locked_until = None
+    job.enqueued_at = None
+    job.next_attempt_at = datetime.now(UTC) + timedelta(seconds=2)
+    await db.commit()
+    return JobState.RETRYING.value
 
 
 async def _retry_admin_job(db, job_id: uuid.UUID, reason: str) -> str:
@@ -175,6 +196,7 @@ class Worker:
             worker_id=self.id,
             boot_id=self.boot_id,
         )
+        self.risex_submission_lock = asyncio.Lock()
         self._risex_arm_task = None
 
     def follower_hl(self, network: Network) -> HyperliquidAdapter:
@@ -202,6 +224,78 @@ class Worker:
 
     async def _maintain_risex_window_once(self) -> None:
         await maintain_risex_window_once(self)
+
+    async def _run_risex_copy_job(self, db, job: CopyJob) -> str:
+        self.risex_window.expire_if_needed()
+        if self.risex_window.state != RISExExecutionState.ENABLED:
+            return await _defer_risex_window_unavailable(
+                db,
+                job,
+                window_state=self.risex_window.state.value,
+            )
+
+        readiness_assertions = {
+            'disposable_account_asserted': True,
+            'dedicated_signer_asserted': True,
+            'operatorhub_bypass_disabled': True,
+            'fund_movement_path_absent': True,
+        }
+        credential = load_testnet_signer_credential(os.environ)
+        context_fingerprint = current_risex_context_fingerprint(self, readiness_assertions)
+        if context_fingerprint != self.risex_window.context_fingerprint:
+            async with self.risex_submission_lock:
+                self.risex_window.lock('RISEx security-relevant runtime context changed before CopyJob')
+            job.state=JobState.DEAD
+            job.last_error='RISEx continuous authorization context mismatch'
+            job.owner=None
+            job.locked_until=None
+            job.next_attempt_at=None
+            await db.commit()
+            return JobState.DEAD.value
+
+        try:
+            singleton_ok = await risex_singleton_matches_worker(self, db)
+        except Exception:
+            singleton_ok = False
+        if not singleton_ok:
+            async with self.risex_submission_lock:
+                self.risex_window.lock('RISEx singleton invariant cannot be established at point of use')
+            job.state=JobState.DEAD
+            job.last_error='RISEx singleton execution-worker invariant is not established'
+            job.owner=None
+            job.locked_until=None
+            job.next_attempt_at=None
+            await db.commit()
+            return JobState.DEAD.value
+
+        async def _final_authorizer() -> None:
+            fresh_context = current_risex_context_fingerprint(self, readiness_assertions)
+            if fresh_context != context_fingerprint:
+                self.risex_window.lock('RISEx security-relevant runtime context changed during submission')
+                raise ProviderWriteDisabled('RISEx continuous authorization context changed')
+            if not await risex_singleton_matches_worker(self, db):
+                self.risex_window.lock('RISEx singleton invariant changed during submission')
+                raise ProviderWriteDisabled('RISEx singleton execution-worker invariant changed')
+
+        continuous_authorization=SimpleNamespace(
+            window=self.risex_window,
+            account_address=credential.account_address,
+            signer_address=credential.signer_address,
+            context_fingerprint=context_fingerprint,
+            submission_lock=self.risex_submission_lock,
+            final_authorizer=_final_authorizer,
+        )
+        adapter = RISExAdapter(
+            network='testnet',
+            gate3_mode='continuous_window',
+            continuous_authorization=continuous_authorization,
+        )
+        result=await process_risex_job(
+            db,
+            adapter,
+            job,
+        )
+        return result
 
     async def _run_admin_reconcile(self, db, job: CopyJob) -> str:
         user=await db.get(User,job.user_id)
@@ -568,28 +662,31 @@ class Worker:
                 elif job.origin=='ADMIN_LEVERAGE_SYNC':
                     result=await self._run_admin_leverage_sync(db,job)
                 else:
-                    network=(await user_network_state(db,job.user_id)).network
-                    result=await process_job(db,self.follower_hl(network),job)
-                    if result in {JobState.RETRYING.value, JobState.DEAD.value}:
-                        await db.refresh(job)
-                        if (job.last_error or '').startswith('Master leverage unavailable'):
-                            try:
-                                raw_order=(job.context or {}).get('master_intent_order')
-                                intent_order=int(Decimal(str(raw_order)))
-                                if intent_order <= 0 or Decimal(str(raw_order)) != Decimal(intent_order):
-                                    raise ValueError('missing or invalid stable master intent order')
-                                await record_master_leverage_missing(
-                                    self.redis,
-                                    job.user_id,
-                                    job.asset,
-                                    intent_order=intent_order,
-                                )
-                            except Exception:
-                                log.warning(
-                                    'Master leverage missing-intent metric update failed; execution remains fail-closed',
-                                    extra={'job_id':str(job.id),'user_id':str(job.user_id),'asset':job.asset},
-                                    exc_info=True,
-                                )
+                    if job.execution_provider=='risex':
+                        result=await self._run_risex_copy_job(db,job)
+                    else:
+                        network=(await user_network_state(db,job.user_id)).network
+                        result=await process_job(db,self.follower_hl(network),job)
+                        if result in {JobState.RETRYING.value, JobState.DEAD.value}:
+                            await db.refresh(job)
+                            if (job.last_error or '').startswith('Master leverage unavailable'):
+                                try:
+                                    raw_order=(job.context or {}).get('master_intent_order')
+                                    intent_order=int(Decimal(str(raw_order)))
+                                    if intent_order <= 0 or Decimal(str(raw_order)) != Decimal(intent_order):
+                                        raise ValueError('missing or invalid stable master intent order')
+                                    await record_master_leverage_missing(
+                                        self.redis,
+                                        job.user_id,
+                                        job.asset,
+                                        intent_order=intent_order,
+                                    )
+                                except Exception:
+                                    log.warning(
+                                        'Master leverage missing-intent metric update failed; execution remains fail-closed',
+                                        extra={'job_id':str(job.id),'user_id':str(job.user_id),'asset':job.asset},
+                                        exc_info=True,
+                                    )
             finally:
                 self.current_job=None
                 try: await self.heartbeat()

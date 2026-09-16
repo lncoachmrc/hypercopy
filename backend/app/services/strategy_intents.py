@@ -142,9 +142,6 @@ def _newer_intent_reason(
                 f'Strategy intent superseded by newer causal order '
                 f'{candidate_order} (current {current_order})'
             )
-        # An unversioned intent created after the current one destroys our ability
-        # to prove that the current intent is still latest. Fail closed until a
-        # later, versioned reconciliation restores an authoritative ordering.
         if (
             candidate_order is None
             and current.created_at is not None
@@ -165,12 +162,7 @@ def _mark_superseded(job: CopyJob, reason: str) -> None:
 
 
 async def prepare_strategy_job_for_publish(db: AsyncSession, job: CopyJob) -> bool:
-    """Coalesce queued strategy work so only the newest user/asset intent publishes.
-
-    PROCESSING jobs are deliberately not mutated here because they may already be
-    near a signed action boundary. The independent pre-submit authorization fence
-    rejects those jobs if this publication made them stale.
-    """
+    """Coalesce queued strategy work so only the newest user/asset intent publishes."""
     if job.origin not in STRATEGY_ORIGINS:
         return True
 
@@ -232,13 +224,13 @@ async def current_strategy_intent_for_cloid(
     cloid: str,
     follower_network: Network,
     asset: str,
+    execution_provider: str = 'hyperliquid',
 ) -> StrategyIntentEvidence | None:
-    """Authorize the durable execution immediately before a signed order.
+    """Authorize the durable execution immediately before a provider order.
 
-    The Execution row is committed before Hyperliquid is called, so its CLOID is
-    a durable handle back to the CopyJob. Every order, including emergency
-    CLOSE_ALL, must still belong to the exact active execution destination epoch.
-    Strategy EVENT/RECONCILE jobs receive the additional latest-intent checks.
+    The Execution row is committed before a provider call, so its CLOID is a
+    durable handle back to the CopyJob. Every order must still belong to the exact
+    active execution destination epoch and to the writer selected by the caller.
     """
     async with SessionLocal() as db:
         execution = (await db.execute(
@@ -261,9 +253,9 @@ async def current_strategy_intent_for_cloid(
             raise StrategyIntentAuthorizationError(
                 'Stale or unbound execution destination epoch'
             )
-        if job.execution_provider != 'hyperliquid' or job.execution_network != follower_network:
+        if job.execution_provider != execution_provider or job.execution_network != follower_network:
             raise StrategyIntentAuthorizationError(
-                'Execution destination does not match the Hyperliquid writer'
+                'Execution destination does not match the selected provider writer'
             )
         if (
             execution.execution_epoch_id != job.execution_epoch_id

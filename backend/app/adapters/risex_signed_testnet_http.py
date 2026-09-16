@@ -98,10 +98,17 @@ class RISExSignedTestnetHTTPTransport:
         self._owns_client = client is None
         self._freshness_probe = freshness_probe
 
-    async def post_place_order(
+    async def prepare_place_order_post(
         self,
         request: RISExPreparedPlaceOrderRequest,
     ) -> dict[str, Any]:
+        """Run typed-request and live freshness checks without submitting anything.
+
+        ADR-0004 §10B requires the continuous caller to regain its process-local
+        authorization serialization boundary after this awaited freshness probe and
+        before the provider POST. The legacy short-lived path may call
+        ``post_place_order`` which preserves the historical one-call behavior.
+        """
         if not isinstance(request, RISExPreparedPlaceOrderRequest):
             raise SignedTestnetBlocked(
                 'RISEx signed transport requires a typed place-order request'
@@ -125,8 +132,22 @@ class RISExSignedTestnetHTTPTransport:
             evidence=current_evidence,
         )
         _reject_ambient_auth(self._client)
+        return payload
 
+    async def post_prepared_place_order(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Submit a payload that has just passed ``prepare_place_order_post``."""
+        _reject_ambient_auth(self._client)
         return await self._post_json('/v1/orders/place', json=payload)
+
+    async def post_place_order(
+        self,
+        request: RISExPreparedPlaceOrderRequest,
+    ) -> dict[str, Any]:
+        payload = await self.prepare_place_order_post(request)
+        return await self.post_prepared_place_order(payload)
 
     async def _post_json(
         self,
