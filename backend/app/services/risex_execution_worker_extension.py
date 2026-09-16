@@ -7,8 +7,9 @@ import os
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, TypeVar
 
 from sqlalchemy import select
 
@@ -46,10 +47,23 @@ _REQUIRED_ARM_ASSERTIONS = (
     'operatorhub_bypass_disabled',
     'fund_movement_path_absent',
 )
+_T = TypeVar('_T')
 
 
 def _worker_module(worker: Any) -> Any:
     return sys.modules[worker.__class__.__module__]
+
+
+async def _serialized_window_transition(
+    worker: Any,
+    transition: Callable[[], _T],
+) -> _T:
+    """Serialize authorization-ending local transitions with the §10B POST fence."""
+    lock = getattr(worker, 'risex_submission_lock', None)
+    if lock is None:
+        return transition()
+    async with lock:
+        return transition()
 
 
 def _current_context_fingerprint(
@@ -190,7 +204,10 @@ async def _run_risex_arm_attempt(
                 try:
                     await db.commit()
                 except Exception:
-                    worker.risex_window.lock('RISEx finalization transaction failed')
+                    await _serialized_window_transition(
+                        worker,
+                        lambda: worker.risex_window.lock('RISEx finalization transaction failed'),
+                    )
                     raise
         await worker.heartbeat()
     except asyncio.CancelledError:
@@ -264,9 +281,12 @@ async def _poll_risex_control_once(worker: Any) -> None:
 
     worker.risex_window.last_control_request_id = request.request_id
     if request.action == 'DISARM':
-        worker.risex_window.disarm(
-            control_generation=int(request.control_generation),
-            reason=f'operator DISARM: {request.reason}',
+        await _serialized_window_transition(
+            worker,
+            lambda: worker.risex_window.disarm(
+                control_generation=int(request.control_generation),
+                reason=f'operator DISARM: {request.reason}',
+            ),
         )
         task = getattr(worker, '_risex_arm_task', None)
         if task is not None and not task.done():
@@ -275,17 +295,24 @@ async def _poll_risex_control_once(worker: Any) -> None:
         return
 
     if request.action != 'ARM':
-        worker.risex_window.lock('unknown RISEx control action')
+        await _serialized_window_transition(
+            worker,
+            lambda: worker.risex_window.lock('unknown RISEx control action'),
+        )
         await worker.heartbeat()
         return
 
     readiness_assertions = _assertions_from_request(request)
     context_fingerprint = _current_context_fingerprint(worker, readiness_assertions)
-    if not worker.risex_window.begin_arm(
-        request_id=request.request_id,
-        control_generation=int(request.control_generation),
-        context_fingerprint=context_fingerprint,
-    ):
+    armed = await _serialized_window_transition(
+        worker,
+        lambda: worker.risex_window.begin_arm(
+            request_id=request.request_id,
+            control_generation=int(request.control_generation),
+            context_fingerprint=context_fingerprint,
+        ),
+    )
+    if not armed:
         return
     await worker.heartbeat()
 
@@ -313,7 +340,7 @@ async def _poll_risex_control_once(worker: Any) -> None:
 
 
 async def _maintain_risex_window_once(worker: Any) -> None:
-    changed = worker.risex_window.expire_if_needed()
+    changed = bool(await _serialized_window_transition(worker, worker.risex_window.expire_if_needed))
     if worker.risex_window.state in {
         RISExExecutionState.ARMING,
         RISExExecutionState.ENABLED,
@@ -326,7 +353,10 @@ async def _maintain_risex_window_once(worker: Any) -> None:
         except Exception:
             singleton_ok = False
         if not singleton_ok:
-            worker.risex_window.lock('RISEx singleton invariant cannot be established')
+            await _serialized_window_transition(
+                worker,
+                lambda: worker.risex_window.lock('RISEx singleton invariant cannot be established'),
+            )
             task = getattr(worker, '_risex_arm_task', None)
             if task is not None and not task.done():
                 task.cancel()
@@ -350,6 +380,7 @@ def install_risex_window(worker_cls: type[Any]) -> None:
             worker_id=self.id,
             boot_id=self.boot_id,
         )
+        self.risex_submission_lock = asyncio.Lock()
         self._risex_arm_task = None
 
     async def heartbeat(self: Any) -> None:
