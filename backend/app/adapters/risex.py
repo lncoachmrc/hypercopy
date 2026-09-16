@@ -318,13 +318,6 @@ class RISExAdapter:
                 job=job,
             )
 
-        if not isinstance(self.transport, RISExSignedTestnetHTTPTransport):
-            self._reject_place_ioc(
-                cause=4,
-                detail='attested signed testnet transport is required',
-                job=job,
-            )
-
         if self._gate3_mode == 'short_lived_attestation':
             try:
                 assert_runtime_readiness_attested(
@@ -335,12 +328,26 @@ class RISExAdapter:
                 )
             except SignedTestnetBlocked as exc:
                 self._reject_place_ioc(cause=3, detail=str(exc), job=job)
+
+            if not isinstance(self.transport, RISExSignedTestnetHTTPTransport):
+                self._reject_place_ioc(
+                    cause=4,
+                    detail='attested signed testnet transport is required',
+                    job=job,
+                )
             try:
                 result = await self.transport.post_place_order(request)
             except SignedTestnetBlocked as exc:
                 self._reject_place_ioc(cause=4, detail=str(exc), job=job)
         else:
             snapshot = self._continuous_snapshot(request=request, job=job)
+
+            if not isinstance(self.transport, RISExSignedTestnetHTTPTransport):
+                self._reject_place_ioc(
+                    cause=4,
+                    detail='attested signed testnet transport is required',
+                    job=job,
+                )
             try:
                 payload = await self.transport.prepare_place_order_post(request)
             except SignedTestnetBlocked as exc:
