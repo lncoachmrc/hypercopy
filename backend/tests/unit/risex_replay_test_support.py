@@ -14,6 +14,7 @@ from app.security.risex_place_order_request import RISExPreparedPlaceOrderReques
 AUTH_IMPL = '0x' + ('77' * 20)
 ROUTER_IMPL = '0x' + ('88' * 20)
 TEST_FINGERPRINT = 'ab' * 32
+TEST_OBSERVED_NONCE_BITMAP = 0x5A
 
 
 class _API:
@@ -29,6 +30,7 @@ class _API:
             'data': {
                 'nonce_anchor': str(self.request.permit.nonce_anchor),
                 'current_bitmap_index': self.request.permit.nonce_bitmap_index,
+                'bitmap': hex(TEST_OBSERVED_NONCE_BITMAP),
             }
         }
 
@@ -63,7 +65,7 @@ class _RPC:
             return (
                 '0x'
                 + f'{self.request.permit.nonce_anchor:064x}'
-                + f'{self.request.permit.nonce_bitmap_index:064x}'
+                + f'{TEST_OBSERVED_NONCE_BITMAP:064x}'
             )
         if selector == self.module.IS_NONCE_USED_SELECTOR.lower():
             return '0x' + ('00' * 32)
