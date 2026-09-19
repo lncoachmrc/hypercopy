@@ -31,13 +31,19 @@ A subsequent read-only preflight observed a different deployment identity and re
 
 The reviewed new canonical deployment fingerprint is:
 
-`443ba3af…`
+`443ba3af37d36e5ab044ab68d1af8b05b0372fd05987c41a3121cc628b18d2bd`
 
-The full reviewed fingerprint value is the value that must be applied by the separate implementation PR that updates `PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT`. This ADR intentionally records the fingerprint in shortened display form and does not modify the runtime constant.
+This exact reviewed fingerprint is the value that must be applied by the separate implementation PR that updates `PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT`. This ADR records the complete trust-anchor value and does not modify the runtime constant.
 
-The failure was caused by EIP-1967 implementation upgrades behind otherwise stable proxy identities.
+The failure was caused by EIP-1967 implementation upgrades behind otherwise stable proxy identities. The read-only deployment evidence was observed at block `54740392`.
 
 ## Read-only evidence collected on 2026-09-19
+
+### Observation block
+
+The deployment re-review evidence summarized below was observed at block:
+
+`54740392`
 
 ### Stable proxy identities
 
@@ -62,7 +68,8 @@ Runtime implementation size changed from:
 
 - previous: `15558` bytes;
 - new: `19949` bytes;
-- delta: `+4391` bytes, approximately `+28%`.
+- delta: `+4391` bytes, approximately `+28%`;
+- implementation runtime code keccak256: `0x7ce281c4192e00cc73238e560429ed4a084b1a098b0503f8bfa77c7b9cb7d698`.
 
 ### Router implementation change
 
@@ -78,7 +85,8 @@ Runtime implementation size changed from:
 
 - previous: `20742` bytes;
 - new: `25743` bytes;
-- delta: `+5001` bytes, approximately `+24%`.
+- delta: `+5001` bytes, approximately `+24%`;
+- implementation runtime code keccak256: `0x1acd9cf57565bf4239ae9061a62251ec396024b14172e3a2e21ae8bf0a017652`.
 
 ### Fingerprint change
 
@@ -88,7 +96,7 @@ The canonical deployment fingerprint changed from:
 
 to:
 
-`443ba3af…`
+`443ba3af37d36e5ab044ab68d1af8b05b0372fd05987c41a3121cc628b18d2bd`
 
 This is the expected behavior of the TRAXION deployment pin: implementation-address or implementation-runtime changes invalidate the previously reviewed deployment identity even when the proxies themselves remain stable.
 
@@ -227,7 +235,7 @@ The pin is therefore not documentation metadata. It is an active security bounda
 
 TRAXION accepts the reviewed RISEx testnet deployment identity represented by fingerprint:
 
-`443ba3af…`
+`443ba3af37d36e5ab044ab68d1af8b05b0372fd05987c41a3121cc628b18d2bd`
 
 for the **testnet verification perimeter only**.
 
@@ -235,7 +243,7 @@ The implementation PR that follows this ADR may update:
 
 `PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT`
 
-from the previous reviewed fingerprint to the full reviewed `443ba3af…` fingerprint.
+from the previous reviewed fingerprint to the full reviewed `443ba3af37d36e5ab044ab68d1af8b05b0372fd05987c41a3121cc628b18d2bd` fingerprint.
 
 This ADR itself does not change the constant.
 
@@ -316,7 +324,7 @@ The re-pin must never be self-healing or self-updating.
 
 This ADR remains **Proposed** in this documentation-only PR.
 
-It moves to **Accepted** only in the separate PR that actually updates `PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT` to the full reviewed `443ba3af…` fingerprint.
+It moves to **Accepted** only in the separate PR that actually updates `PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT` to the full reviewed `443ba3af37d36e5ab044ab68d1af8b05b0372fd05987c41a3121cc628b18d2bd` fingerprint.
 
 That implementation PR must preserve the same separation already used by ADR-0003 and ADR-0004:
 
