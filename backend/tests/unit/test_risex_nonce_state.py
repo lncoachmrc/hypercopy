@@ -31,11 +31,12 @@ class FakeAPI:
 async def test_nonce_state_uses_provider_anchor_and_bitmap_index() -> None:
     from app.security.risex_nonce_state import collect_order_nonce_selection
 
-    api = FakeAPI({'data': {'nonce_anchor': '42', 'current_bitmap_index': 17}})
+    api = FakeAPI({'data': {'nonce_anchor': '42', 'current_bitmap_index': 17, 'bitmap': '0x1ffff'}})
     evidence = await collect_order_nonce_selection(api, account=ACCOUNT)
 
     assert evidence.observed_nonce_anchor == 42
     assert evidence.observed_bitmap_index == 17
+    assert evidence.observed_bitmap == 0x1FFFF
     assert evidence.selected_nonce_anchor == 42
     assert evidence.selected_bitmap_index == 17
     assert evidence.rolled_anchor is False
@@ -46,11 +47,12 @@ async def test_nonce_state_uses_provider_anchor_and_bitmap_index() -> None:
 async def test_nonce_state_rolls_full_anchor_exactly_as_provider_documents() -> None:
     from app.security.risex_nonce_state import collect_order_nonce_selection
 
-    api = FakeAPI({'nonce_anchor': 42, 'current_bitmap_index': 208})
+    api = FakeAPI({'nonce_anchor': 42, 'current_bitmap_index': 208, 'bitmap': (1 << 208) - 1})
     evidence = await collect_order_nonce_selection(api, account=ACCOUNT)
 
     assert evidence.observed_nonce_anchor == 42
     assert evidence.observed_bitmap_index == 208
+    assert evidence.observed_bitmap == (1 << 208) - 1
     assert evidence.selected_nonce_anchor == 43
     assert evidence.selected_bitmap_index == 0
     assert evidence.rolled_anchor is True
@@ -60,14 +62,16 @@ async def test_nonce_state_rolls_full_anchor_exactly_as_provider_documents() -> 
 @pytest.mark.parametrize(
     ('payload', 'match'),
     [
-        ({'nonce_anchor': -1, 'current_bitmap_index': 0}, 'nonce_anchor'),
-        ({'nonce_anchor': 1 << 48, 'current_bitmap_index': 0}, 'nonce_anchor'),
-        ({'nonce_anchor': 42, 'current_bitmap_index': -1}, 'current_bitmap_index'),
-        ({'nonce_anchor': 42, 'current_bitmap_index': 209}, 'current_bitmap_index'),
-        ({'nonce_anchor': True, 'current_bitmap_index': 0}, 'nonce_anchor'),
-        ({'nonce_anchor': 42, 'current_bitmap_index': False}, 'current_bitmap_index'),
-        ({'nonce_anchor': 'not-a-number', 'current_bitmap_index': 0}, 'nonce_anchor'),
-        ({'nonce_anchor': 42}, 'current_bitmap_index'),
+        ({'nonce_anchor': -1, 'current_bitmap_index': 0, 'bitmap': 0}, 'nonce_anchor'),
+        ({'nonce_anchor': 1 << 48, 'current_bitmap_index': 0, 'bitmap': 0}, 'nonce_anchor'),
+        ({'nonce_anchor': 42, 'current_bitmap_index': -1, 'bitmap': 0}, 'current_bitmap_index'),
+        ({'nonce_anchor': 42, 'current_bitmap_index': 209, 'bitmap': 0}, 'current_bitmap_index'),
+        ({'nonce_anchor': True, 'current_bitmap_index': 0, 'bitmap': 0}, 'nonce_anchor'),
+        ({'nonce_anchor': 42, 'current_bitmap_index': False, 'bitmap': 0}, 'current_bitmap_index'),
+        ({'nonce_anchor': 'not-a-number', 'current_bitmap_index': 0, 'bitmap': 0}, 'nonce_anchor'),
+        ({'nonce_anchor': 42, 'bitmap': 0}, 'current_bitmap_index'),
+        ({'nonce_anchor': 42, 'current_bitmap_index': 0}, 'bitmap'),
+        ({'nonce_anchor': 42, 'current_bitmap_index': 0, 'bitmap': 'bad'}, 'bitmap'),
     ],
 )
 async def test_nonce_state_rejects_malformed_or_out_of_range_provider_data(
@@ -84,7 +88,7 @@ async def test_nonce_state_rejects_malformed_or_out_of_range_provider_data(
 async def test_nonce_state_rejects_uint48_rollover_overflow() -> None:
     from app.security.risex_nonce_state import collect_order_nonce_selection
 
-    api = FakeAPI({'nonce_anchor': (1 << 48) - 1, 'current_bitmap_index': 208})
+    api = FakeAPI({'nonce_anchor': (1 << 48) - 1, 'current_bitmap_index': 208, 'bitmap': (1 << 208) - 1})
     with pytest.raises(ProviderDataMalformed, match='overflow'):
         await collect_order_nonce_selection(api, account=ACCOUNT)
 
@@ -93,7 +97,7 @@ async def test_nonce_state_rejects_uint48_rollover_overflow() -> None:
 async def test_nonce_state_requires_explicit_public_read_only_transport() -> None:
     from app.security.risex_nonce_state import collect_order_nonce_selection
 
-    api = FakeAPI({'nonce_anchor': 42, 'current_bitmap_index': 0})
+    api = FakeAPI({'nonce_anchor': 42, 'current_bitmap_index': 0, 'bitmap': 0})
     api.public_read_only = False
 
     with pytest.raises(ProviderReadUnavailable, match='public read-only'):
