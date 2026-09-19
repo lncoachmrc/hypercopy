@@ -2,9 +2,9 @@
 
 **Project:** TRAXION
 
-**Scope:** RISEx Phase 4 deployment identity, signer authorization and controlled signed-order evidence
+**Scope:** RISEx Phase 4 deployment identity, signer authorization and signed-order evidence
 
-**Write authorization:** controlled RISEx testnet-only
+**Write authorization:** RISEx testnet-only
 
 **Deployment identity preflight:** `PASS`
 
@@ -12,7 +12,7 @@
 
 ## Purpose
 
-This record preserves the evidence used to identify the exact RISEx testnet deployment and the results of controlled signed tests. It is intentionally separate from application configuration and does not enable RISEx writes in the normal CopyJob path.
+This record preserves the evidence used to identify the exact RISEx testnet deployment and the results of signed tests. It is intentionally separate from application configuration and does not enable RISEx writes in the normal CopyJob path.
 
 Full public contract addresses are retained in the referenced GitHub Actions diagnostic logs and are emitted by the permanent read-only preflight. The historical sections below use shortened addresses plus cryptographic fingerprints so deployment identities are not treated as credentials or hand-maintained runtime configuration.
 
@@ -225,7 +225,7 @@ Security status:
 
 ## First signed order — 2026-09-19
 
-The first controlled signed RISEx testnet order completed successfully against the deployment pinned by ADR-0005.
+A signed RISEx testnet POST produced a fully filled order against the deployment pinned by ADR-0005. This is an execution result, not a security-gate `PASS`.
 
 Deployment evidence:
 
@@ -248,7 +248,7 @@ Submitted order:
 - terminal message: `Order fully filled`;
 - `GET /v1/tx/{hash}`: `success = true`, `error = null`.
 
-### Nonce consumption — behavioral replay-protection evidence
+### Nonce consumption — behavioral evidence of consumption
 
 Nonce state before submission:
 
@@ -264,7 +264,23 @@ Nonce state after submission:
 
 Bit `2`, used by the permit, changed from unset to consumed. This is the first **behavioral** evidence that a successfully submitted signed order consumes the selected nonce. It is distinct from the architectural replay-protection attestation produced by the collector.
 
-This evidence proves nonce consumption for this successful submission. It does not yet prove that a replayed payload is rejected, and it does not replace the pending post-revoke order-rejection test.
+This evidence proves nonce consumption for this successful submission. It does **not** prove that the provider rejects a replay. That proof requires a second POST using the same permit: if replay protection works, no order is placed; if it does not, a second order can be placed. That negative test was not attempted and requires separate explicit operator authorization. It also does not replace the pending post-revoke order-rejection test.
+
+### Active replay prerequisite was not satisfied before the POST
+
+At the time of the first positive POST, replay protection was supported only by the collector's **architectural** attestation. The behavioral prerequisite in ADR-0001, lines 25–30 — rejection of a replayed signed request before the first positive order — had not been satisfied. The successful POST therefore occurred without satisfying that active prerequisite.
+
+ADR-0002 supersedes ADR-0001 only with respect to the erroneous execution-environment premise; it explicitly carries the isolation requirement forward and does not supersede the independent replay prerequisite. ADR-0003 made `fund_movement_rejected` and `withdrawal_rejected` conditionally applicable, but did not change replay evidence: replay was expressly outside that ADR's scope, and its decision states that independent replay controls are not weakened.
+
+The exposed perimeter of this non-conforming execution was:
+
+- RISEx testnet;
+- a disposable account;
+- one `0,0001 BTC` order, approximately USD 8 notional;
+- a revocable signer;
+- capital confined by the bounded-capital requirement in ADR-0002.
+
+These facts define what was exposed. They do not minimize, waive or retroactively satisfy the unmet replay prerequisite.
 
 ### Three fail-closed blocks observed before the successful POST
 
@@ -281,9 +297,10 @@ All three blocks occurred in previously unexecuted code paths and demonstrate th
 | Gate evidence | Status |
 |---|---|
 | Pinned deployment identity | **PASS** — ADR-0005 fingerprint, preflight `6/6` |
-| Signed perpetual order | **PASS** — first controlled testnet IOC fully filled |
-| Replay-protection architecture | **PASS** — collector attestation |
-| Nonce consumption after signed submission | **PASS — behaviorally proven** |
+| Signed-order POST outcome | **SUCCEEDED** — testnet IOC fully filled; factual execution result, not a security-gate `PASS` |
+| Replay-protection architecture | **ATTESTED ONLY** — collector evidence, not behavioral replay rejection |
+| Nonce consumption after signed submission | **OBSERVED** — bitmap changed from `0x3` to `0x7`; proves consumption only |
+| ADR-0001 replay prerequisite before first positive POST | **NOT SATISFIED** — behavioral replay rejection was not proven before the POST |
 | Replayed payload rejection | **NOT YET PROVEN** |
 | `post_revoke_order_rejected` | **NOT YET PROVEN** |
 | RISEx CopyJob submission path | **NOT CONNECTED** |
