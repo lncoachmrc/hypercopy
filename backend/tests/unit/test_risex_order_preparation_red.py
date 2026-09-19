@@ -166,6 +166,7 @@ async def test_preparer_builds_typed_request_from_live_metadata_runtime_and_nonc
                 'data': {
                     'nonce_anchor': '7',
                     'current_bitmap_index': 3,
+                    'bitmap': '0x7',
                 }
             },
         }

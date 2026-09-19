@@ -70,6 +70,7 @@ def _request():
     nonce = RISExOrderNonceSelection(
         observed_nonce_anchor=42,
         observed_bitmap_index=17,
+        observed_bitmap=0x1FFFF,
         selected_nonce_anchor=42,
         selected_bitmap_index=17,
         rolled_anchor=False,
@@ -129,6 +130,7 @@ class FakeAPI:
             'data': {
                 'nonce_anchor': '42',
                 'current_bitmap_index': 17,
+                'bitmap': '0x1ffff',
             }
         }
 
@@ -173,7 +175,7 @@ class FakeRPC:
             value = self.typehash_override or self.module.VERIFY_WITNESS_TYPEHASH
             return value
         if selector == self.module.GET_NONCE_STATE_SELECTOR.lower():
-            return '0x' + f'{42:064x}{17:064x}'
+            return '0x' + f'{42:064x}{0x1FFFF:064x}'
         if selector == self.module.IS_NONCE_USED_SELECTOR.lower():
             return '0x' + f'{int(self.nonce_used):064x}'
 
