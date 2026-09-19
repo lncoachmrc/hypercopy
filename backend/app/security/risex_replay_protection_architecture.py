@@ -410,13 +410,13 @@ async def collect_replay_protection_architecture_attestation(
             block_tag,
         ],
     )
-    chain_anchor, chain_bitmap_index = _decode_two_uints(
+    chain_anchor, chain_bitmap = _decode_two_uints(
         chain_nonce_state_raw,
         field_name='getNonceState',
     )
     if (
         chain_anchor != nonce_selection.observed_nonce_anchor
-        or chain_bitmap_index != nonce_selection.observed_bitmap_index
+        or chain_bitmap != nonce_selection.observed_bitmap
     ):
         raise SignedTestnetBlocked(
             'RISEx replay architecture API and on-chain nonce state disagree'
