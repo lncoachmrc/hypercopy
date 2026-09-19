@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -101,3 +101,64 @@ def test_manual_cli_sanitizes_private_key_and_signature_material() -> None:
     assert 'signature' not in rendered
     assert payload['market_id'] == 17
     assert payload['client_order_id'] == 42
+
+
+@pytest.mark.asyncio
+async def test_build_pre_order_gate_rejects_without_disposable_account_assertion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+
+    credential = SimpleNamespace(
+        account_address='0x' + ('11' * 20),
+        signer_address='0x' + ('22' * 20),
+    )
+    deployment = SimpleNamespace(
+        block_number=123,
+        api_chain_id=11155931,
+        domain_verifying_contract='0x' + ('33' * 20),
+        system_router='0x' + ('44' * 20),
+    )
+    deployment_report = SimpleNamespace(
+        verdict='PASS',
+        deployment_identity_verified=True,
+    )
+    authorization = SimpleNamespace(
+        session_active=True,
+        account=credential.account_address,
+        session_expiration=1_900_000_100,
+        perps_only_scope=None,
+        perps_permission=True,
+        block_timestamp=1_900_000_000,
+    )
+
+    monkeypatch.setattr(module, 'load_testnet_signer_credential', lambda _env: credential)
+
+    async def collect_deployment(*_args: object, **_kwargs: object) -> object:
+        return deployment
+
+    async def collect_authorization(*_args: object, **_kwargs: object) -> object:
+        return authorization
+
+    monkeypatch.setattr(module, 'collect_runtime_deployment_evidence', collect_deployment)
+    monkeypatch.setattr(
+        module,
+        'evaluate_pinned_deployment_preflight',
+        lambda *_args, **_kwargs: deployment_report,
+    )
+    monkeypatch.setattr(
+        module,
+        'collect_authorization_session_evidence',
+        collect_authorization,
+    )
+
+    with pytest.raises(SignedTestnetBlocked, match='disposable'):
+        await module._build_pre_order_gate(
+            env={},
+            api=object(),
+            rpc=object(),
+            disposable_account_asserted=False,
+            dedicated_signer_asserted=True,
+            operatorhub_bypass_disabled=True,
+            fund_movement_path_absent=True,
+        )
