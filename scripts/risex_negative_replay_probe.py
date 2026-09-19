@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -88,10 +87,12 @@ _NONCE_REPLAY_CODES = frozenset({
 })
 
 
-@dataclass(slots=True)
 class _SubmissionBudget:
-    limit: int = MAX_SUBMISSIONS
-    consumed: int = 0
+    __slots__ = ('limit', 'consumed')
+
+    def __init__(self) -> None:
+        self.limit = MAX_SUBMISSIONS
+        self.consumed = 0
 
     def consume_before_post(self) -> int:
         if self.limit != MAX_SUBMISSIONS:
