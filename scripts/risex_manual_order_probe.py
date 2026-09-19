@@ -43,6 +43,10 @@ from app.security.risex_deployment_runtime import (  # noqa: E402
     collect_runtime_deployment_evidence,
 )
 from app.security.risex_pre_order_gate import authorize_pre_order_probe  # noqa: E402
+from app.security.risex_replay_protection_architecture import (  # noqa: E402
+    RISExReplayProtectionArchitectureAttestation,
+    collect_replay_protection_architecture_attestation,
+)
 from app.security.risex_signed_testnet_policy import (  # noqa: E402
     SignedTestnetBlocked,
     SignedTestnetPolicy,
@@ -160,6 +164,7 @@ async def _build_pre_order_gate(
     rpc: RISExReadOnlyRPCTransport,
     disposable_account_asserted: bool,
     dedicated_signer_asserted: bool,
+    replay_protection_architecture_attestation: RISExReplayProtectionArchitectureAttestation,
     operatorhub_bypass_disabled: bool,
     fund_movement_path_absent: bool,
 ) -> object:
@@ -220,7 +225,7 @@ async def _build_pre_order_gate(
         policy=policy,
         evidence=evidence,
         now=authorization.block_timestamp,
-        replay_protection_verified=True,
+        replay_protection_architecture_attestation=replay_protection_architecture_attestation,
     )
 
 
@@ -257,12 +262,18 @@ async def _execute_once(args: argparse.Namespace) -> dict[str, Any]:
                 slippage_bps=args.slippage_bps,
                 deadline_seconds=args.deadline_seconds,
             )
+            replay_architecture = await collect_replay_protection_architecture_attestation(
+                api=api,
+                rpc=rpc,
+                request=request,
+            )
             gate = await _build_pre_order_gate(
                 env=os.environ,
                 api=api,
                 rpc=rpc,
                 disposable_account_asserted=args.disposable_account_asserted,
                 dedicated_signer_asserted=args.dedicated_signer_asserted,
+                replay_protection_architecture_attestation=replay_architecture,
                 operatorhub_bypass_disabled=args.operatorhub_bypass_disabled,
                 fund_movement_path_absent=args.fund_movement_path_absent,
             )
