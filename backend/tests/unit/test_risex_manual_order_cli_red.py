@@ -159,6 +159,7 @@ async def test_build_pre_order_gate_rejects_without_disposable_account_assertion
             rpc=object(),
             disposable_account_asserted=False,
             dedicated_signer_asserted=True,
+            replay_protection_architecture_attestation=object(),  # type: ignore[arg-type]
             operatorhub_bypass_disabled=True,
             fund_movement_path_absent=True,
         )
