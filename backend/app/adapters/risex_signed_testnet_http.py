@@ -118,6 +118,10 @@ class RISExSignedTestnetHTTPTransport:
             order=request.order,
             permit=request.permit,
         )
+        assert_pre_order_probe_gate_attested(
+            self._gate,
+            request=validated,
+        )
         payload = validated.json_for_testnet_transport()
         _assert_permit_identity_bound(self._gate, payload)
 
