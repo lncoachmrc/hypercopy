@@ -55,6 +55,7 @@ def _nonce(*, rolled: bool = True) -> RISExOrderNonceSelection:
         return RISExOrderNonceSelection(
             observed_nonce_anchor=42,
             observed_bitmap_index=208,
+            observed_bitmap=(1 << 208) - 1,
             selected_nonce_anchor=43,
             selected_bitmap_index=0,
             rolled_anchor=True,
@@ -62,6 +63,7 @@ def _nonce(*, rolled: bool = True) -> RISExOrderNonceSelection:
     return RISExOrderNonceSelection(
         observed_nonce_anchor=42,
         observed_bitmap_index=17,
+        observed_bitmap=0x1FFFF,
         selected_nonce_anchor=42,
         selected_bitmap_index=17,
         rolled_anchor=False,
@@ -139,10 +141,10 @@ def test_place_order_permit_rejects_deadline_after_session_expiration() -> None:
 @pytest.mark.parametrize(
     'nonce_selection',
     [
-        RISExOrderNonceSelection(42, 17, 43, 17, False),
-        RISExOrderNonceSelection(42, 208, 42, 208, False),
-        RISExOrderNonceSelection(42, 208, 44, 0, True),
-        RISExOrderNonceSelection(42, 17, 43, 0, True),
+        RISExOrderNonceSelection(42, 17, 0x1FFFF, 43, 17, False),
+        RISExOrderNonceSelection(42, 208, (1 << 208) - 1, 42, 208, False),
+        RISExOrderNonceSelection(42, 208, (1 << 208) - 1, 44, 0, True),
+        RISExOrderNonceSelection(42, 17, 0x1FFFF, 43, 0, True),
     ],
 )
 def test_place_order_permit_rejects_tampered_nonce_selection(
