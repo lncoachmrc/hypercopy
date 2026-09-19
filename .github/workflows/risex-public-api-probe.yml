@@ -1,0 +1,46 @@
+name: RISEx public API probe
+on:
+  push:
+    branches:
+      - feat/risex-2e-preparer-manual-entrypoint
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe RISEx testnet public API
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from urllib.parse import urlencode
+          from urllib.request import urlopen, Request
+
+          BASE = 'https://api.testnet.rise.trade'
+
+          def get(path, params=None):
+              url = BASE + path
+              if params:
+                  url += '?' + urlencode(params)
+              req = Request(url, headers={'Accept':'application/json','User-Agent':'TRAXION-readonly-probe/1.0'})
+              with urlopen(req, timeout=20) as resp:
+                  body = resp.read().decode('utf-8')
+                  print('URL', url)
+                  print('STATUS', resp.status)
+                  print('CONTENT_TYPE', resp.headers.get('content-type'))
+                  payload = json.loads(body)
+                  print('PAYLOAD', json.dumps(payload, indent=2, sort_keys=True)[:12000])
+                  return payload
+
+          markets = get('/v1/markets')
+          candidates = markets.get('markets') or markets.get('data', {}).get('markets') or []
+          btc = next((m for m in candidates if str(m.get('base_asset_symbol','')).upper() == 'BTC' or 'BTC' in str(m.get('display_name','')).upper()), None)
+          if not btc:
+              raise SystemExit('BTC market not found in /v1/markets payload')
+          market_id = int(btc['market_id'])
+          print('BTC_MARKET', json.dumps(btc, indent=2, sort_keys=True))
+          get('/v1/orderbook', {'market_id': market_id, 'limit': 1})
+          PY
