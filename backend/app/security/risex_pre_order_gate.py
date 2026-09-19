@@ -3,6 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from app.security.risex_replay_protection_architecture import (
+    RISExReplayProtectionArchitectureAttestation,
+    assert_replay_protection_architecture_attested,
+)
+from app.security.risex_place_order_request import RISExPreparedPlaceOrderRequest
 from app.security.risex_signed_testnet_policy import (
     SignedTestnetBlocked,
     SignedTestnetPolicy,
@@ -49,6 +54,9 @@ class RISExPreOrderProbeGate:
     fund_movement_rejected_probe_status: Literal['N/A'] = 'N/A'
     withdrawal_rejected_probe_status: Literal['N/A'] = 'N/A'
     negative_probe_reason: str = NEGATIVE_PROBE_NA_REASON
+    _replay_protection_architecture_attestation: object = field(
+        repr=False, compare=False, default=None
+    )
     _attestation_seal: object = field(repr=False, compare=False, default=None)
 
 
@@ -57,6 +65,7 @@ def assert_pre_order_probe_gate_attested(
     *,
     now: int | None = None,
     evidence: RISExSignerCapabilityEvidence | None = None,
+    request: RISExPreparedPlaceOrderRequest | None = None,
 ) -> None:
     """Reject forged or stale gates before any provider mutation.
 
@@ -70,6 +79,16 @@ def assert_pre_order_probe_gate_attested(
         raise SignedTestnetBlocked('RISEx order probe requires an attested pre-order gate')
     if gate._attestation_seal is not _ATTESTATION_SEAL or gate.order_probe_allowed is not True:
         raise SignedTestnetBlocked('RISEx order probe requires an attested pre-order gate')
+
+    assert_replay_protection_architecture_attested(
+        gate._replay_protection_architecture_attestation,
+        request=request,
+        account_address=gate.account_address,
+        signer_address=gate.signer_address,
+        chain_id=gate.deployment_chain_id,
+        authorization_address=gate.deployment_auth_contract,
+        router_address=gate.deployment_router,
+    )
 
     if now is None and evidence is None:
         return
@@ -110,7 +129,7 @@ def authorize_pre_order_probe(
     policy: SignedTestnetPolicy,
     evidence: RISExSignerCapabilityEvidence,
     now: int,
-    replay_protection_verified: bool | None,
+    replay_protection_architecture_attestation: RISExReplayProtectionArchitectureAttestation,
 ) -> RISExPreOrderProbeGate:
     """Fail closed until every security proof required before the first order is explicit.
 
@@ -145,8 +164,14 @@ def authorize_pre_order_probe(
         raise SignedTestnetBlocked('RISEx ADR-0002 fund-movement path absence is not asserted')
     if evidence.operatorhub_bypass_disabled is not True:
         raise SignedTestnetBlocked('RISEx JWT/OperatorHub bypass must remain disabled')
-    if replay_protection_verified is not True:
-        raise SignedTestnetBlocked('RISEx replay protection has not been verified')
+    assert_replay_protection_architecture_attested(
+        replay_protection_architecture_attestation,
+        account_address=evidence.account,
+        signer_address=evidence.signer,
+        chain_id=evidence.chain_id,
+        authorization_address=evidence.auth_contract,
+        router_address=evidence.router,
+    )
 
     gate = RISExPreOrderProbeGate(
         account_address=evidence.account,
@@ -159,6 +184,9 @@ def authorize_pre_order_probe(
         fund_movement_rejected_probe_status='N/A',
         withdrawal_rejected_probe_status='N/A',
         negative_probe_reason=NEGATIVE_PROBE_NA_REASON,
+        _replay_protection_architecture_attestation=(
+            replay_protection_architecture_attestation
+        ),
         _attestation_seal=_ATTESTATION_SEAL,
     )
     assert_pre_order_probe_gate_attested(gate)
