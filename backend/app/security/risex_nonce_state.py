@@ -20,6 +20,7 @@ class RISExOrderNonceSelection:
 
     observed_nonce_anchor: int
     observed_bitmap_index: int
+    observed_bitmap: int
     selected_nonce_anchor: int
     selected_bitmap_index: int
     rolled_anchor: bool
@@ -32,6 +33,21 @@ def _unwrap(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ProviderDataMalformed('RISEx nonce-state data envelope is not an object')
     return data
+
+
+def _parse_bitmap(value: object, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise ProviderDataMalformed(f'{field} is not a valid integer')
+    try:
+        if isinstance(value, str):
+            result = int(value, 0)
+        else:
+            result = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ProviderDataMalformed(f'{field} is not a valid integer') from exc
+    if result < 0:
+        raise ProviderDataMalformed(f'{field} must be non-negative')
+    return result
 
 
 def _parse_int(value: object, *, field: str) -> int:
@@ -62,6 +78,7 @@ async def collect_order_nonce_selection(
         payload.get('current_bitmap_index'),
         field='current_bitmap_index',
     )
+    bitmap = _parse_bitmap(payload.get('bitmap'), field='bitmap')
 
     if nonce_anchor < 0 or nonce_anchor >= _UINT48_LIMIT:
         raise ProviderDataMalformed('nonce_anchor is outside uint48 range')
@@ -74,6 +91,7 @@ async def collect_order_nonce_selection(
         return RISExOrderNonceSelection(
             observed_nonce_anchor=nonce_anchor,
             observed_bitmap_index=bitmap_index,
+            observed_bitmap=bitmap,
             selected_nonce_anchor=nonce_anchor + 1,
             selected_bitmap_index=0,
             rolled_anchor=True,
@@ -82,6 +100,7 @@ async def collect_order_nonce_selection(
     return RISExOrderNonceSelection(
         observed_nonce_anchor=nonce_anchor,
         observed_bitmap_index=bitmap_index,
+        observed_bitmap=bitmap,
         selected_nonce_anchor=nonce_anchor,
         selected_bitmap_index=bitmap_index,
         rolled_anchor=False,
