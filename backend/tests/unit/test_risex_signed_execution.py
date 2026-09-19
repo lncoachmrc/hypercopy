@@ -20,6 +20,7 @@ from app.security.risex_place_order_request import (
     prepare_place_order_request,
 )
 from app.security.risex_pre_order_gate import RISExPreOrderProbeGate, authorize_pre_order_probe
+from tests.unit.risex_replay_test_support import make_test_replay_architecture_attestation
 from app.security.risex_signed_testnet_policy import SignedTestnetBlocked, SignedTestnetPolicy
 from app.security.risex_signed_testnet_runner import RISExSignedTestnetReadinessResult
 from app.security.risex_signer_probe import RISExSignerCapabilityEvidence
@@ -178,11 +179,18 @@ def _gate(
             router=router_address,
         ),
         now=int(FIXED_NOW),
-        replay_protection_verified=True,
+        replay_protection_architecture_attestation=(
+            make_test_replay_architecture_attestation(
+                request=_request(account=account, signer=signer),
+                chain_id=CHAIN_ID,
+                authorization_address=authorization_address,
+                router_address=router_address,
+            )
+        ),
     )
 
 
-def _request() -> RISExPreparedPlaceOrderRequest:
+def _request(*, account: str = ACCOUNT, signer: str = SIGNER) -> RISExPreparedPlaceOrderRequest:
     order = RISExPlaceOrder(
         market_id=1,
         size_steps=100,
@@ -197,8 +205,8 @@ def _request() -> RISExPreparedPlaceOrderRequest:
         ttl_units=0,
     )
     permit = RISExPreparedPlaceOrderPermit(
-        account_address=ACCOUNT,
-        signer_address=SIGNER,
+        account_address=account,
+        signer_address=signer,
         action_hash=build_place_order_action_hash(order),
         nonce_anchor=43,
         nonce_bitmap_index=0,
