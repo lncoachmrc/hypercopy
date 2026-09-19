@@ -84,6 +84,7 @@ def _request():
     selection = RISExOrderNonceSelection(
         observed_nonce_anchor=1,
         observed_bitmap_index=2,
+        observed_bitmap=3,
         selected_nonce_anchor=1,
         selected_bitmap_index=2,
         rolled_anchor=False,
