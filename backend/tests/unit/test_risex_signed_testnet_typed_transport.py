@@ -73,7 +73,7 @@ def _gate(*, evidence: RISExSignerCapabilityEvidence | None = None):
                     account=current.account,
                     signer=current.signer,
                 ),
-                chain_id=current.chain_id or CHAIN_ID,
+                chain_id=current.chain_id or 11155931,
                 authorization_address=current.auth_contract or AUTH,
                 router_address=current.router or ROUTER,
             )
