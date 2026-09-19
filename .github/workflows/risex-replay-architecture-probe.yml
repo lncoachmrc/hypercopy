@@ -12,7 +12,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install -q eth-utils eth-abi requests
+      - run: pip install -q 'eth-hash[pycryptodome]' eth-utils eth-abi requests
       - name: Read-only runtime selector and typehash probe
         run: |
           python - <<'PY'
