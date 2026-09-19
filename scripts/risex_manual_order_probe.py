@@ -279,8 +279,11 @@ async def _execute_once(args: argparse.Namespace) -> dict[str, Any]:
             )
             freshness_probe = make_freshness_probe(
                 api=api,
+                rpc=rpc,
                 account_address=request.permit.account_address,
                 signer_address=request.permit.signer_address,
+                operatorhub_bypass_disabled=args.operatorhub_bypass_disabled,
+                fund_movement_path_absent=args.fund_movement_path_absent,
             )
 
             async with await arm_risex_signed_testnet_execution(

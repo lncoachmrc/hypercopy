@@ -25,7 +25,7 @@ from app.security.risex_place_order_request import (
     prepare_place_order_request,
 )
 from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
-from app.security.risex_signer_probe import collect_public_signer_evidence
+from app.security.risex_signer_probe import RISExSignerCapabilityEvidence
 from app.security.risex_testnet_signer import load_testnet_signer_credential
 
 
@@ -398,17 +398,64 @@ async def prepare_risex_ioc_request(
 def make_freshness_probe(
     *,
     api: RISExPublicReadTransport,
+    rpc: PublicRPCTransport,
     account_address: str,
     signer_address: str,
+    operatorhub_bypass_disabled: bool,
+    fund_movement_path_absent: bool,
 ) -> Callable[[], Any]:
-    """Create a no-cache live freshness probe for the signed testnet transport."""
+    """Create a no-cache freshness probe from live deployment + on-chain session state.
+
+    Every invocation recollects the runtime deployment identity, including a fresh
+    block number, then reads the Authorization session at that exact block. No
+    block tag or session lifecycle evidence is captured when the callback is built.
+    """
 
     async def probe() -> Any:
-        return await collect_public_signer_evidence(
+        deployment = await collect_runtime_deployment_evidence(
             api,
+            rpc,
+            network='testnet',
+        )
+        required_runtime = (
+            deployment.block_number,
+            deployment.api_chain_id,
+            deployment.domain_verifying_contract,
+            deployment.system_router,
+        )
+        if any(value is None for value in required_runtime):
+            raise SignedTestnetBlocked(
+                'RISEx freshness deployment evidence is incomplete'
+            )
+
+        block_number = int(deployment.block_number)  # type: ignore[arg-type]
+        authorization_address = str(deployment.domain_verifying_contract)
+        authorization = await collect_authorization_session_evidence(
+            rpc,
+            authorization_address=authorization_address,
+            account=account_address,
+            signer=signer_address,
+            block_tag=hex(block_number),
+        )
+
+        return RISExSignerCapabilityEvidence(
             network='testnet',
             account=account_address,
             signer=signer_address,
+            chain_id=int(deployment.api_chain_id),  # type: ignore[arg-type]
+            auth_contract=authorization_address,
+            router=str(deployment.system_router),
+            session_active=authorization.session_active,
+            session_account=authorization.account,
+            session_expiration=authorization.session_expiration,
+            onchain_perps_only_scope=authorization.perps_only_scope,
+            perps_order_succeeded=None,
+            fund_movement_rejected=None,
+            withdrawal_rejected=None,
+            post_revoke_order_rejected=None,
+            operatorhub_bypass_disabled=operatorhub_bypass_disabled,
+            perps_permission=authorization.perps_permission,
+            fund_movement_path_absent=fund_movement_path_absent,
         )
 
     return probe
