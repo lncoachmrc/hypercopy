@@ -327,30 +327,62 @@ async def test_freshness_probe_recollects_live_evidence_on_every_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _module()
-    calls: list[tuple[str, str]] = []
-    first = object()
-    second = object()
-    results = iter((first, second))
+    runtime_blocks = iter((0x1234, 0x1235))
+    runtime_calls: list[int] = []
+    authorization_calls: list[str] = []
 
-    async def collect(
-        _api: object,
+    async def collect_deployment(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        block = next(runtime_blocks)
+        runtime_calls.append(block)
+        return SimpleNamespace(
+            block_number=block,
+            api_chain_id=11155931,
+            domain_verifying_contract=AUTH,
+            system_router=ROUTER,
+        )
+
+    async def collect_authorization(
+        _rpc: object,
         *,
-        network: str,
+        authorization_address: str,
         account: str,
         signer: str,
-    ) -> object:
-        assert network == 'testnet'
-        calls.append((account, signer))
-        return next(results)
+        block_tag: str,
+    ) -> SimpleNamespace:
+        assert authorization_address == AUTH
+        assert account == ACCOUNT
+        assert signer == SIGNER
+        authorization_calls.append(block_tag)
+        return SimpleNamespace(
+            session_active=True,
+            account=ACCOUNT,
+            session_expiration=1_900_003_600,
+            perps_only_scope=None,
+            perps_permission=True,
+        )
 
-    monkeypatch.setattr(module, 'collect_public_signer_evidence', collect)
+    monkeypatch.setattr(module, 'collect_runtime_deployment_evidence', collect_deployment)
+    monkeypatch.setattr(
+        module,
+        'collect_authorization_session_evidence',
+        collect_authorization,
+    )
 
     probe = module.make_freshness_probe(
         api=object(),
+        rpc=object(),
         account_address=ACCOUNT,
         signer_address=SIGNER,
+        operatorhub_bypass_disabled=True,
+        fund_movement_path_absent=True,
     )
 
-    assert await probe() is first
-    assert await probe() is second
-    assert calls == [(ACCOUNT, SIGNER), (ACCOUNT, SIGNER)]
+    first = await probe()
+    second = await probe()
+
+    assert runtime_calls == [0x1234, 0x1235]
+    assert authorization_calls == ['0x1234', '0x1235']
+    assert first.session_active is True
+    assert first.session_account == ACCOUNT
+    assert second.session_active is True
+    assert second.session_account == ACCOUNT
