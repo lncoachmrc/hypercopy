@@ -158,6 +158,8 @@ async def _build_pre_order_gate(
     env: os._Environ[str],
     api: RISExReadOnlyHTTPTransport,
     rpc: RISExReadOnlyRPCTransport,
+    disposable_account_asserted: bool,
+    dedicated_signer_asserted: bool,
     operatorhub_bypass_disabled: bool,
     fund_movement_path_absent: bool,
 ) -> object:
@@ -191,8 +193,8 @@ async def _build_pre_order_gate(
         explicit_approval=True,
         deployment_verdict=deployment_report.verdict,
         deployment_identity_verified=deployment_report.deployment_identity_verified,
-        disposable_account_asserted=True,
-        dedicated_signer_asserted=True,
+        disposable_account_asserted=disposable_account_asserted,
+        dedicated_signer_asserted=dedicated_signer_asserted,
         operatorhub_bypass_disabled=operatorhub_bypass_disabled,
     )
     evidence = RISExSignerCapabilityEvidence(
@@ -259,6 +261,8 @@ async def _execute_once(args: argparse.Namespace) -> dict[str, Any]:
                 env=os.environ,
                 api=api,
                 rpc=rpc,
+                disposable_account_asserted=args.disposable_account_asserted,
+                dedicated_signer_asserted=args.dedicated_signer_asserted,
                 operatorhub_bypass_disabled=args.operatorhub_bypass_disabled,
                 fund_movement_path_absent=args.fund_movement_path_absent,
             )
