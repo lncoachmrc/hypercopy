@@ -18,6 +18,7 @@ from app.security.risex_order_codec import RISExPlaceOrder, build_place_order_ac
 from app.security.risex_place_order_permit import RISExPreparedPlaceOrderPermit
 from app.security.risex_place_order_request import prepare_place_order_request
 from app.security.risex_pre_order_gate import authorize_pre_order_probe
+from tests.unit.risex_replay_test_support import make_test_replay_architecture_attestation
 from app.security.risex_signed_testnet_policy import SignedTestnetBlocked, SignedTestnetPolicy
 from app.security.risex_signer_probe import RISExSignerCapabilityEvidence
 
@@ -155,7 +156,14 @@ def _pre_order_gate(*, now: int) -> object:
         policy=policy,
         evidence=evidence,
         now=now,
-        replay_protection_verified=True,
+        replay_protection_architecture_attestation=(
+            make_test_replay_architecture_attestation(
+                request=_prepared_request(),
+                chain_id=11155931,
+                authorization_address=AUTH,
+                router_address=ROUTER,
+            )
+        ),
     )
 
 

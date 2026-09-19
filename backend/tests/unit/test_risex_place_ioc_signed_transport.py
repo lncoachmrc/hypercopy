@@ -19,6 +19,7 @@ from app.security.risex_place_order_request import (
     prepare_place_order_request,
 )
 from app.security.risex_pre_order_gate import authorize_pre_order_probe
+from tests.unit.risex_replay_test_support import make_test_replay_architecture_attestation
 from app.security.risex_signed_testnet_policy import SignedTestnetPolicy
 from app.security.risex_signed_testnet_runner import RISExSignedTestnetReadinessReport
 from app.security.risex_signer_probe import RISExSignerCapabilityEvidence
@@ -151,7 +152,14 @@ def _gate() -> object:
         policy=policy,
         evidence=_evidence(),
         now=int(time()),
-        replay_protection_verified=True,
+        replay_protection_architecture_attestation=(
+            make_test_replay_architecture_attestation(
+                request=_request(),
+                chain_id=CHAIN_ID,
+                authorization_address=AUTH,
+                router_address=ROUTER,
+            )
+        ),
     )
 
 

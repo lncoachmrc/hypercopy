@@ -7,7 +7,11 @@ from typing import Any
 
 import pytest
 
+from app.security.risex_order_codec import RISExPlaceOrder, build_place_order_action_hash
+from app.security.risex_place_order_permit import RISExPreparedPlaceOrderPermit
+from app.security.risex_place_order_request import prepare_place_order_request
 from app.security.risex_signed_testnet_policy import SignedTestnetBlocked, SignedTestnetPolicy
+from tests.unit.risex_replay_test_support import make_test_replay_architecture_attestation
 from app.security.risex_signer_probe import RISExSignerCapabilityEvidence
 
 
@@ -18,6 +22,43 @@ ROUTER = '0x' + ('44' * 20)
 ADR_REFERENCE = 'ADR-0002'
 ADR_0003_REFERENCE = 'ADR-0003'
 AUTHORIZATION_CRITERION = 'perps_permission_and_fund_movement_path_absent'
+
+
+
+def _request(*, account: str = ACCOUNT, signer: str = SIGNER):
+    now = int(time())
+    order = RISExPlaceOrder(
+        market_id=1,
+        size_steps=100,
+        price_ticks=50_000,
+        side=0,
+        post_only=False,
+        reduce_only=False,
+        stp_mode=0,
+        order_type=1,
+        time_in_force=3,
+        client_order_id=7,
+        ttl_units=0,
+    )
+    permit = RISExPreparedPlaceOrderPermit(
+        account_address=account,
+        signer_address=signer,
+        action_hash=build_place_order_action_hash(order),
+        nonce_anchor=43,
+        nonce_bitmap_index=0,
+        deadline=now + 300,
+        _signature=bytes([9]) * 65,
+    )
+    return prepare_place_order_request(order=order, permit=permit)
+
+
+def _replay_attestation(*, account: str = ACCOUNT, signer: str = SIGNER):
+    return make_test_replay_architecture_attestation(
+        request=_request(account=account, signer=signer),
+        chain_id=11155931,
+        authorization_address=AUTH,
+        router_address=ROUTER,
+    )
 
 
 def _policy(**overrides: object) -> SignedTestnetPolicy:
@@ -96,7 +137,7 @@ def _gate(**evidence_overrides: object):
         policy=_policy(),
         evidence=_evidence(**evidence_overrides),
         now=int(time()),
-        replay_protection_verified=True,
+        replay_protection_architecture_attestation=_replay_attestation(),
     )
 
 
@@ -107,7 +148,7 @@ def _authorize_adr0002(**evidence_overrides: object):
         policy=_policy(),
         evidence=_adr0002_evidence(**evidence_overrides),  # type: ignore[arg-type]
         now=int(time()),
-        replay_protection_verified=True,
+        replay_protection_architecture_attestation=_replay_attestation(),
     )
 
 
@@ -164,7 +205,7 @@ def test_pre_order_gate_rejects_when_fund_path_assertion_is_omitted() -> None:
             policy=_policy(),
             evidence=_evidence_without_explicit_fund_path_assertion(),
             now=int(time()),
-            replay_protection_verified=True,
+            replay_protection_architecture_attestation=_replay_attestation(),
         )
 
 
@@ -204,21 +245,20 @@ def test_pre_order_gate_fails_closed_without_required_provider_evidence(
             policy=_policy(),
             evidence=_evidence(**{field: value}),
             now=int(time()),
-            replay_protection_verified=True,
+            replay_protection_architecture_attestation=_replay_attestation(),
         )
 
 
-def test_pre_order_gate_requires_replay_protection_proof() -> None:
+def test_pre_order_gate_requires_sealed_replay_architecture_evidence() -> None:
     from app.security.risex_pre_order_gate import authorize_pre_order_probe
 
-    for value in (None, False):
-        with pytest.raises(SignedTestnetBlocked, match='replay'):
-            authorize_pre_order_probe(
-                policy=_policy(),
-                evidence=_evidence(),
-                now=int(time()),
-                replay_protection_verified=value,  # type: ignore[arg-type]
-            )
+    with pytest.raises(SignedTestnetBlocked, match='replay|architectural|sealed'):
+        authorize_pre_order_probe(
+            policy=_policy(),
+            evidence=_evidence(),
+            now=int(time()),
+            replay_protection_architecture_attestation=object(),  # type: ignore[arg-type]
+        )
 
 
 def test_pre_order_gate_binds_session_to_expected_account() -> None:
@@ -229,7 +269,7 @@ def test_pre_order_gate_binds_session_to_expected_account() -> None:
             policy=_policy(),
             evidence=_evidence(session_account='0x' + ('55' * 20)),
             now=int(time()),
-            replay_protection_verified=True,
+            replay_protection_architecture_attestation=_replay_attestation(),
         )
 
 
