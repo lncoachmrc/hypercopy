@@ -1,6 +1,6 @@
 # ADR-0005 — RISEx testnet deployment re-pin
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-09-19
 - **Scope:** TRAXION / RISEx testnet deployment identity re-review and controlled re-pin
 - **Decision owner:** TRAXION project owner

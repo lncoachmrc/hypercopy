@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -187,7 +188,17 @@ async def test_rpc_transport_allows_only_explicit_deployment_read_methods() -> N
     ]
 
 
-def test_reviewed_testnet_pin_matches_retained_runtime_evidence() -> None:
-    assert PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT == (
-        '764412dd3ebb2ecb2b2878e3318bce39e9593cbd32108ebefa90e20161722e2f'
+def test_reviewed_testnet_pin_matches_recorded_adr_decision() -> None:
+    """Prevent silent re-pins by binding the runtime constant to a recorded ADR."""
+
+    expected = '443ba3af37d36e5ab044ab68d1af8b05b0372fd05987c41a3121cc628b18d2bd'
+    adr_path = (
+        Path(__file__).resolve().parents[3]
+        / 'docs'
+        / 'adr'
+        / 'ADR-0005-risex-testnet-deployment-repin.md'
     )
+    adr = adr_path.read_text(encoding='utf-8')
+
+    assert PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT == expected
+    assert expected in adr
