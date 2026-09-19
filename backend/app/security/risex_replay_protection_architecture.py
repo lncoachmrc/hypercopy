@@ -5,6 +5,7 @@ from typing import Literal
 
 from eth_account import Account
 from eth_account.messages import encode_typed_data
+from eth_utils import keccak
 
 from app.adapters.risex_types import ProviderDataMalformed, ProviderReadUnavailable
 from app.security.risex_authorization_session import collect_authorization_session_evidence
@@ -107,6 +108,7 @@ def _attested_values(
     network: str,
     deployment_fingerprint: str,
     block_tag: str,
+    chain_id: int,
     account_address: str,
     signer_address: str,
     authorization_address: str,
@@ -124,6 +126,7 @@ def _attested_values(
         network,
         deployment_fingerprint,
         block_tag,
+        chain_id,
         account_address.lower(),
         signer_address.lower(),
         authorization_address.lower(),
@@ -158,6 +161,7 @@ class RISExReplayProtectionArchitectureAttestation:
     network: Literal['testnet']
     deployment_fingerprint: str
     block_tag: str
+    chain_id: int
     account_address: str
     signer_address: str
     authorization_address: str
@@ -206,6 +210,7 @@ def assert_replay_protection_architecture_attested(
         network=attestation.network,
         deployment_fingerprint=attestation.deployment_fingerprint,
         block_tag=attestation.block_tag,
+        chain_id=attestation.chain_id,
         account_address=attestation.account_address,
         signer_address=attestation.signer_address,
         authorization_address=attestation.authorization_address,
@@ -246,8 +251,12 @@ def assert_replay_protection_architecture_attested(
                 f'RISEx replay architecture {label} identity does not match'
             )
 
-    if type(chain_id) is not int or chain_id <= 0:
-        raise SignedTestnetBlocked('RISEx replay architecture chain identity is invalid')
+    if (
+        type(chain_id) is not int
+        or chain_id <= 0
+        or attestation.chain_id != chain_id
+    ):
+        raise SignedTestnetBlocked('RISEx replay architecture chain identity does not match')
 
     if request is None:
         return
@@ -457,6 +466,14 @@ async def collect_replay_protection_architecture_attestation(
             'RISEx replay architecture action hash does not match the signed permit'
         )
 
+    expected_type_fields = [
+        {'name': 'account', 'type': 'address'},
+        {'name': 'target', 'type': 'address'},
+        {'name': 'hash', 'type': 'bytes32'},
+        {'name': 'nonceAnchor', 'type': 'uint48'},
+        {'name': 'nonceBitmap', 'type': 'uint8'},
+        {'name': 'deadline', 'type': 'uint32'},
+    ]
     typed_data = build_verify_witness_typed_data(
         domain_name=deployment.domain_name,
         domain_version=deployment.domain_version,
@@ -469,6 +486,23 @@ async def collect_replay_protection_architecture_attestation(
         nonce_bitmap=permit.nonce_bitmap_index,
         deadline=permit.deadline,
     )
+    witness_fields = typed_data.get('types', {}).get('VerifyWitness')
+    if witness_fields != expected_type_fields:
+        raise SignedTestnetBlocked(
+            'RISEx replay architecture VerifyWitness signing schema changed'
+        )
+    schema_type_string = 'VerifyWitness(' + ','.join(
+        f"{field['type']} {field['name']}" for field in witness_fields
+    ) + ')'
+    schema_typehash = '0x' + keccak(text=schema_type_string).hex()
+    if (
+        schema_type_string != VERIFY_WITNESS_TYPE_STRING
+        or schema_typehash.lower() != runtime_typehash.lower()
+    ):
+        raise SignedTestnetBlocked(
+            'RISEx replay architecture VerifyWitness signing typehash does not match runtime'
+        )
+
     recovered = Account.recover_message(
         encode_typed_data(full_message=typed_data),
         signature=permit._signature,
@@ -482,6 +516,7 @@ async def collect_replay_protection_architecture_attestation(
         network='testnet',
         deployment_fingerprint=preflight.observed_fingerprint,
         block_tag=block_tag,
+        chain_id=deployment.api_chain_id,
         account_address=permit.account_address,
         signer_address=permit.signer_address,
         authorization_address=deployment.domain_verifying_contract,
@@ -503,6 +538,7 @@ async def collect_replay_protection_architecture_attestation(
         preflight.observed_fingerprint,
     )
     object.__setattr__(attestation, 'block_tag', block_tag)
+    object.__setattr__(attestation, 'chain_id', deployment.api_chain_id)
     object.__setattr__(attestation, 'account_address', permit.account_address)
     object.__setattr__(attestation, 'signer_address', permit.signer_address)
     object.__setattr__(
