@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -252,6 +252,8 @@ class Execution(BaseUuid, Base):
     execution_network: Mapped[str | None] = mapped_column(String(16))
     attempt_kind: Mapped[str] = mapped_column(String(1), default='o')
     cloid: Mapped[str] = mapped_column(String(34), unique=True, nullable=False)
+    client_order_id: Mapped[Decimal | None] = mapped_column(Numeric(20, 0), nullable=True)
+    reserved_exposure_usdc: Mapped[Decimal | None] = mapped_column(D, nullable=True)
     state: Mapped[ExecutionState] = mapped_column(Enum(ExecutionState, name='execution_state_enum', native_enum=False, length=32), default=ExecutionState.SUBMITTING, index=True)
     asset: Mapped[str] = mapped_column(String(24), nullable=False)
     is_buy: Mapped[bool] = mapped_column(Boolean, nullable=False)
@@ -268,6 +270,14 @@ class Execution(BaseUuid, Base):
     __table_args__ = (
         UniqueConstraint('copy_job_id', 'attempt_kind', name='uq_execution_job_kind'),
         Index('ix_executions_execution_destination', 'execution_provider', 'execution_network'),
+        Index(
+            'ux_executions_provider_network_client_order_id',
+            'execution_provider',
+            'execution_network',
+            'client_order_id',
+            unique=True,
+            postgresql_where=text('client_order_id IS NOT NULL'),
+        ),
     )
 
 

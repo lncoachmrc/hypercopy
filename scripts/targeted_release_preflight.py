@@ -47,6 +47,7 @@ EXPECTED_MIGRATIONS = {
     '0011_execution_destination_epochs.py',
     '0012_bind_execution_epoch.py',
     '0013_risex_execution_control.py',
+    '0014_risex_client_order_id.py',
 }
 
 missing = [path for path in REQUIRED_FILES if not (root / path).exists()]

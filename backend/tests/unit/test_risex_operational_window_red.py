@@ -26,7 +26,7 @@ def _build_worker(monkeypatch: pytest.MonkeyPatch) -> worker_module.Worker:
 
 
 def test_0013_schema_revision_and_migration_are_additive_only() -> None:
-    assert schema_module.EXPECTED_REVISION == '0013_risex_execution_control'
+    assert schema_module.EXPECTED_REVISION == '0014_risex_client_order_id'
 
     backend_root = Path(__file__).resolve().parents[2]
     migration = backend_root / 'alembic' / 'versions' / '0013_risex_execution_control.py'
