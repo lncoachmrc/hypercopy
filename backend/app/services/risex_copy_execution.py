@@ -298,8 +298,9 @@ async def _defer_for_resolution(
     job.owner = None
     job.locked_until = None
     job.enqueued_at = None
-    if job.attempt_count > 0:
-        job.attempt_count -= 1
+    attempt_count = getattr(job, 'attempt_count', None)
+    if isinstance(attempt_count, int) and attempt_count > 0:
+        job.attempt_count = attempt_count - 1
     await db.commit()
     return JobState.RETRYING.value
 
