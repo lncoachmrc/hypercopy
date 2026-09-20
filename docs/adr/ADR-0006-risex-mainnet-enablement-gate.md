@@ -155,15 +155,15 @@ Option (c) is based on the amount of real capital TRAXION is prepared to have ec
 The initial accepted observed exposure budget is:
 
 ```text
-RISEX_USER_EXPOSURE_CEILING_USDC = 1,000
-RISEX_TOTAL_EXPOSURE_CEILING_USDC = 2,500
+RISEX_USER_EXPOSURE_CEILING_USDC = 25,000
+RISEX_TOTAL_EXPOSURE_CEILING_USDC = 75,000
 ```
 
-The per-user ceiling limits concentration: compromise or misuse associated with one account should not intentionally place more than 1,000 USDC of observed capital-at-risk inside the transitional perimeter.
+The per-user ceiling limits concentration: compromise or misuse associated with one account should not intentionally place more than 25,000 USDC of observed capital-at-risk inside the transitional perimeter.
 
-The aggregate ceiling is the project-level loss budget for option (c): TRAXION does not intentionally authorize continued exposure-increasing operation while more than 2,500 USDC of observed user capital is inside this unresolved `MoveFund` trust boundary.
+The aggregate ceiling is the project-level loss budget for option (c): TRAXION accepts at most 75,000 USDC of observed aggregate capital-at-risk while relying on collateral confinement rather than cryptographic least privilege. The aggregate value is derived from the initial invited-rollout ceiling of three active RISEx users at up to 25,000 USDC observed exposure each.
 
-These values are deliberately aligned with the initial restricted rollout rather than commercial scale.
+These values are a deliberate worst-case loss-budget decision, not an estimate of what users are expected to deposit.
 
 They are policy ceilings over **observed** exposure. Because users can independently deposit capital and TRAXION is non-custodial, they are not cryptographically guaranteed maximum-loss bounds. The detection gap and provider-read outage limitation are recorded explicitly below.
 
@@ -180,9 +180,9 @@ The `execution-worker` operational layer, or a dedicated component sharing the s
 Required cadence:
 
 ```text
-RISEX_EXPOSURE_MONITOR_INTERVAL_SECONDS = 30
-RISEX_EXPOSURE_READ_TIMEOUT_SECONDS = 10
-RISEX_EXPOSURE_SAMPLE_MAX_AGE_SECONDS = 60
+RISEX_EXPOSURE_MONITOR_INTERVAL_SECONDS = 240
+RISEX_EXPOSURE_READ_TIMEOUT_SECONDS = 60
+RISEX_EXPOSURE_SAMPLE_MAX_AGE_SECONDS = 300
 ```
 
 Exposure must also be checked synchronously immediately before every candidate operation capable of increasing exposure.
@@ -198,7 +198,7 @@ Cached account exposure older than `RISEX_EXPOSURE_SAMPLE_MAX_AGE_SECONDS` canno
 
 If a user's verified:
 
-`exposure_at_risk > 1,000 USDC`
+`exposure_at_risk > 25,000 USDC`
 
 TRAXION must:
 
@@ -214,7 +214,7 @@ TRAXION must not automatically withdraw or transfer user collateral.
 
 If verified aggregate exposure across all active RISEx accounts exceeds:
 
-`2,500 USDC`
+`75,000 USDC`
 
 option (c) is no longer within its accepted loss budget.
 
@@ -226,7 +226,7 @@ TRAXION must:
 - refuse automatic re-enable;
 - require aggregate verified exposure to return to or below the ceiling, or require option (a) or (b), before normal RISEx execution resumes.
 
-Above 2,500 USDC aggregate exposure, option (c) cannot be used as the basis for continued scale-out.
+Above 75,000 USDC aggregate exposure, option (c) cannot be used as the basis for continued scale-out.
 
 #### 1.3.5 Pre-POST exposure check
 
@@ -235,7 +235,7 @@ Before every exposure-increasing RISEx provider POST, TRAXION must establish fro
 ```text
 current_user_exposure_at_risk
 + conservative_max_incremental_exposure(candidate_order)
-<= 1,000 USDC
+<= 25,000 USDC
 ```
 
 and:
@@ -243,7 +243,7 @@ and:
 ```text
 current_aggregate_exposure_at_risk
 + conservative_max_incremental_exposure(candidate_order)
-<= 2,500 USDC
+<= 75,000 USDC
 ```
 
 The candidate-order calculation must use the conservative worst-case economic effect of the order.
@@ -273,27 +273,27 @@ Under healthy provider telemetry, an out-of-band collateral increase can occur i
 With:
 
 ```text
-monitor interval = 30 seconds
-provider read timeout = 10 seconds
+monitor interval = 240 seconds
+provider read timeout = 60 seconds
 ```
 
-the accepted maximum normal detection window is:
+the accepted maximum healthy-telemetry detection window is:
 
 ```text
-40 seconds
+300 seconds = 5 minutes
 ```
 
-from an out-of-band change occurring immediately after a successful observation to completion of the next scheduled observation, assuming the provider read succeeds within the configured timeout.
+from an out-of-band change occurring immediately after a successful observation to completion of the next scheduled observation, assuming the provider read completes within the configured timeout.
 
-For up to that 40-second window, actual exposure can exceed the declared ceiling without TRAXION knowing it.
+For up to that five-minute window, actual exposure can exceed the declared ceiling without TRAXION knowing it.
 
-That detection gap is explicitly accepted as part of temporary option (c).
+That five-minute detection gap is explicitly accepted as part of temporary option (c).
 
 If RISEx account-state reads fail, the actual amount of an out-of-band deposit cannot be bounded by TRAXION until provider visibility returns.
 
 After the last successful sample becomes older than:
 
-`60 seconds`
+`300 seconds`
 
 TRAXION must fail closed for every exposure-increasing RISEx write and raise an incident/alert.
 
@@ -309,7 +309,7 @@ Under option (c), TRAXION explicitly accepts the following residual-risk model:
 
 For multiple compromised accounts, the potential aggregate exposure is the sum of those account-level values.
 
-Under normal monitored operation TRAXION intends to keep observed exposure within 1,000 USDC per user and 2,500 USDC aggregate.
+Under normal monitored operation TRAXION intends to keep observed exposure within 25,000 USDC per user and 75,000 USDC aggregate.
 
 Those figures are the accepted transitional loss budget, not a cryptographic guarantee that loss cannot exceed them.
 
@@ -320,27 +320,6 @@ Collateral confinement limits accepted economic exposure operationally.
 It does not prove that the signer lacks fund-movement authority.
 
 It does not prevent misuse of that authority.
-
-#### 1.3.9 User disclosure and acknowledgement
-
-The RISEx-specific residual `MoveFund` risk must be disclosed to users before they enable RISEx mainnet execution.
-
-It must not be hidden in internal documentation only.
-
-PR C must require a clear acknowledgement before first RISEx mainnet activation. The disclosure must state, in substance:
-
-- the current RISEx signer model may expose broader authority than the Perps execution capability TRAXION requires;
-- TRAXION's temporary protection is an economic collateral-confinement policy, not cryptographic least privilege;
-- capital deposited in the RISEx account, plus the liquidatable value of open positions, may be exposed if the signer is compromised or the provider authorization behaves more broadly than expected;
-- TRAXION cannot prevent the user from independently depositing above the configured ceiling;
-- when excess exposure is detected, TRAXION blocks additional exposure but does not automatically withdraw user funds;
-- this specific unresolved RISEx `MoveFund` authorization risk is not part of the current Hyperliquid execution path.
-
-The UI must show the currently applicable per-user ceiling.
-
-The acknowledgement version and timestamp must be persisted so that a material change in this risk model can require a new acknowledgement.
-
-A user who does not acknowledge the disclosure cannot enable RISEx mainnet execution.
 
 #### 1.3.10 Implementation required for option (c)
 
@@ -356,10 +335,11 @@ The required implementation surface is bounded to:
    - fail-closed handling of missing/malformed provider state.
 
 2. **Periodic monitor**
-   - 30-second cadence for active RISEx mainnet accounts;
+   - 240-second cadence for active RISEx mainnet accounts;
+   - provider-read timeout capped at 60 seconds;
    - latest successful sample timestamp;
    - per-user and aggregate calculation;
-   - stale-sample detection at 60 seconds.
+   - stale-sample detection at 300 seconds.
 
 3. **Point-of-use enforcement**
    - synchronous fresh exposure check before every exposure-increasing provider POST;
@@ -391,7 +371,88 @@ No new standalone Railway service is inherently required: the current execution-
 
 This is a bounded medium-size implementation: one provider read/evaluation path, one periodic monitor, one point-of-use enforcement boundary, one incident/alert path and a focused regression suite. It is not expected to be the dominant schedule risk relative to unresolved provider-side RISEx information, but it remains a hard mainnet prerequisite.
 
-### 1.4 Transitional nature of option (c)
+### 1.4 Operational enforcement and DISARM timing
+
+The five-minute window defined above is the maximum accepted healthy-telemetry detection gap for out-of-band exposure changes. It is not automatically a guarantee about the current DISARM control path.
+
+Current implementation evidence shows:
+
+- the consumer task polls the RISEx control channel before taking the next queue item, so that poll does not run again while the same consumer is inside a long `handle_job_id()`;
+- a separate maintenance task also polls the RISEx control channel and therefore can process DISARM while the consumer is executing a job;
+- maintenance reconciliation is deadline-bounded, but the current control path has no dedicated independently scheduled fast-poll loop and no proven end-to-end upper bound from persisted DISARM request to effective window disarm.
+
+Therefore the current implementation must **not** claim that DISARM is guaranteed to take effect within five minutes, within five seconds, or specifically only after the active job completes.
+
+Before ADR-0006 can become `Accepted`, the RISEx mainnet kill-switch path must provide a measured and regression-tested maximum effect time of no more than **5 minutes** from successful persistence of a valid SUPERADMIN DISARM request to the point at which every subsequent RISEx signed provider POST is blocked.
+
+The preferred implementation is a dedicated control-poll task independent of:
+
+- queue-job duration;
+- reconciliation duration;
+- exposure-monitor execution;
+- normal maintenance work.
+
+DISARM must continue to serialize with the existing submission boundary so that a request already irreversibly transmitted is treated as potentially executed, while any later POST is blocked.
+
+Until this bound is implemented and demonstrated behaviorally, the kill-switch timing gate remains **BLOCKED**.
+
+### 1.5 User disclosure and explicit acknowledgement
+
+The option-(c) risk must be presented **inside the provider-selection / activation flow before the user's first RISEx mainnet activation**.
+
+A repository document, terms page that the user is not required to view, settings metadata, or a stored `risk_disclosure_version` value by itself does not constitute disclosure or acknowledgement.
+
+The minimum disclosure shown in the activation flow must state clearly that:
+
+- the RISEx signer currently observed by TRAXION is granted `MoveFund` authority in addition to the Perps capability TRAXION needs;
+- TRAXION cannot currently verify the complete source code of the relevant RISEx Authorization/Router implementations;
+- RISEx has previously changed security-relevant contract implementations without a provider upgrade notice identified by TRAXION;
+- under option (c), an out-of-band increase in exposure may remain undetected for up to **5 minutes** under healthy provider telemetry;
+- the capital economically exposed to signer compromise is the **collateral deposited on RISEx plus the liquidatable value of open positions**;
+- the observed per-user confinement ceiling is **25,000 USDC**, but this is an operational/detective ceiling and not a cryptographic guarantee because the user can independently deposit additional collateral;
+- if the ceiling is exceeded or exposure state becomes stale/unknown, TRAXION blocks additional exposure but does not automatically withdraw or move the user's funds;
+- this unresolved `MoveFund` authorization risk is specific to the RISEx execution path and is not a property of TRAXION's current Hyperliquid execution path.
+
+The user must make an explicit affirmative acknowledgement before RISEx mainnet can be activated. Passive display, continued use, pre-checked consent, or merely storing a disclosure version is insufficient.
+
+PR C must persist the acknowledgement in an additive durable record, proposed as:
+
+`provider_risk_acknowledgements`
+
+with at least:
+
+- `user_id`;
+- `execution_provider = 'risex'`;
+- `execution_network = 'mainnet'`;
+- `disclosure_version`;
+- a cryptographic hash of the exact disclosure text shown;
+- `acknowledged_at`;
+- the execution epoch or activation request to which the acknowledgement applied.
+
+A uniqueness rule must prevent one acknowledgement row from being silently rewritten into acceptance of a later disclosure version.
+
+A material change to any of the following requires a new disclosure version and a new affirmative acknowledgement before the next RISEx mainnet activation:
+
+- signer permission model;
+- source/provenance status;
+- exposure ceiling;
+- detection window;
+- definition of capital at risk;
+- provider upgrade model;
+- accepted §1 risk treatment.
+
+If the decision owner elects **not** to disclose this risk to users, that choice must be made as an explicit amendment to this ADR before mainnet enablement. The amendment must:
+
+- state that user-facing disclosure is intentionally omitted;
+- identify the decision owner;
+- record the rationale for accepting undisclosed user exposure;
+- remove the disclosure/acknowledgement gate from the acceptance table explicitly.
+
+Silence, missing UI work, schedule pressure or absence of an acknowledgement record must never be interpreted as a decision not to disclose.
+
+Under the current `Proposed` ADR, the decision is: **disclosure and explicit recorded acknowledgement are mandatory**.
+
+### 1.6 Transitional nature of option (c)
 
 Option (c) is temporary.
 
@@ -413,17 +474,19 @@ The review must occur earlier if RISEx provides:
 
 If option (a) or option (b) becomes available and passes independent verification, TRAXION must migrate away from collateral confinement as the primary `MoveFund` mitigation.
 
-### 1.5 Decision summary for this security dimension
+### 1.7 Decision summary for this security dimension
 
 | Condition | Mainnet treatment |
 | --- | --- |
 | (a) Verified Perps-only / `MoveFund=false` signer | Preferred; may satisfy this gate |
 | (b) Verified cryptographic isolation boundary | Acceptable long-term alternative |
-| (c) Observed exposure ≤ 1,000 USDC/user and ≤ 2,500 USDC aggregate, with monitor/enforcement active | Temporarily acceptable with explicit residual risk |
+| (c) Observed exposure ≤ 25,000 USDC/user and ≤ 75,000 USDC aggregate, with monitor/enforcement active | Temporarily acceptable with explicit residual risk |
 | Exposure cannot be measured reliably | BLOCKED |
-| Exposure sample older than 60 seconds | Exposure-increasing RISEx writes BLOCKED |
+| Exposure sample older than 300 seconds | Exposure-increasing RISEx writes BLOCKED |
 | User exceeds per-user ceiling | Exposure-increasing execution for that user BLOCKED |
-| Aggregate observed exposure exceeds 2,500 USDC | Option (c) invalid; RISEx exposure-increasing mainnet execution BLOCKED |
+| Aggregate observed exposure exceeds 75,000 USDC | Option (c) invalid; RISEx exposure-increasing mainnet execution BLOCKED |
+| User has not acknowledged the current RISEx mainnet risk disclosure | RISEx mainnet activation BLOCKED |
+| DISARM maximum effect time is not behaviorally proven ≤ 5 minutes | RISEx mainnet activation BLOCKED |
 | Capital expansion beyond option-(c) ceiling requested | Requires (a), (b), or explicit ADR revision based on new evidence |
 
 ## 2. Mainnet deployment identity must be established independently
@@ -627,8 +690,8 @@ Initial writes are restricted to:
 Only after Phase 1 passes:
 
 - maximum active RISEx users: `3`;
-- maximum observed §1 exposure-at-risk per user: `1,000 USDC`;
-- maximum aggregate observed §1 exposure-at-risk: `2,500 USDC`;
+- maximum observed §1 exposure-at-risk per user: `25,000 USDC`;
+- maximum aggregate observed §1 exposure-at-risk: `75,000 USDC`;
 - maximum leverage: `2x`;
 - duration: minimum `7 consecutive days`;
 - minimum completed/reconciled executions: `100`;
@@ -679,12 +742,15 @@ Automatic fail-closed hard stop is also required for security-critical events in
 
 The kill switch must be tested before mainnet acceptance.
 
-From successful operator hard-stop request to prevention of further RISEx provider writes:
+From successful persistence of a valid operator hard-stop request to prevention of further RISEx provider writes:
 
 - target: before the next attempted provider POST;
-- maximum accepted control-plane latency: `5 seconds`.
+- maximum accepted and behaviorally proven effect time: `5 minutes`;
+- the control path must be independent of queue-job duration and ordinary maintenance/reconciliation work.
 
-A POST already irreversibly transmitted before the stop was accepted is treated as potentially executed and must be reconciled. The kill switch must never assume that an in-flight request was cancelled.
+The current implementation has not yet proven this bound, so this gate remains BLOCKED until the dedicated control path or equivalent behavior is implemented and tested.
+
+A POST already irreversibly transmitted before the stop became effective is treated as potentially executed and must be reconciled. The kill switch must never assume that an in-flight request was cancelled.
 
 ## 10. Rollback and incident behavior
 
@@ -736,7 +802,7 @@ At minimum the review must be able to verify:
 | `MoveFund` treatment | (a), (b), or constrained transitional (c) active |
 | Option-(c) exposure monitor, if used | PASS |
 | Option-(c) pre-POST exposure enforcement, if used | PASS |
-| Option-(c) disclosure/acknowledgement, if used | PASS |
+| Option-(c) in-flow disclosure + explicit persisted acknowledgement, if used | PASS |
 | Provenance | resolved or explicitly accepted under §3 compensating controls |
 | Replay | behavioral PASS |
 | Post-revoke | behavioral PASS |
@@ -844,7 +910,7 @@ It is not a blanket assertion that RISEx or TRAXION is risk-free.
 
 - The preferred `MoveFund` solution may remain blocked until RISEx exposes a least-privilege mechanism or an enforceable isolation model.
 - Option (c) does not prevent out-of-band user deposits and therefore cannot guarantee its observed ceilings continuously.
-- During healthy telemetry an external exposure increase may remain undetected for up to 40 seconds under the defined cadence/timeout.
+- During healthy telemetry an external exposure increase may remain undetected for up to 5 minutes under the defined cadence/timeout.
 - During provider-read outage the duration of unknown external exposure cannot be bounded, although TRAXION exposure-increasing writes fail closed once evidence becomes stale.
 - The replay gate may remain blocked if RISEx rejects replay but does not provide evidence sufficient to attribute the rejection to permit replay protection.
 - Source provenance may remain a residual external dependency on RISEx.
