@@ -254,7 +254,76 @@ If either calculation cannot be completed:
 
 A post-trade monitor does not replace this point-of-use check.
 
-#### 1.3.6 TRAXION does not control out-of-band deposits
+#### 1.3.6 Atomic aggregate exposure reservation
+
+A fresh exposure read followed by an independent POST is not sufficient to enforce the aggregate loss budget. Two concurrent jobs can observe the same aggregate state, each pass the ceiling check independently, and together exceed the ceiling.
+
+For every exposure-increasing RISEx mainnet order, the aggregate exposure check and authorization must therefore use one shared serialization domain across all workers.
+
+The required mechanism is the existing PostgreSQL transaction-scoped advisory-lock pattern already used by ADR-0004 control fencing, applied to a stable global resource key for the RISEx mainnet exposure budget, conceptually:
+
+`risex:mainnet:exposure-budget`.
+
+The singleton execution-worker invariant in ADR-0004 is not considered a correctness guarantee for this control. The exposure-budget mechanism must remain correct if multiple worker processes are active concurrently.
+
+The authorization sequence is:
+
+1. begin a database transaction;
+2. acquire the transaction-scoped PostgreSQL advisory lock for the RISEx mainnet exposure budget;
+3. re-read sufficiently fresh authoritative exposure state for the candidate user and aggregate RISEx population;
+4. load every active, unreleased RISEx exposure reservation;
+5. calculate:
+   - current verified per-user exposure;
+   - current verified aggregate exposure;
+   - all pending/in-flight reserved increments;
+   - the conservative maximum incremental exposure of the candidate order;
+6. reject fail-closed if any required exposure state is stale, unavailable, malformed or otherwise indeterminate;
+7. reject if the candidate would exceed either the per-user or aggregate ceiling after including existing reservations;
+8. otherwise create a durable reservation bound uniquely to the candidate `Execution`;
+9. commit the reservation before any RISEx provider POST;
+10. only after the commit may the existing continuous-window / freshness / §10B submission path reach the provider POST.
+
+The durable reservation must contain at least:
+
+- `execution_id` with a uniqueness guarantee;
+- `user_id`;
+- `execution_provider = 'risex'`;
+- `execution_network = 'mainnet'`;
+- reserved exposure amount in USDC;
+- reservation state;
+- `created_at`;
+- `released_at` and release reason when eventually resolved.
+
+A second worker cannot authorize against the pre-reservation aggregate: it must acquire the same PostgreSQL advisory lock after the first transaction commits and must include the first worker's reservation in its calculation.
+
+The advisory lock does not need to remain held during the network POST. The committed reservation carries the serialized authorization across that external side effect.
+
+Reservation release is also fail-closed:
+
+- a definitive provider rejection that proves no exposure was created may release its reservation;
+- a definitive fill/partial-fill/cancel outcome may release or reduce the reservation only inside the same serialized exposure-budget transaction that refreshes/persists provider exposure so the resulting real exposure replaces the reservation without a counting gap;
+- a provider acknowledgement that does not establish final exposure does not release the reservation;
+- timeout, lost connection, malformed response, `SUBMITTING`, `UNKNOWN`, worker crash or any other ambiguous outcome does **not** release the reservation;
+- reservations have no automatic TTL-based release.
+
+After a crash between reservation commit and POST, or whenever transmission is uncertain, 4C must resolve the durable `client_order_id` against RISEx before the reservation can be released. Until then the reservation remains part of aggregate exposure and blocks additional risk if necessary.
+
+If PostgreSQL is unavailable, the advisory lock cannot be acquired, active reservations cannot be read, the exposure snapshot is not sufficiently fresh, or reservation state cannot be established unambiguously:
+
+`POST = BLOCKED`.
+
+The acceptance tests for option (c) must include at minimum:
+
+- two concurrent exposure-increasing jobs for different users that would individually pass but jointly exceed the aggregate ceiling: at most one may obtain a reservation;
+- the same race executed from separate worker processes sharing PostgreSQL;
+- reservation persisted before the provider POST;
+- ambiguous provider outcome retains the reservation;
+- process crash after reservation commit retains the reservation;
+- definitive no-effect rejection releases the reservation;
+- filled/partially-filled resolution cannot create a gap between reservation release and refreshed real exposure accounting;
+- lock acquisition/database/exposure-state failure produces zero provider POSTs.
+
+#### 1.3.7 TRAXION does not control out-of-band deposits
 
 TRAXION can enforce whether TRAXION itself submits another order.
 
@@ -266,7 +335,7 @@ If the user independently deposits above the configured limit, the system has no
 
 The ceiling must never be described as a guaranteed cap on the amount physically present in the RISEx account.
 
-#### 1.3.7 Quantified detection gap
+#### 1.3.8 Quantified detection gap
 
 Under healthy provider telemetry, an out-of-band collateral increase can occur immediately after a successful sample.
 
@@ -301,7 +370,7 @@ This stale-data hard stop prevents TRAXION from adding further exposure, but it 
 
 Accordingly, during a provider-read outage the duration of **unknown external exposure is not cryptographically bounded**. This limitation is an explicit residual risk of option (c) and is another reason option (c) is transitional rather than equivalent to (a) or (b).
 
-#### 1.3.8 Residual-risk statement
+#### 1.3.9 Residual-risk statement
 
 Under option (c), TRAXION explicitly accepts the following residual-risk model:
 
@@ -341,10 +410,13 @@ The required implementation surface is bounded to:
    - per-user and aggregate calculation;
    - stale-sample detection at 300 seconds.
 
-3. **Point-of-use enforcement**
+3. **Point-of-use enforcement and atomic reservation**
    - synchronous fresh exposure check before every exposure-increasing provider POST;
-   - conservative candidate-order increment;
+   - PostgreSQL transaction-scoped advisory-lock serialization shared by all workers;
+   - durable per-Execution exposure reservation committed before POST;
+   - conservative candidate-order increment plus all active reservations;
    - per-user and aggregate ceiling enforcement;
+   - ambiguous outcomes retain reservations until 4C resolves provider truth;
    - risk-reducing actions treated separately.
 
 4. **Breach handling**
@@ -363,6 +435,10 @@ The required implementation surface is bounded to:
    - malformed/missing balance or position data;
    - provider-read timeout;
    - pre-POST race protection;
+   - concurrent multi-worker aggregate reservation race;
+   - reservation-before-POST ordering;
+   - ambiguous outcome and crash retain reservation;
+   - definitive resolution releases/replaces reservation without an accounting gap;
    - reduction allowed while increase blocked;
    - restart/recovery behavior;
    - no automatic Hyperliquid fallback.
