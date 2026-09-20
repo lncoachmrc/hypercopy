@@ -226,6 +226,7 @@ def _install_execute_once_boundary(
     )
     monkeypatch.setattr(module, '_build_pre_order_gate', AsyncMock(return_value=object()))
     monkeypatch.setattr(module, 'make_freshness_probe', lambda **_kwargs: AsyncMock())
+    monkeypatch.setattr(module, 'RISExSignedTestnetHTTPTransport', FakeTransport)
     monkeypatch.setattr(
         module,
         'arm_risex_signed_testnet_execution',
