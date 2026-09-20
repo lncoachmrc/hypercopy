@@ -21,6 +21,10 @@ PRIVATE_KEY = '0x' + ('ab' * 32)
 SIGNATURE = 'sensitive-signature'
 CLIENT_ORDER_ID = 424242
 DEADLINE = 1_900_000_060
+AUTH = '0x' + ('33' * 20)
+ROUTER = '0x' + ('44' * 20)
+FINGERPRINT = 'f' * 64
+OTHER_ACCOUNT = '0x' + ('55' * 20)
 
 
 def _module() -> ModuleType:
@@ -128,6 +132,138 @@ class FakeTransport:
         return outcome
 
 
+class _AsyncContext:
+    def __init__(self, value):
+        self.value = value
+
+    async def __aenter__(self):
+        return self.value
+
+    async def __aexit__(self, _exc_type, _exc, _tb):
+        return None
+
+
+class _FakeSession:
+    def __init__(self, transport):
+        self.adapter = SimpleNamespace(transport=transport)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, _exc_type, _exc, _tb):
+        return None
+
+
+def _approved_args(module):
+    return module.build_parser().parse_args([
+        '--approve-two-identical-signed-order-submissions',
+        '--disposable-account-asserted',
+        '--dedicated-signer-asserted',
+        '--operatorhub-bypass-disabled',
+        '--fund-movement-path-absent',
+    ])
+
+
+def _runtime_attestation(*, chain_id=11155931):
+    return SimpleNamespace(
+        chain_id=chain_id,
+        authorization_address=AUTH,
+        router_address=ROUTER,
+        deployment_fingerprint=FINGERPRINT,
+    )
+
+
+def _deployment(*, router=ROUTER):
+    return SimpleNamespace(
+        block_number=54_750_000,
+        api_chain_id=11155931,
+        domain_verifying_contract=AUTH,
+        system_router=router,
+    )
+
+
+def _authorization(*, active=True, account=ACCOUNT):
+    return SimpleNamespace(
+        session_active=active,
+        account=account,
+        session_expiration=DEADLINE + 300,
+        block_timestamp=DEADLINE - 30,
+    )
+
+
+def _install_execute_once_boundary(
+    monkeypatch,
+    module,
+    transport,
+    *,
+    chain_id=11155931,
+    deployment=None,
+    deployment_fingerprint=FINGERPRINT,
+    authorization=None,
+):
+    monkeypatch.setenv('RISEX_SIGNED_WRITES_ENABLED', 'true')
+    api = object()
+    rpc = object()
+    monkeypatch.setattr(
+        module,
+        'RISExReadOnlyHTTPTransport',
+        lambda **_kwargs: _AsyncContext(api),
+    )
+    monkeypatch.setattr(
+        module,
+        'RISExReadOnlyRPCTransport',
+        lambda **_kwargs: _AsyncContext(rpc),
+    )
+    monkeypatch.setattr(
+        module,
+        'prepare_risex_ioc_request',
+        AsyncMock(return_value=_request()),
+    )
+    monkeypatch.setattr(
+        module,
+        'collect_replay_protection_architecture_attestation',
+        AsyncMock(return_value=_runtime_attestation(chain_id=chain_id)),
+    )
+    monkeypatch.setattr(module, '_build_pre_order_gate', AsyncMock(return_value=object()))
+    monkeypatch.setattr(module, 'make_freshness_probe', lambda **_kwargs: AsyncMock())
+    monkeypatch.setattr(
+        module,
+        'arm_risex_signed_testnet_execution',
+        AsyncMock(return_value=_FakeSession(transport)),
+    )
+    monkeypatch.setattr(
+        module,
+        'collect_consumed_nonce_evidence',
+        AsyncMock(return_value=_evidence()),
+    )
+
+    observed_deployment = deployment or _deployment()
+    observed_authorization = authorization or _authorization()
+
+    async def collect_runtime(*_args, **_kwargs):
+        return observed_deployment
+
+    async def collect_authorization(*_args, **_kwargs):
+        return observed_authorization
+
+    monkeypatch.setattr(module, 'collect_runtime_deployment_evidence', collect_runtime)
+    monkeypatch.setattr(
+        module,
+        'evaluate_pinned_deployment_preflight',
+        lambda *_args, **_kwargs: SimpleNamespace(
+            verdict='PASS',
+            deployment_identity_verified=True,
+            observed_fingerprint=deployment_fingerprint,
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        'collect_authorization_session_evidence',
+        collect_authorization,
+    )
+    return _approved_args(module)
+
+
 def _wrapped_http_failure(status_code, body, *, timeout=False):
     request = httpx.Request('POST', 'https://api.testnet.rise.trade/v1/orders/place')
     if timeout:
@@ -199,15 +335,23 @@ def test_02_old_manual_approval_flag_alone_cannot_authorize(monkeypatch):
     assert execute_once.await_count == 0
 
 
-def test_03_non_testnet_runtime_is_rejected_before_any_post():
+@pytest.mark.asyncio
+async def test_03_non_testnet_runtime_is_rejected_by_execute_once_before_any_post(
+    monkeypatch,
+):
     module = _module()
+    transport = FakeTransport()
+    args = _install_execute_once_boundary(
+        monkeypatch,
+        module,
+        transport,
+        chain_id=1,
+    )
 
     with pytest.raises(SignedTestnetBlocked, match='testnet|chain'):
-        module._assert_testnet_runtime(
-            network='mainnet',
-            chain_id=1,
-            api_base_url='https://api.rise.trade',
-        )
+        await module._execute_once(args)
+
+    assert transport.post_calls == []
 
 
 def test_04_request_preparation_occurs_exactly_once():
@@ -302,6 +446,60 @@ async def test_13_insufficient_deadline_margin_causes_one_post():
 
 
 @pytest.mark.asyncio
+async def test_13a_execute_once_deployment_change_blocks_second_post(monkeypatch):
+    module = _module()
+    transport = FakeTransport()
+    args = _install_execute_once_boundary(
+        monkeypatch,
+        module,
+        transport,
+        deployment_fingerprint='0' * 64,
+    )
+
+    result = await module._execute_once(args)
+
+    assert len(transport.post_calls) == 1
+    assert result['submission_count'] == 1
+    assert result['result'] == 'SECOND_PRECONDITION_FAILED'
+
+
+@pytest.mark.asyncio
+async def test_13b_execute_once_inactive_session_blocks_second_post(monkeypatch):
+    module = _module()
+    transport = FakeTransport()
+    args = _install_execute_once_boundary(
+        monkeypatch,
+        module,
+        transport,
+        authorization=_authorization(active=False),
+    )
+
+    result = await module._execute_once(args)
+
+    assert len(transport.post_calls) == 1
+    assert result['submission_count'] == 1
+    assert result['result'] == 'SECOND_PRECONDITION_FAILED'
+
+
+@pytest.mark.asyncio
+async def test_13c_execute_once_identity_change_blocks_second_post(monkeypatch):
+    module = _module()
+    transport = FakeTransport()
+    args = _install_execute_once_boundary(
+        monkeypatch,
+        module,
+        transport,
+        authorization=_authorization(account=OTHER_ACCOUNT),
+    )
+
+    result = await module._execute_once(args)
+
+    assert len(transport.post_calls) == 1
+    assert result['submission_count'] == 1
+    assert result['result'] == 'SECOND_PRECONDITION_FAILED'
+
+
+@pytest.mark.asyncio
 async def test_14_payload_fingerprint_mismatch_blocks_second_post():
     module = _module()
     first = _payload()
@@ -365,30 +563,26 @@ async def test_17_signature_nonce_deadline_action_hash_and_client_order_id_are_i
 
 
 @pytest.mark.asyncio
-async def test_18_nonce_attributable_second_rejection_is_nonce_classification():
-    module = _module()
-    transport = FakeTransport(outcomes=[
-        {'success': True, 'order_id': 'first'},
-        _wrapped_http_failure(
-            409,
-            {'code': 'NONCE_ALREADY_USED', 'message': 'permit nonce already used'},
-        ),
-    ])
-    result = await _run(module, transport=transport)
-    assert result['result'] == 'REPLAY_REJECTED_NONCE'
-    assert result['behavioral_replay_rejection_proven'] is True
-
-
-@pytest.mark.asyncio
-async def test_19_unattributed_second_rejection_is_unspecified():
+async def test_18_unattributed_second_rejection_is_unspecified_and_not_proof():
     module = _module()
     transport = FakeTransport(outcomes=[
         {'success': True, 'order_id': 'first'},
         _wrapped_http_failure(400, {'message': 'request rejected'}),
     ])
+
     result = await _run(module, transport=transport)
+
     assert result['result'] == 'REPLAY_REJECTED_UNSPECIFIED'
     assert result['behavioral_replay_rejection_proven'] is False
+
+
+def test_19_nonce_classification_is_reserved_for_future_reviewed_evidence():
+    """No known RISEx response today activates _NONCE; it remains future-only."""
+
+    module = _module()
+
+    assert module.AUTOMATIC_NONCE_REJECTION_ATTRIBUTION_ENABLED is False
+    assert module.behavioral_replay_rejection_proven_for('REPLAY_REJECTED_NONCE') is True
 
 
 def test_20_only_nonce_attributable_rejection_is_eligible_behavioral_proof():
@@ -448,37 +642,59 @@ async def test_23_second_acceptance_never_causes_third_post():
     assert result['submission_count'] == 2
 
 
-def test_24_output_sanitization_removes_permit_and_signature():
+def test_24_main_sanitizes_success_output_at_stdout_boundary(monkeypatch, capsys):
     module = _module()
-    sanitized = module.sanitize_diagnostic_payload({
+    sensitive = {
         'result': 'REPLAY_REJECTED_UNSPECIFIED',
         'permit': _payload()['permit'],
         'signature': SIGNATURE,
         '_signature': SIGNATURE,
-        'payload_fingerprint': 'abc123',
-    })
-    rendered = json.dumps(sanitized, sort_keys=True).lower()
-    assert 'permit' not in rendered
-    assert 'signature' not in rendered
-    assert SIGNATURE.lower() not in rendered
-    assert sanitized['payload_fingerprint'] == 'abc123'
-
-
-def test_25_output_sanitization_removes_private_key_and_environment_secrets():
-    module = _module()
-    sanitized = module.sanitize_diagnostic_payload({
-        'result': 'REPLAY_REJECTED_UNSPECIFIED',
         'RISEX_TESTNET_SIGNER_PRIVATE_KEY': PRIVATE_KEY,
         'private_key': PRIVATE_KEY,
-        'secret': 'hidden',
-        'cookie': 'session=hidden',
-        'authorization': 'Bearer hidden',
+        'secret': 'hidden-secret',
+        'cookie': 'session=hidden-cookie',
+        'authorization': 'Bearer hidden-token',
         'payload_fingerprint': 'abc123',
-    })
-    rendered = json.dumps(sanitized, sort_keys=True).lower()
-    assert PRIVATE_KEY.lower() not in rendered
-    assert 'private_key' not in rendered
-    assert 'secret' not in rendered
-    assert 'cookie' not in rendered
-    assert 'authorization' not in rendered
-    assert sanitized['payload_fingerprint'] == 'abc123'
+    }
+    monkeypatch.setattr(module, '_execute_once', AsyncMock(return_value=sensitive))
+
+    exit_code = module.main(['--approve-two-identical-signed-order-submissions'])
+    rendered = capsys.readouterr().out.lower()
+
+    assert exit_code == 0
+    assert 'abc123' in rendered
+    for forbidden in (
+        'permit',
+        'signature',
+        SIGNATURE.lower(),
+        PRIVATE_KEY.lower(),
+        'private_key',
+        'hidden-secret',
+        'hidden-cookie',
+        'hidden-token',
+        'authorization',
+    ):
+        assert forbidden not in rendered
+
+
+def test_25_main_sanitizes_exception_output_at_stdout_boundary(monkeypatch, capsys):
+    module = _module()
+    exception = SignedTestnetBlocked(
+        f'permit signature private_key={PRIVATE_KEY} secret=hidden-exception-secret'
+    )
+    monkeypatch.setattr(module, '_execute_once', AsyncMock(side_effect=exception))
+
+    exit_code = module.main(['--approve-two-identical-signed-order-submissions'])
+    rendered = capsys.readouterr().out.lower()
+
+    assert exit_code != 0
+    assert 'signedtestnetblocked' in rendered
+    for forbidden in (
+        'permit',
+        'signature',
+        PRIVATE_KEY.lower(),
+        'private_key',
+        'hidden-exception-secret',
+        'secret=',
+    ):
+        assert forbidden not in rendered
