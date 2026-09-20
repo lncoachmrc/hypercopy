@@ -77,14 +77,10 @@ _SENSITIVE_KEY_FRAGMENTS = (
     'auth_header',
     'token',
 )
-_NONCE_REPLAY_CODES = frozenset({
-    'NONCE_ALREADY_USED',
-    'NONCE_USED',
-    'PERMIT_NONCE_ALREADY_USED',
-    'PERMIT_NONCE_USED',
-    'REPLAY',
-    'REPLAY_REJECTED',
-})
+# RISEx currently publishes no stable place-order response that proves a
+# consumed VerifyWitness permit nonce caused a rejection. Keep the future
+# classification name, but do not infer it automatically from guessed strings.
+AUTOMATIC_NONCE_REJECTION_ATTRIBUTION_ENABLED = False
 
 
 class _SubmissionBudget:
@@ -235,29 +231,6 @@ def _provider_error_body(exc: BaseException) -> dict[str, Any] | None:
     return body if isinstance(body, dict) else None
 
 
-def _provider_rejection_is_nonce_attributable(exc: BaseException) -> bool:
-    status_error = _http_status_error(exc)
-    if status_error is None or not 400 <= status_error.response.status_code < 500:
-        return False
-
-    body = _provider_error_body(exc) or {}
-    code = body.get('code')
-    if isinstance(code, str) and code.strip().upper() in _NONCE_REPLAY_CODES:
-        return True
-
-    message = body.get('message')
-    if not isinstance(message, str):
-        return False
-    normalized = ' '.join(message.lower().split())
-    return (
-        'replay' in normalized
-        or (
-            'nonce' in normalized
-            and ('already used' in normalized or 'consumed' in normalized)
-            and ('permit' in normalized or 'witness' in normalized)
-        )
-    )
-
 def _provider_failure_details(exc: BaseException) -> dict[str, Any]:
     status_error = _http_status_error(exc)
     result: dict[str, Any] = {'error_type': type(exc).__name__}
@@ -398,11 +371,9 @@ async def _execute_replay_sequence(
         if _ambiguous_transport_error(exc):
             outcome = 'SECOND_SUBMISSION_AMBIGUOUS'
         elif status_error is not None and 400 <= status_error.response.status_code < 500:
-            outcome = (
-                'REPLAY_REJECTED_NONCE'
-                if _provider_rejection_is_nonce_attributable(exc)
-                else 'REPLAY_REJECTED_UNSPECIFIED'
-            )
+            # No currently documented RISEx response can be attributed safely
+            # to consumed permit-nonce replay without separate evidence review.
+            outcome = 'REPLAY_REJECTED_UNSPECIFIED'
         else:
             outcome = 'SECOND_SUBMISSION_AMBIGUOUS'
         return _result(
