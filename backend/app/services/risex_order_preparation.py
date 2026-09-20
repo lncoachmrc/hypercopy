@@ -30,6 +30,7 @@ from app.security.risex_testnet_signer import load_testnet_signer_credential
 
 
 Side = Literal['BUY', 'SELL']
+Network = Literal['testnet', 'mainnet']
 _UINT32_LIMIT = 1 << 32
 _UINT24_LIMIT = 1 << 24
 _UINT64_LIMIT = 1 << 64
@@ -47,6 +48,24 @@ class RISExMarketMetadata:
 class RISExTopOfBook:
     best_bid: Decimal
     best_ask: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class RISExOrderIntent:
+    symbol: str
+    is_buy: bool
+    requested_size: Decimal
+    reduce_only: bool
+    slippage_bps: int
+    client_order_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class RISExIOCPlan:
+    order: RISExPlaceOrder
+    requested_size: Decimal
+    limit_price: Decimal
+    market: RISExMarketMetadata
 
 
 def _unwrap_data(payload: dict[str, Any], *, field: str) -> dict[str, Any]:
@@ -243,13 +262,69 @@ def marketable_price_to_ticks(
     return ticks
 
 
+def assert_risex_execution_network_allowed(network: Network = 'testnet') -> Network:
+    """Fail closed until ADR-0006 is Accepted by the mainnet-enablement PR."""
+
+    if network == 'testnet':
+        return network
+    if network == 'mainnet':
+        raise RuntimeError('RISEx mainnet is blocked until ADR-0006 is Accepted')
+    raise RuntimeError(f'Unsupported RISEx execution network: {network!r}')
+
+
 def generate_client_order_id() -> int:
-    """Generate a non-zero uint64 client order id without local persistence."""
+    """Generate a non-zero uint64 client order id for manual/probe tooling only."""
 
     value = 0
     while value == 0:
         value = secrets.randbits(64)
     return value
+
+
+async def prepare_risex_ioc_plan(
+    api: RISExPublicReadTransport,
+    intent: RISExOrderIntent,
+) -> RISExIOCPlan:
+    """Build a provider-typed unsigned IOC plan from application intent."""
+
+    market = await resolve_market_metadata(api, symbol=intent.symbol)
+    book = await load_top_of_book(api, market_id=market.market_id)
+    requested_size = Decimal(str(intent.requested_size))
+    size_steps = size_to_steps(
+        size=requested_size,
+        step_size=market.step_size,
+        min_order_size=market.min_order_size,
+    )
+    side: Side = 'BUY' if intent.is_buy else 'SELL'
+    price_ticks = marketable_price_to_ticks(
+        side=side,
+        best_bid=book.best_bid,
+        best_ask=book.best_ask,
+        step_price=market.step_price,
+        slippage_bps=intent.slippage_bps,
+    )
+    if type(intent.client_order_id) is not int or not 0 < intent.client_order_id < _UINT64_LIMIT:
+        raise SignedTestnetBlocked('RISEx client_order_id must be a non-zero uint64 integer')
+
+    order = RISExPlaceOrder(
+        market_id=market.market_id,
+        size_steps=size_steps,
+        price_ticks=price_ticks,
+        side=0 if intent.is_buy else 1,
+        post_only=False,
+        reduce_only=intent.reduce_only,
+        stp_mode=0,
+        order_type=1,
+        time_in_force=3,
+        client_order_id=intent.client_order_id,
+        ttl_units=0,
+    )
+    return RISExIOCPlan(
+        order=order,
+        requested_size=Decimal(size_steps) * market.step_size,
+        limit_price=Decimal(price_ticks) * market.step_price,
+        market=market,
+    )
 
 
 def _deadline(
@@ -277,6 +352,7 @@ async def prepare_risex_ioc_request(
     env: Mapping[str, str],
     api: PublicAPITransport,
     rpc: PublicRPCTransport,
+    network: Network = 'testnet',
     symbol: str,
     side: Side,
     use_min_order_size: bool,
@@ -292,6 +368,7 @@ async def prepare_risex_ioc_request(
     permit signing and typed request binding.
     """
 
+    network = assert_risex_execution_network_allowed(network)
     credential = load_testnet_signer_credential(env)
     market = await resolve_market_metadata(api, symbol=symbol)
     book = await load_top_of_book(api, market_id=market.market_id)
@@ -299,7 +376,7 @@ async def prepare_risex_ioc_request(
     deployment = await collect_runtime_deployment_evidence(
         api,
         rpc,
-        network='testnet',
+        network=network,
     )
     required_runtime = (
         deployment.block_number,
