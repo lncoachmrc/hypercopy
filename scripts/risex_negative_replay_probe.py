@@ -258,12 +258,12 @@ def _provider_rejection_is_nonce_attributable(exc: BaseException) -> bool:
         )
     )
 
-
 def _provider_failure_details(exc: BaseException) -> dict[str, Any]:
     status_error = _http_status_error(exc)
     result: dict[str, Any] = {'error_type': type(exc).__name__}
     if status_error is not None:
-        result['http_status'] = status_error.response.status_code        body = _provider_error_body(exc)
+        result['http_status'] = status_error.response.status_code
+        body = _provider_error_body(exc)
         if body is not None:
             code = body.get('code')
             message = body.get('message')
@@ -517,12 +517,12 @@ async def _validate_second_submission_preconditions(
     if (
         deployment_report.verdict != 'PASS'
         or deployment_report.deployment_identity_verified is not True
-        or deployment_report.observed_fingerprint is None
-        or deployment_report.observed_fingerprint.lower()
+        or deployment_report.observed_fingerprint is None        or deployment_report.observed_fingerprint.lower()
         != replay_architecture.deployment_fingerprint.lower()
     ):
         raise SignedTestnetBlocked(
-            'RISEx negative replay deployment changed before second submission'        )
+            'RISEx negative replay deployment changed before second submission'
+        )
     if (
         deployment.block_number is None
         or deployment.api_chain_id != replay_architecture.chain_id
