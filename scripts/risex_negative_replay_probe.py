@@ -164,24 +164,30 @@ def _assert_testnet_runtime(*, network: str, chain_id: int, api_base_url: str) -
         )
 
 
-def _canonical_payload_bytes(payload: dict[str, Any]) -> bytes:
+def _wire_payload_bytes(payload: dict[str, Any]) -> bytes:
+    """Return the exact JSON body bytes httpx would send for the place-order POST.
+
+    The signed transport submits with client.post(..., json=payload). Building
+    the equivalent httpx.Request here exercises the same httpx JSON encoder, so
+    the fingerprint covers serialized wire-body bytes rather than a separate
+    canonical representation invented by this probe.
+    """
+
     try:
-        rendered = json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(',', ':'),
-            ensure_ascii=False,
-            allow_nan=False,
+        request = httpx.Request(
+            'POST',
+            f'{_TESTNET_API_URL}/v1/orders/place',
+            json=payload,
         )
     except (TypeError, ValueError) as exc:
         raise SignedTestnetBlocked(
-            'RISEx replay probe wire payload is not canonically serializable'
+            'RISEx replay probe wire payload is not serializable by httpx'
         ) from exc
-    return rendered.encode('utf-8')
+    return request.content
 
 
 def _payload_fingerprint(payload: dict[str, Any]) -> str:
-    return hashlib.sha256(_canonical_payload_bytes(payload)).hexdigest()
+    return hashlib.sha256(_wire_payload_bytes(payload)).hexdigest()
 
 
 def behavioral_replay_rejection_proven_for(result: str) -> bool:
@@ -257,8 +263,7 @@ def _provider_failure_details(exc: BaseException) -> dict[str, Any]:
     status_error = _http_status_error(exc)
     result: dict[str, Any] = {'error_type': type(exc).__name__}
     if status_error is not None:
-        result['http_status'] = status_error.response.status_code
-        body = _provider_error_body(exc)
+        result['http_status'] = status_error.response.status_code        body = _provider_error_body(exc)
         if body is not None:
             code = body.get('code')
             message = body.get('message')
@@ -517,8 +522,7 @@ async def _validate_second_submission_preconditions(
         != replay_architecture.deployment_fingerprint.lower()
     ):
         raise SignedTestnetBlocked(
-            'RISEx negative replay deployment changed before second submission'
-        )
+            'RISEx negative replay deployment changed before second submission'        )
     if (
         deployment.block_number is None
         or deployment.api_chain_id != replay_architecture.chain_id
