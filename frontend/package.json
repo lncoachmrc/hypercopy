@@ -12,12 +12,12 @@
     "test:wallet-login": "node scripts/check-wallet-login-chain-independence.mjs"
   },
   "dependencies": {
-    "@reown/appkit": "1.8.23",
-    "@reown/appkit-adapter-ethers": "1.8.23",
+    "@reown/appkit": "1.8.24",
+    "@reown/appkit-adapter-ethers": "1.8.24",
     "ethers": "6.17.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "7.18.3",
+    "react-router-dom": "7.18.4",
     "recharts": "^2.13.3"
   },
   "devDependencies": {
