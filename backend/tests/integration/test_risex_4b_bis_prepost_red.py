@@ -190,6 +190,7 @@ async def test_execution_is_committed_before_post_identity_can_be_used_and_ambig
             assert execution.client_order_id == Decimal("424242")
             assert execution.requested_size == Decimal("0.5")
             assert execution.limit_px == Decimal("200")
+            assert execution.reserved_exposure_usdc == Decimal("100")
 
             # UNKNOWN remains a live reservation; it cannot be interpreted as released.
             execution.state = ExecutionState.UNKNOWN

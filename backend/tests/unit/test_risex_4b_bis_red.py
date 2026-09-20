@@ -29,6 +29,15 @@ def test_execution_has_dedicated_nullable_uint64_client_order_id_column_and_uniq
     assert column.type.precision == 20
     assert column.type.scale == 0
 
+    assert "reserved_exposure_usdc" in table.c, (
+        "RED: the durable reservation amount must be stored on Execution"
+    )
+    reserved = table.c.reserved_exposure_usdc
+    assert reserved.nullable is True
+    assert isinstance(reserved.type, Numeric)
+    assert reserved.type.precision == 30
+    assert reserved.type.scale == 12
+
     matching = [
         index
         for index in table.indexes
@@ -89,6 +98,7 @@ def test_risex_reservation_is_the_nonterminal_execution_and_survives_ambiguity()
         execution_network="mainnet",
         requested_size=100,
         limit_px=25,
+        reserved_exposure_usdc=2500,
         reduce_only=False,
     )
     submitting = SimpleNamespace(**base, state=ExecutionState.SUBMITTING)
