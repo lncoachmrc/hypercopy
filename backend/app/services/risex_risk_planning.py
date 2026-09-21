@@ -507,6 +507,21 @@ def plan_risex_order_intent(
                 "RISEx market is reduce-only; exposure-increasing intent denied"
             )
 
+    provider_risk_alarm = portfolio.in_liquidation or portfolio.risk_level != "NORMAL"
+    if provider_risk_alarm and _is_exposure_increasing(sizing):
+        if sizing.intent is OrderIntent.REVERSE:
+            sizing = _suppress_reopen(
+                sizing,
+                "RISEx provider risk alarm suppressed reversal reopen",
+            )
+        else:
+            reason = (
+                "RISEx provider risk: in_liquidation=true"
+                if portfolio.in_liquidation
+                else f"RISEx provider risk_level={portfolio.risk_level!r} is not NORMAL"
+            )
+            raise RISExRiskPlanningDenied(reason)
+
     position_limit = provider_position_limit_non_binding_under_risk_caps(
         market=market,
         account_equity=portfolio.total_account_value,
