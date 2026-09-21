@@ -194,7 +194,7 @@ async def test_filled_settlement_refreshes_provider_truth_while_shared_lock_is_h
 
     lock_was_held = False
 
-    async def persist_provider_truth(settlement_db, execution) -> None:
+    async def persist_provider_truth(settlement_db, execution):
         nonlocal lock_was_held
         assert execution.id == execution_id
 
