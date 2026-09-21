@@ -321,8 +321,9 @@ async def test_ambiguous_existing_execution_never_causes_second_post_and_keeps_r
                     reserved_exposure_usdc=Decimal("100"),
                 )
             db.add(execution)
-            await db.commit()
+            await db.flush()
             execution_id = execution.id
+            await db.commit()
 
         monkeypatch.setattr(
             risex_copy_execution,
