@@ -295,9 +295,8 @@ class Worker:
             )
         except Exception as exc:
             log.warning(
-                'RISEx preparation failed before provider submission',
-                extra={'job_id': str(job.id), 'exception_type': type(exc).__name__},
-                exc_info=True,
+                f'RISEx preparation failed before provider submission ({type(exc).__name__})',
+                extra={'job_id': str(job.id)},
             )
             return await _retry_or_dead(
                 db,
