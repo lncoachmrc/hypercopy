@@ -48,6 +48,7 @@ from app.services.networking import user_network_state
 from app.services.queue import ensure_group, prepare_job_destination_for_execution, repair_stream
 from app.services.reconcile import master_snapshot, reconcile_active_users, reconcile_user
 from app.services.risex_copy_execution import process_risex_job
+from app.services.risex_worker_submission import prepare_risex_worker_submission
 from app.services.risex_execution_window import RISExExecutionState, RISExOperationalWindowController
 from app.services.risex_execution_worker_extension import (
     _current_context_fingerprint as current_risex_context_fingerprint,
@@ -285,17 +286,55 @@ class Worker:
             submission_lock=self.risex_submission_lock,
             final_authorizer=_final_authorizer,
         )
+
+        try:
+            prepared = await prepare_risex_worker_submission(
+                db,
+                job,
+                readiness_assertions=readiness_assertions,
+            )
+        except Exception as exc:
+            job.state=JobState.RETRYING
+            job.attempt_count=max(0,int(job.attempt_count)-1)
+            job.last_error=f'RISEx preparation failed before provider submission: {type(exc).__name__}: {exc}'
+            job.owner=None
+            job.locked_until=None
+            job.enqueued_at=None
+            job.next_attempt_at=datetime.now(UTC)+timedelta(seconds=2)
+            await db.commit()
+            return JobState.RETRYING.value
+
+        if prepared is None:
+            adapter = RISExAdapter(
+                network='testnet',
+                gate3_mode='continuous_window',
+                continuous_authorization=continuous_authorization,
+            )
+            return await process_risex_job(
+                db,
+                adapter,
+                job,
+                submission=None,
+            )
+
         adapter = RISExAdapter(
             network='testnet',
+            transport=prepared.transport,
             gate3_mode='continuous_window',
             continuous_authorization=continuous_authorization,
         )
-        result=await process_risex_job(
-            db,
-            adapter,
-            job,
-        )
-        return result
+        try:
+            result=await process_risex_job(
+                db,
+                adapter,
+                job,
+                submission=prepared.submission,
+            )
+            return result
+        finally:
+            close_prepared=getattr(prepared,'aclose',None)
+            if callable(close_prepared):
+                await close_prepared()
 
     async def _run_admin_reconcile(self, db, job: CopyJob) -> str:
         user=await db.get(User,job.user_id)
