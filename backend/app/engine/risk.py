@@ -40,6 +40,7 @@ class RiskContext:
     max_asset_exposure: Decimal = Decimal('2500')
     max_leverage: Decimal = Decimal('3')
     max_positions: int = 5
+    minimum_executable_notional: Decimal = EXCHANGE_MIN_NOTIONAL
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,11 +142,11 @@ def evaluate(plan: SizingResult, ctx: RiskContext) -> RiskDecision:
     allowed_notional = min(caps)
     if allowed_notional <= 0:
         return RiskDecision(RiskAction.DENY, plan, 'Exposure or margin limit reached')
-    if allowed_notional < EXCHANGE_MIN_NOTIONAL:
+    if allowed_notional < ctx.minimum_executable_notional:
         return RiskDecision(
             RiskAction.DENY,
             plan,
-            f'Risk headroom ${allowed_notional:.2f} is below exchange minimum ${EXCHANGE_MIN_NOTIONAL:.0f}',
+            f'Risk headroom ${allowed_notional:.2f} is below exchange minimum ${ctx.minimum_executable_notional:.0f}',
         )
     if plan.notional <= allowed_notional:
         return RiskDecision(RiskAction.ALLOW, plan)
@@ -162,11 +163,11 @@ def evaluate(plan: SizingResult, ctx: RiskContext) -> RiskDecision:
 
     unit_price = plan.notional / plan.order_size
     trimmed_notional = trimmed_size * unit_price
-    if trimmed_notional < EXCHANGE_MIN_NOTIONAL:
+    if trimmed_notional < ctx.minimum_executable_notional:
         return RiskDecision(
             RiskAction.DENY,
             plan,
-            f'Rounded risk-limited order ${trimmed_notional:.2f} is below exchange minimum ${EXCHANGE_MIN_NOTIONAL:.0f}',
+            f'Rounded risk-limited order ${trimmed_notional:.2f} is below exchange minimum ${ctx.minimum_executable_notional:.0f}',
         )
 
     trimmed = replace(plan, order_size=trimmed_size, notional=trimmed_notional)

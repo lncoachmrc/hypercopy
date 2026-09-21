@@ -42,6 +42,13 @@ class RISExMarketMetadata:
     step_size: Decimal
     step_price: Decimal
     min_order_size: Decimal
+    max_leverage: Decimal | None = None
+    active: bool = True
+    reduce_only: bool = False
+    unlocked: bool = True
+    max_position_size_raw: Decimal | None = None
+    mark_price: Decimal | None = None
+    maintenance_margin_factor_raw: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +94,12 @@ def _positive_decimal(value: object, *, field: str) -> Decimal:
     if not parsed.is_finite() or parsed <= 0:
         raise ProviderDataMalformed(f'RISEx {field} must be positive and finite')
     return parsed
+
+
+def _optional_positive_decimal(value: object, *, field: str) -> Decimal | None:
+    if value is None:
+        return None
+    return _positive_decimal(value, field=field)
 
 
 def _positive_int(value: object, *, field: str) -> int:
@@ -162,6 +175,26 @@ async def resolve_market_metadata(
             min_order_size=_positive_decimal(
                 config.get('min_order_size'),
                 field='min_order_size',
+            ),
+            max_leverage=_optional_positive_decimal(
+                config.get('max_leverage'),
+                field='max_leverage',
+            ),
+            active=raw.get('active', True) is not False,
+            reduce_only=raw.get('reduce_only', False) is True,
+            unlocked=config.get('unlocked', True) is not False,
+            max_position_size_raw=_optional_positive_decimal(
+                raw.get('max_position_size'),
+                field='max_position_size',
+            ),
+            mark_price=_optional_positive_decimal(
+                raw.get('mark_price'),
+                field='mark_price',
+            ),
+            maintenance_margin_factor_raw=(
+                None
+                if config.get('maintenance_margin_factor') is None
+                else str(config.get('maintenance_margin_factor'))
             ),
         )
 
