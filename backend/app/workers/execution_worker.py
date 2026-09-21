@@ -40,7 +40,7 @@ from app.services.admin_leverage_sync import (
 )
 from app.services.audit import audit
 from app.services.credentials import monitor_credential_expiry
-from app.services.execution import claim_job, process_job, release_stale_jobs
+from app.services.execution import _retry_or_dead, claim_job, process_job, release_stale_jobs
 from app.services.execution_destination import job_matches_active_destination
 from app.services.execution_resolution import resolve_ambiguous_executions
 from app.services.master_leverage_cache import record_master_leverage_missing
@@ -294,17 +294,21 @@ class Worker:
                 readiness_assertions=readiness_assertions,
             )
         except Exception as exc:
-            job.state=JobState.RETRYING
-            job.attempt_count=max(0,int(job.attempt_count)-1)
-            job.last_error=f'RISEx preparation failed before provider submission: {type(exc).__name__}: {exc}'
-            job.owner=None
-            job.locked_until=None
-            job.enqueued_at=None
-            job.next_attempt_at=datetime.now(UTC)+timedelta(seconds=2)
-            await db.commit()
-            return JobState.RETRYING.value
+            log.warning(
+                'RISEx preparation failed before provider submission',
+                extra={'job_id': str(job.id), 'exception_type': type(exc).__name__},
+                exc_info=True,
+            )
+            return await _retry_or_dead(
+                db,
+                job,
+                f'RISEx preparation failed before provider submission: {type(exc).__name__}',
+            )
 
         if prepared is None:
+            # ADR-0006 is not accepted yet, so b2 is intentionally testnet-only.
+            # If ADR_0006_MAINNET_GATE_ACCEPTED ever becomes True, this hard-coded
+            # adapter network must be redesigned before mainnet can be enabled.
             adapter = RISExAdapter(
                 network='testnet',
                 gate3_mode='continuous_window',
@@ -317,6 +321,9 @@ class Worker:
                 submission=None,
             )
 
+        # ADR-0006 is not accepted yet, so b2 is intentionally testnet-only.
+        # If ADR_0006_MAINNET_GATE_ACCEPTED ever becomes True, this hard-coded
+        # adapter network must be redesigned before mainnet can be enabled.
         adapter = RISExAdapter(
             network='testnet',
             transport=prepared.transport,
