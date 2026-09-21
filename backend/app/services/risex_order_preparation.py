@@ -35,6 +35,10 @@ _UINT32_LIMIT = 1 << 32
 _UINT24_LIMIT = 1 << 24
 _UINT64_LIMIT = 1 << 64
 
+# Code-level mainnet acceptance latch. It remains False until the dedicated
+# ADR-0006 acceptance PR explicitly changes it after every gate is satisfied.
+ADR_0006_MAINNET_GATE_ACCEPTED = False
+
 
 @dataclass(frozen=True, slots=True)
 class RISExMarketMetadata:
@@ -305,6 +309,62 @@ def assert_risex_execution_network_allowed(network: Network = 'testnet') -> Netw
     raise RuntimeError(f'Unsupported RISEx execution network: {network!r}')
 
 
+def assert_risex_worker_write_allowed(
+    *,
+    network: Network,
+    env: Mapping[str, str],
+) -> Network:
+    """Fail closed on environment identity before any RISEx worker signing.
+
+    ENABLE_LIVE_TRADING is parsed strictly: only the exact string 'false'
+    identifies an isolated test stack. Missing, empty, differently-cased or
+    malformed values are treated as a real-capital environment under ADR-0002.
+    """
+
+    if network not in {'testnet', 'mainnet'}:
+        raise SignedTestnetBlocked(f'Unsupported RISEx execution network: {network!r}')
+    if env.get('RISEX_SIGNED_WRITES_ENABLED') != 'true':
+        raise SignedTestnetBlocked(
+            'RISEX_SIGNED_WRITES_ENABLED must be explicitly true for RISEx worker writes'
+        )
+
+    isolated_test_stack = env.get('ENABLE_LIVE_TRADING') == 'false'
+    if isolated_test_stack:
+        if network != 'testnet':
+            raise SignedTestnetBlocked(
+                'RISEx mainnet is blocked on the isolated test stack until ADR-0006 acceptance'
+            )
+        return network
+
+    if ADR_0006_MAINNET_GATE_ACCEPTED is not True:
+        raise SignedTestnetBlocked(
+            'ADR-0002 blocks RISEx signing in a real-capital/live environment '
+            'until ADR-0006 mainnet gate is accepted'
+        )
+    return network
+
+
+def assert_risex_plan_matches_intent(
+    *,
+    intent: RISExOrderIntent,
+    plan: RISExIOCPlan,
+) -> None:
+    """Bind the signed protocol order exactly to the b1-authorized intent."""
+
+    encoded_size = Decimal(plan.order.size_steps) * plan.market.step_size
+    expected_side = 0 if intent.is_buy else 1
+    invariants = (
+        plan.requested_size == intent.requested_size,
+        encoded_size == intent.requested_size,
+        plan.order.client_order_id == intent.client_order_id,
+        plan.order.reduce_only is intent.reduce_only,
+        plan.order.side == expected_side,
+    )
+    if not all(invariants):
+        raise SignedTestnetBlocked(
+            'RISEx executable plan does not match the risk-authorized intent'
+        )
+
 def generate_client_order_id() -> int:
     """Generate a non-zero uint64 client order id for manual/probe tooling only."""
 
@@ -504,6 +564,76 @@ async def prepare_risex_ioc_request(
     )
     return prepare_place_order_request(order=order, permit=permit)
 
+
+async def prepare_risex_ioc_request_from_plan(
+    *,
+    env: Mapping[str, str],
+    api: PublicAPITransport,
+    rpc: PublicRPCTransport,
+    plan: RISExIOCPlan,
+    network: Network = 'testnet',
+    deadline_seconds: int = 30,
+) -> RISExPreparedPlaceOrderRequest:
+    """Sign exactly one already-authorized IOC plan without rebuilding execution fields."""
+
+    network = assert_risex_execution_network_allowed(network)
+    credential = load_testnet_signer_credential(env)
+
+    deployment = await collect_runtime_deployment_evidence(
+        api,
+        rpc,
+        network=network,
+    )
+    required_runtime = (
+        deployment.block_number,
+        deployment.api_chain_id,
+        deployment.domain_name,
+        deployment.domain_version,
+        deployment.domain_verifying_contract,
+        deployment.system_router,
+    )
+    if any(value is None for value in required_runtime):
+        raise SignedTestnetBlocked('RISEx runtime EIP-712 identity is incomplete')
+
+    block_number = int(deployment.block_number)  # type: ignore[arg-type]
+    chain_id = int(deployment.api_chain_id)  # type: ignore[arg-type]
+    domain_name = str(deployment.domain_name)
+    domain_version = str(deployment.domain_version)
+    verifying_contract = str(deployment.domain_verifying_contract)
+    router = str(deployment.system_router)
+
+    authorization = await collect_authorization_session_evidence(
+        rpc,
+        authorization_address=verifying_contract,
+        account=credential.account_address,
+        signer=credential.signer_address,
+        block_tag=hex(block_number),
+    )
+
+    # Nonce selection is the final provider read before permit signing.
+    # The already-authorized plan.order is signed exactly as-is.
+    nonce_selection = await collect_order_nonce_selection(
+        api,
+        account=credential.account_address,
+    )
+    permit = prepare_place_order_permit(
+        order=plan.order,
+        credential=credential,
+        nonce_selection=nonce_selection,
+        domain_name=domain_name,
+        domain_version=domain_version,
+        chain_id=chain_id,
+        verifying_contract=verifying_contract,
+        router=router,
+        observed_block_timestamp=authorization.block_timestamp,
+        session_expiration=authorization.session_expiration,
+        deadline=_deadline(
+            observed_block_timestamp=authorization.block_timestamp,
+            session_expiration=authorization.session_expiration,
+            deadline_seconds=deadline_seconds,
+        ),
+    )
+    return prepare_place_order_request(order=plan.order, permit=permit)
 
 def make_freshness_probe(
     *,

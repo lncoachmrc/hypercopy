@@ -40,7 +40,7 @@ from app.services.admin_leverage_sync import (
 )
 from app.services.audit import audit
 from app.services.credentials import monitor_credential_expiry
-from app.services.execution import claim_job, process_job, release_stale_jobs
+from app.services.execution import _retry_or_dead, claim_job, process_job, release_stale_jobs
 from app.services.execution_destination import job_matches_active_destination
 from app.services.execution_resolution import resolve_ambiguous_executions
 from app.services.master_leverage_cache import record_master_leverage_missing
@@ -48,6 +48,7 @@ from app.services.networking import user_network_state
 from app.services.queue import ensure_group, prepare_job_destination_for_execution, repair_stream
 from app.services.reconcile import master_snapshot, reconcile_active_users, reconcile_user
 from app.services.risex_copy_execution import process_risex_job
+from app.services.risex_worker_submission import prepare_risex_worker_submission
 from app.services.risex_execution_window import RISExExecutionState, RISExOperationalWindowController
 from app.services.risex_execution_worker_extension import (
     _current_context_fingerprint as current_risex_context_fingerprint,
@@ -285,17 +286,61 @@ class Worker:
             submission_lock=self.risex_submission_lock,
             final_authorizer=_final_authorizer,
         )
+
+        try:
+            prepared = await prepare_risex_worker_submission(
+                db,
+                job,
+                readiness_assertions=readiness_assertions,
+            )
+        except Exception as exc:
+            log.warning(
+                f'RISEx preparation failed before provider submission ({type(exc).__name__})',
+                extra={'job_id': str(job.id)},
+            )
+            return await _retry_or_dead(
+                db,
+                job,
+                f'RISEx preparation failed before provider submission: {type(exc).__name__}',
+            )
+
+        if prepared is None:
+            # ADR-0006 is not accepted yet, so b2 is intentionally testnet-only.
+            # If ADR_0006_MAINNET_GATE_ACCEPTED ever becomes True, this hard-coded
+            # adapter network must be redesigned before mainnet can be enabled.
+            adapter = RISExAdapter(
+                network='testnet',
+                gate3_mode='continuous_window',
+                continuous_authorization=continuous_authorization,
+            )
+            return await process_risex_job(
+                db,
+                adapter,
+                job,
+                submission=None,
+            )
+
+        # ADR-0006 is not accepted yet, so b2 is intentionally testnet-only.
+        # If ADR_0006_MAINNET_GATE_ACCEPTED ever becomes True, this hard-coded
+        # adapter network must be redesigned before mainnet can be enabled.
         adapter = RISExAdapter(
             network='testnet',
+            transport=prepared.transport,
             gate3_mode='continuous_window',
             continuous_authorization=continuous_authorization,
         )
-        result=await process_risex_job(
-            db,
-            adapter,
-            job,
-        )
-        return result
+        try:
+            result=await process_risex_job(
+                db,
+                adapter,
+                job,
+                submission=prepared.submission,
+            )
+            return result
+        finally:
+            close_prepared=getattr(prepared,'aclose',None)
+            if callable(close_prepared):
+                await close_prepared()
 
     async def _run_admin_reconcile(self, db, job: CopyJob) -> str:
         user=await db.get(User,job.user_id)

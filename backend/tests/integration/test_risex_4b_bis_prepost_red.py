@@ -303,8 +303,7 @@ async def test_ambiguous_existing_execution_never_causes_second_post_and_keeps_r
         async with SessionLocal() as db:
             job = await db.get(CopyJob, job_id)
             assert job is not None
-            db.add(
-                Execution(
+            execution = Execution(
                     copy_job_id=job.id,
                     user_id=job.user_id,
                     execution_epoch_id=job.execution_epoch_id,
@@ -321,7 +320,9 @@ async def test_ambiguous_existing_execution_never_causes_second_post_and_keeps_r
                     limit_px=Decimal("100"),
                     reserved_exposure_usdc=Decimal("100"),
                 )
-            )
+            db.add(execution)
+            await db.flush()
+            execution_id = execution.id
             await db.commit()
 
         monkeypatch.setattr(
@@ -332,7 +333,11 @@ async def test_ambiguous_existing_execution_never_causes_second_post_and_keeps_r
 
         adapter = CountingAdapter()
         submission = risex_copy_execution.RISExPreparedCopySubmission(
+            execution_id=execution_id,
             cloid=cloid,
+            client_order_id=999,
+            intent=object(),  # UNKNOWN recovery must stop before process-local material is inspected.
+            plan=object(),
             request=object(),
         )
 
