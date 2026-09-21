@@ -214,6 +214,7 @@ def test_reduce_only_is_bound_into_signed_action_hash_bit() -> None:
     order_flags = (order_data >> 6) & 0xFF
     assert order_flags & 0x04 == 0x04
     assert request.order.reduce_only is True
+    assert request.json_for_testnet_transport()["reduce_only"] is True
     assert request.permit.action_hash == build_place_order_action_hash(plan.order)
 
 
