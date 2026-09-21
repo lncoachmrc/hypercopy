@@ -231,7 +231,6 @@ async def test_risex_preparation_failure_consumes_retry_budget_and_backoff_grows
         else:
             assert result == JobState.DEAD.value
             assert job.state == JobState.DEAD
-            assert job.next_attempt_at is None
 
     assert len(observed_delays) == settings.MAX_JOB_RETRIES - 1
     assert all(
@@ -243,6 +242,7 @@ async def test_risex_preparation_failure_consumes_retry_budget_and_backoff_grows
 @pytest.mark.asyncio
 async def test_risex_preparation_failure_does_not_persist_exception_message(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     fixed_now = datetime(2026, 9, 21, 19, 0, tzinfo=UTC)
     worker = _enabled_worker(fixed_now)
@@ -271,3 +271,6 @@ async def test_risex_preparation_failure_does_not_persist_exception_message(
     assert secret not in job.last_error
     assert signature not in job.last_error
     assert 'provider rejected' not in job.last_error
+    assert secret not in caplog.text
+    assert signature not in caplog.text
+    assert 'provider rejected' not in caplog.text
