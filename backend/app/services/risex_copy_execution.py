@@ -487,13 +487,6 @@ async def process_risex_job(
             'RISEx writer received a job outside the RISEx testnet execution epoch',
         )
 
-    if submission is None:
-        return await _finish_without_submission(
-            db,
-            job,
-            'RISEx prepared process-local submission is unavailable',
-        )
-
     existing = (
         await db.execute(
             select(Execution).where(
@@ -519,6 +512,13 @@ async def process_risex_job(
         job.locked_until = None
         await db.commit()
         return JobState.SKIPPED.value
+
+    if submission is None:
+        return await _finish_without_submission(
+            db,
+            job,
+            'RISEx prepared process-local submission is unavailable',
+        )
 
     if existing is None:
         return await _finish_without_submission(
