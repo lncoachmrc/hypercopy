@@ -14,6 +14,7 @@ from app.adapters.hyperliquid import deterministic_cloid
 from app.adapters.risex import RISExAdapter
 from app.models.entities import CopyJob, Execution, ExecutionState, JobState
 from app.security.risex_place_order_request import RISExPreparedPlaceOrderRequest
+from app.services.risex_order_preparation import RISExIOCPlan, RISExOrderIntent
 from app.services.strategy_intents import (
     StrategyIntentAuthorizationError,
     current_strategy_intent_for_cloid,
@@ -28,7 +29,11 @@ _ACTIVE_RESERVATION_STATES = (ExecutionState.SUBMITTING, ExecutionState.UNKNOWN)
 class RISExPreparedCopySubmission:
     """Process-local signed submission material for one durable RISEx Execution."""
 
+    execution_id: uuid.UUID
     cloid: str
+    client_order_id: int
+    intent: RISExOrderIntent
+    plan: RISExIOCPlan
     request: RISExPreparedPlaceOrderRequest
 
 
@@ -375,6 +380,71 @@ async def settle_risex_execution_under_accounting_lock(
         raise
 
 
+async def claim_risex_first_post(
+    db: AsyncSession,
+    *,
+    job: CopyJob,
+    submission: RISExPreparedCopySubmission,
+) -> Execution | None:
+    """Atomically consume PRE_POST_COMMITTED for one exact process-local submission."""
+
+    execution = (
+        await db.execute(
+            select(Execution)
+            .where(
+                Execution.id == submission.execution_id,
+                Execution.copy_job_id == job.id,
+                Execution.attempt_kind == 'o',
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if execution is None:
+        raise RuntimeError('RISEx first-POST execution identity mismatch')
+
+    response = dict(execution.response or {})
+    risex_status = dict(response.get('risex_4b_bis') or {})
+    submission_status = risex_status.get('submission_status')
+    if (
+        execution.state == ExecutionState.UNKNOWN
+        or execution.state != ExecutionState.SUBMITTING
+        or submission_status != 'PRE_POST_COMMITTED'
+    ):
+        await db.rollback()
+        return None
+
+    durable_client_order_id = (
+        int(execution.client_order_id)
+        if execution.client_order_id is not None
+        else None
+    )
+    request = submission.request
+    plan = submission.plan
+    identity_matches = (
+        execution.id == submission.execution_id
+        and execution.cloid == submission.cloid
+        and durable_client_order_id == submission.client_order_id
+        and request.order.client_order_id == submission.client_order_id
+        and request.order == plan.order
+        and plan.order.client_order_id == submission.intent.client_order_id
+        and plan.order.reduce_only is submission.intent.reduce_only
+        and execution.nonce_anchor == request.permit.nonce_anchor
+        and execution.nonce_bitmap_index == request.permit.nonce_bitmap_index
+        and execution.reduce_only is request.order.reduce_only
+        and execution.requested_size == plan.requested_size
+        and execution.limit_px == plan.limit_price
+    )
+    if not identity_matches:
+        await db.rollback()
+        raise RuntimeError('RISEx first-POST submission identity mismatch')
+
+    risex_status['submission_status'] = 'POST_IN_FLIGHT'
+    response['risex_4b_bis'] = risex_status
+    execution.response = response
+    await db.commit()
+    return execution
+
+
 async def _defer_for_resolution(
     db: AsyncSession,
     job: CopyJob,
@@ -433,12 +503,6 @@ async def process_risex_job(
         )
     ).scalar_one_or_none()
 
-    if existing is not None and existing.state in _ACTIVE_RESERVATION_STATES:
-        return await _defer_for_resolution(
-            db,
-            job,
-            'RISEx execution is awaiting provider-truth reconciliation',
-        )
     if existing is not None and existing.state == ExecutionState.FILLED:
         job.state = JobState.DONE
         job.owner = None
@@ -479,6 +543,19 @@ async def process_risex_job(
         job.enqueued_at = None
         await db.commit()
         return JobState.SKIPPED.value
+
+    claimed = await claim_risex_first_post(
+        db,
+        job=job,
+        submission=submission,
+    )
+    if claimed is None:
+        return await _defer_for_resolution(
+            db,
+            job,
+            'RISEx execution is awaiting provider-truth reconciliation',
+        )
+    existing = claimed
 
     result: dict[str, Any] = await adapter.place_ioc(
         db=db,
