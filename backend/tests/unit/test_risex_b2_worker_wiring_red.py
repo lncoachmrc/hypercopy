@@ -25,6 +25,7 @@ from app.security.risex_order_codec import (
 from app.security.risex_place_order_permit import RISExPreparedPlaceOrderPermit
 from app.security.risex_place_order_request import prepare_place_order_request
 from app.services import risex_copy_execution, risex_order_preparation
+from app.workers import execution_worker
 
 
 ACCOUNT = "0x" + ("11" * 20)
@@ -367,3 +368,20 @@ def test_real_capital_worker_requires_adr_gate_even_for_testnet(
             "RISEX_SIGNED_WRITES_ENABLED": "true",
         },
     ) == "testnet"
+
+
+def test_testnet_adapter_hardwire_must_be_removed_before_adr_0006_acceptance() -> None:
+    source = inspect.getsource(execution_worker.Worker._run_risex_copy_job)
+    hardwired_testnet = "network='testnet'" in source
+
+    # b2 intentionally remains testnet-only while ADR-0006 is not accepted.
+    # Flipping the gate to True without redesigning adapter network selection
+    # must make this test fail before such a change can merge.
+    if risex_order_preparation.ADR_0006_MAINNET_GATE_ACCEPTED:
+        assert not hardwired_testnet, (
+            "ADR-0006 became accepted while _run_risex_copy_job still hard-wires "
+            "RISExAdapter(network='testnet'); provider network selection must be redesigned"
+        )
+    else:
+        assert hardwired_testnet
+        assert 'ADR-0006 is not accepted yet' in source
