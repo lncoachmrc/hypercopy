@@ -544,15 +544,19 @@ async def process_risex_job(
         await db.commit()
         return JobState.SKIPPED.value
 
+    job_id_before_claim = job.id
     claimed = await claim_risex_first_post(
         db,
         job=job,
         submission=submission,
     )
     if claimed is None:
+        fresh_job = await db.get(CopyJob, job_id_before_claim)
+        if fresh_job is None:
+            raise RuntimeError('RISEx CopyJob disappeared after first-POST claim fence')
         return await _defer_for_resolution(
             db,
-            job,
+            fresh_job,
             'RISEx execution is awaiting provider-truth reconciliation',
         )
     existing = claimed
