@@ -7,7 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.core.config import settings
 from app.models.entities import JobState
+from app.services import execution as execution_service
 from app.services.risex_execution_window import (
     RISExExecutionState,
     RISExOperationalWindowController,
@@ -75,6 +77,7 @@ def _patch_common(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _job(worker, fixed_now):
     return SimpleNamespace(
+        id=uuid.uuid4(),
         execution_provider='risex',
         execution_network='testnet',
         state=JobState.PROCESSING,
@@ -83,6 +86,7 @@ def _job(worker, fixed_now):
         locked_until=fixed_now,
         enqueued_at=fixed_now,
         attempt_count=1,
+        next_attempt_at=None,
     )
 
 
@@ -182,3 +186,88 @@ async def test_risex_worker_preparation_failure_never_reaches_writer_or_post(
     assert result == JobState.RETRYING.value
     assert job.state == JobState.RETRYING
     assert 'prepar' in (job.last_error or '').lower()
+
+
+@pytest.mark.asyncio
+async def test_risex_preparation_failure_consumes_retry_budget_and_backoff_grows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 9, 21, 19, 0, tzinfo=UTC)
+    worker = _enabled_worker(fixed_now)
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(execution_service.random, 'uniform', lambda _a, _b: 1.0)
+
+    async def fail_preparation(*_args, **_kwargs):
+        raise RuntimeError('permanent metadata failure')
+
+    monkeypatch.setattr(
+        execution_worker,
+        'prepare_risex_worker_submission',
+        fail_preparation,
+        raising=False,
+    )
+
+    async def unexpected_writer(*_args, **_kwargs):
+        raise AssertionError('preparation failure must never reach process_risex_job')
+
+    monkeypatch.setattr(execution_worker, 'process_risex_job', unexpected_writer)
+
+    db = _CommitDB()
+    job = _job(worker, fixed_now)
+    observed_delays: list[float] = []
+
+    for attempt in range(1, settings.MAX_JOB_RETRIES + 1):
+        job.state = JobState.PROCESSING
+        job.owner = worker.id
+        job.attempt_count = attempt
+        before = datetime.now(UTC)
+        result = await execution_worker.Worker._run_risex_copy_job(worker, db, job)
+
+        if attempt < settings.MAX_JOB_RETRIES:
+            assert result == JobState.RETRYING.value
+            assert job.state == JobState.RETRYING
+            assert job.next_attempt_at is not None
+            observed_delays.append((job.next_attempt_at - before).total_seconds())
+        else:
+            assert result == JobState.DEAD.value
+            assert job.state == JobState.DEAD
+            assert job.next_attempt_at is None
+
+    assert len(observed_delays) == settings.MAX_JOB_RETRIES - 1
+    assert all(
+        later > earlier
+        for earlier, later in zip(observed_delays, observed_delays[1:])
+    )
+
+
+@pytest.mark.asyncio
+async def test_risex_preparation_failure_does_not_persist_exception_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 9, 21, 19, 0, tzinfo=UTC)
+    worker = _enabled_worker(fixed_now)
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(execution_service.random, 'uniform', lambda _a, _b: 1.0)
+
+    secret = '0x' + ('ab' * 32)
+    signature = 'MEUCIQD' + ('SENSITIVE' * 8)
+
+    async def fail_preparation(*_args, **_kwargs):
+        raise RuntimeError(f'provider rejected private key {secret} signature {signature}')
+
+    monkeypatch.setattr(
+        execution_worker,
+        'prepare_risex_worker_submission',
+        fail_preparation,
+        raising=False,
+    )
+
+    db = _CommitDB()
+    job = _job(worker, fixed_now)
+    result = await execution_worker.Worker._run_risex_copy_job(worker, db, job)
+
+    assert result == JobState.RETRYING.value
+    assert job.last_error == 'RISEx preparation failed before provider submission: RuntimeError'
+    assert secret not in job.last_error
+    assert signature not in job.last_error
+    assert 'provider rejected' not in job.last_error
