@@ -297,29 +297,72 @@ def test_request_specific_gate_and_freshness_are_built_after_signed_request() ->
     assert sign_index < replay_index < gate_index < freshness_index < transport_index
 
 
-def test_mainnet_worker_write_path_requires_both_explicit_gates(
+def test_risex_worker_write_gate_matrix_is_fail_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gate = _require(risex_order_preparation, "assert_risex_worker_write_allowed")
     accepted = getattr(risex_order_preparation, "ADR_0006_MAINNET_GATE_ACCEPTED", None)
     assert accepted is False, "RED: ADR-0006 mainnet gate must default False"
 
-    monkeypatch.delenv("RISEX_SIGNED_WRITES_ENABLED", raising=False)
+    def env(*, live: str | None, signed: str = "true") -> dict[str, str]:
+        values = {"RISEX_SIGNED_WRITES_ENABLED": signed}
+        if live is not None:
+            values["ENABLE_LIVE_TRADING"] = live
+        return values
+
+    # Real-capital worker: ADR-0002 requires ADR-0006 acceptance on ANY RISEx network.
+    with pytest.raises(Exception, match="ADR-0002|ADR-0006|real-capital|live"):
+        gate(network="testnet", env=env(live="true"))
+    with pytest.raises(Exception, match="ADR-0006|mainnet|real-capital|live"):
+        gate(network="mainnet", env=env(live="true"))
+
+    # Dedicated test stack: signed testnet is reachable, mainnet remains impossible.
+    assert gate(network="testnet", env=env(live="false")) == "testnet"
+    with pytest.raises(Exception, match="mainnet|ADR-0006"):
+        gate(network="mainnet", env=env(live="false"))
+
+    # Missing or malformed ENABLE_LIVE_TRADING is treated as real-capital fail-closed.
+    for malformed in (None, "", "0", "1", "TRUE", "False", "garbage"):
+        with pytest.raises(Exception, match="ADR-0002|ADR-0006|real-capital|live"):
+            gate(network="testnet", env=env(live=malformed))
+
+    # The signed-write opt-in remains mandatory even on the isolated test stack.
     with pytest.raises(Exception, match="signed|RISEX_SIGNED_WRITES_ENABLED"):
-        gate(network="mainnet", env=os.environ)
+        gate(network="testnet", env=env(live="false", signed="false"))
 
-    monkeypatch.setenv("RISEX_SIGNED_WRITES_ENABLED", "true")
-    with pytest.raises(Exception, match="ADR-0006|mainnet"):
-        gate(network="mainnet", env=os.environ)
 
+def test_risex_mainnet_remains_blocked_on_test_stack_even_if_adr_gate_is_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _require(risex_order_preparation, "assert_risex_worker_write_allowed")
     monkeypatch.setattr(
         risex_order_preparation,
         "ADR_0006_MAINNET_GATE_ACCEPTED",
         True,
     )
-    monkeypatch.delenv("RISEX_SIGNED_WRITES_ENABLED", raising=False)
-    with pytest.raises(Exception, match="signed|RISEX_SIGNED_WRITES_ENABLED"):
-        gate(network="mainnet", env=os.environ)
+    with pytest.raises(Exception, match="mainnet|test stack|ADR-0006"):
+        gate(
+            network="mainnet",
+            env={
+                "ENABLE_LIVE_TRADING": "false",
+                "RISEX_SIGNED_WRITES_ENABLED": "true",
+            },
+        )
 
-    monkeypatch.setenv("RISEX_SIGNED_WRITES_ENABLED", "true")
-    assert gate(network="mainnet", env=os.environ) == "mainnet"
+
+def test_real_capital_worker_requires_adr_gate_even_for_testnet(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _require(risex_order_preparation, "assert_risex_worker_write_allowed")
+    monkeypatch.setattr(
+        risex_order_preparation,
+        "ADR_0006_MAINNET_GATE_ACCEPTED",
+        True,
+    )
+    assert gate(
+        network="testnet",
+        env={
+            "ENABLE_LIVE_TRADING": "true",
+            "RISEX_SIGNED_WRITES_ENABLED": "true",
+        },
+    ) == "testnet"
