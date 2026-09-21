@@ -486,7 +486,7 @@ The minimum disclosure shown in the activation flow must state clearly that:
 - TRAXION cannot currently verify the complete source code of the relevant RISEx Authorization/Router implementations;
 - RISEx has previously changed security-relevant contract implementations without a provider upgrade notice identified by TRAXION;
 - under option (c), an out-of-band increase in exposure may remain undetected for up to **5 minutes** under healthy provider telemetry;
-- the capital economically exposed to signer compromise is the **collateral deposited on RISEx plus the liquidatable value of open positions**;
+- under option (c), the capital economically exposed to signer compromise is measured by RISEx `summary.total_account_value`; gross position notional is monitored separately as a leverage/risk signal and is not added to that account-value measure;
 - the observed per-user confinement ceiling is **25,000 USDC**, but this is an operational/detective ceiling and not a cryptographic guarantee because the user can independently deposit additional collateral;
 - if the ceiling is exceeded or exposure state becomes stale/unknown, TRAXION blocks additional exposure but does not automatically withdraw or move the user's funds;
 - this unresolved `MoveFund` authorization risk is specific to the RISEx execution path and is not a property of TRAXION's current Hyperliquid execution path.
