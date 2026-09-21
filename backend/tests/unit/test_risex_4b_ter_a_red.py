@@ -12,14 +12,14 @@ from app.services import risex_copy_execution
 
 def test_execution_model_persists_risex_nonce_identity() -> None:
     table = Execution.__table__
-    assert "risex_nonce_anchor" in table.c, (
+    assert "nonce_anchor" in table.c, (
         "RED: Execution must persist the exact RISEx permit nonce anchor before POST"
     )
-    assert "risex_nonce_bitmap_index" in table.c, (
+    assert "nonce_bitmap_index" in table.c, (
         "RED: Execution must persist the exact RISEx permit bitmap index before POST"
     )
-    assert table.c.risex_nonce_anchor.nullable is True
-    assert table.c.risex_nonce_bitmap_index.nullable is True
+    assert table.c.nonce_anchor.nullable is True
+    assert table.c.nonce_bitmap_index.nullable is True
 
 
 def test_schema_and_release_preflight_register_0015_nonce_migration() -> None:
@@ -41,10 +41,10 @@ def test_prepost_persistence_requires_exact_nonce_identity() -> None:
     persist = risex_copy_execution.persist_risex_pre_post_execution
     params = inspect.signature(persist).parameters
 
-    assert "risex_nonce_anchor" in params, (
+    assert "nonce_anchor" in params, (
         "RED: pre-POST persistence must require the signed permit nonce anchor"
     )
-    assert "risex_nonce_bitmap_index" in params, (
+    assert "nonce_bitmap_index" in params, (
         "RED: pre-POST persistence must require the signed permit bitmap index"
     )
 
