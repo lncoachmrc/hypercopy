@@ -124,29 +124,31 @@ Its purpose is to establish a quantified, monitored loss budget for the transiti
 
 #### 1.3.1 Exposure-at-risk definition
 
-For each RISEx user account:
+For each RISEx user account, the authoritative option-(c) capital-at-risk measure is:
 
 ```text
-exposure_at_risk =
-    deposited_collateral
-    + liquidatable_value_of_open_positions
+exposure_at_risk = summary.total_account_value
 ```
 
-The relevant amount is therefore the capital actually exposed inside RISEx, not the user's external wallet balance, total wealth or total portfolio value.
+where `summary.total_account_value` is read from the live RISEx portfolio/account response.
 
-Where RISEx exposes an authoritative liquidation/close value for open positions, TRAXION must use that provider value.
-
-If RISEx does not expose a sufficiently reliable liquidation-value field, TRAXION must use a conservative substitute:
+This definition replaces the earlier draft formula:
 
 ```text
-sum(abs(position_size) × current_mark_price)
+deposited_collateral + liquidatable_value_of_open_positions
 ```
 
-for open positions.
+because that formula double-counts cross-margin exposure. In a cross-margin account the open-position notional is already supported by the same account collateral/equity; adding position notional or liquidation value to the account capital a second time overstates the economic value actually present inside the RISEx account.
 
-If neither value can be established reliably, `exposure_at_risk` is considered **UNKNOWN** and the account fails closed for new exposure.
+The correction is based on the live testnet `/v1/portfolio/details` response verified on 2026-09-21, which exposes `summary.total_account_value` together with collateral/balance fields, `summary.total_notional`, and per-position size/mark/liquidation data.
 
-Missing data must never be interpreted as zero.
+`summary.total_notional` is retained as a secondary leverage and gross-position signal. It is **not** an additive component of `exposure_at_risk`.
+
+Position-level `size`, `mark_price`, `avg_entry_price`, `market_id` and `liquidation_price` remain relevant to leverage, liquidation-distance, reconciliation and deterministic Risk Engine controls, but they are not added to `summary.total_account_value` for the option-(c) loss budget.
+
+If `summary.total_account_value` is unavailable, cannot be parsed as a finite numeric value, or is otherwise indeterminate, `exposure_at_risk` is **UNKNOWN** and the account fails closed for new exposure.
+
+Missing or malformed data must never be interpreted as zero.
 
 #### 1.3.2 Accepted loss budget and ceilings
 
@@ -233,95 +235,91 @@ Above 75,000 USDC aggregate exposure, option (c) cannot be used as the basis for
 Before every exposure-increasing RISEx provider POST, TRAXION must establish from sufficiently fresh provider truth:
 
 ```text
-current_user_exposure_at_risk
-+ conservative_max_incremental_exposure(candidate_order)
-<= 25,000 USDC
+current_user_exposure_at_risk <= 25,000 USDC
 ```
 
 and:
 
 ```text
-current_aggregate_exposure_at_risk
-+ conservative_max_incremental_exposure(candidate_order)
-<= 75,000 USDC
+current_aggregate_exposure_at_risk <= 75,000 USDC
 ```
 
-The candidate-order calculation must use the conservative worst-case economic effect of the order.
+where every account-level value is derived exclusively from `summary.total_account_value`.
 
-If either calculation cannot be completed:
+The candidate order's notional is **not** added to `exposure_at_risk`. Doing so would reintroduce the cross-margin double counting corrected in §1.3.1.
+
+Order notional, leverage, margin headroom, liquidation distance, per-trade limits and asset exposure remain independently enforced by the deterministic Risk Engine and provider-specific execution constraints. `summary.total_notional` may be used as a secondary leverage/gross-position signal for those controls, but not as part of the option-(c) capital-at-risk sum.
+
+If either the per-user or aggregate `summary.total_account_value` calculation cannot be completed from sufficiently fresh authoritative provider data:
 
 `POST = BLOCKED`.
 
 A post-trade monitor does not replace this point-of-use check.
 
-#### 1.3.6 Atomic aggregate exposure reservation
+#### 1.3.6 Atomic pending-execution reservation and accounting serialization
 
-A fresh exposure read followed by an independent POST is not sufficient to enforce the aggregate loss budget. Two concurrent jobs can observe the same aggregate state, each pass the ceiling check independently, and together exceed the ceiling.
+The option-(c) loss budget is governed by authoritative `summary.total_account_value` as defined in §1.3.1.
 
-For every exposure-increasing RISEx mainnet order, the aggregate exposure check and authorization must therefore use one shared serialization domain across all workers.
+A pending order's notional or local `reserved_exposure_usdc` must **not** be added to `summary.total_account_value` when evaluating the 25,000 / 75,000 USDC option-(c) ceilings.
 
-The required mechanism is the existing PostgreSQL transaction-scoped advisory-lock pattern already used by ADR-0004 control fencing, applied to a stable global resource key for the RISEx mainnet exposure budget, conceptually:
+TRAXION nevertheless requires a durable pending-execution reservation for a separate reason: concurrent or ambiguous executions must not create a local risk/notional-accounting gap, permit blind resubmission, or allow unresolved provider effects to disappear from the execution budget.
+
+The shared serialization domain remains the PostgreSQL transaction-scoped advisory-lock pattern already used by ADR-0004 control fencing, applied to a stable global resource key for RISEx execution accounting, conceptually:
 
 `risex:mainnet:exposure-budget`.
 
-The singleton execution-worker invariant in ADR-0004 is not considered a correctness guarantee for this control. The exposure-budget mechanism must remain correct if multiple worker processes are active concurrently.
+The singleton execution-worker invariant in ADR-0004 is not considered a correctness guarantee for this control. The reservation mechanism must remain correct if multiple worker processes are active concurrently.
 
-The authorization sequence is:
+For every exposure-increasing RISEx mainnet order, the execution-accounting sequence is:
 
 1. begin a database transaction;
-2. acquire the transaction-scoped PostgreSQL advisory lock for the RISEx mainnet exposure budget;
-3. re-read sufficiently fresh authoritative exposure state for the candidate user and aggregate RISEx population;
-4. load every active, unreleased RISEx exposure reservation;
-5. calculate:
-   - current verified per-user exposure;
-   - current verified aggregate exposure;
-   - all pending/in-flight reserved increments;
-   - the conservative maximum incremental exposure of the candidate order;
-6. reject fail-closed if any required exposure state is stale, unavailable, malformed or otherwise indeterminate;
-7. reject if the candidate would exceed either the per-user or aggregate ceiling after including existing reservations;
-8. otherwise create a durable reservation bound uniquely to the candidate `Execution`;
-9. commit the reservation before any RISEx provider POST;
-10. only after the commit may the existing continuous-window / freshness / §10B submission path reach the provider POST.
+2. acquire the transaction-scoped PostgreSQL advisory lock;
+3. re-read sufficiently fresh authoritative `summary.total_account_value` for the candidate user and aggregate RISEx population;
+4. fail closed if the option-(c) per-user or aggregate ceiling is already exceeded or indeterminate;
+5. load active unresolved RISEx execution reservations relevant to deterministic order/risk headroom;
+6. apply the ordinary Risk Engine and provider-specific notional/leverage controls without adding those reservations to `summary.total_account_value`;
+7. create a durable reservation bound uniquely to the candidate `Execution`;
+8. commit the reservation before any RISEx provider POST;
+9. only after the commit may the existing continuous-window / freshness submission path reach the provider POST.
 
-The durable reservation must contain at least:
+The durable reservation must contain enough information to preserve the unresolved execution obligation across restart and reconciliation. At minimum this includes:
 
 - `execution_id` with a uniqueness guarantee;
 - `user_id`;
 - `execution_provider = 'risex'`;
-- `execution_network = 'mainnet'`;
-- reserved exposure amount in USDC;
+- execution network;
+- provider/client order identity;
+- the conservative order/risk amount reserved for local execution accounting;
 - reservation state;
 - `created_at`;
-- `released_at` and release reason when eventually resolved.
+- release/resolution evidence when eventually resolved.
 
-A second worker cannot authorize against the pre-reservation aggregate: it must acquire the same PostgreSQL advisory lock after the first transaction commits and must include the first worker's reservation in its calculation.
+The advisory lock does not need to remain held during the network POST. The committed reservation carries the serialized execution-accounting obligation across that external side effect.
 
-The advisory lock does not need to remain held during the network POST. The committed reservation carries the serialized authorization across that external side effect.
+Reservation release is fail-closed:
 
-Reservation release is also fail-closed:
-
-- a definitive provider rejection that proves no exposure was created may release its reservation;
-- a definitive fill/partial-fill/cancel outcome may release or reduce the reservation only inside the same serialized exposure-budget transaction that refreshes/persists provider exposure so the resulting real exposure replaces the reservation without a counting gap;
-- a provider acknowledgement that does not establish final exposure does not release the reservation;
+- a definitive provider rejection that proves no order/exposure side effect was created may release its reservation under the shared serialization lock;
+- a definitive fill, partial fill or cancellation may release or reduce the reservation only inside a transaction holding the same serialization lock that also refreshes and persists the relevant provider truth, including `summary.total_account_value` and the position/notional state needed by the Risk Engine, so the real provider state replaces the pending reservation without an accounting gap;
+- a provider acknowledgement that does not establish final execution state does not release the reservation;
 - timeout, lost connection, malformed response, `SUBMITTING`, `UNKNOWN`, worker crash or any other ambiguous outcome does **not** release the reservation;
 - reservations have no automatic TTL-based release.
 
-After a crash between reservation commit and POST, or whenever transmission is uncertain, 4C must resolve the durable `client_order_id` against RISEx before the reservation can be released. Until then the reservation remains part of aggregate exposure and blocks additional risk if necessary.
+After a crash between reservation commit and POST, or whenever transmission is uncertain, 4C must resolve the durable provider identity/nonce evidence before the reservation can be released. Until then the execution remains unresolved and blocks additional risk where required by the deterministic execution controls.
 
-If PostgreSQL is unavailable, the advisory lock cannot be acquired, active reservations cannot be read, the exposure snapshot is not sufficiently fresh, or reservation state cannot be established unambiguously:
+If PostgreSQL is unavailable, the advisory lock cannot be acquired, active reservations cannot be read, authoritative `summary.total_account_value` is stale/unavailable, or reservation state cannot be established unambiguously:
 
 `POST = BLOCKED`.
 
-The acceptance tests for option (c) must include at minimum:
+The acceptance tests must include at minimum:
 
-- two concurrent exposure-increasing jobs for different users that would individually pass but jointly exceed the aggregate ceiling: at most one may obtain a reservation;
-- the same race executed from separate worker processes sharing PostgreSQL;
-- reservation persisted before the provider POST;
+- reservation persisted before provider POST;
+- concurrent execution-accounting authorization remains serialized across sessions/processes;
+- option-(c) ceilings use only authoritative `summary.total_account_value` and do not add order notional or reservations;
 - ambiguous provider outcome retains the reservation;
 - process crash after reservation commit retains the reservation;
-- definitive no-effect rejection releases the reservation;
-- filled/partially-filled resolution cannot create a gap between reservation release and refreshed real exposure accounting;
-- lock acquisition/database/exposure-state failure produces zero provider POSTs.
+- definitive no-effect rejection releases the reservation only under the shared lock;
+- filled/partially-filled resolution cannot create a gap between reservation release and refreshed provider/account/position truth;
+- lock acquisition/database/provider-state failure produces zero provider POSTs.
 
 #### 1.3.7 TRAXION does not control out-of-band deposits
 
@@ -374,9 +372,11 @@ Accordingly, during a provider-read outage the duration of **unknown external ex
 
 Under option (c), TRAXION explicitly accepts the following residual-risk model:
 
-> If an attacker obtains effective control of a RISEx signer that still possesses `MoveFund` authority, the capital potentially reachable by that attacker is the collateral deposited in the affected RISEx account plus the liquidatable value of its open positions, subject to the actual capabilities enforced by RISEx.
+> If an attacker obtains effective control of a RISEx signer that still possesses `MoveFund` authority, the capital economically exposed inside the affected RISEx account is measured by the account's current `summary.total_account_value`, subject to the actual capabilities enforced by RISEx.
 
-For multiple compromised accounts, the potential aggregate exposure is the sum of those account-level values.
+Gross position notional may exceed account equity because leverage can be used, but that notional is not added a second time to the option-(c) capital-at-risk measure. `summary.total_notional` remains a separate leverage/gross-position risk signal.
+
+For multiple compromised accounts, the observed aggregate option-(c) exposure is the sum of their authoritative `summary.total_account_value` values.
 
 Under normal monitored operation TRAXION intends to keep observed exposure within 25,000 USDC per user and 75,000 USDC aggregate.
 
@@ -397,26 +397,27 @@ The exposure monitor and enforcement path do not exist yet and are mandatory bef
 The required implementation surface is bounded to:
 
 1. **RISEx exposure read model**
-   - current collateral/balance read;
-   - open-position read;
-   - provider mark/liquidation-value input;
-   - deterministic `exposure_at_risk` calculation;
-   - fail-closed handling of missing/malformed provider state.
+   - read `/v1/portfolio/details` for the relevant account;
+   - parse `summary.total_account_value` as the authoritative option-(c) `exposure_at_risk`;
+   - retain `summary.total_notional` and position-level size/mark/liquidation data as secondary leverage, liquidation and reconciliation inputs;
+   - never add `total_notional`, position notional or local order reservations to `summary.total_account_value`;
+   - fail closed on missing, malformed, non-finite or otherwise indeterminate `summary.total_account_value`.
 
 2. **Periodic monitor**
    - 240-second cadence for active RISEx mainnet accounts;
    - provider-read timeout capped at 60 seconds;
    - latest successful sample timestamp;
-   - per-user and aggregate calculation;
+   - per-user and aggregate calculation from `summary.total_account_value`;
    - stale-sample detection at 300 seconds.
 
-3. **Point-of-use enforcement and atomic reservation**
-   - synchronous fresh exposure check before every exposure-increasing provider POST;
-   - PostgreSQL transaction-scoped advisory-lock serialization shared by all workers;
-   - durable per-Execution exposure reservation committed before POST;
-   - conservative candidate-order increment plus all active reservations;
-   - per-user and aggregate ceiling enforcement;
+3. **Point-of-use enforcement and execution-accounting reservation**
+   - synchronous fresh `summary.total_account_value` check before every exposure-increasing provider POST;
+   - per-user and aggregate option-(c) ceilings evaluated only against account-value exposure;
+   - PostgreSQL transaction-scoped advisory-lock serialization shared by all workers for pending execution/risk accounting;
+   - durable per-Execution reservation committed before POST;
+   - reservations excluded from the option-(c) account-value sum and used only for deterministic order/risk accounting and ambiguity safety;
    - ambiguous outcomes retain reservations until 4C resolves provider truth;
+   - terminal release/replacement occurs under the same serialization lock that refreshes/persists relevant provider account/position truth;
    - risk-reducing actions treated separately.
 
 4. **Breach handling**
@@ -430,22 +431,23 @@ The required implementation surface is bounded to:
    - under-limit pass;
    - per-user breach;
    - aggregate breach;
+   - cross-margin account proves no collateral/notional double counting;
+   - `total_notional` changes do not alter `exposure_at_risk` when `total_account_value` is unchanged;
    - out-of-band deposit detection;
    - stale provider data;
-   - malformed/missing balance or position data;
+   - missing/malformed `summary.total_account_value`;
    - provider-read timeout;
-   - pre-POST race protection;
-   - concurrent multi-worker aggregate reservation race;
    - reservation-before-POST ordering;
+   - concurrent multi-worker reservation serialization;
    - ambiguous outcome and crash retain reservation;
    - definitive resolution releases/replaces reservation without an accounting gap;
    - reduction allowed while increase blocked;
    - restart/recovery behavior;
    - no automatic Hyperliquid fallback.
 
-No new standalone Railway service is inherently required: the current execution-worker maintenance/control architecture and existing durable incident/system-control primitives can host the monitor if the implementation preserves isolation and point-of-use checks.
+No new standalone Railway service is inherently required: the current execution-worker architecture and existing durable incident/system-control primitives can host the monitor if the implementation preserves task isolation and point-of-use checks.
 
-This is a bounded medium-size implementation: one provider read/evaluation path, one periodic monitor, one point-of-use enforcement boundary, one incident/alert path and a focused regression suite. It is not expected to be the dominant schedule risk relative to unresolved provider-side RISEx information, but it remains a hard mainnet prerequisite.
+This is a bounded medium-size implementation. The provider read model is now concretely anchored to `summary.total_account_value`; leverage/notional controls remain independent deterministic controls rather than components of the option-(c) loss-budget formula.
 
 ### 1.4 Operational enforcement and DISARM timing
 
