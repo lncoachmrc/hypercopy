@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import Numeric
 
 from app.adapters.hyperliquid import deterministic_cloid
@@ -62,7 +64,10 @@ def test_0014_is_registered_and_is_additive_only():
     repo_root = backend_root.parent
     migration = backend_root / "alembic" / "versions" / "0014_risex_client_order_id.py"
 
-    assert EXPECTED_REVISION == "0014_risex_client_order_id"
+    alembic_config = Config(str(backend_root / "alembic.ini"))
+    alembic_config.set_main_option("script_location", str(backend_root / "alembic"))
+    actual_head = ScriptDirectory.from_config(alembic_config).get_current_head()
+    assert EXPECTED_REVISION == actual_head
     assert migration.exists(), "RED: migration 0014_risex_client_order_id.py is missing"
 
     source = migration.read_text()

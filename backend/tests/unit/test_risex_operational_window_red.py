@@ -8,6 +8,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import inspect as sa_inspect
 
 from app.api import admin as admin_module
@@ -26,9 +28,12 @@ def _build_worker(monkeypatch: pytest.MonkeyPatch) -> worker_module.Worker:
 
 
 def test_0013_schema_revision_and_migration_are_additive_only() -> None:
-    assert schema_module.EXPECTED_REVISION == '0014_risex_client_order_id'
-
     backend_root = Path(__file__).resolve().parents[2]
+    alembic_config = Config(str(backend_root / 'alembic.ini'))
+    alembic_config.set_main_option('script_location', str(backend_root / 'alembic'))
+    actual_head = ScriptDirectory.from_config(alembic_config).get_current_head()
+    assert schema_module.EXPECTED_REVISION == actual_head
+
     migration = backend_root / 'alembic' / 'versions' / '0013_risex_execution_control.py'
     assert migration.exists(), '0013_risex_execution_control.py must exist'
 
