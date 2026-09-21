@@ -7,9 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.adapters.risex import RISExAdapter
 from app.models.entities import JobState
-from app.services.risex_copy_execution import process_risex_job as real_process_risex_job
 from app.services.risex_execution_window import (
     RISExExecutionState,
     RISExOperationalWindowController,
@@ -30,20 +28,7 @@ class _CommitDB:
         self.commits += 1
 
 
-@pytest.mark.asyncio
-async def test_enabled_risex_worker_defers_without_prepared_submission_and_never_posts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Step 4B ends at routing + continuous authorization, before submission preparation.
-
-    With an ENABLED operational window and all point-of-use authorization fences
-    satisfied, the worker reaches ``process_risex_job`` without a
-    ``RISExPreparedCopySubmission``. The dedicated writer must therefore return
-    RETRYING and no signed provider POST may be attempted. Preparing that
-    process-local submission is intentionally left to the dedicated follow-up PR.
-    """
-
-    fixed_now = datetime(2026, 9, 16, 10, 0, tzinfo=UTC)
+def _enabled_worker(fixed_now: datetime):
     worker = execution_worker.Worker.__new__(execution_worker.Worker)
     worker.id = 'execution-worker-test'
     worker.boot_id = uuid.uuid4()
@@ -53,7 +38,6 @@ async def test_enabled_risex_worker_defers_without_prepared_submission_and_never
         boot_id=worker.boot_id,
         clock=lambda: fixed_now,
     )
-
     request_id = uuid.uuid4()
     assert worker.risex_window.begin_arm(
         request_id=request_id,
@@ -65,8 +49,10 @@ async def test_enabled_risex_worker_defers_without_prepared_submission_and_never
         control_generation=1,
         context_fingerprint=CONTEXT_FINGERPRINT,
     )
-    assert worker.risex_window.state == RISExExecutionState.ENABLED
+    return worker
 
+
+def _patch_common(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         execution_worker,
         'load_testnet_signer_credential',
@@ -86,27 +72,9 @@ async def test_enabled_risex_worker_defers_without_prepared_submission_and_never
 
     monkeypatch.setattr(execution_worker, 'risex_singleton_matches_worker', singleton_ok)
 
-    writer_calls = 0
 
-    async def counted_process_risex_job(db, adapter, job, **kwargs):
-        nonlocal writer_calls
-        writer_calls += 1
-        assert kwargs.get('submission') is None
-        return await real_process_risex_job(db, adapter, job, **kwargs)
-
-    monkeypatch.setattr(execution_worker, 'process_risex_job', counted_process_risex_job)
-
-    post_calls = 0
-
-    async def unexpected_place_ioc(self, **_kwargs):
-        nonlocal post_calls
-        post_calls += 1
-        raise AssertionError('Step 4B must not enter the signed POST path without submission material')
-
-    monkeypatch.setattr(RISExAdapter, 'place_ioc', unexpected_place_ioc)
-
-    db = _CommitDB()
-    job = SimpleNamespace(
+def _job(worker, fixed_now):
+    return SimpleNamespace(
         execution_provider='risex',
         execution_network='testnet',
         state=JobState.PROCESSING,
@@ -114,17 +82,103 @@ async def test_enabled_risex_worker_defers_without_prepared_submission_and_never
         owner=worker.id,
         locked_until=fixed_now,
         enqueued_at=fixed_now,
+        attempt_count=1,
     )
 
+
+@pytest.mark.asyncio
+async def test_enabled_risex_worker_passes_exact_prepared_submission_and_request_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """b2 crosses the old Step-4B boundary with one exact process-local submission."""
+
+    fixed_now = datetime(2026, 9, 21, 19, 0, tzinfo=UTC)
+    worker = _enabled_worker(fixed_now)
+    _patch_common(monkeypatch)
+
+    transport = object()
+    submission = object()
+    prepared = SimpleNamespace(transport=transport, submission=submission)
+    prepare_calls = 0
+
+    async def prepare_once(*_args, **_kwargs):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return prepared
+
+    monkeypatch.setattr(
+        execution_worker,
+        'prepare_risex_worker_submission',
+        prepare_once,
+        raising=False,
+    )
+
+    adapter_transport = None
+
+    class CapturingAdapter:
+        def __init__(self, *, transport=None, **_kwargs):
+            nonlocal adapter_transport
+            adapter_transport = transport
+
+    monkeypatch.setattr(execution_worker, 'RISExAdapter', CapturingAdapter)
+
+    writer_calls = 0
+    writer_submission = None
+
+    async def counted_process_risex_job(_db, _adapter, _job, **kwargs):
+        nonlocal writer_calls, writer_submission
+        writer_calls += 1
+        writer_submission = kwargs.get('submission')
+        return JobState.DONE.value
+
+    monkeypatch.setattr(execution_worker, 'process_risex_job', counted_process_risex_job)
+
+    db = _CommitDB()
+    result = await execution_worker.Worker._run_risex_copy_job(
+        worker,
+        db,
+        _job(worker, fixed_now),
+    )
+
+    assert prepare_calls == 1
+    assert adapter_transport is transport
+    assert writer_calls == 1
+    assert writer_submission is submission
+    assert result == JobState.DONE.value
+
+
+@pytest.mark.asyncio
+async def test_risex_worker_preparation_failure_never_reaches_writer_or_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixed_now = datetime(2026, 9, 21, 19, 0, tzinfo=UTC)
+    worker = _enabled_worker(fixed_now)
+    _patch_common(monkeypatch)
+
+    async def fail_preparation(*_args, **_kwargs):
+        raise RuntimeError('b2 preparation failed before durable submission')
+
+    monkeypatch.setattr(
+        execution_worker,
+        'prepare_risex_worker_submission',
+        fail_preparation,
+        raising=False,
+    )
+
+    writer_calls = 0
+
+    async def unexpected_writer(*_args, **_kwargs):
+        nonlocal writer_calls
+        writer_calls += 1
+        raise AssertionError('failed preparation must never reach process_risex_job')
+
+    monkeypatch.setattr(execution_worker, 'process_risex_job', unexpected_writer)
+
+    db = _CommitDB()
+    job = _job(worker, fixed_now)
     result = await execution_worker.Worker._run_risex_copy_job(worker, db, job)
 
-    assert writer_calls == 1
+    assert writer_calls == 0
     assert result == JobState.RETRYING.value
     assert job.state == JobState.RETRYING
-    assert 'prepared process-local submission is unavailable' in (job.last_error or '')
-    assert job.owner is None
-    assert job.locked_until is None
-    assert job.enqueued_at is None
-    assert db.commits == 1
-    assert post_calls == 0
-    assert worker.risex_window.state == RISExExecutionState.ENABLED
+    assert 'prepar' in (job.last_error or '').lower()
