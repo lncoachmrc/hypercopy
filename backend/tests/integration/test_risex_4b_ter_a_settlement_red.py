@@ -171,8 +171,8 @@ async def test_prepost_commit_persists_nonce_anchor_and_bitmap_index_durably() -
                 exposure_reader=lambda: (Decimal("0"), Decimal("0")),
                 user_exposure_ceiling=Decimal("25000"),
                 total_exposure_ceiling=Decimal("75000"),
-                risex_nonce_anchor=7,
-                risex_nonce_bitmap_index=13,
+                nonce_anchor=7,
+                nonce_bitmap_index=13,
             )
             execution_id = execution.id
 
@@ -180,8 +180,8 @@ async def test_prepost_commit_persists_nonce_anchor_and_bitmap_index_durably() -
         async with SessionLocal() as db:
             durable = await db.get(Execution, execution_id)
             assert durable is not None
-            assert durable.risex_nonce_anchor == 7
-            assert durable.risex_nonce_bitmap_index == 13
+            assert durable.nonce_anchor == 7
+            assert durable.nonce_bitmap_index == 13
             assert durable.state == ExecutionState.SUBMITTING
     finally:
         await _cleanup(user_id)
@@ -216,6 +216,7 @@ async def test_filled_settlement_refreshes_provider_truth_while_shared_lock_is_h
         response["provider_truth_refreshed"] = True
         execution.response = response
         await settlement_db.flush()
+        return {"provider_truth_persisted": True}
 
     outcome = risex_copy_execution.RISExSubmissionOutcome(
         definitive=True,
@@ -243,6 +244,80 @@ async def test_filled_settlement_refreshes_provider_truth_while_shared_lock_is_h
             assert durable.state == ExecutionState.FILLED
             assert durable.resolved_at is not None
             assert (durable.response or {}).get("provider_truth_refreshed") is True
+    finally:
+        await _cleanup(user_id)
+
+
+@pytest.mark.asyncio
+async def test_missing_provider_truth_callback_keeps_reservation_and_nonterminal_state() -> None:
+    settle = _require("settle_risex_execution_under_accounting_lock")
+    user_id, _job_id, execution_id = await _seed_execution(suffix="settle-missing-truth")
+
+    outcome = risex_copy_execution.RISExSubmissionOutcome(
+        definitive=True,
+        execution_state=ExecutionState.FILLED,
+        reservation_active=False,
+        provider_order_id="risex-order-missing-truth",
+        filled_quantity=Decimal("0.5"),
+    )
+
+    try:
+        async with SessionLocal() as db:
+            with pytest.raises(RuntimeError, match="provider truth"):
+                await settle(
+                    db,
+                    execution_id=execution_id,
+                    outcome=outcome,
+                    persist_provider_truth=None,
+                )
+
+        async with SessionLocal() as db:
+            durable = await db.get(Execution, execution_id)
+            assert durable is not None
+            assert durable.state == ExecutionState.SUBMITTING
+            assert durable.reserved_exposure_usdc == Decimal("100")
+            assert durable.resolved_at is None
+    finally:
+        await _cleanup(user_id)
+
+
+@pytest.mark.asyncio
+async def test_invalid_provider_truth_callback_result_rolls_back_and_keeps_reservation() -> None:
+    settle = _require("settle_risex_execution_under_accounting_lock")
+    user_id, _job_id, execution_id = await _seed_execution(suffix="settle-invalid-truth")
+
+    async def invalid_provider_truth(settlement_db, execution):
+        response = dict(execution.response or {})
+        response["must_rollback"] = True
+        execution.response = response
+        await settlement_db.flush()
+        return {}
+
+    outcome = risex_copy_execution.RISExSubmissionOutcome(
+        definitive=True,
+        execution_state=ExecutionState.FILLED,
+        reservation_active=False,
+        provider_order_id="risex-order-invalid-truth",
+        filled_quantity=Decimal("0.5"),
+    )
+
+    try:
+        async with SessionLocal() as db:
+            with pytest.raises(RuntimeError, match="provider truth"):
+                await settle(
+                    db,
+                    execution_id=execution_id,
+                    outcome=outcome,
+                    persist_provider_truth=invalid_provider_truth,
+                )
+
+        async with SessionLocal() as db:
+            durable = await db.get(Execution, execution_id)
+            assert durable is not None
+            assert durable.state == ExecutionState.SUBMITTING
+            assert durable.reserved_exposure_usdc == Decimal("100")
+            assert durable.resolved_at is None
+            assert (durable.response or {}).get("must_rollback") is None
     finally:
         await _cleanup(user_id)
 
