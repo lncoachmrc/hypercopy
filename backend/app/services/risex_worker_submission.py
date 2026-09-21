@@ -15,6 +15,7 @@ from app.models.entities import (
     CopyJob,
     CopyState,
     Execution,
+    ExecutionEpoch,
     ExecutionState,
     RiskHalt,
     RiskProfile,
@@ -214,6 +215,19 @@ async def prepare_risex_worker_submission(
         raise SignedTestnetBlocked(
             'RISEX_TESTNET_ACCOUNT_ADDRESS is required for RISEx portfolio truth'
         )
+    if job.execution_epoch_id is None:
+        raise SignedTestnetBlocked('RISEx CopyJob has no execution epoch')
+    epoch = await db.get(ExecutionEpoch, job.execution_epoch_id)
+    if (
+        epoch is None
+        or epoch.provider != 'risex'
+        or epoch.network != 'testnet'
+        or not epoch.account_address
+        or epoch.account_address.lower() != account_address.lower()
+    ):
+        raise SignedTestnetBlocked(
+            'RISEx execution epoch account does not match the configured test account'
+        )
 
     api = RISExReadOnlyHTTPTransport(base_url=_RISEX_TESTNET_API_URL)
     rpc = RISExReadOnlyRPCTransport(rpc_url=_RISEX_TESTNET_RPC_URL)
@@ -239,6 +253,10 @@ async def prepare_risex_worker_submission(
         ).scalar_one_or_none()
         if user is None or risk is None:
             raise SignedTestnetBlocked('RISEx user or RiskProfile is unavailable')
+        if user.copy_state == CopyState.SHADOW:
+            raise SignedTestnetBlocked(
+                'RISEx SHADOW mode never authorizes a signed provider write'
+            )
 
         ent = await entitlement(
             db,
