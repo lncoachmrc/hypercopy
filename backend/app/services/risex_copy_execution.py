@@ -197,6 +197,8 @@ async def persist_risex_pre_post_execution(
     exposure_reader: Callable[[], Any],
     user_exposure_ceiling: Decimal,
     total_exposure_ceiling: Decimal,
+    nonce_anchor: int | None = None,
+    nonce_bitmap_index: int | None = None,
     attempt_kind: str = 'o',
 ) -> Execution:
     """Atomically authorize and persist the pre-POST Execution/reservation."""
@@ -205,6 +207,16 @@ async def persist_risex_pre_post_execution(
         raise RuntimeError('RISEx durable execution requires a bound RISEx execution epoch')
     if type(client_order_id) is not int or not 0 < client_order_id < (1 << 64):
         raise RuntimeError('RISEx client_order_id must be a non-zero uint64')
+    if (nonce_anchor is None) != (nonce_bitmap_index is None):
+        raise RuntimeError('RISEx nonce anchor and bitmap index must be persisted together')
+    if nonce_anchor is not None:
+        if type(nonce_anchor) is not int or not 0 <= nonce_anchor < (1 << 48):
+            raise RuntimeError('RISEx nonce_anchor must be a uint48')
+        if (
+            type(nonce_bitmap_index) is not int
+            or not 0 <= nonce_bitmap_index < (1 << 8)
+        ):
+            raise RuntimeError('RISEx nonce_bitmap_index must be a uint8')
 
     requested = _decimal_or_none(requested_size)
     limit = _decimal_or_none(limit_px)
@@ -271,6 +283,8 @@ async def persist_risex_pre_post_execution(
         cloid=cloid,
         client_order_id=client_order_id,
         reserved_exposure_usdc=reservation,
+        nonce_anchor=nonce_anchor,
+        nonce_bitmap_index=nonce_bitmap_index,
         state=ExecutionState.SUBMITTING,
         asset=job.asset,
         is_buy=is_buy,
@@ -286,6 +300,79 @@ async def persist_risex_pre_post_execution(
     db.add(execution)
     await db.commit()
     return execution
+
+
+async def _persist_provider_truth_for_settlement(
+    callback: Callable[[AsyncSession, Execution], Any] | None,
+    db: AsyncSession,
+    execution: Execution,
+) -> Mapping[str, Any]:
+    if callback is None:
+        raise RuntimeError('RISEx provider truth callback is required before reservation release')
+    result = callback(db, execution)
+    if inspect.isawaitable(result):
+        result = await result
+    if not isinstance(result, Mapping) or result.get('provider_truth_persisted') is not True:
+        raise RuntimeError('RISEx provider truth callback returned invalid persistence evidence')
+    return result
+
+
+async def settle_risex_execution_under_accounting_lock(
+    db: AsyncSession,
+    *,
+    execution_id: uuid.UUID,
+    outcome: RISExSubmissionOutcome,
+    persist_provider_truth: Callable[[AsyncSession, Execution], Any] | None,
+) -> Execution:
+    """Release a RISEx reservation only inside the shared serialized accounting transaction."""
+
+    if not outcome.definitive or outcome.execution_state not in {
+        ExecutionState.FILLED,
+        ExecutionState.REJECTED,
+        ExecutionState.CANCELED,
+    }:
+        raise RuntimeError('RISEx settlement requires a definitive terminal outcome')
+
+    try:
+        await _acquire_exposure_budget_lock(db)
+        execution = (
+            await db.execute(
+                select(Execution)
+                .where(Execution.id == execution_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if execution is None:
+            raise RuntimeError('RISEx settlement execution was not found')
+        if execution.state not in _ACTIVE_RESERVATION_STATES:
+            raise RuntimeError('RISEx settlement requires an active reservation')
+
+        provider_truth_persisted = outcome.execution_state == ExecutionState.REJECTED
+        if not provider_truth_persisted:
+            await _persist_provider_truth_for_settlement(
+                persist_provider_truth,
+                db,
+                execution,
+            )
+            provider_truth_persisted = True
+
+        response = dict(execution.response or {})
+        response['risex_4b_ter_a'] = {
+            **dict(response.get('risex_4b_ter_a') or {}),
+            'provider_truth_persisted': provider_truth_persisted,
+            'settlement_serialized': True,
+        }
+        execution.response = response
+        execution.state = outcome.execution_state
+        execution.exchange_oid = outcome.provider_order_id
+        execution.filled_size = outcome.filled_quantity or Decimal(0)
+        execution.reject_reason = outcome.reason
+        execution.resolved_at = datetime.now(UTC)
+        await db.commit()
+        return execution
+    except Exception:
+        await db.rollback()
+        raise
 
 
 async def _defer_for_resolution(
@@ -319,6 +406,7 @@ async def process_risex_job(
     job: CopyJob,
     *,
     submission: RISExPreparedCopySubmission | None = None,
+    persist_provider_truth: Callable[[AsyncSession, Execution], Any] | None = None,
 ) -> str:
     """Submit at most once; provider truth remains fenced until terminal evidence."""
 
@@ -419,13 +507,25 @@ async def process_risex_job(
             'RISEx provider acknowledgement is not terminal provider truth',
         )
 
-    existing.state = outcome.execution_state
-    existing.exchange_oid = outcome.provider_order_id
-    existing.filled_size = outcome.filled_quantity or Decimal(0)
-    existing.reject_reason = outcome.reason
-    existing.resolved_at = datetime.now(UTC)
+    job_id = job.id
+    try:
+        settled = await settle_risex_execution_under_accounting_lock(
+            db,
+            execution_id=existing.id,
+            outcome=outcome,
+            persist_provider_truth=persist_provider_truth,
+        )
+    except RuntimeError as exc:
+        fresh_job = await db.get(CopyJob, job_id)
+        if fresh_job is None:
+            raise
+        return await _defer_for_resolution(
+            db,
+            fresh_job,
+            f'RISEx terminal outcome awaits serialized provider truth: {exc}',
+        )
 
-    if outcome.execution_state == ExecutionState.FILLED:
+    if settled.state == ExecutionState.FILLED:
         job.state = JobState.DONE
         job.last_error = None
     else:
