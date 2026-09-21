@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint, func, text
+from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -254,6 +254,8 @@ class Execution(BaseUuid, Base):
     cloid: Mapped[str] = mapped_column(String(34), unique=True, nullable=False)
     client_order_id: Mapped[Decimal | None] = mapped_column(Numeric(20, 0), nullable=True)
     reserved_exposure_usdc: Mapped[Decimal | None] = mapped_column(D, nullable=True)
+    nonce_anchor: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    nonce_bitmap_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     state: Mapped[ExecutionState] = mapped_column(Enum(ExecutionState, name='execution_state_enum', native_enum=False, length=32), default=ExecutionState.SUBMITTING, index=True)
     asset: Mapped[str] = mapped_column(String(24), nullable=False)
     is_buy: Mapped[bool] = mapped_column(Boolean, nullable=False)
