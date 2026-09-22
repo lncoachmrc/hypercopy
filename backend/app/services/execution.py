@@ -424,7 +424,7 @@ async def _process_ai_profit_exit_locked(
         return await _finish_profit_exit_failure(db, job, decision, 'AI profit exit account, risk profile or managed ledger is unavailable')
 
     cred = (await db.execute(select(SigningCredential).where(SigningCredential.trading_account_id == account.id))).scalar_one_or_none()
-    if not _credential_active(cred):
+    if cred is None or not _credential_active(cred):
         return await _finish_profit_exit_failure(db, job, decision, 'Trading credential is unavailable')
 
     open_event = await db.get(MasterEvent, decision.source_cycle_open_event_id)
@@ -440,16 +440,23 @@ async def _process_ai_profit_exit_locked(
         history_end_ms=None,
         slippage_bps=risk.max_slippage_bps,
     )
+    observed_economics = observation.economics
+    observed_net_pnl = (
+        observed_economics.net_pnl
+        if observed_economics is not None
+        else None
+    )
     if (
         not observation.complete
         or not observation.eligible
         or observation.current_position is None
         or observation.mark_price is None
         or observation.executable_exit_price is None
-        or observation.economics is None
+        or observed_economics is None
+        or observed_net_pnl is None
         or not profit_exit_economically_admissible(
-            net_pnl=observation.economics.net_pnl,
-            pnl_complete=observation.economics.complete,
+            net_pnl=observed_net_pnl,
+            pnl_complete=observed_economics.complete,
             position_fresh=True,
         )
     ):
@@ -578,15 +585,22 @@ async def _process_ai_profit_exit_locked(
             history_end_ms=None,
             slippage_bps=risk.max_slippage_bps,
         )
+        fresh_economics = fresh.economics
+        fresh_net_pnl = (
+            fresh_economics.net_pnl
+            if fresh_economics is not None
+            else None
+        )
         if (
             not fresh.complete
             or not fresh.eligible
             or fresh.current_position is None
             or fresh.executable_exit_price is None
-            or fresh.economics is None
+            or fresh_economics is None
+            or fresh_net_pnl is None
             or not profit_exit_economically_admissible(
-                net_pnl=fresh.economics.net_pnl,
-                pnl_complete=fresh.economics.complete,
+                net_pnl=fresh_net_pnl,
+                pnl_complete=fresh_economics.complete,
                 position_fresh=True,
             )
         ):
@@ -786,6 +800,18 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
                 raise ValueError('invalid snapshot boundary')
         except Exception:
             snapshot_boundary = None
+
+        if (
+            job.execution_epoch_id is None
+            or job.execution_provider is None
+            or job.execution_network is None
+        ):
+            return await _finish(
+                db,
+                job,
+                JobState.SKIPPED,
+                'Strategy job lost its execution destination binding',
+            )
 
         protected_target = await protected_reconcile_target(
             db,
