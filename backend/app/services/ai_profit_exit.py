@@ -524,8 +524,10 @@ def source_cycle_events_stmt(
         select(MasterEvent)
         .where(
             MasterEvent.asset == str(asset).upper(),
-            MasterEvent.causal_order.is_not(None),
-            MasterEvent.causal_order < snapshot_started_order,
+            (
+                MasterEvent.causal_order.is_(None)
+                | (MasterEvent.causal_order < snapshot_started_order)
+            ),
         )
         .order_by(
             MasterEvent.causal_order.asc(),
