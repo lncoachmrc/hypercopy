@@ -49,6 +49,8 @@ EXPECTED_MIGRATIONS = {
     '0013_risex_execution_control.py',
     '0014_risex_client_order_id.py',
     '0015_risex_execution_nonce.py',
+    '0016_ai_profit_exit_decisions.py',
+    '0017_master_event_causal_order.py',
 }
 
 missing = [path for path in REQUIRED_FILES if not (root / path).exists()]
@@ -71,7 +73,15 @@ allowed_prefixes = ('development', 'CHANGE', 'ci-only')
 hits: list[str] = []
 for path in root.rglob('*'):
     if not path.is_file() or any(
-        part in {'.git', 'node_modules', 'dist', '.pytest_cache', '__pycache__'}
+        part in {
+            '.git',
+            '.venv',
+            'venv',
+            'node_modules',
+            'dist',
+            '.pytest_cache',
+            '__pycache__',
+        }
         for part in path.parts
     ):
         continue

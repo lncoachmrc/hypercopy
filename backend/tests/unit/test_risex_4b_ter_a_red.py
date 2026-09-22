@@ -22,19 +22,33 @@ def test_execution_model_persists_risex_nonce_identity() -> None:
     assert table.c.nonce_bitmap_index.nullable is True
 
 
-def test_schema_and_release_preflight_register_0015_nonce_migration() -> None:
-    assert db_schema.EXPECTED_REVISION == "0015_risex_execution_nonce", (
-        "RED: schema head must advance to additive 0015 RISEx nonce persistence"
+def test_schema_head_and_release_preflight_preserve_0015_nonce_migration() -> None:
+    assert db_schema.EXPECTED_REVISION == "0017_master_event_causal_order", (
+        "schema head must match the current additive migration chain"
     )
 
     repo_root = Path(__file__).resolve().parents[3]
-    migration = repo_root / "backend" / "alembic" / "versions" / "0015_risex_execution_nonce.py"
-    assert migration.exists(), "RED: additive 0015 RISEx execution nonce migration is missing"
-
-    preflight = (repo_root / "scripts" / "targeted_release_preflight.py").read_text()
-    assert "'0015_risex_execution_nonce.py'" in preflight, (
-        "RED: targeted release preflight must register migration 0015"
+    migration = (
+        repo_root
+        / "backend"
+        / "alembic"
+        / "versions"
+        / "0015_risex_execution_nonce.py"
     )
+    assert migration.exists(), (
+        "additive 0015 RISEx execution nonce migration must remain present"
+    )
+
+    preflight = (
+        repo_root / "scripts" / "targeted_release_preflight.py"
+    ).read_text()
+
+    for expected in (
+        "'0015_risex_execution_nonce.py'",
+        "'0016_ai_profit_exit_decisions.py'",
+        "'0017_master_event_causal_order.py'",
+    ):
+        assert expected in preflight
 
 
 def test_prepost_persistence_requires_exact_nonce_identity() -> None:

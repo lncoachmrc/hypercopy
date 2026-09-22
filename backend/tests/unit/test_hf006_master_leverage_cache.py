@@ -235,25 +235,40 @@ async def test_shared_cache_fails_closed_for_malformed_or_unpaired_equity(config
 
 @pytest.mark.asyncio
 async def test_master_snapshot_uses_shared_order_before_exchange_read(configured_master, monkeypatch):
-    redis = FakeRedis()
-    monkeypatch.setattr(reconcile_module, 'redis_client', lambda: redis)
+    events: list[str] = []
+
+    async def fake_next_master_leverage_causal_order(_redis=None):
+        events.append('causal-order')
+        return 1
+
+    monkeypatch.setattr(
+        reconcile_module,
+        'next_master_leverage_causal_order',
+        fake_next_master_leverage_causal_order,
+    )
 
     class FakeMasterAdapter:
         async def account_snapshot(self, *_args, **_kwargs):
-            order_keys = [key for key in redis.values if ':master-leverage-missing:order:' in key]
-            assert len(order_keys) == 1
-            assert redis.values[order_keys[0]] == '1'
-            return SimpleNamespace(perp_state={'assetPositions': []}, account_value=Decimal('900'))
+            assert events == ['causal-order']
+            events.append('account-snapshot')
+            return SimpleNamespace(
+                perp_state={'assetPositions': []},
+                account_value=Decimal('900'),
+            )
 
         async def mids(self):
+            events.append('mids')
             return {'BTC': '100'}
 
-    positions, equity, mids = await master_snapshot(FakeMasterAdapter())  # type: ignore[arg-type]
+    positions, equity, mids = await master_snapshot(
+        FakeMasterAdapter()
+    )  # type: ignore[arg-type]
 
     assert positions == {}
     assert equity == Decimal('900')
     assert mids == {'BTC': '100'}
     assert getattr(mids, 'snapshot_started_order') == 1
+    assert events == ['causal-order', 'account-snapshot', 'mids']
 
 
 @pytest.mark.asyncio
