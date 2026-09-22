@@ -657,6 +657,69 @@ class HyperliquidAdapter:
             weight=WEIGHT_USER_FILLS_MAX, priority=Priority.RECONCILE, timeout=30,
         )
 
+    async def user_funding_history(
+        self,
+        account: str,
+        start_ms: int,
+        end_ms: int | None = None,
+    ) -> list[dict]:
+        """Read authoritative user funding ledger entries for one time window."""
+
+        value = await self._read(
+            self.info.user_funding_history,
+            account,
+            start_ms,
+            end_ms,
+            weight=WEIGHT_USER_FILLS_MAX,
+            priority=Priority.RECONCILE,
+            timeout=30,
+        )
+        if not isinstance(value, list) or any(
+            not isinstance(row, dict) for row in value
+        ):
+            raise ValueError(
+                "Malformed Hyperliquid user funding response"
+            )
+        return value
+
+    async def user_fees(
+        self,
+        account: str,
+    ) -> dict:
+        """Read the user's current authoritative Hyperliquid fee schedule."""
+
+        value = await self._read(
+            self.info.user_fees,
+            account,
+            weight=WEIGHT_STANDARD_INFO,
+            priority=Priority.RECONCILE,
+            timeout=15,
+        )
+        if not isinstance(value, dict):
+            raise ValueError(
+                "Malformed Hyperliquid user fees response"
+            )
+
+        cross_rate = value.get("userCrossRate")
+        if cross_rate in (None, ""):
+            raise ValueError(
+                "Malformed Hyperliquid user fees response: userCrossRate missing"
+            )
+
+        try:
+            parsed_cross_rate = Decimal(str(cross_rate))
+        except Exception as exc:
+            raise ValueError(
+                "Malformed Hyperliquid user fees response: invalid userCrossRate"
+            ) from exc
+
+        if not parsed_cross_rate.is_finite() or parsed_cross_rate < 0:
+            raise ValueError(
+                "Malformed Hyperliquid user fees response: invalid userCrossRate"
+            )
+
+        return value
+
     async def place_ioc(
         self, *, account_address: str, private_key: str, asset: str, is_buy: bool,
         size: Decimal, mark_price: Decimal, slippage_bps: int, reduce_only: bool, cloid: str,
