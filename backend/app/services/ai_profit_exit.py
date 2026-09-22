@@ -173,6 +173,45 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.entities import AIProfitExitDecision, MasterEvent
 
 
+_PROFIT_EXIT_DECISION_NAMESPACE = uuid.UUID("2fa3a0ab-84d5-5d1a-84bf-241b7ae6a3b2")
+_PROFIT_EXIT_JOB_NAMESPACE = uuid.UUID("67f4c698-1171-5c08-bc29-f61b421c89c7")
+
+
+def profit_exit_decision_id(
+    *,
+    user_id: uuid.UUID,
+    execution_epoch_id: uuid.UUID,
+    execution_provider: str,
+    execution_network: str,
+    asset: str,
+    source_cycle_id: str,
+    state_version: int,
+    follower_position: Decimal,
+    evaluation_slot: int,
+) -> uuid.UUID:
+    """Deterministic semantic identity for one evaluated follower snapshot."""
+    if evaluation_slot < 0 or state_version <= 0:
+        raise ValueError("Profit-exit identity requires positive causal evidence")
+    material = "|".join(
+        (
+            str(user_id),
+            str(execution_epoch_id),
+            str(execution_provider).lower(),
+            str(execution_network).lower(),
+            str(asset).upper(),
+            str(source_cycle_id),
+            str(state_version),
+            format(follower_position, "f"),
+            str(evaluation_slot),
+        )
+    )
+    return uuid.uuid5(_PROFIT_EXIT_DECISION_NAMESPACE, material)
+
+
+def profit_exit_job_id(decision_id: uuid.UUID) -> uuid.UUID:
+    return uuid.uuid5(_PROFIT_EXIT_JOB_NAMESPACE, str(decision_id))
+
+
 @dataclass(frozen=True, slots=True)
 class SourceCycle:
     open_event_id: uuid.UUID

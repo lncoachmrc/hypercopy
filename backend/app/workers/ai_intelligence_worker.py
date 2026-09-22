@@ -15,6 +15,8 @@ from app.db.schema import assert_schema
 from app.db.session import SessionLocal, engine
 from app.models.entities import MasterEvent
 from app.services.ai_intelligence import read_ai_intelligence, refresh_ai_intelligence
+from app.services.ai_profit_exit import ProfitExitFeatureMode, profit_exit_feature_mode
+from app.services.ai_profit_exit_decision import evaluate_profit_exit_portfolio
 
 settings.validate_for_service('ai-intelligence-worker')
 configure_logging(); log=get_logger(__name__)
@@ -70,6 +72,8 @@ class AIIntelligenceWorker:
         self._pending=False
         self._last_signal_mono: float | None=None
         self._source_ts: datetime | None=None
+        self.profit_exit_interval=max(int(settings.AI_PROFIT_EXIT_EVAL_SECONDS),1)
+        self._last_profit_exit_eval=0.0
 
     async def _latest_master_event(self) -> MasterEvent | None:
         async with SessionLocal() as db:
@@ -187,6 +191,22 @@ class AIIntelligenceWorker:
         if self._is_new_event(latest):
             self._mark_pending_from_event_time(latest.event_ts)
 
+    async def _run_profit_exit_evaluation(self) -> bool:
+        async with engine.connect() as conn:
+            acquired=bool((await conn.execute(
+                text("SELECT pg_try_advisory_lock(hashtext('hypercopy:ai-profit-exit'))")
+            )).scalar_one())
+            if not acquired:
+                return False
+            try:
+                async with SessionLocal() as db:
+                    result=await evaluate_profit_exit_portfolio(db,self.redis)
+            finally:
+                await conn.execute(text("SELECT pg_advisory_unlock(hashtext('hypercopy:ai-profit-exit'))"))
+                await conn.commit()
+        log.info('AI profit-exit evaluation completed',extra=result)
+        return True
+
     async def run(self):
         async with SessionLocal() as db:
             await assert_schema(db)
@@ -198,8 +218,8 @@ class AIIntelligenceWorker:
             'max_refresh_seconds':self.max_refresh,
         })
 
-        if not _env_bool('LLM_ENABLED',False):
-            log.info('AI intelligence worker idle because LLM_ENABLED=false')
+        if not _env_bool('LLM_ENABLED',False) and profit_exit_feature_mode() is ProfitExitFeatureMode.OFF:
+            log.info('AI intelligence worker idle because LLM and AI Profit Exit are disabled')
             while not stop.is_set():
                 await asyncio.sleep(30)
             return
@@ -214,6 +234,15 @@ class AIIntelligenceWorker:
             await self._db_fallback_check()
 
             now=asyncio.get_running_loop().time()
+            if (
+                profit_exit_feature_mode() is not ProfitExitFeatureMode.OFF
+                and now-self._last_profit_exit_eval >= self.profit_exit_interval
+            ):
+                try:
+                    await self._run_profit_exit_evaluation()
+                except Exception:
+                    log.warning('AI profit-exit evaluation failed closed',exc_info=True)
+                self._last_profit_exit_eval=now
             state=await self._state()
             age=self._state_age_seconds(state)
             retry_after=self.failure_retry if state.get('status')=='degraded' else self.min_refresh

@@ -73,6 +73,8 @@ class Settings(BaseSettings):
     # OFF: no new operational decisions; SHADOW: record-only; ON: may queue a
     # CLOSE_PROFIT that still passes deterministic execution/economic fences.
     AI_PROFIT_EXIT_MODE: Literal['OFF', 'SHADOW', 'ON'] = 'OFF'
+    AI_PROFIT_EXIT_EVAL_SECONDS: int = 60
+    AI_PROFIT_EXIT_DECISION_TTL_SECONDS: int = 90
 
     SESSION_SECRET: str = 'development-only-change-me'
     # Dedicated pseudonymization key for audit IPs. Local development derives a
@@ -212,6 +214,10 @@ class Settings(BaseSettings):
             raise ValueError('HL_SAFE_READ_BACKOFF_SECONDS cannot be negative')
         if self.STRATEGY_JOB_MAX_AGE_SECONDS <= 0:
             raise ValueError('STRATEGY_JOB_MAX_AGE_SECONDS must be positive')
+        if self.AI_PROFIT_EXIT_EVAL_SECONDS <= 0:
+            raise ValueError('AI_PROFIT_EXIT_EVAL_SECONDS must be positive')
+        if self.AI_PROFIT_EXIT_DECISION_TTL_SECONDS <= 0:
+            raise ValueError('AI_PROFIT_EXIT_DECISION_TTL_SECONDS must be positive')
         return self
 
     def audit_ip_hash_key_bytes(self) -> bytes:
