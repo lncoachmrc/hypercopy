@@ -55,7 +55,7 @@ async def read_profit_exit_mode_state(db: AsyncSession) -> dict:
         "evaluates": mode is not ProfitExitFeatureMode.OFF,
         "operational": mode is ProfitExitFeatureMode.ON,
         "reason": row.reason,
-        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "updated_at": (row.value or {}).get("updated_at") if isinstance(row.value, dict) else None,
     }
 
 
