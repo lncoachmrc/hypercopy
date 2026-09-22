@@ -3,6 +3,11 @@ from __future__ import annotations
 from decimal import Decimal
 from enum import Enum
 
+from app.engine.sizing import OrderIntent, SizingResult, round_size
+
+
+PROFIT_EXIT_ORIGIN = "AI_PROFIT_EXIT"
+
 
 class ProfitExitAction(str, Enum):
     HOLD = "HOLD"
@@ -16,6 +21,44 @@ class ProfitExitIntentState(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     AMBIGUOUS = "AMBIGUOUS"
+
+
+def build_profit_exit_close_plan(
+    *,
+    asset: str,
+    current_position: Decimal,
+    mark_price: Decimal,
+    sz_decimals: int,
+) -> SizingResult:
+    """Build the only order shape AI Profit Exit is allowed to submit.
+
+    The AI may choose timing, but execution is always a full residual close of
+    the currently verified follower side. The order can never open, increase or
+    reverse exposure.
+    """
+    if not current_position.is_finite() or current_position == 0:
+        raise ValueError("Profit-exit position must be finite and non-zero")
+    if not mark_price.is_finite() or mark_price <= 0:
+        raise ValueError("Profit-exit mark price must be finite and positive")
+    if isinstance(sz_decimals, bool) or not isinstance(sz_decimals, int) or sz_decimals < 0:
+        raise ValueError("Profit-exit size precision is invalid")
+
+    order_size = round_size(abs(current_position), sz_decimals)
+    if order_size <= 0:
+        raise ValueError("Profit-exit residual rounds to zero")
+
+    return SizingResult(
+        asset=str(asset).upper(),
+        intent=OrderIntent.CLOSE,
+        target_size=Decimal(0),
+        current_size=current_position,
+        delta=-current_position,
+        order_size=order_size,
+        is_buy=current_position < 0,
+        reduce_only=True,
+        notional=order_size * mark_price,
+        notes=["AI profit exit: full verified residual close"],
+    )
 
 
 class SourceCycleTransition(str, Enum):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
@@ -10,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.action_errors import ActionRetryPolicy, classify_action_error
 from app.adapters.hyperliquid import HyperliquidAdapter, OrderOutcome, deterministic_cloid
+from app.adapters.ratelimit import Priority
 from app.core.config import Network, settings
 from app.core.crypto import EncryptedCredential, crypto
 from app.core.logging import get_logger
@@ -17,15 +19,26 @@ from app.db.position_ledger_lock import position_ledger_lock
 from app.engine.risk import RiskAction, RiskContext, evaluate
 from app.engine.sizing import FollowerState, MasterExposure, SizingResult, plan, round_size
 from app.models.entities import (
-    CopyJob, CopyState, CredentialStatus, EquitySnapshot, Execution, ExecutionState,
-    JobState, PositionLedger, RiskHalt, RiskProfile, RiskState, SigningCredential,
-    SystemFlag, TradingAccount, User, UserState,
+    AIProfitExitDecision, CopyJob, CopyState, CredentialStatus, EquitySnapshot,
+    Execution, ExecutionState, JobState, MasterEvent, PositionLedger, RiskHalt,
+    RiskProfile, RiskState, SigningCredential, SystemFlag, TradingAccount, User,
+    UserState,
 )
+from app.services.ai_profit_exit import (
+    PROFIT_EXIT_ORIGIN,
+    ProfitExitAction,
+    ProfitExitIntentState,
+    build_profit_exit_close_plan,
+    profit_exit_economically_admissible,
+    read_current_source_cycle,
+)
+from app.services.ai_profit_exit_collector import collect_profit_exit_economics
 from app.services.audit import audit
 from app.services.effective_risk import resolve_effective_risk
 from app.services.entitlement import entitlement
 from app.services.execution_destination import job_matches_active_destination
 from app.services.networking import user_network_state
+from app.services.strategy_intents import master_position_from_state
 
 log = get_logger(__name__)
 TERMINAL_EXEC = {
@@ -215,6 +228,335 @@ async def _renew_job_lease_after_lock(
     return job
 
 
+async def _set_profit_exit_state(
+    db: AsyncSession,
+    decision: AIProfitExitDecision,
+    state: ProfitExitIntentState,
+) -> None:
+    decision.intent_state = state.value
+    await db.flush()
+
+
+async def _finish_profit_exit_failure(
+    db: AsyncSession,
+    job: CopyJob,
+    decision: AIProfitExitDecision | None,
+    reason: str,
+) -> str:
+    if decision is not None:
+        await _set_profit_exit_state(db, decision, ProfitExitIntentState.FAILED)
+    await audit(
+        db,
+        action='AI_PROFIT_EXIT_BLOCKED',
+        subject_id=job.user_id,
+        reason=reason,
+        correlation_id=job.correlation_id,
+        after={'asset': job.asset, 'job_id': str(job.id)},
+    )
+    return await _finish(db, job, JobState.SKIPPED, reason)
+
+
+async def _process_ai_profit_exit_locked(
+    db: AsyncSession,
+    hl: HyperliquidAdapter,
+    job: CopyJob,
+    user: User,
+    network_state,
+) -> str:
+    """Execute one durable AI CLOSE_PROFIT through the normal Hyperliquid path."""
+    if job.execution_provider != 'hyperliquid':
+        return await _finish(db, job, JobState.SKIPPED, 'AI profit exit v1 is Hyperliquid-only')
+    network = network_state.network
+    if job.execution_network != network or hl.network != network:
+        return await _finish(db, job, JobState.SKIPPED, 'AI profit exit destination network is stale')
+
+    ctx = dict(job.context or {})
+    try:
+        decision_id = uuid.UUID(str(ctx['ai_profit_exit_decision_id']))
+    except Exception:
+        return await _finish(db, job, JobState.SKIPPED, 'AI profit exit decision identity is missing')
+
+    decision = await db.get(AIProfitExitDecision, decision_id)
+    if decision is None:
+        return await _finish(db, job, JobState.SKIPPED, 'AI profit exit decision is unavailable')
+
+    binding_ok = (
+        decision.user_id == user.id
+        and decision.copy_job_id == job.id
+        and decision.execution_epoch_id == job.execution_epoch_id
+        and decision.execution_provider == 'hyperliquid'
+        and decision.execution_network == network
+        and decision.asset == job.asset
+    )
+    if not binding_ok:
+        return await _finish_profit_exit_failure(db, job, decision, 'AI profit exit durable binding mismatch')
+    if decision.action != ProfitExitAction.CLOSE_PROFIT.value:
+        return await _finish_profit_exit_failure(db, job, decision, 'AI profit exit decision is not CLOSE_PROFIT')
+    if decision.intent_state != ProfitExitIntentState.PENDING.value:
+        return await _finish(db, job, JobState.SKIPPED, 'AI profit exit decision is no longer pending')
+
+    now = datetime.now(UTC)
+    if decision.expires_at <= now:
+        return await _finish_profit_exit_failure(db, job, decision, 'AI profit exit decision expired before execution')
+    if decision.net_pnl is None or not profit_exit_economically_admissible(
+        net_pnl=decision.net_pnl,
+        pnl_complete=decision.pnl_complete,
+        position_fresh=True,
+    ):
+        return await _finish_profit_exit_failure(db, job, decision, 'AI profit exit durable economics are not profitable')
+
+    account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
+    risk = (await db.execute(select(RiskProfile).where(RiskProfile.user_id == user.id))).scalar_one_or_none()
+    risk_state = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
+    ledger = (await db.execute(select(PositionLedger).where(
+        PositionLedger.user_id == user.id,
+        PositionLedger.asset == job.asset,
+    ))).scalar_one_or_none()
+    if not account or not risk or ledger is None or not ledger.managed:
+        return await _finish_profit_exit_failure(db, job, decision, 'AI profit exit account, risk profile or managed ledger is unavailable')
+
+    cred = (await db.execute(select(SigningCredential).where(SigningCredential.trading_account_id == account.id))).scalar_one_or_none()
+    if not _credential_active(cred):
+        return await _finish_profit_exit_failure(db, job, decision, 'Trading credential is unavailable')
+
+    open_event = await db.get(MasterEvent, decision.source_cycle_open_event_id)
+    if open_event is None or open_event.event_ts is None:
+        return await _finish_profit_exit_failure(db, job, decision, 'AI profit exit source-cycle opening evidence is unavailable')
+    history_start_ms = max(0, int(open_event.event_ts.timestamp() * 1000))
+
+    observation = await collect_profit_exit_economics(
+        hl,
+        account_address=account.account_address,
+        asset=job.asset,
+        history_start_ms=history_start_ms,
+        history_end_ms=None,
+        slippage_bps=risk.max_slippage_bps,
+    )
+    if (
+        not observation.complete
+        or not observation.eligible
+        or observation.current_position is None
+        or observation.mark_price is None
+        or observation.executable_exit_price is None
+        or observation.economics is None
+        or not profit_exit_economically_admissible(
+            net_pnl=observation.economics.net_pnl,
+            pnl_complete=observation.economics.complete,
+            position_fresh=True,
+        )
+    ):
+        return await _finish_profit_exit_failure(
+            db,
+            job,
+            decision,
+            observation.reason or 'AI profit exit economics are incomplete or non-positive',
+        )
+
+    current = observation.current_position
+    expected_side = 'LONG' if current > 0 else 'SHORT'
+    if expected_side != decision.side:
+        return await _finish_profit_exit_failure(db, job, decision, 'AI profit exit follower side changed')
+    if _persisted_ledger_decimal(ledger.size) != _persisted_ledger_decimal(current):
+        return await _finish_profit_exit_failure(db, job, decision, 'AI profit exit follower ledger is not synchronized with exchange truth')
+
+    spec = await hl.asset_spec(job.asset)
+    try:
+        close_plan = build_profit_exit_close_plan(
+            asset=job.asset,
+            current_position=current,
+            mark_price=observation.mark_price,
+            sz_decimals=spec.sz_decimals,
+        )
+    except ValueError as exc:
+        return await _finish_profit_exit_failure(db, job, decision, str(exc))
+
+    equity = (await db.execute(select(EquitySnapshot).where(
+        EquitySnapshot.user_id == user.id,
+        EquitySnapshot.taken_at >= network_state.started_at,
+    ).order_by(EquitySnapshot.taken_at.desc()).limit(1))).scalar_one_or_none()
+    if equity is None:
+        return await _finish_profit_exit_failure(db, job, decision, 'Follower equity is unavailable')
+
+    ent = await entitlement(db, user)
+    effective_risk = resolve_effective_risk(risk, ent, exchange_max_leverage=spec.max_leverage)
+    ledger.mark_price = observation.mark_price
+    ledgers = (await db.execute(select(PositionLedger).where(
+        PositionLedger.user_id == user.id,
+        PositionLedger.managed.is_(True),
+    ))).scalars().all()
+    total_exposure = sum((abs(row.size) * max(row.mark_price or Decimal(0), Decimal(0)) for row in ledgers), Decimal(0))
+    asset_exposure = abs(current) * observation.mark_price
+    stale = equity.taken_at < now - timedelta(seconds=settings.LEDGER_STALE_SECONDS)
+    allowed_asset = (not risk.allow_assets or job.asset in risk.allow_assets) and job.asset not in risk.block_assets
+    global_pause_flag = await db.get(SystemFlag, 'global_pause')
+    emergency_stop_flag = await db.get(SystemFlag, 'emergency_stop')
+    risk_decision = evaluate(
+        close_plan,
+        RiskContext(
+            user_active=user.state == UserState.ACTIVE,
+            entitlement_active=bool(ent['entitled']),
+            credential_active=True,
+            user_paused=user.copy_state == CopyState.PAUSED,
+            global_pause=bool(global_pause_flag and global_pause_flag.enabled),
+            emergency_stop=bool(emergency_stop_flag and emergency_stop_flag.enabled),
+            close_only=risk.close_only,
+            asset_allowed=allowed_asset,
+            drawdown_halt=bool(risk_state and risk_state.state == RiskHalt.DRAWDOWN_HALT),
+            daily_loss_halt=bool(risk_state and risk_state.state == RiskHalt.DAILY_LOSS_HALT),
+            near_liquidation=bool(risk_state and risk_state.near_liquidation),
+            data_stale=stale,
+            current_total_exposure=total_exposure,
+            current_asset_exposure=asset_exposure,
+            free_margin=max(equity.free_margin, Decimal(0)),
+            account_equity=max(equity.account_value, Decimal(0)),
+            current_leverage=total_exposure / equity.account_value if equity.account_value > 0 else Decimal(999),
+            open_positions=len([row for row in ledgers if row.size != 0]),
+            is_new_market=False,
+            max_notional_per_trade=effective_risk.max_notional_per_trade,
+            max_total_exposure=effective_risk.max_total_exposure,
+            max_asset_exposure=effective_risk.max_asset_exposure,
+            max_leverage=effective_risk.max_leverage,
+            max_positions=effective_risk.max_positions,
+        ),
+    )
+    if risk_decision.action in {RiskAction.DENY, RiskAction.SKIP} or not risk_decision.plan.actionable:
+        return await _finish_profit_exit_failure(db, job, decision, risk_decision.reason or 'AI profit exit blocked by Risk Engine')
+    if not risk_decision.plan.reduce_only or risk_decision.plan.target_size != 0 or risk_decision.plan.secondary is not None:
+        return await _finish_profit_exit_failure(db, job, decision, 'Risk Engine produced an invalid AI profit-exit plan')
+    if not await live_trading_allowed(db, network):
+        return await _finish_profit_exit_failure(db, job, decision, 'Mainnet live-trading gate is closed')
+
+    expected_limit_px = observation.executable_exit_price
+    planned_size = risk_decision.plan.order_size
+
+    async def _revalidate_profit_exit() -> None:
+        await db.refresh(job, attribute_names=['execution_epoch_id', 'execution_provider', 'execution_network'])
+        await db.refresh(decision)
+        if not await job_matches_active_destination(db, job):
+            raise RuntimeError('AI profit exit destination epoch changed before submission')
+        if job.execution_provider != 'hyperliquid' or job.execution_network != network:
+            raise RuntimeError('AI profit exit destination changed before submission')
+        if decision.copy_job_id != job.id or decision.intent_state != ProfitExitIntentState.PENDING.value:
+            raise RuntimeError('AI profit exit decision is no longer pending for this job')
+        if decision.expires_at <= datetime.now(UTC):
+            raise RuntimeError('AI profit exit decision expired before submission')
+
+        from app.services.reconcile import master_snapshot_started_order
+
+        snapshot_started_order = await master_snapshot_started_order(required=True)
+        master_hl = HyperliquidAdapter(hl.limiter, network=settings.master_network)
+        master_snapshot = await master_hl.account_snapshot(
+            settings.HYPERLIQUID_MASTER_ADDRESS,
+            priority=Priority.ORDER,
+        )
+        fresh_master_position = master_position_from_state(master_snapshot.perp_state, job.asset)
+        source_cycle = await read_current_source_cycle(
+            db,
+            asset=job.asset,
+            master_network=settings.master_network,
+            snapshot_started_order=snapshot_started_order,
+            current_master_position=fresh_master_position,
+        )
+        if source_cycle is None or source_cycle.source_cycle_id != decision.source_cycle_id:
+            raise RuntimeError('AI profit exit source cycle changed before submission')
+
+        fresh = await collect_profit_exit_economics(
+            hl,
+            account_address=account.account_address,
+            asset=job.asset,
+            history_start_ms=history_start_ms,
+            history_end_ms=None,
+            slippage_bps=risk.max_slippage_bps,
+        )
+        if (
+            not fresh.complete
+            or not fresh.eligible
+            or fresh.current_position is None
+            or fresh.executable_exit_price is None
+            or fresh.economics is None
+            or not profit_exit_economically_admissible(
+                net_pnl=fresh.economics.net_pnl,
+                pnl_complete=fresh.economics.complete,
+                position_fresh=True,
+            )
+        ):
+            raise RuntimeError(fresh.reason or 'Residual net PnL is no longer strictly positive')
+        fresh_side = 'LONG' if fresh.current_position > 0 else 'SHORT'
+        if fresh_side != decision.side:
+            raise RuntimeError('Follower position side changed before profit exit')
+        fresh_size = round_size(abs(fresh.current_position), spec.sz_decimals)
+        if fresh_size != planned_size:
+            raise RuntimeError('Follower residual size changed before profit exit')
+        if fresh.executable_exit_price != expected_limit_px:
+            raise RuntimeError('Executable IOC price changed after profit-exit planning')
+
+    private_key = crypto.decrypt(_blob(cred), user_id=str(user.id), account_id=str(account.id))
+    try:
+        outcome = await _execute_leg(
+            db,
+            hl,
+            job,
+            user.id,
+            account.account_address,
+            private_key,
+            risk_decision.plan,
+            observation.mark_price,
+            risk.max_slippage_bps,
+            'o',
+            ledger.last_execution_id,
+            before_submit=_revalidate_profit_exit,
+        )
+    finally:
+        private_key = ''
+
+    if outcome.state == 'UNKNOWN':
+        await _set_profit_exit_state(db, decision, ProfitExitIntentState.AMBIGUOUS)
+        return await _retry_or_dead(db, job, outcome.reason or 'AI profit exit execution is ambiguous', ambiguous=True)
+    if outcome.state != 'FILLED':
+        await _set_profit_exit_state(db, decision, ProfitExitIntentState.FAILED)
+        return await _finish_action_rejection(
+            db,
+            job,
+            user_id=user.id,
+            network=network,
+            outcome=outcome,
+            leg='ai_profit_exit',
+            rejected_target=Decimal(0),
+            rejected_real=ledger.size,
+        )
+
+    try:
+        await _apply_fill_to_ledger(db, ledger, job, 'o', risk_decision.plan, outcome)
+    except LedgerApplicationDeferred as exc:
+        await _set_profit_exit_state(db, decision, ProfitExitIntentState.AMBIGUOUS)
+        return await _retry_or_dead(db, job, f'AI profit exit fill ledger application deferred: {exc}', ambiguous=True)
+
+    filled_size = outcome.filled_size or Decimal(0)
+    if filled_size < planned_size or _persisted_ledger_decimal(ledger.size) != Decimal(0):
+        await _set_profit_exit_state(db, decision, ProfitExitIntentState.PARTIAL)
+        terminal_state = ProfitExitIntentState.PARTIAL.value
+    else:
+        await _set_profit_exit_state(db, decision, ProfitExitIntentState.COMPLETED)
+        terminal_state = ProfitExitIntentState.COMPLETED.value
+
+    await audit(
+        db,
+        action='AI_PROFIT_EXIT_EXECUTED',
+        subject_id=user.id,
+        correlation_id=job.correlation_id,
+        after={
+            'asset': job.asset,
+            'decision_id': str(decision.id),
+            'intent_state': terminal_state,
+            'requested_size': str(planned_size),
+            'filled_size': str(filled_size),
+            'ledger_size': str(ledger.size),
+            'network': network,
+        },
+    )
+    return await _finish(db, job, JobState.DONE, None)
+
+
 async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: CopyJob) -> str:
     user = await db.get(User, job.user_id)
     if not user:
@@ -233,6 +575,9 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
         return await _finish(db, job, JobState.SKIPPED, 'Stale job from a previous Hyperliquid network epoch')
     if hl.network != network:
         return await _finish(db, job, JobState.SKIPPED, 'Execution worker adapter does not match the user network')
+
+    if job.origin == PROFIT_EXIT_ORIGIN:
+        return await _process_ai_profit_exit_locked(db, hl, job, user, network_state)
 
     account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
     risk = (await db.execute(select(RiskProfile).where(RiskProfile.user_id == user.id))).scalar_one_or_none()
@@ -555,6 +900,7 @@ async def _execute_leg(
     slippage_bps: int,
     kind: str,
     ledger_last_execution_id_before_submit: uuid.UUID | None = None,
+    before_submit: Callable[[], Awaitable[None]] | None = None,
 ) -> OrderOutcome:
     cloid = deterministic_cloid(str(job.id), kind)
     existing = (await db.execute(select(Execution).where(Execution.copy_job_id == job.id, Execution.attempt_kind == kind))).scalar_one_or_none()
@@ -598,7 +944,18 @@ async def _execute_leg(
     db.add(execution)
     await db.commit()
     try:
-        outcome = await hl.place_ioc(account_address=account_address, private_key=private_key, asset=job.asset, is_buy=leg.is_buy, size=size, mark_price=mark, slippage_bps=slippage_bps, reduce_only=leg.reduce_only, cloid=cloid)
+        outcome = await hl.place_ioc(
+            account_address=account_address,
+            private_key=private_key,
+            asset=job.asset,
+            is_buy=leg.is_buy,
+            size=size,
+            mark_price=mark,
+            slippage_bps=slippage_bps,
+            reduce_only=leg.reduce_only,
+            cloid=cloid,
+            before_submit=before_submit,
+        )
     except Exception as exc:
         execution.state = ExecutionState.UNKNOWN
         execution.reject_reason = f'ambiguous transport failure: {type(exc).__name__}'
