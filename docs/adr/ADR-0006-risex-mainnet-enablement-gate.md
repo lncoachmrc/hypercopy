@@ -47,6 +47,26 @@ The implementation sequence is:
 
 PR C may expose the provider-selection UI only when its production behavior remains gated by this ADR. The existence of a RISEx option in code or UI is not authorization to place mainnet orders.
 
+## 0. Per-user RISEx account and signer isolation is mandatory
+
+Code investigation of the current implementation shows that `execution-worker` testnet verification is performed using environment-level signer credentials such as `RISEX_TESTNET_SIGNER_PRIVATE_KEY` and `RISEX_TESTNET_ACCOUNT_ADDRESS`, and that the provider-switch endpoint (`PUT /trading-provider`) creates an `ExecutionEpoch` for RISEx with `account_address` and `credential_version` both `NULL` when a user is switched to RISEx. No per-user credential identity, signer-binding verification, or credential rotation logic exists yet. As implemented today, two different users switched to RISEx would both receive `NULL` in `execution_epochs.account_address`, with no credential isolation between them.
+
+This is an unresolved architectural gap, not merely a testnet convenience. Before RISEx mainnet can be enabled, TRAXION must mandate per-user account and signer isolation equivalent to the model already proven for Hyperliquid API wallets, where each user supplies their own verified credentials. The following conditions are mandatory and are additive to every other condition in this ADR:
+
+- Each TRAXION user enabled for RISEx production must have their own verified RISEx account identity and a dedicated RISEx session/API signer credential. No two production users may share an account identity or a signer credential.
+- The user creates and registers the RISEx signer externally and supplies TRAXION the RISEx account address plus the dedicated signer private key, matching the operational model already used for Hyperliquid API wallets.
+- TRAXION does **not** generate the user's RISEx signer and does **not** perform `RegisterSigner` on behalf of the user in this architecture.
+- Before accepting the credential, TRAXION must verify from authoritative RISEx/on-chain authorization state that the signer is bound to that account, active, unexpired, and has the required permissions. Indeterminate or mismatched state fails closed and the credential must be rejected.
+- The signer private key must be envelope-encrypted at rest using the existing credential security boundary, or an equivalent provider-aware extension of it, and must never be stored in plaintext.
+- The credential identity/version and the RISEx account address must be bound to the user's active `ExecutionEpoch`; a `NULL` account address/credential version is not an acceptable production state.
+- `execution-worker` must resolve the RISEx credential by `CopyJob.user_id` plus the active execution epoch, decrypt the signer only at the point of use, and validate the account/signer/epoch binding before signing.
+- A single environment-level RISEx account or signer shared by multiple TRAXION users is explicitly **PROHIBITED** for production/mainnet use.
+- The environment-level `RISEX_TESTNET_ACCOUNT_ADDRESS` / `RISEX_TESTNET_SIGNER_PRIVATE_KEY` variables may exist only for isolated single-account test verification and are not an acceptable production credential model.
+- A provider switch, credential rotation, expiration, revocation, or account/signer mismatch invalidates the prior execution epoch/credential authorization. The system must fail closed until a fresh, verified credential binding exists.
+- Acceptance evidence for this section must include at least two distinct users/accounts demonstrating credential isolation, with zero cross-user signer or account reuse.
+
+This gate is mandatory before ADR-0006 can move from `Proposed` to `Accepted`.
+
 ## 1. ADR-0002 must be explicitly re-evaluated for real capital
 
 ADR-0002 accepted the observed RISEx testnet signer permission state despite:
