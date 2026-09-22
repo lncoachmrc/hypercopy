@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.models.entities import (
     AIProfitExitDecision,
     CopyJob,
+    CopyState,
     JobState,
     MasterEvent,
     PositionLedger,
@@ -140,6 +141,7 @@ async def evaluate_profit_exit_portfolio(db: AsyncSession, redis) -> dict:
         .join(RiskProfile, RiskProfile.user_id == User.id)
         .where(
             User.state == UserState.ACTIVE,
+            User.copy_state == CopyState.ACTIVE,
             PositionLedger.managed.is_(True),
             PositionLedger.size != 0,
         )
@@ -237,6 +239,7 @@ async def evaluate_profit_exit_portfolio(db: AsyncSession, redis) -> dict:
             continue
 
         action, reason, runtime = await _decide_with_ai(inputs)
+        decision_now = datetime.now(UTC)
         operational = (
             mode is ProfitExitFeatureMode.ON
             and action is ProfitExitAction.CLOSE_PROFIT
@@ -259,14 +262,14 @@ async def evaluate_profit_exit_portfolio(db: AsyncSession, redis) -> dict:
             intent_state=ProfitExitIntentState.PENDING.value if operational else None,
             net_pnl=observation.economics.net_pnl,
             pnl_complete=True,
-            position_verified_at=now,
+            position_verified_at=decision_now,
             decision_inputs=inputs,
             decision_reason=reason,
             model_provider=str(runtime.get("provider") or "unavailable"),
             model_name=str(runtime.get("model") or "unavailable"),
             model_version=None,
-            decided_at=now,
-            expires_at=now + timedelta(seconds=settings.AI_PROFIT_EXIT_DECISION_TTL_SECONDS),
+            decided_at=decision_now,
+            expires_at=decision_now + timedelta(seconds=settings.AI_PROFIT_EXIT_DECISION_TTL_SECONDS),
             copy_job_id=job_id,
         )
         db.add(decision)
