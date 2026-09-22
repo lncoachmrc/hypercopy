@@ -288,3 +288,30 @@ def resolve_current_source_cycle(
         master_position=current_master_position,
         side="LONG" if current_master_position > 0 else "SHORT",
     )
+
+
+def profit_exit_reconcile_target(
+    *,
+    desired_target: Decimal,
+    current_source_cycle: SourceCycle | None,
+    intent_state: ProfitExitIntentState | None,
+    intent_source_cycle_id: str,
+) -> Decimal:
+    """
+    Apply durable AI profit-exit memory to the ordinary reconcile target.
+
+    Only a proven current source cycle matching an operational AI exit intent
+    may suppress the master-derived target. Missing/obsolete/FAILED/SHADOW
+    evidence leaves ordinary reconciliation unchanged.
+    """
+    if current_source_cycle is None:
+        return desired_target
+
+    if suppresses_same_cycle_retarget(
+        intent_state=intent_state,
+        intent_source_cycle_id=intent_source_cycle_id,
+        current_source_cycle_id=current_source_cycle.source_cycle_id,
+    ):
+        return Decimal(0)
+
+    return desired_target
