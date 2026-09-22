@@ -111,3 +111,183 @@ def suppresses_same_cycle_retarget(
         ProfitExitIntentState.COMPLETED,
         ProfitExitIntentState.AMBIGUOUS,
     }
+
+
+from dataclasses import dataclass
+import uuid
+
+from app.models.entities import MasterEvent
+
+
+@dataclass(frozen=True, slots=True)
+class SourceCycle:
+    open_event_id: uuid.UUID
+    source_cycle_id: str
+    state_version: int
+    master_position: Decimal
+    side: str
+
+
+def _master_event_network(event: MasterEvent) -> str | None:
+    raw = event.raw if isinstance(event.raw, dict) else {}
+    value = raw.get("_hypercopy_network")
+    if not value:
+        return None
+    return str(value).lower()
+
+
+def _positive_event_causal_order(event: MasterEvent) -> int | None:
+    raw = event.causal_order
+
+    if raw is None or isinstance(raw, bool):
+        return None
+
+    try:
+        value = int(raw)
+        numeric = Decimal(str(raw))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+    if value <= 0:
+        return None
+
+    if numeric != Decimal(value):
+        return None
+
+    return value
+
+
+def resolve_current_source_cycle(
+    events: list[MasterEvent],
+    *,
+    asset: str,
+    master_network: str,
+    current_master_position: Decimal,
+) -> SourceCycle | None:
+    """
+    Resolve the active master position cycle using durable causal evidence.
+
+    Fail closed when:
+    - current master position is flat or invalid;
+    - the opening/reversal event cannot be proven;
+    - causal ordering is missing or ambiguous;
+    - the position chain is discontinuous;
+    - the latest event disagrees with the authoritative master snapshot.
+    """
+    if not current_master_position.is_finite():
+        return None
+
+    if current_master_position == 0:
+        return None
+
+    normalized_asset = str(asset).upper()
+    normalized_network = str(master_network).lower()
+
+    matching = [
+        event
+        for event in events
+        if str(event.asset).upper() == normalized_asset
+        and _master_event_network(event) == normalized_network
+    ]
+
+    if not matching:
+        return None
+
+    versioned: list[tuple[int, MasterEvent]] = []
+
+    for event in matching:
+        order = _positive_event_causal_order(event)
+        if order is not None:
+            versioned.append((order, event))
+
+    if not versioned:
+        return None
+
+    versioned.sort(key=lambda item: item[0])
+
+    orders = [order for order, _ in versioned]
+    if len(orders) != len(set(orders)):
+        return None
+
+    latest_order, latest_event = versioned[-1]
+
+    try:
+        latest_position = Decimal(str(latest_event.position_after))
+    except Exception:
+        return None
+
+    if not latest_position.is_finite():
+        return None
+
+    if latest_position != current_master_position:
+        return None
+
+    open_event: MasterEvent | None = None
+    later_event: MasterEvent | None = None
+
+    for _order, event in reversed(versioned):
+        try:
+            start = Decimal(str(event.start_position))
+            after = Decimal(str(event.position_after))
+        except Exception:
+            return None
+
+        if not start.is_finite() or not after.is_finite():
+            return None
+
+        transition = classify_source_cycle_transition(start, after)
+
+        if later_event is not None:
+            try:
+                later_start = Decimal(str(later_event.start_position))
+            except Exception:
+                return None
+
+            if after != later_start:
+                return None
+
+            # causal_order is authoritative; timestamps are only a sanity check.
+            # Equal exchange timestamps are allowed.
+            if event.event_ts > later_event.event_ts:
+                return None
+
+        if transition in {
+            SourceCycleTransition.OPEN,
+            SourceCycleTransition.REVERSE,
+        }:
+            open_event = event
+            break
+
+        if transition in {
+            SourceCycleTransition.CLOSE,
+            SourceCycleTransition.FLAT,
+        }:
+            return None
+
+        later_event = event
+
+    if open_event is None:
+        return None
+
+    # Any unversioned event that may belong to this active cycle makes the
+    # history incomplete. Historical unversioned events strictly older than
+    # the verified opening boundary do not invalidate the new cycle.
+    for event in matching:
+        if _positive_event_causal_order(event) is not None:
+            continue
+
+        try:
+            if event.event_ts >= open_event.event_ts:
+                return None
+        except Exception:
+            return None
+
+    return SourceCycle(
+        open_event_id=open_event.id,
+        source_cycle_id=(
+            f"{normalized_network}:{normalized_asset}:{open_event.id}"
+        ),
+        state_version=latest_order,
+        master_position=current_master_position,
+        side="LONG" if current_master_position > 0 else "SHORT",
+    )

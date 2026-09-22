@@ -40,6 +40,18 @@ async def persist_master_fill_and_jobs(
     if existing:
         return None, []
 
+    master_intent_order = None
+    try:
+        master_intent_order = await next_master_leverage_causal_order(
+            redis_client()
+        )
+    except Exception:
+        log.warning(
+            'Unable to allocate master intent causal order; execution remains fail-closed',
+            extra={'exchange_event_id': eid},
+            exc_info=True,
+        )
+
     asset = str(fill['coin'])
     size = Decimal(str(fill['sz']))
     price = Decimal(str(fill['px']))
@@ -55,7 +67,7 @@ async def persist_master_fill_and_jobs(
         exchange_event_id=eid, asset=asset, side=str(fill.get('side') or fill.get('dir') or ''),
         size=size, price=price, start_position=start, position_after=position_after,
         master_equity=master_equity, event_ts=_event_time(fill), raw=raw,
-        fencing_token=fencing_token,
+        fencing_token=fencing_token, causal_order=master_intent_order,
     )
     db.add(event)
     await db.flush()
@@ -72,16 +84,6 @@ async def persist_master_fill_and_jobs(
     if not create_copy_jobs or historical_event:
         await db.commit()
         return event, []
-
-    master_intent_order = None
-    try:
-        master_intent_order = await next_master_leverage_causal_order(redis_client())
-    except Exception:
-        log.warning(
-            'Unable to allocate master intent causal order; execution remains fail-closed',
-            extra={'asset': asset, 'master_event_id': str(event.id)},
-            exc_info=True,
-        )
 
     # The configured master wallet is a source principal only. Paused followers
     # deliberately do not accumulate realtime EVENT intents: their next resume

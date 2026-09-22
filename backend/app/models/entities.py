@@ -213,6 +213,7 @@ class MasterEvent(BaseUuid, Base):
     event_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
     fencing_token: Mapped[int] = mapped_column(Integer, nullable=False)
+    causal_order: Mapped[int | None] = mapped_column(BigInteger, index=True)
     __table_args__ = (Index('ix_master_asset_ts', 'asset', 'event_ts'),)
 
 
