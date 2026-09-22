@@ -18,6 +18,7 @@ from app.engine.risk import RiskAction, RiskContext, evaluate
 from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, FollowerState, MasterExposure, compute_target, plan, round_size
 from app.models.entities import CopyJob, CopyState, EquitySnapshot, Execution, ExecutionState, Fill, JobState, PositionLedger, ReconciliationRun, RiskHalt, RiskProfile, RiskState, TradingAccount, User, UserState
 from app.services.ai_mode import read_ai_execution_policy
+from app.services.ai_profit_exit import protected_reconcile_target
 from app.services.audit import audit
 from app.services.effective_risk import resolve_effective_risk
 from app.services.entitlement import entitlement
@@ -555,6 +556,21 @@ async def _reconcile_user_locked(
                     follower_mark,
                 )
                 desired_target = base_target * ai_factor
+
+            desired_target = await protected_reconcile_target(
+                db,
+                user_id=user.id,
+                execution_epoch_id=network_state.epoch_id,
+                execution_provider=network_state.provider,
+                execution_network=network,
+                asset=asset,
+                master_network=settings.master_network,
+                snapshot_started_order=master_snapshot_started_order,
+                current_master_position=master_pos,
+                current_position=real,
+                desired_target=desired_target,
+            )
+
             ledger.target_size = desired_target
 
             master_config = source_configs.get(asset)

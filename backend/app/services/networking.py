@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.adapters.base import ExecutionProvider
 from app.core.config import Network
 from app.services.execution_destination import (
     bootstrap_user_destination_epoch,
@@ -17,6 +19,8 @@ from app.services.execution_destination import (
 class UserNetworkState:
     network: Network
     started_at: datetime
+    provider: ExecutionProvider
+    epoch_id: uuid.UUID
 
 
 async def user_network_state(db: AsyncSession, user_id) -> UserNetworkState:
@@ -26,7 +30,12 @@ async def user_network_state(db: AsyncSession, user_id) -> UserNetworkState:
         if str(exc) != 'User has no active execution destination epoch':
             raise
         destination = await bootstrap_user_destination_epoch(db, user_id)
-    return UserNetworkState(network=destination.network, started_at=destination.started_at)
+    return UserNetworkState(
+        network=destination.network,
+        started_at=destination.started_at,
+        provider=destination.provider,
+        epoch_id=destination.epoch_id,
+    )
 
 
 async def set_user_network(db: AsyncSession, user_id, network: Network) -> UserNetworkState:
@@ -44,4 +53,9 @@ async def set_user_network(db: AsyncSession, user_id, network: Network) -> UserN
         provider=provider,
         network=network,
     )
-    return UserNetworkState(network=destination.network, started_at=destination.started_at)
+    return UserNetworkState(
+        network=destination.network,
+        started_at=destination.started_at,
+        provider=destination.provider,
+        epoch_id=destination.epoch_id,
+    )

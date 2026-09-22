@@ -113,7 +113,10 @@ def suppresses_same_cycle_retarget(
 from dataclasses import dataclass
 import uuid
 
-from app.models.entities import MasterEvent
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.entities import AIProfitExitDecision, MasterEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,28 +293,262 @@ def resolve_current_source_cycle(
     )
 
 
+
 def profit_exit_reconcile_target(
     *,
     desired_target: Decimal,
+    current_position: Decimal,
     current_source_cycle: SourceCycle | None,
     intent_state: ProfitExitIntentState | None,
     intent_source_cycle_id: str,
 ) -> Decimal:
     """
-    Apply durable AI profit-exit memory to the ordinary reconcile target.
+    Apply durable AI profit-exit memory to ordinary reconciliation.
 
-    Only a proven current source cycle matching an operational AI exit intent
-    may suppress the master-derived target. Missing/obsolete/FAILED/SHADOW
-    evidence leaves ordinary reconciliation unchanged.
+    Reconciliation must not become a second profit-exit executor. While an
+    operational AI exit belongs to the current cycle, preserve the follower's
+    authoritative current position so reconcile neither reopens/increases it
+    nor submits another close for a partial/ambiguous residual.
+
+    If the current source cycle cannot yet be proven, existing operational
+    memory remains conservative: do not re-enable master retargeting until a
+    distinct new source cycle is verified.
     """
-    if current_source_cycle is None:
+    # Ordinary/master/safety flattening always wins. AI memory may prevent
+    # reopening/reintegration, but it must never block a deterministic close.
+    if desired_target == 0:
         return desired_target
+
+    operational = intent_state in {
+        ProfitExitIntentState.PENDING,
+        ProfitExitIntentState.PARTIAL,
+        ProfitExitIntentState.COMPLETED,
+        ProfitExitIntentState.AMBIGUOUS,
+    }
+
+    if not operational or not intent_source_cycle_id:
+        return desired_target
+
+    if current_source_cycle is None:
+        return current_position
 
     if suppresses_same_cycle_retarget(
         intent_state=intent_state,
         intent_source_cycle_id=intent_source_cycle_id,
         current_source_cycle_id=current_source_cycle.source_cycle_id,
     ):
-        return Decimal(0)
+        return current_position
 
     return desired_target
+
+
+
+def operational_profit_exit_memory_stmt(
+    *,
+    user_id: uuid.UUID,
+    execution_epoch_id: uuid.UUID,
+    execution_provider: str,
+    execution_network: str,
+    asset: str,
+    source_cycle_id: str | None,
+):
+    """
+    Build the durable anti-reopen memory lookup for one exact destination.
+
+    Decision expiry is intentionally not part of this query: expiry controls
+    whether an AI decision may still be submitted, not whether an already
+    operational exit may be forgotten.
+
+    When the current source cycle is proven, require the exact cycle id.
+    When it is temporarily unprovable, retain conservative visibility of the
+    latest operational exit memory inside the exact destination/asset scope
+    until a distinct new cycle is verified.
+    """
+    operational_states = (
+        ProfitExitIntentState.PENDING.value,
+        ProfitExitIntentState.PARTIAL.value,
+        ProfitExitIntentState.COMPLETED.value,
+        ProfitExitIntentState.AMBIGUOUS.value,
+    )
+
+    stmt = select(AIProfitExitDecision).where(
+        AIProfitExitDecision.user_id == user_id,
+        AIProfitExitDecision.execution_epoch_id == execution_epoch_id,
+        AIProfitExitDecision.execution_provider
+        == str(execution_provider).lower(),
+        AIProfitExitDecision.execution_network
+        == str(execution_network).lower(),
+        AIProfitExitDecision.asset == str(asset).upper(),
+        AIProfitExitDecision.action == ProfitExitAction.CLOSE_PROFIT.value,
+        AIProfitExitDecision.intent_state.in_(operational_states),
+    )
+
+    if source_cycle_id is not None:
+        stmt = stmt.where(
+            AIProfitExitDecision.source_cycle_id == source_cycle_id
+        )
+
+    return stmt.order_by(
+        AIProfitExitDecision.decided_at.desc(),
+        AIProfitExitDecision.created_at.desc(),
+    ).limit(1)
+
+
+async def read_operational_profit_exit_memory(
+    db: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    execution_epoch_id: uuid.UUID,
+    execution_provider: str,
+    execution_network: str,
+    asset: str,
+    source_cycle_id: str | None,
+) -> AIProfitExitDecision | None:
+    stmt = operational_profit_exit_memory_stmt(
+        user_id=user_id,
+        execution_epoch_id=execution_epoch_id,
+        execution_provider=execution_provider,
+        execution_network=execution_network,
+        asset=asset,
+        source_cycle_id=source_cycle_id,
+    )
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
+def source_cycle_events_stmt(
+    *,
+    asset: str,
+    snapshot_started_order: int,
+):
+    """
+    Read only master events that existed before the authoritative master
+    snapshot started.
+
+    Events allocated at or after snapshot_started_order cannot be used to
+    explain that snapshot retroactively.
+    """
+    return (
+        select(MasterEvent)
+        .where(
+            MasterEvent.asset == str(asset).upper(),
+            MasterEvent.causal_order.is_not(None),
+            MasterEvent.causal_order < snapshot_started_order,
+        )
+        .order_by(
+            MasterEvent.causal_order.asc(),
+            MasterEvent.event_ts.asc(),
+        )
+    )
+
+
+async def read_current_source_cycle(
+    db: AsyncSession,
+    *,
+    asset: str,
+    master_network: str,
+    snapshot_started_order: int | None,
+    current_master_position: Decimal,
+) -> SourceCycle | None:
+    """
+    Resolve the source cycle visible to one specific master snapshot.
+
+    Missing causal-boundary evidence deliberately returns None rather than
+    guessing from timestamps or later master events.
+    """
+    if (
+        snapshot_started_order is None
+        or isinstance(snapshot_started_order, bool)
+        or snapshot_started_order <= 0
+    ):
+        return None
+
+    events = (
+        await db.execute(
+            source_cycle_events_stmt(
+                asset=asset,
+                snapshot_started_order=snapshot_started_order,
+            )
+        )
+    ).scalars().all()
+
+    return resolve_current_source_cycle(
+        list(events),
+        asset=asset,
+        master_network=master_network,
+        current_master_position=current_master_position,
+    )
+
+
+async def protected_reconcile_target(
+    db: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    execution_epoch_id: uuid.UUID,
+    execution_provider: str,
+    execution_network: str,
+    asset: str,
+    master_network: str,
+    snapshot_started_order: int | None,
+    current_master_position: Decimal,
+    current_position: Decimal,
+    desired_target: Decimal,
+) -> Decimal:
+    """
+    Apply durable profit-exit memory to a master-derived reconcile target.
+
+    This function never creates a close decision. It only prevents ordinary
+    reconciliation from reopening/reintegrating exposure already affected by
+    an operational AI profit exit.
+
+    Hyperliquid is the only enabled v1 provider for this feature.
+    """
+    # Master/safety flattening has unconditional precedence.
+    if desired_target == 0:
+        return desired_target
+
+    # v1 is intentionally Hyperliquid-only.
+    if str(execution_provider).lower() != "hyperliquid":
+        return desired_target
+
+    current_cycle = await read_current_source_cycle(
+        db,
+        asset=asset,
+        master_network=master_network,
+        snapshot_started_order=snapshot_started_order,
+        current_master_position=current_master_position,
+    )
+
+    memory = await read_operational_profit_exit_memory(
+        db,
+        user_id=user_id,
+        execution_epoch_id=execution_epoch_id,
+        execution_provider=execution_provider,
+        execution_network=execution_network,
+        asset=asset,
+        source_cycle_id=(
+            current_cycle.source_cycle_id
+            if current_cycle is not None
+            else None
+        ),
+    )
+
+    if memory is None:
+        return desired_target
+
+    raw_state = memory.intent_state
+    try:
+        intent_state = (
+            raw_state
+            if isinstance(raw_state, ProfitExitIntentState)
+            else ProfitExitIntentState(str(raw_state))
+        )
+    except (TypeError, ValueError):
+        return desired_target
+
+    return profit_exit_reconcile_target(
+        desired_target=desired_target,
+        current_position=current_position,
+        current_source_cycle=current_cycle,
+        intent_state=intent_state,
+        intent_source_cycle_id=str(memory.source_cycle_id or ""),
+    )
