@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Enum, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint, func, text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Enum, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -240,6 +240,101 @@ class CopyJob(BaseUuid, Base):
         UniqueConstraint('master_event_id', 'user_id', name='uq_job_master_user'),
         Index('ix_jobs_state_created', 'state', 'created_at'),
         Index('ix_copy_jobs_execution_destination', 'execution_provider', 'execution_network'),
+    )
+
+
+class AIProfitExitDecision(BaseUuid, Timestamped, Base):
+    __tablename__ = 'ai_profit_exit_decisions'
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey('users.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    execution_epoch_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey('execution_epochs.id', ondelete='RESTRICT'),
+        nullable=False,
+        index=True,
+    )
+    execution_provider: Mapped[str] = mapped_column(String(24), nullable=False)
+    execution_network: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    asset: Mapped[str] = mapped_column(String(24), nullable=False)
+    side: Mapped[str] = mapped_column(String(8), nullable=False)
+
+    source_cycle_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    source_cycle_open_event_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey('master_events.id', ondelete='RESTRICT'),
+        nullable=False,
+        index=True,
+    )
+    source_master_position: Mapped[Decimal] = mapped_column(D, nullable=False)
+    follower_position_size: Mapped[Decimal] = mapped_column(D, nullable=False)
+    state_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    action: Mapped[str] = mapped_column(String(24), nullable=False)
+    intent_state: Mapped[str | None] = mapped_column(String(24))
+
+    net_pnl: Mapped[Decimal | None] = mapped_column(D)
+    pnl_complete: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+    )
+    position_verified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+    decision_inputs: Mapped[dict] = mapped_column(
+        JSON,
+        default=dict,
+        nullable=False,
+    )
+    decision_reason: Mapped[str] = mapped_column(Text, nullable=False)
+
+    model_provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    model_version: Mapped[str | None] = mapped_column(String(80))
+
+    decided_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
+
+    copy_job_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey('copy_jobs.id', ondelete='SET NULL'),
+        index=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('HOLD', 'CLOSE_PROFIT', 'ABSTAIN')",
+            name='ck_ai_profit_exit_action',
+        ),
+        CheckConstraint(
+            "intent_state IS NULL OR intent_state IN "
+            "('PENDING', 'PARTIAL', 'COMPLETED', 'FAILED', 'AMBIGUOUS')",
+            name='ck_ai_profit_exit_intent_state',
+        ),
+        Index(
+            'ix_ai_profit_exit_scope_cycle',
+            'user_id',
+            'execution_provider',
+            'execution_network',
+            'asset',
+            'source_cycle_id',
+        ),
+        Index(
+            'ix_ai_profit_exit_state_expiry',
+            'intent_state',
+            'expires_at',
+        ),
     )
 
 
