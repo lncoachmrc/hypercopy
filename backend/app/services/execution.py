@@ -17,7 +17,7 @@ from app.core.crypto import EncryptedCredential, crypto
 from app.core.logging import get_logger
 from app.db.position_ledger_lock import position_ledger_lock
 from app.engine.risk import RiskAction, RiskContext, evaluate
-from app.engine.sizing import FollowerState, MasterExposure, SizingResult, plan, round_size
+from app.engine.sizing import FollowerState, MasterExposure, OrderIntent, SizingResult, plan, round_size
 from app.models.entities import (
     AIProfitExitDecision, CopyJob, CopyState, CredentialStatus, EquitySnapshot,
     Execution, ExecutionState, JobState, MasterEvent, PositionLedger, RiskHalt,
@@ -300,10 +300,107 @@ async def _process_ai_profit_exit_locked(
         ProfitExitIntentState.AMBIGUOUS.value,
     }:
         return await _finish(db, job, JobState.SKIPPED, 'AI profit exit decision is no longer executable')
-    if (
-        decision.intent_state == ProfitExitIntentState.PENDING.value
-        and profit_exit_feature_mode() is not ProfitExitFeatureMode.ON
-    ):
+    account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
+    ledger = (await db.execute(select(PositionLedger).where(
+        PositionLedger.user_id == user.id,
+        PositionLedger.asset == job.asset,
+    ))).scalar_one_or_none()
+
+    # Crash/restart recovery has precedence over feature mode, decision expiry,
+    # credential availability and fresh-profit checks. Once an Execution row
+    # exists, the only safe action is to reconcile its deterministic CLOID.
+    existing = (await db.execute(select(Execution).where(
+        Execution.copy_job_id == job.id,
+        Execution.attempt_kind == 'o',
+    ))).scalar_one_or_none()
+    if existing is not None:
+        if account is None:
+            if decision.intent_state == ProfitExitIntentState.PENDING.value:
+                await _set_profit_exit_state(db, decision, ProfitExitIntentState.AMBIGUOUS)
+            return await _retry_or_dead(
+                db,
+                job,
+                'AI profit exit execution exists but trading account is unavailable for CLOID resolution',
+                ambiguous=True,
+            )
+        if not existing.reduce_only:
+            await _set_profit_exit_state(db, decision, ProfitExitIntentState.AMBIGUOUS)
+            return await _finish(db, job, JobState.DEAD, 'AI profit exit durable execution is not reduce-only')
+
+        if existing.state not in TERMINAL_EXEC:
+            await _set_profit_exit_state(db, decision, ProfitExitIntentState.AMBIGUOUS)
+
+        recovery_current = (
+            ledger.size
+            if ledger is not None
+            else decision.follower_position_size
+        )
+        recovery_plan = SizingResult(
+            asset=job.asset,
+            intent=OrderIntent.CLOSE,
+            target_size=Decimal(0),
+            current_size=recovery_current,
+            delta=-recovery_current,
+            order_size=existing.requested_size,
+            is_buy=existing.is_buy,
+            reduce_only=True,
+            notional=existing.requested_size * existing.limit_px,
+        )
+        outcome = await _execute_leg(
+            db,
+            hl,
+            job,
+            user.id,
+            account.account_address,
+            '',
+            recovery_plan,
+            existing.limit_px,
+            0,
+            'o',
+            ledger.last_execution_id if ledger is not None else None,
+        )
+        if outcome.state == 'UNKNOWN':
+            await _set_profit_exit_state(db, decision, ProfitExitIntentState.AMBIGUOUS)
+            return await _retry_or_dead(db, job, outcome.reason or 'AI profit exit remains ambiguous', ambiguous=True)
+        if outcome.state != 'FILLED':
+            await _set_profit_exit_state(db, decision, ProfitExitIntentState.FAILED)
+            return await _finish_action_rejection(
+                db,
+                job,
+                user_id=user.id,
+                network=network,
+                outcome=outcome,
+                leg='ai_profit_exit_recovery',
+                rejected_target=Decimal(0),
+                rejected_real=ledger.size if ledger is not None else decision.follower_position_size,
+            )
+        if ledger is None or not ledger.managed:
+            await _set_profit_exit_state(db, decision, ProfitExitIntentState.AMBIGUOUS)
+            return await _retry_or_dead(
+                db,
+                job,
+                'AI profit exit fill is confirmed but managed ledger is unavailable',
+                ambiguous=True,
+            )
+        try:
+            await _apply_fill_to_ledger(db, ledger, job, 'o', recovery_plan, outcome)
+        except LedgerApplicationDeferred as exc:
+            await _set_profit_exit_state(db, decision, ProfitExitIntentState.AMBIGUOUS)
+            return await _retry_or_dead(db, job, f'AI profit exit recovery ledger application deferred: {exc}', ambiguous=True)
+        filled = outcome.filled_size or Decimal(0)
+        if filled < existing.requested_size or _persisted_ledger_decimal(ledger.size) != Decimal(0):
+            await _set_profit_exit_state(db, decision, ProfitExitIntentState.PARTIAL)
+        else:
+            await _set_profit_exit_state(db, decision, ProfitExitIntentState.COMPLETED)
+        return await _finish(db, job, JobState.DONE, None)
+
+    if decision.intent_state == ProfitExitIntentState.AMBIGUOUS.value:
+        await _set_profit_exit_state(db, decision, ProfitExitIntentState.FAILED)
+        return await _finish(db, job, JobState.SKIPPED, 'Ambiguous AI profit exit has no durable execution evidence')
+
+    # From here on there is provably no provider submission yet, so mode/expiry
+    # and fresh economics may safely decide whether a new order is admissible.
+    if profit_exit_feature_mode() is not ProfitExitFeatureMode.ON:
         return await _finish_profit_exit_failure(
             db,
             job,
@@ -321,78 +418,14 @@ async def _process_ai_profit_exit_locked(
     ):
         return await _finish_profit_exit_failure(db, job, decision, 'AI profit exit durable economics are not profitable')
 
-    account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
     risk = (await db.execute(select(RiskProfile).where(RiskProfile.user_id == user.id))).scalar_one_or_none()
     risk_state = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
-    ledger = (await db.execute(select(PositionLedger).where(
-        PositionLedger.user_id == user.id,
-        PositionLedger.asset == job.asset,
-    ))).scalar_one_or_none()
     if not account or not risk or ledger is None or not ledger.managed:
         return await _finish_profit_exit_failure(db, job, decision, 'AI profit exit account, risk profile or managed ledger is unavailable')
 
     cred = (await db.execute(select(SigningCredential).where(SigningCredential.trading_account_id == account.id))).scalar_one_or_none()
     if not _credential_active(cred):
         return await _finish_profit_exit_failure(db, job, decision, 'Trading credential is unavailable')
-
-    if decision.intent_state == ProfitExitIntentState.AMBIGUOUS.value:
-        existing = (await db.execute(select(Execution).where(
-            Execution.copy_job_id == job.id,
-            Execution.attempt_kind == 'o',
-        ))).scalar_one_or_none()
-        if existing is None:
-            return await _finish(db, job, JobState.SKIPPED, 'Ambiguous AI profit exit has no durable execution evidence')
-        if not existing.reduce_only:
-            return await _finish(db, job, JobState.DEAD, 'Ambiguous AI profit exit execution is not reduce-only')
-
-        recovery_plan = SizingResult(
-            asset=job.asset,
-            intent=__import__('app.engine.sizing', fromlist=['OrderIntent']).OrderIntent.CLOSE,
-            target_size=Decimal(0),
-            current_size=ledger.size,
-            delta=-ledger.size,
-            order_size=existing.requested_size,
-            is_buy=existing.is_buy,
-            reduce_only=True,
-            notional=existing.requested_size * existing.limit_px,
-        )
-        outcome = await _execute_leg(
-            db,
-            hl,
-            job,
-            user.id,
-            account.account_address,
-            '',
-            recovery_plan,
-            existing.limit_px,
-            risk.max_slippage_bps,
-            'o',
-            ledger.last_execution_id,
-        )
-        if outcome.state == 'UNKNOWN':
-            return await _retry_or_dead(db, job, outcome.reason or 'AI profit exit remains ambiguous', ambiguous=True)
-        if outcome.state != 'FILLED':
-            await _set_profit_exit_state(db, decision, ProfitExitIntentState.FAILED)
-            return await _finish_action_rejection(
-                db,
-                job,
-                user_id=user.id,
-                network=network,
-                outcome=outcome,
-                leg='ai_profit_exit_recovery',
-                rejected_target=Decimal(0),
-                rejected_real=ledger.size,
-            )
-        try:
-            await _apply_fill_to_ledger(db, ledger, job, 'o', recovery_plan, outcome)
-        except LedgerApplicationDeferred as exc:
-            return await _retry_or_dead(db, job, f'AI profit exit recovery ledger application deferred: {exc}', ambiguous=True)
-        filled = outcome.filled_size or Decimal(0)
-        if filled < existing.requested_size or _persisted_ledger_decimal(ledger.size) != Decimal(0):
-            await _set_profit_exit_state(db, decision, ProfitExitIntentState.PARTIAL)
-        else:
-            await _set_profit_exit_state(db, decision, ProfitExitIntentState.COMPLETED)
-        return await _finish(db, job, JobState.DONE, None)
 
     open_event = await db.get(MasterEvent, decision.source_cycle_open_event_id)
     if open_event is None or open_event.event_ts is None:

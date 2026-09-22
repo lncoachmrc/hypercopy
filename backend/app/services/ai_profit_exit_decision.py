@@ -34,6 +34,7 @@ from app.services.ai_profit_exit import (
     read_operational_profit_exit_memory,
 )
 from app.services.ai_profit_exit_collector import collect_profit_exit_economics
+from app.services.master_source_identity import is_master_source_user
 from app.services.networking import user_network_state
 from app.services.queue import publish_job
 from app.services.reconcile import master_snapshot_started_order
@@ -151,6 +152,9 @@ async def evaluate_profit_exit_portfolio(db: AsyncSession, redis) -> dict:
 
     for user, ledger, account, risk in rows:
         evaluated += 1
+        if is_master_source_user(user):
+            abstained += 1
+            continue
         try:
             destination = await user_network_state(db, user.id)
         except Exception:
@@ -187,6 +191,7 @@ async def evaluate_profit_exit_portfolio(db: AsyncSession, redis) -> dict:
         if memory is not None and memory.intent_state in {
             ProfitExitIntentState.PENDING.value,
             ProfitExitIntentState.AMBIGUOUS.value,
+            ProfitExitIntentState.COMPLETED.value,
         }:
             continue
 
@@ -296,8 +301,12 @@ async def evaluate_profit_exit_portfolio(db: AsyncSession, redis) -> dict:
         if job is not None:
             try:
                 await publish_job(redis, db, job)
-                await db.commit()
-                queued += 1
+                if job.state in {JobState.SKIPPED, JobState.DEAD}:
+                    decision.intent_state = ProfitExitIntentState.FAILED.value
+                    await db.commit()
+                else:
+                    await db.commit()
+                    queued += 1
             except Exception:
                 await db.rollback()
                 # The committed QUEUED row has enqueued_at=NULL; normal repair_stream

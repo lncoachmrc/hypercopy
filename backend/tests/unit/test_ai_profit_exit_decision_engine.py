@@ -49,15 +49,21 @@ def test_profit_exit_llm_contract_is_closed() -> None:
     assert action is ProfitExitAction.ABSTAIN
 
 
-def test_ambiguous_profit_exit_retries_only_durable_cloid_resolution() -> None:
+def test_existing_execution_recovery_precedes_new_submission_gates() -> None:
     source=inspect.getsource(execution._process_ai_profit_exit_locked)
-    ambiguous=source[source.index("if decision.intent_state == ProfitExitIntentState.AMBIGUOUS.value"):]
-    ambiguous=ambiguous[:ambiguous.index("open_event = await db.get")]
+    existing_index=source.index("existing = (await db.execute(select(Execution)")
+    mode_index=source.index("profit_exit_feature_mode() is not ProfitExitFeatureMode.ON")
+    expiry_index=source.index("decision.expires_at <= now")
+    credential_index=source.index("cred = (await db.execute(select(SigningCredential)")
 
-    assert "select(Execution)" in ambiguous
-    assert "_execute_leg(" in ambiguous
-    assert "before_submit=" not in ambiguous
-    assert "crypto.decrypt" not in ambiguous
+    assert existing_index < mode_index < credential_index
+    assert existing_index < expiry_index
+
+    recovery=source[existing_index:source.index("open_event = await db.get")]
+    assert "_execute_leg(" in recovery
+    assert "before_submit=" not in recovery
+    assert "crypto.decrypt" not in recovery
+    assert "OrderIntent.CLOSE" in recovery
 
 
 def test_ai_worker_runs_profit_exit_as_separate_singleton_workflow() -> None:
