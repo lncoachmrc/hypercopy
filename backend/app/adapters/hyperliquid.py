@@ -66,6 +66,10 @@ class MainnetWriterFenceError(RuntimeError):
     """Definitive local rejection before any MAINNET signed exchange action."""
 
 
+class IOCPreSubmitAuthorizationError(RuntimeError):
+    """Definitive local rejection before an IOC reaches the exchange."""
+
+
 def deterministic_cloid(copy_job_id: str, attempt_kind: str) -> str:
     return '0x' + hashlib.blake2b(f'{copy_job_id}:{attempt_kind}'.encode(), digest_size=16).hexdigest()
 
@@ -723,6 +727,7 @@ class HyperliquidAdapter:
     async def place_ioc(
         self, *, account_address: str, private_key: str, asset: str, is_buy: bool,
         size: Decimal, mark_price: Decimal, slippage_bps: int, reduce_only: bool, cloid: str,
+        before_submit: Callable[[], Awaitable[None]] | None = None,
     ) -> OrderOutcome:
         from app.services.strategy_intents import (
             StrategyIntentAuthorizationError,
@@ -777,6 +782,25 @@ class HyperliquidAdapter:
                     f'{type(exc).__name__}: {exc}'
                 ) from exc
 
+        async def _authorize_ioc_submission() -> None:
+            # Preserve the existing strategy/master fence first.
+            await _authorize_strategy_order()
+
+            # Profit-exit callers may add one final read-only economic
+            # authorization. This is executed by _signed_call as the last await
+            # before the common writer fence and synchronous exchange.order().
+            if before_submit is None:
+                return
+            try:
+                await before_submit()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise IOCPreSubmitAuthorizationError(
+                    f"Profit-exit pre-submit revalidation failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
+
         def _submit():
             exchange.set_expires_after(int(time.time() * 1000) + settings.HL_ORDER_EXPIRES_AFTER_MS)
             return exchange.order(
@@ -789,7 +813,22 @@ class HyperliquidAdapter:
                 account_address,
                 local.address,
                 _submit,
-                before_submit=_authorize_strategy_order,
+                before_submit=_authorize_ioc_submission,
+            )
+        except IOCPreSubmitAuthorizationError as exc:
+            # The callback is the last awaited application authorization before
+            # the common writer fence and exchange.order(). No exchange action
+            # has been sent, so this is a definitive local cancellation.
+            return OrderOutcome(
+                'CANCELED',
+                reason=str(exc),
+                raw={
+                    'status': 'iocPreSubmitCanceled',
+                    'reason': str(exc),
+                    'asset': asset,
+                    'network': self.network,
+                    'exchange_action_sent': False,
+                },
             )
         except MainnetWriterFenceError as exc:
             # The boundary check runs in the same synchronous worker frame as
