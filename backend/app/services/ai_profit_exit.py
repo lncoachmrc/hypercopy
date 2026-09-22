@@ -84,21 +84,18 @@ def profit_exit_economically_admissible(
 
 def suppresses_same_cycle_retarget(
     *,
-    intent_state: ProfitExitIntentState,
+    intent_state: ProfitExitIntentState | None,
     intent_source_cycle_id: str,
     current_source_cycle_id: str,
-    execution_enabled: bool,
 ) -> bool:
     """
     Prevent normal master reconciliation from reopening exposure belonging to
     a source cycle already affected by an executable AI profit exit.
 
-    Shadow-only decisions never suppress the normal master target.
-    A definitively failed pre-submit intent does not suppress it either.
+    Feature disablement must not erase durable exit memory. Shadow/HOLD/ABSTAIN
+    decisions have no operational intent_state and therefore never suppress.
+    A definitively failed pre-submit intent does not suppress either.
     """
-    if not execution_enabled:
-        return False
-
     if not intent_source_cycle_id or not current_source_cycle_id:
         return False
 

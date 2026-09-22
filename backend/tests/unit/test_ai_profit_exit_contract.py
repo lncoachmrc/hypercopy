@@ -107,7 +107,6 @@ def test_live_or_effectful_exit_memory_suppresses_same_cycle_retarget(state):
         intent_state=state,
         intent_source_cycle_id="btc:cycle-123",
         current_source_cycle_id="btc:cycle-123",
-        execution_enabled=True,
     )
 
 
@@ -116,7 +115,6 @@ def test_failed_pre_submit_intent_does_not_suppress_retarget():
         intent_state=ProfitExitIntentState.FAILED,
         intent_source_cycle_id="btc:cycle-123",
         current_source_cycle_id="btc:cycle-123",
-        execution_enabled=True,
     )
 
 
@@ -125,14 +123,25 @@ def test_new_verified_source_cycle_reenables_master_target():
         intent_state=ProfitExitIntentState.COMPLETED,
         intent_source_cycle_id="btc:cycle-123",
         current_source_cycle_id="btc:cycle-456",
-        execution_enabled=True,
     )
 
 
-def test_shadow_decision_never_suppresses_master_target():
+def test_non_operational_shadow_hold_or_abstain_never_suppresses_master_target():
     assert not suppresses_same_cycle_retarget(
+        intent_state=None,
+        intent_source_cycle_id="btc:cycle-123",
+        current_source_cycle_id="btc:cycle-123",
+    )
+
+
+def test_same_cycle_completed_memory_does_not_depend_on_current_feature_mode():
+    import inspect
+
+    parameters = inspect.signature(suppresses_same_cycle_retarget).parameters
+    assert "execution_enabled" not in parameters
+
+    assert suppresses_same_cycle_retarget(
         intent_state=ProfitExitIntentState.COMPLETED,
         intent_source_cycle_id="btc:cycle-123",
         current_source_cycle_id="btc:cycle-123",
-        execution_enabled=False,
     )
