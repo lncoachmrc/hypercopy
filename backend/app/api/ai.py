@@ -13,6 +13,8 @@ from app.db.session import get_db
 from app.models.entities import PositionLedger, Role, User
 from app.services.ai_intelligence import provider_chain, read_ai_intelligence
 from app.services.ai_mode import read_ai_execution_policy, set_ai_execution_mode
+from app.services.ai_profit_exit import ProfitExitFeatureMode
+from app.services.ai_profit_exit_mode import read_profit_exit_mode_state, set_profit_exit_mode
 from app.services.audit import audit
 
 router = APIRouter(prefix='/ai', tags=['ai'])
@@ -22,6 +24,11 @@ superadmin = require_role(Role.SUPERADMIN)
 class AiModeChange(BaseModel):
     mode: Literal['shadow', 'on']
     reason: str = Field(default='Dashboard AI mode toggle', min_length=3, max_length=300)
+
+
+class AiProfitExitModeChange(BaseModel):
+    mode: Literal['OFF', 'SHADOW', 'ON']
+    reason: str = Field(default='Dashboard AI Profit Exit mode toggle', min_length=3, max_length=300)
 
 
 @router.get('/intelligence')
@@ -102,3 +109,36 @@ async def update_mode(
         **policy.as_dict(),
         'takes_effect': 'next_reconciliation',
     }
+
+
+@router.get('/profit-exit-mode')
+async def profit_exit_mode(
+    _actor: User = Depends(superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    return await read_profit_exit_mode_state(db)
+
+
+@router.post('/profit-exit-mode', dependencies=[Depends(require_csrf)])
+async def update_profit_exit_mode(
+    body: AiProfitExitModeChange,
+    actor: User = Depends(superadmin),
+    db: AsyncSession = Depends(get_db),
+):
+    before = await read_profit_exit_mode_state(db)
+    state = await set_profit_exit_mode(
+        db,
+        mode=ProfitExitFeatureMode(body.mode),
+        reason=body.reason,
+        actor_id=actor.id,
+    )
+    await audit(
+        db,
+        action='AI_PROFIT_EXIT_MODE_CHANGED',
+        actor_id=actor.id,
+        reason=body.reason,
+        before=before,
+        after=state,
+    )
+    await db.commit()
+    return {'ok': True, **state, 'takes_effect': 'next_profit_exit_evaluation'}
