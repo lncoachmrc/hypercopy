@@ -398,8 +398,15 @@ async def _process_ai_profit_exit_locked(
         await _set_profit_exit_state(db, decision, ProfitExitIntentState.FAILED)
         return await _finish(db, job, JobState.SKIPPED, 'Ambiguous AI profit exit has no durable execution evidence')
 
-    # From here on there is provably no provider submission yet, so mode/expiry
-    # and fresh economics may safely decide whether a new order is admissible.
+    # From here on there is provably no provider submission yet, so user/mode/
+    # expiry and fresh economics may safely decide whether a new order is admissible.
+    if user.copy_state != CopyState.ACTIVE:
+        return await _finish_profit_exit_failure(
+            db,
+            job,
+            decision,
+            'AI profit exit requires ACTIVE user copy state before submission',
+        )
     if profit_exit_feature_mode() is not ProfitExitFeatureMode.ON:
         return await _finish_profit_exit_failure(
             db,
