@@ -61,7 +61,7 @@ A Checkout success redirect never grants entitlement. Only a verified Stripe sub
 | POST | `/admin/system/live-trading/disable` | disable persistent mainnet execution gate |
 | POST | `/admin/system/resume` | clear global/emergency pause |
 | GET | `/admin/audit` | append-only audit stream |
-
+| GET | `/ai/profit-exit-mode` | read global AI Profit Exit OFF/SHADOW/ON mode; SUPERADMIN only |\n| POST | `/ai/profit-exit-mode` | auditably change global AI Profit Exit runtime mode; SUPERADMIN only |\n
 ## Health / metrics
 
 `GET /health/live` proves process liveness. `GET /health/ready` verifies PostgreSQL, Redis and expected Alembic revision for the API. `/metrics` is intended for private/admin collection; in production it returns 404 unless `X-Metrics-Token` matches `METRICS_TOKEN`.
