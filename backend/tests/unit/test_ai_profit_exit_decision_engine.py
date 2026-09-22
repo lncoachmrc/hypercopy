@@ -9,7 +9,7 @@ from app.services.ai_profit_exit import (
     profit_exit_decision_id,
     profit_exit_job_id,
 )
-from app.services.ai_profit_exit_decision import _validated_profit_exit_action
+from app.services.ai_profit_exit_decision import _validated_profit_exit_action, evaluate_profit_exit_portfolio
 from app.services import execution
 from app.workers import ai_intelligence_worker
 
@@ -70,3 +70,28 @@ def test_ai_worker_runs_profit_exit_as_separate_singleton_workflow() -> None:
     source=inspect.getsource(ai_intelligence_worker.AIIntelligenceWorker)
     assert "hypercopy:ai-profit-exit" in source
     assert "evaluate_profit_exit_portfolio" in source
+
+
+def test_profit_exit_evaluator_excludes_shadow_and_paused_copy_users() -> None:
+    source = inspect.getsource(evaluate_profit_exit_portfolio)
+    assert "User.copy_state == CopyState.ACTIVE" in source
+
+
+def test_profit_exit_execution_rechecks_active_copy_state_before_new_submission() -> None:
+    source = inspect.getsource(execution._process_ai_profit_exit_locked)
+    existing_index = source.index("existing = (await db.execute(select(Execution)")
+    active_index = source.index("user.copy_state != CopyState.ACTIVE")
+    mode_index = source.index("profit_exit_feature_mode() is not ProfitExitFeatureMode.ON")
+
+    assert existing_index < active_index < mode_index
+
+
+def test_profit_exit_decision_timestamp_is_captured_after_ai_response() -> None:
+    source = inspect.getsource(evaluate_profit_exit_portfolio)
+    ai_index = source.index("action, reason, runtime = await _decide_with_ai(inputs)")
+    timestamp_index = source.index("decision_now = datetime.now(UTC)")
+
+    assert ai_index < timestamp_index
+    assert "position_verified_at=decision_now" in source
+    assert "decided_at=decision_now" in source
+    assert "expires_at=decision_now + timedelta(" in source
