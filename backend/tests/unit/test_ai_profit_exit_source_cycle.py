@@ -3,7 +3,7 @@ from decimal import Decimal
 import uuid
 
 from app.models.entities import MasterEvent
-from app.services.ai_profit_exit import resolve_current_source_cycle
+from app.services.ai_profit_exit import resolve_current_source_cycle, source_cycle_events_stmt
 
 
 BASE = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
@@ -191,3 +191,16 @@ def test_wrong_asset_and_network_do_not_enter_cycle():
     assert cycle is not None
     assert cycle.open_event_id == btc.id
     assert cycle.state_version == 1000
+
+
+def test_source_cycle_query_includes_unversioned_events_for_fail_closed_resolution():
+    compiled = str(
+        source_cycle_events_stmt(
+            asset="BTC",
+            snapshot_started_order=500,
+        ).compile(compile_kwargs={"literal_binds": True})
+    )
+
+    assert "master_events.causal_order IS NULL" in compiled
+    assert "master_events.causal_order < 500" in compiled
+    assert " OR " in compiled
