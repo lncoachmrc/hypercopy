@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     # this flag or the independent PostgreSQL live_trading flag.
     ENABLE_LIVE_TRADING: bool = False
     DEFAULT_SHADOW_MODE: bool = True
+    # AI Profit Exit is independent from the legacy AI capital-influence mode.
+    # OFF: no new operational decisions; SHADOW: record-only; ON: may queue a
+    # CLOSE_PROFIT that still passes deterministic execution/economic fences.
+    AI_PROFIT_EXIT_MODE: Literal['OFF', 'SHADOW', 'ON'] = 'OFF'
 
     SESSION_SECRET: str = 'development-only-change-me'
     # Dedicated pseudonymization key for audit IPs. Local development derives a

@@ -27,9 +27,12 @@ from app.models.entities import (
 from app.services.ai_profit_exit import (
     PROFIT_EXIT_ORIGIN,
     ProfitExitAction,
+    ProfitExitFeatureMode,
     ProfitExitIntentState,
     build_profit_exit_close_plan,
     profit_exit_economically_admissible,
+    profit_exit_feature_mode,
+    protected_reconcile_target,
     read_current_source_cycle,
 )
 from app.services.ai_profit_exit_collector import collect_profit_exit_economics
@@ -280,6 +283,14 @@ async def _process_ai_profit_exit_locked(
     if decision is None:
         return await _finish(db, job, JobState.SKIPPED, 'AI profit exit decision is unavailable')
 
+    if profit_exit_feature_mode() is not ProfitExitFeatureMode.ON:
+        return await _finish_profit_exit_failure(
+            db,
+            job,
+            decision,
+            'AI profit exit operational mode is not ON',
+        )
+
     binding_ok = (
         decision.user_id == user.id
         and decision.copy_job_id == job.id
@@ -432,6 +443,8 @@ async def _process_ai_profit_exit_locked(
     async def _revalidate_profit_exit() -> None:
         await db.refresh(job, attribute_names=['execution_epoch_id', 'execution_provider', 'execution_network'])
         await db.refresh(decision)
+        if profit_exit_feature_mode() is not ProfitExitFeatureMode.ON:
+            raise RuntimeError('AI profit exit operational mode changed before submission')
         if not await job_matches_active_destination(db, job):
             raise RuntimeError('AI profit exit destination epoch changed before submission')
         if job.execution_provider != 'hyperliquid' or job.execution_network != network:
@@ -653,6 +666,68 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
         min_notional=risk.min_notional,
         follower_mark_price=follower_mark,
     )
+
+    # Final action-boundary anti-reopen fence. Reconcile already applies the
+    # same durable memory upstream, but EVENT jobs can arrive independently and
+    # must never recreate exposure from a source cycle already profit-exited.
+    # Feature mode is intentionally irrelevant here: operational memory survives
+    # OFF/SHADOW changes. A master/safety target of zero always passes through.
+    if job.origin in {'EVENT', 'RECONCILE'} and sizing.target_size != 0:
+        raw_boundary = ctx.get('master_snapshot_started_order')
+        if job.origin == 'EVENT':
+            raw_order = ctx.get('master_intent_order')
+            try:
+                causal_order = int(Decimal(str(raw_order)))
+                if causal_order <= 0 or Decimal(str(raw_order)) != Decimal(causal_order):
+                    raise ValueError('invalid causal order')
+                raw_boundary = causal_order + 1
+            except Exception:
+                raw_boundary = None
+        try:
+            snapshot_boundary = int(Decimal(str(raw_boundary)))
+            if snapshot_boundary <= 0 or Decimal(str(raw_boundary)) != Decimal(snapshot_boundary):
+                raise ValueError('invalid snapshot boundary')
+        except Exception:
+            snapshot_boundary = None
+
+        protected_target = await protected_reconcile_target(
+            db,
+            user_id=user.id,
+            execution_epoch_id=job.execution_epoch_id,
+            execution_provider=job.execution_provider,
+            execution_network=job.execution_network,
+            asset=job.asset,
+            master_network=settings.master_network,
+            snapshot_started_order=snapshot_boundary,
+            current_master_position=master_pos,
+            current_position=current,
+            desired_target=sizing.target_size,
+        )
+        if protected_target != sizing.target_size:
+            if ledger:
+                ledger.target_size = current
+            await audit(
+                db,
+                action='AI_PROFIT_EXIT_SAME_CYCLE_RETARGET_BLOCKED',
+                subject_id=user.id,
+                reason='Operational AI profit-exit memory suppresses same-cycle master retarget',
+                correlation_id=job.correlation_id,
+                after={
+                    'asset': job.asset,
+                    'origin': job.origin,
+                    'current': str(current),
+                    'master_target': str(sizing.target_size),
+                    'protected_target': str(protected_target),
+                    'network': network,
+                },
+            )
+            return await _finish(
+                db,
+                job,
+                JobState.SKIPPED,
+                'Same-cycle AI profit exit prevents master retarget',
+            )
+
     if ledger:
         ledger.target_size = sizing.target_size
     else:

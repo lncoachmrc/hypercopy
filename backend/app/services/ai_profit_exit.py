@@ -3,10 +3,21 @@ from __future__ import annotations
 from decimal import Decimal
 from enum import Enum
 
+from app.core.config import settings
 from app.engine.sizing import OrderIntent, SizingResult, round_size
 
 
 PROFIT_EXIT_ORIGIN = "AI_PROFIT_EXIT"
+
+
+class ProfitExitFeatureMode(str, Enum):
+    OFF = "OFF"
+    SHADOW = "SHADOW"
+    ON = "ON"
+
+
+def profit_exit_feature_mode() -> ProfitExitFeatureMode:
+    return ProfitExitFeatureMode(settings.AI_PROFIT_EXIT_MODE)
 
 
 class ProfitExitAction(str, Enum):

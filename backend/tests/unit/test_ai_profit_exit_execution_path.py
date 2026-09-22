@@ -89,3 +89,28 @@ def test_execute_leg_forwards_final_authorization_without_second_executor() -> N
     assert "state=ExecutionState.SUBMITTING" in source
     assert "deterministic_cloid(" in source
     assert "before_submit=before_submit" in source
+
+
+def test_profit_exit_feature_mode_is_separate_and_defaults_off() -> None:
+    from app.core.config import Settings
+    from app.services.ai_profit_exit import ProfitExitFeatureMode
+
+    configured = Settings()
+    assert configured.AI_PROFIT_EXIT_MODE == "OFF"
+    assert {mode.value for mode in ProfitExitFeatureMode} == {"OFF", "SHADOW", "ON"}
+
+
+def test_event_and_reconcile_have_action_boundary_anti_reopen_fence() -> None:
+    source = inspect.getsource(execution._process_job_locked)
+
+    assert "job.origin in {'EVENT', 'RECONCILE'}" in source
+    assert "protected_reconcile_target(" in source
+    assert "Same-cycle AI profit exit prevents master retarget" in source
+    assert "sizing.target_size != 0" in source
+
+
+def test_feature_off_does_not_disable_durable_anti_reopen_memory() -> None:
+    source = inspect.getsource(execution._process_job_locked)
+    anti_reopen = source[source.index("# Final action-boundary anti-reopen fence"):]
+
+    assert "profit_exit_feature_mode" not in anti_reopen.split("if ledger:", 1)[0]
