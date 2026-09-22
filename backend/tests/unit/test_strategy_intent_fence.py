@@ -83,7 +83,9 @@ def test_copy_order_has_final_signed_action_authorization_fence() -> None:
     assert 'priority=Priority.ORDER' in source
     assert 'master_position_from_state(' in source
     assert 'fresh_position != evidence.source_master_position' in source
-    assert 'before_submit=_authorize_strategy_order' in source
+    assert 'before_submit=_authorize_ioc_submission' in source
+    assert 'await _authorize_strategy_order()' in source
+    assert source.index('await _authorize_strategy_order()') < source.index('await before_submit()')
     assert 'except StrategyIntentAuthorizationError as exc:' in source
     assert "'CANCELED'" in source
 
