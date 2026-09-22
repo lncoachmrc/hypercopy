@@ -61,6 +61,8 @@ A Checkout success redirect never grants entitlement. Only a verified Stripe sub
 | POST | `/admin/system/live-trading/disable` | disable persistent mainnet execution gate |
 | POST | `/admin/system/resume` | clear global/emergency pause |
 | GET | `/admin/audit` | append-only audit stream |
+| GET | `/ai/profit-exit-mode` | read global AI Profit Exit OFF/SHADOW/ON mode; SUPERADMIN only |
+| POST | `/ai/profit-exit-mode` | auditably change global AI Profit Exit runtime mode; SUPERADMIN only |
 
 ## Health / metrics
 

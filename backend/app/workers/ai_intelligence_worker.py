@@ -15,7 +15,8 @@ from app.db.schema import assert_schema
 from app.db.session import SessionLocal, engine
 from app.models.entities import MasterEvent
 from app.services.ai_intelligence import read_ai_intelligence, refresh_ai_intelligence
-from app.services.ai_profit_exit import ProfitExitFeatureMode, profit_exit_feature_mode
+from app.services.ai_profit_exit import ProfitExitFeatureMode
+from app.services.ai_profit_exit_mode import read_profit_exit_mode
 from app.services.ai_profit_exit_decision import evaluate_profit_exit_portfolio
 
 settings.validate_for_service('ai-intelligence-worker')
@@ -84,6 +85,10 @@ class AIIntelligenceWorker:
     async def _state(self) -> dict:
         async with SessionLocal() as db:
             return await read_ai_intelligence(db)
+
+    async def _profit_exit_mode(self) -> ProfitExitFeatureMode:
+        async with SessionLocal() as db:
+            return await read_profit_exit_mode(db)
 
     async def _sync_source_from_state(self) -> dict:
         state=await self._state()
@@ -218,11 +223,15 @@ class AIIntelligenceWorker:
             'max_refresh_seconds':self.max_refresh,
         })
 
-        if not _env_bool('LLM_ENABLED',False) and profit_exit_feature_mode() is ProfitExitFeatureMode.OFF:
+        if not _env_bool('LLM_ENABLED',False) and await self._profit_exit_mode() is ProfitExitFeatureMode.OFF:
             log.info('AI intelligence worker idle because LLM and AI Profit Exit are disabled')
             while not stop.is_set():
                 await asyncio.sleep(30)
-            return
+                if await self._profit_exit_mode() is not ProfitExitFeatureMode.OFF:
+                    log.info('AI Profit Exit runtime mode enabled; leaving idle state')
+                    break
+            if stop.is_set():
+                return
 
         await self._sync_source_from_state()
         latest=await self._latest_master_event()
@@ -234,8 +243,9 @@ class AIIntelligenceWorker:
             await self._db_fallback_check()
 
             now=asyncio.get_running_loop().time()
+            profit_exit_mode = await self._profit_exit_mode()
             if (
-                profit_exit_feature_mode() is not ProfitExitFeatureMode.OFF
+                profit_exit_mode is not ProfitExitFeatureMode.OFF
                 and now-self._last_profit_exit_eval >= self.profit_exit_interval
             ):
                 try:

@@ -31,11 +31,11 @@ from app.services.ai_profit_exit import (
     ProfitExitIntentState,
     build_profit_exit_close_plan,
     profit_exit_economically_admissible,
-    profit_exit_feature_mode,
     protected_reconcile_target,
     read_current_source_cycle,
 )
 from app.services.ai_profit_exit_collector import collect_profit_exit_economics
+from app.services.ai_profit_exit_mode import read_profit_exit_mode
 from app.services.audit import audit
 from app.services.effective_risk import resolve_effective_risk
 from app.services.entitlement import entitlement
@@ -407,7 +407,7 @@ async def _process_ai_profit_exit_locked(
             decision,
             'AI profit exit requires ACTIVE user copy state before submission',
         )
-    if profit_exit_feature_mode() is not ProfitExitFeatureMode.ON:
+    if await read_profit_exit_mode(db) is not ProfitExitFeatureMode.ON:
         return await _finish_profit_exit_failure(
             db,
             job,
@@ -554,7 +554,7 @@ async def _process_ai_profit_exit_locked(
     async def _revalidate_profit_exit() -> None:
         await db.refresh(job, attribute_names=['execution_epoch_id', 'execution_provider', 'execution_network'])
         await db.refresh(decision)
-        if profit_exit_feature_mode() is not ProfitExitFeatureMode.ON:
+        if await read_profit_exit_mode(db) is not ProfitExitFeatureMode.ON:
             raise RuntimeError('AI profit exit operational mode changed before submission')
         if not await job_matches_active_destination(db, job):
             raise RuntimeError('AI profit exit destination epoch changed before submission')

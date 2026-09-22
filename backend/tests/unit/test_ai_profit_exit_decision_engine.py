@@ -52,7 +52,7 @@ def test_profit_exit_llm_contract_is_closed() -> None:
 def test_existing_execution_recovery_precedes_new_submission_gates() -> None:
     source=inspect.getsource(execution._process_ai_profit_exit_locked)
     existing_index=source.index("existing = (await db.execute(select(Execution)")
-    mode_index=source.index("profit_exit_feature_mode() is not ProfitExitFeatureMode.ON")
+    mode_index=source.index("await read_profit_exit_mode(db) is not ProfitExitFeatureMode.ON")
     expiry_index=source.index("decision.expires_at <= now")
     credential_index=source.index("cred = (await db.execute(select(SigningCredential)")
 
@@ -81,7 +81,7 @@ def test_profit_exit_execution_rechecks_active_copy_state_before_new_submission(
     source = inspect.getsource(execution._process_ai_profit_exit_locked)
     existing_index = source.index("existing = (await db.execute(select(Execution)")
     active_index = source.index("user.copy_state != CopyState.ACTIVE")
-    mode_index = source.index("profit_exit_feature_mode() is not ProfitExitFeatureMode.ON")
+    mode_index = source.index("await read_profit_exit_mode(db) is not ProfitExitFeatureMode.ON")
 
     assert existing_index < active_index < mode_index
 
@@ -95,3 +95,14 @@ def test_profit_exit_decision_timestamp_is_captured_after_ai_response() -> None:
     assert "position_verified_at=decision_now" in source
     assert "decided_at=decision_now" in source
     assert "expires_at=decision_now + timedelta(" in source
+
+
+def test_profit_exit_evaluator_reads_shared_runtime_mode() -> None:
+    source = inspect.getsource(evaluate_profit_exit_portfolio)
+    assert "mode = await read_profit_exit_mode(db)" in source
+
+
+def test_ai_worker_can_leave_idle_state_after_dashboard_mode_change() -> None:
+    source = inspect.getsource(ai_intelligence_worker.AIIntelligenceWorker.run)
+    assert "await self._profit_exit_mode()" in source
+    assert "AI Profit Exit runtime mode enabled; leaving idle state" in source

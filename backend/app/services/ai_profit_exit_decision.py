@@ -29,12 +29,12 @@ from app.services.ai_profit_exit import (
     ProfitExitFeatureMode,
     ProfitExitIntentState,
     profit_exit_decision_id,
-    profit_exit_feature_mode,
     profit_exit_job_id,
     read_current_source_cycle,
     read_operational_profit_exit_memory,
 )
 from app.services.ai_profit_exit_collector import collect_profit_exit_economics
+from app.services.ai_profit_exit_mode import read_profit_exit_mode
 from app.services.master_source_identity import is_master_source_user
 from app.services.networking import user_network_state
 from app.services.queue import publish_job
@@ -125,7 +125,7 @@ def _decision_inputs(observation, cycle, intelligence: dict, evaluation_slot: in
 
 
 async def evaluate_profit_exit_portfolio(db: AsyncSession, redis) -> dict:
-    mode = profit_exit_feature_mode()
+    mode = await read_profit_exit_mode(db)
     if mode is ProfitExitFeatureMode.OFF:
         return {"mode": mode.value, "evaluated": 0, "decisions": 0, "queued": 0, "abstained": 0}
 
