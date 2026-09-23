@@ -41,6 +41,13 @@ from app.services.effective_risk import resolve_effective_risk
 from app.services.entitlement import entitlement
 from app.services.execution_destination import job_matches_active_destination
 from app.services.networking import user_network_state
+from app.services.shadow_positions import (
+    ShadowPositionState,
+    apply_shadow_plan,
+    current_shadow_positions,
+    get_or_create_shadow_position,
+    persist_shadow_plan_result,
+)
 from app.services.strategy_intents import master_position_from_state
 
 log = get_logger(__name__)
@@ -84,6 +91,40 @@ def _effective_master_mark(origin: str, master_mark: Decimal, follower_mark: Dec
 
 def _shadow_suppresses_exchange(copy_state: CopyState, origin: str) -> bool:
     return copy_state == CopyState.SHADOW and origin != 'CLOSE_ALL'
+
+
+def _parse_shadow_session(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _shadow_session_job_allowed(
+    copy_state: CopyState,
+    current_shadow_started_at: datetime | None,
+    job_shadow_started_at: object,
+    origin: str,
+) -> bool:
+    # CLOSE_ALL is an explicit administrative/safety exception and must retain
+    # its existing semantics regardless of the current copy state.
+    if origin == 'CLOSE_ALL':
+        return True
+
+    job_session = _parse_shadow_session(job_shadow_started_at)
+    if copy_state == CopyState.SHADOW:
+        if current_shadow_started_at is None or job_session is None:
+            return False
+        return job_session == current_shadow_started_at.astimezone(UTC)
+
+    # A job born in SHADOW can never become a live write merely because the
+    # user switched to ACTIVE before the queue consumed it.
+    return job_session is None
 
 
 def _ambiguity_reduction_plan_safe(plan: SizingResult) -> bool:
@@ -701,6 +742,18 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
     network_state = await user_network_state(db, user.id)
     network = network_state.network
     ctx = job.context or {}
+    if not _shadow_session_job_allowed(
+        user.copy_state,
+        user.shadow_started_at,
+        ctx.get('shadow_started_at'),
+        job.origin,
+    ):
+        return await _finish(
+            db,
+            job,
+            JobState.SKIPPED,
+            'Stale or unbound SHADOW session job',
+        )
     job_network = str(ctx.get('follower_network') or network).lower()
     if job_network != network:
         return await _finish(db, job, JobState.SKIPPED, 'Stale job from a previous Hyperliquid network epoch')
@@ -722,7 +775,42 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
         EquitySnapshot.taken_at >= network_state.started_at,
     ).order_by(EquitySnapshot.taken_at.desc()).limit(1))).scalar_one_or_none()
     ledger = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user.id, PositionLedger.asset == job.asset))).scalar_one_or_none()
-    current = ledger.size if ledger else Decimal(0)
+    shadow_position = None
+    shadow_session = (
+        user.copy_state == CopyState.SHADOW
+        and job.origin != 'CLOSE_ALL'
+    )
+    if shadow_session:
+        if user.shadow_started_at is None:
+            return await _finish(
+                db,
+                job,
+                JobState.SKIPPED,
+                'Shadow session timestamp is unavailable',
+            )
+        if (
+            job.execution_epoch_id is None
+            or job.execution_provider is None
+            or job.execution_network is None
+        ):
+            return await _finish(
+                db,
+                job,
+                JobState.SKIPPED,
+                'Shadow job lost its execution destination binding',
+            )
+        shadow_position = await get_or_create_shadow_position(
+            db,
+            user_id=user.id,
+            execution_epoch_id=job.execution_epoch_id,
+            execution_provider=job.execution_provider,
+            execution_network=job.execution_network,
+            shadow_started_at=user.shadow_started_at,
+            asset=job.asset,
+        )
+        current = Decimal(str(shadow_position.size))
+    else:
+        current = ledger.size if ledger else Decimal(0)
 
     master_pos = Decimal(str(ctx.get('master_position', '0')))
     master_eq = Decimal(str(ctx.get('master_equity', '0')))
@@ -867,7 +955,35 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
 
     ledger.mark_price = follower_mark
     ledgers = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user.id, PositionLedger.managed.is_(True)))).scalars().all()
-    total_exposure = sum((abs(x.size) * max(x.mark_price or Decimal(0), Decimal(0)) for x in ledgers), Decimal(0))
+    if shadow_session:
+        assert user.shadow_started_at is not None
+        shadow_rows = await current_shadow_positions(
+            db,
+            user_id=user.id,
+            shadow_started_at=user.shadow_started_at,
+        )
+        marks_by_asset = {
+            row.asset: max(row.mark_price or Decimal(0), Decimal(0))
+            for row in ledgers
+        }
+        total_exposure = sum(
+            (
+                abs(Decimal(str(row.size)))
+                * max(
+                    marks_by_asset.get(row.asset, Decimal(0)),
+                    Decimal(str(row.mark_price or 0)),
+                    Decimal(0),
+                )
+                for row in shadow_rows
+            ),
+            Decimal(0),
+        )
+        open_positions = len([
+            row for row in shadow_rows if Decimal(str(row.size)) != 0
+        ])
+    else:
+        total_exposure = sum((abs(x.size) * max(x.mark_price or Decimal(0), Decimal(0)) for x in ledgers), Decimal(0))
+        open_positions = len([x for x in ledgers if x.size != 0])
     asset_exposure = abs(current) * follower_mark
     stale = False if job.origin == 'CLOSE_ALL' else equity.taken_at < datetime.now(UTC) - timedelta(seconds=settings.LEDGER_STALE_SECONDS)
     allowed_asset = (not risk.allow_assets or job.asset in risk.allow_assets) and job.asset not in risk.block_assets
@@ -893,7 +1009,7 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
         free_margin=max(equity.free_margin, Decimal(0)),
         account_equity=max(equity.account_value, Decimal(0)),
         current_leverage=total_exposure / equity.account_value if equity.account_value > 0 else Decimal(999),
-        open_positions=len([x for x in ledgers if x.size != 0]), is_new_market=current == 0,
+        open_positions=open_positions, is_new_market=current == 0,
         max_notional_per_trade=effective_risk.max_notional_per_trade,
         max_total_exposure=effective_risk.max_total_exposure,
         max_asset_exposure=effective_risk.max_asset_exposure,
@@ -903,14 +1019,84 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
     decision = evaluate(sizing, profile_ctx)
 
     if _shadow_suppresses_exchange(user.copy_state, job.origin):
-        await audit(db, action='SHADOW_TARGET', subject_id=user.id, reason='Shadow mode: no exchange order', correlation_id=job.correlation_id, after={
-            'asset': job.asset, 'target': str(sizing.target_size), 'current': str(current), 'delta': str(sizing.delta),
-            'master_network': settings.master_network, 'follower_network': network,
-            'master_mark': str(master_mark), 'follower_mark': str(follower_mark),
-            'master_leverage': master_leverage, 'desired_follower_leverage': desired_leverage,
-            'selected_multiplier': str(risk.multiplier), 'effective_multiplier': str(effective_risk.multiplier),
-            'selected_max_positions': risk.max_positions, 'effective_max_positions': effective_risk.max_positions,
-        })
+        if shadow_position is None:
+            return await _finish(
+                db,
+                job,
+                JobState.SKIPPED,
+                'Shadow position ledger is unavailable',
+            )
+
+        virtual_before = ShadowPositionState(
+            size=Decimal(str(shadow_position.size)),
+            avg_entry_price=Decimal(str(shadow_position.avg_entry_price)),
+            residual_entry_notional=Decimal(str(shadow_position.residual_entry_notional)),
+        )
+        shadow_result = None
+        if decision.action in {RiskAction.ALLOW, RiskAction.TRIM} and decision.plan.actionable:
+            try:
+                shadow_result = apply_shadow_plan(
+                    virtual_before,
+                    decision.plan,
+                    mark_price=follower_mark,
+                    slippage_bps=risk.max_slippage_bps,
+                    sz_decimals=spec.sz_decimals,
+                )
+                persist_shadow_plan_result(
+                    shadow_position,
+                    shadow_result,
+                    mark_price=follower_mark,
+                )
+            except Exception as exc:
+                return await _retry_or_dead(
+                    db,
+                    job,
+                    f'Shadow simulation failed: {type(exc).__name__}: {exc}',
+                )
+
+        virtual_after = (
+            shadow_result.state
+            if shadow_result is not None
+            else virtual_before
+        )
+        await audit(
+            db,
+            action='SHADOW_TARGET',
+            subject_id=user.id,
+            reason='Shadow mode: no exchange order',
+            correlation_id=job.correlation_id,
+            after={
+                'asset': job.asset,
+                'target': str(sizing.target_size),
+                'virtual_current_before': str(virtual_before.size),
+                'virtual_current_after': str(virtual_after.size),
+                'exchange_current': str(ledger.size if ledger else Decimal(0)),
+                'delta': str(sizing.delta),
+                'risk_action': decision.action.value,
+                'risk_reason': decision.reason,
+                'simulated_fills': [
+                    {
+                        'side': 'BUY' if fill.is_buy else 'SELL',
+                        'size': str(fill.size),
+                        'price': str(fill.price),
+                        'reduce_only': fill.reduce_only,
+                    }
+                    for fill in (shadow_result.fills if shadow_result is not None else ())
+                ],
+                'avg_entry_price': str(virtual_after.avg_entry_price),
+                'residual_entry_notional': str(virtual_after.residual_entry_notional),
+                'master_network': settings.master_network,
+                'follower_network': network,
+                'master_mark': str(master_mark),
+                'follower_mark': str(follower_mark),
+                'master_leverage': master_leverage,
+                'desired_follower_leverage': desired_leverage,
+                'selected_multiplier': str(risk.multiplier),
+                'effective_multiplier': str(effective_risk.multiplier),
+                'selected_max_positions': risk.max_positions,
+                'effective_max_positions': effective_risk.max_positions,
+            },
+        )
         return await _finish(db, job, JobState.DONE, 'Shadow mode')
 
     async def _authorize_destination_write() -> None:

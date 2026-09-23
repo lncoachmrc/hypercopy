@@ -51,6 +51,7 @@ EXPECTED_MIGRATIONS = {
     '0015_risex_execution_nonce.py',
     '0016_ai_profit_exit_decisions.py',
     '0017_master_event_causal_order.py',
+    '0018_shadow_position_ledger.py',
 }
 
 missing = [path for path in REQUIRED_FILES if not (root / path).exists()]

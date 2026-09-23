@@ -25,6 +25,7 @@ from app.services.entitlement import entitlement
 from app.services.master_leverage_cache import next_master_leverage_causal_order
 from app.services.master_source_identity import MASTER_SOURCE_NETWORK, is_master_source_user
 from app.services.networking import user_network_state
+from app.services.shadow_positions import current_shadow_positions
 
 log = __import__('app.core.logging', fromlist=['get_logger']).get_logger(__name__)
 
@@ -53,9 +54,14 @@ def _reconciliation_basis(
     copy_state: CopyState,
     previous_target: Decimal | None,
     real: Decimal,
+    *,
+    shadow_current: Decimal | None = None,
 ) -> Decimal:
     if copy_state == CopyState.SHADOW:
-        return previous_target if previous_target is not None else Decimal(0)
+        # Stateful SHADOW uses the session-scoped virtual position as the
+        # reconciliation basis. A fresh shadow session starts flat even when
+        # PositionLedger.target_size still contains an older preview.
+        return shadow_current if shadow_current is not None else Decimal(0)
     return real
 
 
@@ -475,6 +481,15 @@ async def _reconcile_user_locked(
         ledger_rows = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user.id))).scalars().all()
         ledger_by_asset = {x.asset: x for x in ledger_rows}
 
+        shadow_rows = []
+        if user.copy_state == CopyState.SHADOW and user.shadow_started_at is not None:
+            shadow_rows = await current_shadow_positions(
+                db,
+                user_id=user.id,
+                shadow_started_at=user.shadow_started_at,
+            )
+        shadow_by_asset = {row.asset: row for row in shadow_rows}
+
         unmanaged_margin = Decimal(0)
         for row in real_state.get('assetPositions', []):
             pos = row.get('position', row)
@@ -504,7 +519,12 @@ async def _reconcile_user_locked(
             if job_state in _TERMINAL_AMBIGUITY_JOB_STATES
         }
 
-        assets = set(master_positions) | set(real_positions) | set(ledger_by_asset)
+        assets = (
+            set(master_positions)
+            | set(real_positions)
+            | set(ledger_by_asset)
+            | set(shadow_by_asset)
+        )
         discrepancies = []
         liquidity_backoffs = []
         planned_jobs: list[dict] = []
@@ -513,22 +533,50 @@ async def _reconcile_user_locked(
         managed_assets = {x.asset for x in ledger_rows if x.managed} | {
             name for name, size in master_positions.items() if size != 0
         }
-        current_total_exposure = sum(
-            (
-                abs(real_positions.get(name, Decimal(0)))
-                * max(Decimal(str(follower_mids.get(name, '0') or '0')), Decimal(0))
-                for name in managed_assets
-            ),
-            Decimal(0),
-        )
-        current_open_positions = len([
-            name for name in managed_assets if real_positions.get(name, Decimal(0)) != 0
-        ])
+        if user.copy_state == CopyState.SHADOW:
+            current_total_exposure = sum(
+                (
+                    abs(Decimal(str(row.size)))
+                    * max(
+                        Decimal(str(follower_mids.get(row.asset, '0') or '0')),
+                        Decimal(str(row.mark_price or 0)),
+                        Decimal(0),
+                    )
+                    for row in shadow_rows
+                ),
+                Decimal(0),
+            )
+            current_open_positions = len([
+                row for row in shadow_rows if Decimal(str(row.size)) != 0
+            ])
+        else:
+            current_total_exposure = sum(
+                (
+                    abs(real_positions.get(name, Decimal(0)))
+                    * max(Decimal(str(follower_mids.get(name, '0') or '0')), Decimal(0))
+                    for name in managed_assets
+                ),
+                Decimal(0),
+            )
+            current_open_positions = len([
+                name for name in managed_assets if real_positions.get(name, Decimal(0)) != 0
+            ])
         reserved_total_exposure = current_total_exposure
         reserved_open_positions = current_open_positions
 
         for asset in sorted(assets):
             real = real_positions.get(asset, Decimal(0))
+            shadow_row = shadow_by_asset.get(asset)
+            shadow_current = (
+                Decimal(str(shadow_row.size))
+                if shadow_row is not None
+                else Decimal(0)
+            )
+            simulation_current = (
+                shadow_current
+                if user.copy_state == CopyState.SHADOW
+                else real
+            )
             ledger = ledger_by_asset.get(asset)
             follower_mark = Decimal(str(follower_mids.get(asset, '0') or '0'))
             if not ledger:
@@ -552,7 +600,7 @@ async def _reconcile_user_locked(
             if master_pos != 0 and master_equity > 0 and master_mark > 0 and follower_mark > 0:
                 base_target = compute_target(
                     MasterExposure(asset, master_pos, master_mark, master_equity),
-                    FollowerState(str(user.id), equity, unmanaged_margin, real, multiplier),
+                    FollowerState(str(user.id), equity, unmanaged_margin, simulation_current, multiplier),
                     follower_mark,
                 )
                 desired_target = base_target * ai_factor
@@ -567,7 +615,7 @@ async def _reconcile_user_locked(
                 master_network=settings.master_network,
                 snapshot_started_order=master_snapshot_started_order,
                 current_master_position=master_pos,
-                current_position=real,
+                current_position=simulation_current,
                 desired_target=desired_target,
             )
 
@@ -619,7 +667,12 @@ async def _reconcile_user_locked(
             if ambiguity_safe_reduction:
                 leverage_mismatch = False
 
-            basis = _reconciliation_basis(user.copy_state, previous_target, real)
+            basis = _reconciliation_basis(
+                user.copy_state,
+                previous_target,
+                real,
+                shadow_current=shadow_current,
+            )
             drift_notional = abs(desired_target - basis) * follower_mark if follower_mark > 0 else Decimal(0)
             if drift_notional < min_notional and not leverage_mismatch:
                 continue
@@ -652,7 +705,7 @@ async def _reconcile_user_locked(
                         master_equity=master_equity,
                         follower_equity=equity,
                         unmanaged_margin=unmanaged_margin,
-                        real=real,
+                        real=simulation_current,
                         multiplier=multiplier,
                         follower_mark=follower_mark,
                         free_margin=free_margin,
@@ -671,10 +724,15 @@ async def _reconcile_user_locked(
                     submitted_size = None
 
             increasing_exposure = (
-                real == 0 and desired_target != 0
-                or real * desired_target > 0 and abs(desired_target) > abs(real)
+                simulation_current == 0 and desired_target != 0
+                or simulation_current * desired_target > 0
+                and abs(desired_target) > abs(simulation_current)
             )
-            reversal = real != 0 and desired_target != 0 and real * desired_target < 0
+            reversal = (
+                simulation_current != 0
+                and desired_target != 0
+                and simulation_current * desired_target < 0
+            )
             if (
                 user.copy_state == CopyState.ACTIVE
                 and risk
@@ -685,15 +743,19 @@ async def _reconcile_user_locked(
             ):
                 continue
 
-            if drift_notional >= min_notional and await _terminal_action_rejection_blocks_unchanged_intent(
-                db,
-                user.id,
-                asset,
-                network_state.started_at,
-                network=network,
-                desired_target=desired_target,
-                real=real,
-                submitted_size=submitted_size,
+            if (
+                user.copy_state == CopyState.ACTIVE
+                and drift_notional >= min_notional
+                and await _terminal_action_rejection_blocks_unchanged_intent(
+                    db,
+                    user.id,
+                    asset,
+                    network_state.started_at,
+                    network=network,
+                    desired_target=desired_target,
+                    real=real,
+                    submitted_size=submitted_size,
+                )
             ):
                 continue
 
@@ -733,6 +795,10 @@ async def _reconcile_user_locked(
                 'reconcile_reserved_total_exposure': str(reserved_total_exposure),
                 'reconcile_reserved_open_positions': reserved_open_positions,
             }
+            if user.copy_state == CopyState.SHADOW:
+                if user.shadow_started_at is None:
+                    continue
+                context['shadow_started_at'] = user.shadow_started_at.isoformat()
             if master_snapshot_started_order is not None:
                 context['master_snapshot_started_order'] = master_snapshot_started_order
                 context['master_intent_order'] = master_snapshot_started_order

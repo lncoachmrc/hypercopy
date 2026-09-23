@@ -72,9 +72,11 @@ def test_ai_worker_runs_profit_exit_as_separate_singleton_workflow() -> None:
     assert "evaluate_profit_exit_portfolio" in source
 
 
-def test_profit_exit_evaluator_excludes_shadow_and_paused_copy_users() -> None:
+def test_profit_exit_evaluator_includes_active_and_shadow_but_not_paused_users() -> None:
     source = inspect.getsource(evaluate_profit_exit_portfolio)
     assert "User.copy_state == CopyState.ACTIVE" in source
+    assert "User.copy_state == CopyState.SHADOW" in source
+    assert "User.copy_state == CopyState.PAUSED" not in source
 
 
 def test_profit_exit_execution_rechecks_active_copy_state_before_new_submission() -> None:
