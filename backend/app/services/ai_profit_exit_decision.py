@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.adapters.hyperliquid import HyperliquidAdapter
 from app.adapters.ratelimit import Priority
 from app.core.config import Network, settings
+from app.db.position_ledger_lock import position_ledger_lock
 from app.models.entities import (
     AIProfitExitDecision,
     CopyJob,
@@ -48,6 +49,16 @@ from app.services.strategy_intents import master_position_from_state
 
 def _llm_enabled() -> bool:
     return os.getenv("LLM_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _shadow_economic_state(
+    row: ShadowPositionLedger,
+) -> tuple[Decimal, Decimal, Decimal]:
+    return (
+        Decimal(str(row.size)),
+        Decimal(str(row.avg_entry_price)),
+        Decimal(str(row.residual_entry_notional)),
+    )
 
 
 def _validated_profit_exit_action(raw: object) -> tuple[ProfitExitAction, str]:
@@ -288,7 +299,9 @@ async def evaluate_profit_exit_portfolio(
             abstained += 1
             continue
 
+        captured_shadow_state = None
         if shadow_position is not None:
+            captured_shadow_state = _shadow_economic_state(shadow_position)
             mids = shadow_mids_by_network.get(destination.network)
             if mids is None:
                 try:
@@ -315,6 +328,18 @@ async def evaluate_profit_exit_portfolio(
                 and observation.taker_fee_rate is not None
             ):
                 shadow_fee_by_account[fee_key] = observation.taker_fee_rate
+
+            # Market/fee reads above await external I/O. Refresh before paying
+            # for an LLM decision so an execution/reconciliation update cannot
+            # be mistaken for the same virtual economic state.
+            await db.refresh(shadow_position)
+            if (
+                captured_shadow_state is None
+                or _shadow_economic_state(shadow_position)
+                != captured_shadow_state
+            ):
+                abstained += 1
+                continue
 
             observation_valid = bool(
                 observation.eligible
@@ -374,7 +399,7 @@ async def evaluate_profit_exit_portfolio(
         action, reason, runtime = await _decide_with_ai(inputs)
         decision_now = datetime.now(UTC)
         operational = (
-            user.copy_state == CopyState.ACTIVE
+            not is_shadow
             and mode is ProfitExitFeatureMode.ON
             and action is ProfitExitAction.CLOSE_PROFIT
         )
@@ -406,36 +431,59 @@ async def evaluate_profit_exit_portfolio(
             expires_at=decision_now + timedelta(seconds=settings.AI_PROFIT_EXIT_DECISION_TTL_SECONDS),
             copy_job_id=job_id,
         )
-        db.add(decision)
 
         job = None
-        if operational:
-            job = CopyJob(
-                id=job_id,
-                master_event_id=None,
-                user_id=user.id,
-                execution_epoch_id=destination.epoch_id,
-                execution_provider=destination.provider,
-                execution_network=destination.network,
-                asset=ledger.asset,
-                origin=PROFIT_EXIT_ORIGIN,
-                state=JobState.QUEUED,
-                context={
-                    "ai_profit_exit_decision_id": str(decision_id),
-                    "source_cycle_id": cycle.source_cycle_id,
-                    "follower_network": destination.network,
-                    "execution_provider": destination.provider,
-                    "execution_epoch_id": str(destination.epoch_id),
-                },
-                correlation_id=decision_id.hex,
-            )
-            db.add(job)
-
-        # Commit durable intent before the Redis delivery side effect.
-        await db.commit()
-        decisions += 1
         if is_shadow:
+            if shadow_position is None or captured_shadow_state is None:
+                abstained += 1
+                continue
+            # Do not hold the per-user lock while waiting on Hyperliquid or the
+            # LLM. Acquire it only for final state verification + persistence,
+            # matching the execution/reconciliation serialization domain.
+            async with position_ledger_lock(user.id):
+                await db.refresh(user)
+                await db.refresh(shadow_position)
+                if (
+                    user.copy_state != CopyState.SHADOW
+                    or user.shadow_started_at is None
+                    or user.shadow_started_at
+                    != shadow_position.shadow_started_at
+                    or _shadow_economic_state(shadow_position)
+                    != captured_shadow_state
+                ):
+                    abstained += 1
+                    continue
+                db.add(decision)
+                await db.commit()
+            decisions += 1
             shadow_decisions += 1
+        else:
+            db.add(decision)
+            if operational:
+                job = CopyJob(
+                    id=job_id,
+                    master_event_id=None,
+                    user_id=user.id,
+                    execution_epoch_id=destination.epoch_id,
+                    execution_provider=destination.provider,
+                    execution_network=destination.network,
+                    asset=ledger.asset,
+                    origin=PROFIT_EXIT_ORIGIN,
+                    state=JobState.QUEUED,
+                    context={
+                        "ai_profit_exit_decision_id": str(decision_id),
+                        "source_cycle_id": cycle.source_cycle_id,
+                        "follower_network": destination.network,
+                        "execution_provider": destination.provider,
+                        "execution_epoch_id": str(destination.epoch_id),
+                    },
+                    correlation_id=decision_id.hex,
+                )
+                db.add(job)
+
+            # Commit durable live intent before the Redis delivery side effect.
+            await db.commit()
+            decisions += 1
 
         if job is not None:
             try:
