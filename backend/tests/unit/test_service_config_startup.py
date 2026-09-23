@@ -11,12 +11,14 @@ import pytest
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 _VALID_AUDIT_IP_HASH_KEY_B64 = base64.b64encode(b'a' * 32).decode()
+_VALID_MASTER_ADDRESS = '0x' + '11' * 20
 
 
 def _production_env(
     *,
     session_secret: str | None = None,
     audit_ip_hash_key_b64: str | None = _VALID_AUDIT_IP_HASH_KEY_B64,
+    master_address: str | None = _VALID_MASTER_ADDRESS,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env['APP_ENV'] = 'production'
@@ -31,6 +33,10 @@ def _production_env(
         env.pop('AUDIT_IP_HASH_KEY_B64', None)
     else:
         env['AUDIT_IP_HASH_KEY_B64'] = audit_ip_hash_key_b64
+    if master_address is None:
+        env.pop('HYPERLIQUID_MASTER_ADDRESS', None)
+    else:
+        env['HYPERLIQUID_MASTER_ADDRESS'] = master_address
     return env
 
 
@@ -39,6 +45,7 @@ def _import_module(
     *,
     session_secret: str | None = None,
     audit_ip_hash_key_b64: str | None = _VALID_AUDIT_IP_HASH_KEY_B64,
+    master_address: str | None = _VALID_MASTER_ADDRESS,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, '-c', f'import {module}'],
@@ -46,6 +53,7 @@ def _import_module(
         env=_production_env(
             session_secret=session_secret,
             audit_ip_hash_key_b64=audit_ip_hash_key_b64,
+            master_address=master_address,
         ),
         capture_output=True,
         text=True,
@@ -66,6 +74,19 @@ def test_production_worker_startup_does_not_require_api_secrets(module: str) -> 
     result = _import_module(module, audit_ip_hash_key_b64=None)
 
     assert result.returncode == 0, result.stderr
+
+
+def test_production_ai_worker_requires_master_address() -> None:
+    result = _import_module(
+        'app.workers.ai_intelligence_worker',
+        master_address=None,
+    )
+
+    assert result.returncode != 0
+    assert (
+        'HYPERLIQUID_MASTER_ADDRESS is required for production ai-intelligence-worker'
+        in result.stderr
+    )
 
 
 @pytest.mark.parametrize('session_secret', [None, 'too-short'])
