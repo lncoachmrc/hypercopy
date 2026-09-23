@@ -72,9 +72,13 @@ def test_ai_worker_runs_profit_exit_as_separate_singleton_workflow() -> None:
     assert "evaluate_profit_exit_portfolio" in source
 
 
-def test_profit_exit_evaluator_excludes_shadow_and_paused_copy_users() -> None:
+def test_profit_exit_evaluator_includes_copy_shadow_as_record_only_input() -> None:
     source = inspect.getsource(evaluate_profit_exit_portfolio)
     assert "User.copy_state == CopyState.ACTIVE" in source
+    assert "User.copy_state == CopyState.SHADOW" in source
+    assert "PositionLedger.target_size != 0" in source
+    assert "collect_shadow_profit_exit_economics(" in source
+    assert "and user.copy_state == CopyState.ACTIVE" in source
 
 
 def test_profit_exit_execution_rechecks_active_copy_state_before_new_submission() -> None:
@@ -84,6 +88,19 @@ def test_profit_exit_execution_rechecks_active_copy_state_before_new_submission(
     mode_index = source.index("await read_profit_exit_mode(db) is not ProfitExitFeatureMode.ON")
 
     assert existing_index < active_index < mode_index
+
+
+def test_profit_exit_shadow_decisions_never_create_operational_jobs() -> None:
+    source = inspect.getsource(evaluate_profit_exit_portfolio)
+    operational_index = source.index("operational = (")
+    job_index = source.index("job_id = profit_exit_job_id")
+    operational_block = source[operational_index:job_index]
+
+    assert "mode is ProfitExitFeatureMode.ON" in operational_block
+    assert "user.copy_state == CopyState.ACTIVE" in operational_block
+    assert "action is ProfitExitAction.CLOSE_PROFIT" in operational_block
+    assert "pnl_complete=observation.pnl_complete" in source
+    assert '"shadow_decisions": shadow_decisions' in source
 
 
 def test_profit_exit_decision_timestamp_is_captured_after_ai_response() -> None:
