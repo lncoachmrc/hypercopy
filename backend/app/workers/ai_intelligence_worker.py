@@ -8,7 +8,9 @@ from datetime import UTC, datetime
 
 from sqlalchemy import select, text
 
-from app.core.config import settings
+from app.adapters.hyperliquid import HyperliquidAdapter
+from app.adapters.ratelimit import Budget, WeightedRateLimiter
+from app.core.config import Network, settings
 from app.core.logging import configure_logging, get_logger
 from app.db.redis import redis_client
 from app.db.schema import assert_schema
@@ -62,6 +64,15 @@ def _signal_ts(payload: str) -> datetime | None:
 class AIIntelligenceWorker:
     def __init__(self):
         self.redis=redis_client()
+        self.limiter=WeightedRateLimiter(
+            self.redis,
+            Budget(total_per_minute=settings.HL_RATE_BUDGET_PER_MIN),
+        )
+        self.master_hl=HyperliquidAdapter(
+            self.limiter,
+            network=settings.master_network,
+        )
+        self.followers: dict[Network, HyperliquidAdapter]={}
         self.queue=_queue_name()
         self.debounce=max(int(os.getenv('LLM_EVENT_DEBOUNCE_SECONDS','180')),0)
         self.min_refresh=max(int(os.getenv('LLM_MIN_REFRESH_SECONDS','300')),60)
@@ -75,6 +86,16 @@ class AIIntelligenceWorker:
         self._source_ts: datetime | None=None
         self.profit_exit_interval=max(int(settings.AI_PROFIT_EXIT_EVAL_SECONDS),1)
         self._last_profit_exit_eval=0.0
+
+    def _follower_hl(self, network: Network) -> HyperliquidAdapter:
+        adapter=self.followers.get(network)
+        if adapter is None:
+            adapter=HyperliquidAdapter(
+                self.limiter,
+                network=network,
+            )
+            self.followers[network]=adapter
+        return adapter
 
     async def _latest_master_event(self) -> MasterEvent | None:
         async with SessionLocal() as db:
@@ -205,7 +226,12 @@ class AIIntelligenceWorker:
                 return False
             try:
                 async with SessionLocal() as db:
-                    result=await evaluate_profit_exit_portfolio(db,self.redis)
+                    result=await evaluate_profit_exit_portfolio(
+                        db,
+                        self.redis,
+                        master_hl=self.master_hl,
+                        follower_hl_for_network=self._follower_hl,
+                    )
             finally:
                 await conn.execute(text("SELECT pg_advisory_unlock(hashtext('hypercopy:ai-profit-exit'))"))
                 await conn.commit()
@@ -218,6 +244,7 @@ class AIIntelligenceWorker:
 
         log.info('AI intelligence worker started',extra={
             'queue':self.queue,
+            'hl_rate_budget_per_minute':settings.HL_RATE_BUDGET_PER_MIN,
             'debounce_seconds':self.debounce,
             'min_refresh_seconds':self.min_refresh,
             'max_refresh_seconds':self.max_refresh,
