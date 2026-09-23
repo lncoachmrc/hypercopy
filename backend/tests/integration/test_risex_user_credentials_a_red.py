@@ -174,9 +174,11 @@ async def test_account_must_equal_authenticated_siwe_wallet_before_crypto_or_per
     async with SessionLocal() as db:
         user = await _insert_user(db)
         try:
-            body = schema(
-                account_address="0x" + ("44" * 20),
-                signer_private_key=SIGNER_PRIVATE_KEY_1,
+            body = schema.model_validate(
+                {
+                    "account_address": "0x" + ("44" * 20),
+                    "signer_private_key": SIGNER_PRIVATE_KEY_1,
+                }
             )
             with pytest.raises(HTTPException) as exc_info:
                 await endpoint(body, _request(), user, db)
@@ -217,9 +219,11 @@ async def test_main_wallet_private_key_is_rejected_before_provider_io_and_encryp
     async with SessionLocal() as db:
         user = await _insert_user(db)
         try:
-            body = schema(
-                account_address=user.auth_wallet,
-                signer_private_key=MAIN_PRIVATE_KEY,
+            body = schema.model_validate(
+                {
+                    "account_address": user.auth_wallet,
+                    "signer_private_key": MAIN_PRIVATE_KEY,
+                }
             )
             with pytest.raises(HTTPException) as exc_info:
                 await endpoint(body, _request(), user, db)
@@ -267,9 +271,11 @@ async def test_onchain_binding_failures_are_fail_closed_before_crypto_or_persist
     async with SessionLocal() as db:
         user = await _insert_user(db)
         try:
-            body = schema(
-                account_address=user.auth_wallet,
-                signer_private_key=SIGNER_PRIVATE_KEY_1,
+            body = schema.model_validate(
+                {
+                    "account_address": user.auth_wallet,
+                    "signer_private_key": SIGNER_PRIVATE_KEY_1,
+                }
             )
             with pytest.raises(HTTPException):
                 await endpoint(body, _request(), user, db)
@@ -293,9 +299,11 @@ async def test_success_encrypts_with_record_aad_and_binds_epoch_to_logical_gener
     async with SessionLocal() as db:
         user = await _insert_user(db)
         try:
-            body = schema(
-                account_address=user.auth_wallet,
-                signer_private_key=SIGNER_PRIVATE_KEY_1,
+            body = schema.model_validate(
+                {
+                    "account_address": user.auth_wallet,
+                    "signer_private_key": SIGNER_PRIVATE_KEY_1,
+                }
             )
             await endpoint(body, _request(), user, db)
 
@@ -369,9 +377,11 @@ async def test_encryption_failure_leaves_no_account_credential_or_epoch_partial_
     async with SessionLocal() as db:
         user = await _insert_user(db)
         try:
-            body = schema(
-                account_address=user.auth_wallet,
-                signer_private_key=SIGNER_PRIVATE_KEY_1,
+            body = schema.model_validate(
+                {
+                    "account_address": user.auth_wallet,
+                    "signer_private_key": SIGNER_PRIVATE_KEY_1,
+                }
             )
             with pytest.raises(RuntimeError, match="synthetic encryption failure"):
                 await endpoint(body, _request(), user, db)
@@ -402,9 +412,11 @@ async def test_rotation_increments_logical_generation_and_rejects_old_epoch_job(
     async with SessionLocal() as db:
         user = await _insert_user(db)
         try:
-            first_body = schema(
-                account_address=user.auth_wallet,
-                signer_private_key=SIGNER_PRIVATE_KEY_1,
+            first_body = schema.model_validate(
+                {
+                    "account_address": user.auth_wallet,
+                    "signer_private_key": SIGNER_PRIVATE_KEY_1,
+                }
             )
             await endpoint(first_body, _request(), user, db)
 
@@ -442,9 +454,11 @@ async def test_rotation_increments_logical_generation_and_rejects_old_epoch_job(
             db.add(job)
             await db.commit()
 
-            second_body = schema(
-                account_address=user.auth_wallet,
-                signer_private_key=SIGNER_PRIVATE_KEY_2,
+            second_body = schema.model_validate(
+                {
+                    "account_address": user.auth_wallet,
+                    "signer_private_key": SIGNER_PRIVATE_KEY_2,
+                }
             )
             await endpoint(second_body, _request(), user, db)
 
