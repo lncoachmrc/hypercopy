@@ -93,6 +93,40 @@ def _shadow_suppresses_exchange(copy_state: CopyState, origin: str) -> bool:
     return copy_state == CopyState.SHADOW and origin != 'CLOSE_ALL'
 
 
+def _parse_shadow_session(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _shadow_session_job_allowed(
+    copy_state: CopyState,
+    current_shadow_started_at: datetime | None,
+    job_shadow_started_at: object,
+    origin: str,
+) -> bool:
+    # CLOSE_ALL is an explicit administrative/safety exception and must retain
+    # its existing semantics regardless of the current copy state.
+    if origin == 'CLOSE_ALL':
+        return True
+
+    job_session = _parse_shadow_session(job_shadow_started_at)
+    if copy_state == CopyState.SHADOW:
+        if current_shadow_started_at is None or job_session is None:
+            return False
+        return job_session == current_shadow_started_at.astimezone(UTC)
+
+    # A job born in SHADOW can never become a live write merely because the
+    # user switched to ACTIVE before the queue consumed it.
+    return job_session is None
+
+
 def _ambiguity_reduction_plan_safe(plan: SizingResult) -> bool:
     """An ambiguity escape hatch may only reduce the current side, never reverse."""
     return bool(plan.actionable and plan.reduce_only and plan.secondary is None and plan.order_size > 0)
@@ -708,6 +742,18 @@ async def _process_job_locked(db: AsyncSession, hl: HyperliquidAdapter, job: Cop
     network_state = await user_network_state(db, user.id)
     network = network_state.network
     ctx = job.context or {}
+    if not _shadow_session_job_allowed(
+        user.copy_state,
+        user.shadow_started_at,
+        ctx.get('shadow_started_at'),
+        job.origin,
+    ):
+        return await _finish(
+            db,
+            job,
+            JobState.SKIPPED,
+            'Stale or unbound SHADOW session job',
+        )
     job_network = str(ctx.get('follower_network') or network).lower()
     if job_network != network:
         return await _finish(db, job, JobState.SKIPPED, 'Stale job from a previous Hyperliquid network epoch')
