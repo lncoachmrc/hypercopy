@@ -933,3 +933,184 @@ The readiness PASS and Operational Execution Window remain non-persistent. Postg
 - `backend/app/security/risex_signed_testnet_runner.py`
 - `backend/app/services/risex_signed_execution.py`
 - `backend/app/adapters/risex.py`
+
+---
+
+## Amendment: Multi-User RISEx Credential Model (Proposed)
+
+**Status**: Proposed  
+**Decision Date**: 2026-09-23  
+**Operational Rule**: This amendment becomes Accepted/operative only in the separate implementation PR that changes the runtime to the per-user credential model.  
+**Transitional Rule**: Until that implementation PR is merged, the existing single-account model and existing ADR-0004 runtime semantics remain authoritative and unchanged.
+
+### 1. RUNTIME WINDOW SCOPE
+
+The Operational Execution Window authorizes only the worker-global runtime/process epoch, not per-user credentials.
+
+**Worker-global fingerprint includes**:
+- worker_id
+- boot_id (restart invalidation)
+- deployment/build identity
+- provider/network configuration
+- approved API/RPC/transport configuration
+- pinned deployment identity/fingerprint
+- singleton execution-worker state
+- signed-write and kill-switch state
+- security-relevant worker-global configuration
+- control generation/invalidation state where applicable
+
+**Per-user credential elements MUST NOT be in the continuous worker-global fingerprint once this amendment is implemented**:
+- Per-user RISEx account address
+- Per-user signer address/private key
+- Per-user credential identity/version
+- Per-user credential expiration
+- Per-user permission bitmap/state
+
+**Credential invalidation scope**:
+- Credential changes for one user must block/invalidate that user's execution binding only
+- Unrelated users' windows remain valid and unaffected by one user's credential change
+
+**Environment-level credential variables are not valid production runtime-fingerprint inputs after per-user model implementation**:
+- `RISEX_TESTNET_ACCOUNT_ADDRESS`
+- `RISEX_TESTNET_SIGNER_PRIVATE_KEY`
+
+### 2. POINT-OF-USE PER-USER AUTHORIZATION
+
+For each RISEx order in continuous mode, the following authorization must be checked independently at the point of use:
+
+**Required inputs and validation**:
+1. CopyJob.user_id
+2. Exact active ExecutionEpoch referenced by the job
+3. Provider verification: provider=risex
+4. Account and credential version bound to that epoch
+5. Load encrypted per-user RISEx credential from persistent storage (database)
+6. Decrypt credential only at point of use (never in fingerprint or pre-compute)
+7. Derive signer address cryptographically from the decrypted private key
+8. Verify stored signer identity/account/epoch binding matches derived signer
+9. Obtain sufficiently fresh authoritative RISEx/on-chain state for that exact account+signer pair
+10. Require active, unexpired, and required permissions on-chain
+11. Fail closed on missing/stale/malformed/revoked/expired/mismatched/indeterminate state
+12. Re-check window validity and final local fences immediately before provider POST
+
+**Authorization domain independence**:
+- A valid Operational Execution Window cannot substitute for invalid per-user credential authorization
+- A valid per-user credential cannot substitute for a closed/invalid window
+- Both authorization domains must independently pass before the order proceeds
+
+### 3. SECURITY-STRENGTH RATIONALE
+
+Moving account/signer verification from ARM-time (admission to the window) to mandatory per-order point-of-use verification maintains or improves security strength:
+
+**Temporal proximity**:
+- Per-order verification is temporally closer to the actual provider POST than ARM-time checks
+- Expiry/revocation/permission/account-binding state is checked immediately before use, not at window entry
+
+**Order-specific validation**:
+- Each order is validated with the exact credential that will be used
+- No assumption that ARM-time state persists unchanged for the order's lifetime
+
+**ARM's continued role**:
+- ARM protects explicit operator intent and approval
+- ARM enforces process/boot isolation (restart invalidation)
+- ARM maintains singleton execution-worker semantics
+- ARM enforces ARM/DISARM ordering and idempotency
+- ARM validates deployment/runtime integrity
+- ARM bounds window lifetime
+
+**Independence of authorization domains**:
+- The Operational Execution Window and per-user credential authorization are independent security boundaries
+- Each must be validated; neither can substitute for the other
+- Both must pass before execution proceeds
+
+### 4. EXISTING TEXT REALIGNMENT
+
+The existing ADR-0004 statements about unchanged "account, signer, permissions" within an operational epoch and account/signer changes invalidating the prior authorization epoch require clarification:
+
+**Clarification**:
+- An Operational Execution Window tracks worker-global context (process identity, deployment, boot, transport, security configuration)
+- Account/signer/permission changes are per-user authorization state, checked per candidate order at point of use
+- "Unchanged account/signer" in the current single-account model will transition to "per-user account/signer state validated at point of use" in the multi-user model
+
+**Short-lived attestation mode remains unchanged**:
+- Manual/test short-lived attestations remain bound to their specific account+signer pair
+- 300-second TTL semantics are preserved
+- Attestation issuance/revocation logic is unaffected by this amendment
+
+### 5. OPERATOR ASSERTIONS — EXPLICIT MIGRATION
+
+**Current implementation**: The continuous ARM readiness hard-requires four operator assertions, all currently included in the context fingerprint:
+- `disposable_account_asserted`: operator confirms the testnet account is disposable (no real capital)
+- `dedicated_signer_asserted`: operator confirms a dedicated session key is deployed
+- `operatorhub_bypass_disabled`: operator confirms OperatorHub JWT bypass is disabled
+- `fund_movement_path_absent`: operator confirms the session key has no fund-movement capability
+
+**Future multi-user continuous implementation**: Operator assertions evolve as follows:
+
+**Assertions that DROP from continuous/global ARM readiness**:
+
+1. **`disposable_account_asserted` DROPS**: 
+   - Rationale: Was a test-account-specific assertion confirming an isolated disposable/faucet account. Inapplicable and false for real user-owned accounts in production multi-user model.
+
+2. **`dedicated_signer_asserted` DROPS as worker-global operator assertion**:
+   - Rationale: Dedicated signer remains MANDATORY per user under ADR-0006 §0. In the multi-user model, it is established from the user's stored credential and validated against authoritative account↔signer evidence at onboarding and point-of-use, not asserted at ARM time.
+
+3. **`fund_movement_path_absent` DROPS as worker-global operator assertion**:
+   - Rationale: Real-capital MoveFund residual risk is governed by ADR-0006 §1 (permission reduction, isolation, collateral-confinement controls and per-user point-of-use permission verification). No operator assertion can manufacture or substitute for current provider/on-chain permission evidence.
+
+**Assertions that REMAIN in continuous/global ARM readiness**:
+
+4. **`operatorhub_bypass_disabled` REMAINS**:
+   - Rationale: Describes the runtime/transport security boundary and deployment-level configuration, not a single user's credential. Remains a worker-global readiness assertion.
+
+5. **Existing forbidden main-wallet-key input protections REMAIN global**:
+   - Rationale: Fail-closed prevention of operator/configuration errors that could load a main wallet key into the runtime. Worker-global safeguard.
+
+**Future continuous readiness requirements without global signer**:
+
+When no environment-level global RISEx user account/signer exists, continuous readiness must establish:
+- Explicit operator ARM for exact worker_id+boot_id
+- Fresh heartbeat and target identity
+- Singleton execution-worker confirmation
+- Deployment/build identity verification
+- Provider and network configuration
+- Pinned deployment preflight and identity
+- API/RPC/transport configuration finalization
+- Signed-write and kill-switch/global execution gates
+- `operatorhub_bypass_disabled` assertion
+- Other worker-global security configuration and finalization fences
+
+**Requirement**: Future continuous readiness MUST NOT require or load a global RISEx user account/signer to PASS.
+
+**Implementation path**:
+- The existing `run_signed_testnet_readiness()` / single-account assertion path remains authoritative and operative until the implementation PR.
+- The implementation PR must introduce or refactor the continuous readiness path so it no longer depends on environment-level user credentials.
+- Short-lived manual/test mode semantics and attestation behavior remain intact.
+
+### 6. MOVEFUND
+
+Historical ADR-0002/ADR-0003 testnet-specific MoveFund controls remain applicable to the isolated manual/test model where relevant.
+
+For real user capital in the multi-user continuous model:
+- MoveFund exposure and residual risk are controlled by ADR-0006 §1 (permission reduction, isolation, collateral-confinement controls, and per-user point-of-use permission verification)
+- Current per-user authoritative permission evidence (from RISEx and on-chain state) governs allowed operations
+- No operator assertion may manufacture or substitute for current provider/on-chain permission evidence
+
+### 7. IMPLEMENTATION/STATUS BOUNDARY
+
+This amendment follows the ADR-0005 documentation-only pattern:
+
+**In this PR (documentation-only)**:
+- Amendment status is Proposed
+- No runtime behavior changes
+- Current single-account continuous implementation and existing ADR-0004 semantics remain authoritative and fully unchanged
+- Top-level ADR-0004 status remains Accepted
+
+**In the follow-up implementation PR** (future, separate from this PR):
+- Amendment moves to Accepted/operative status
+- Runtime changes include:
+  - Removing account/signer from continuous runtime fingerprint
+  - Introducing per-user point-of-use credential resolution and verification
+  - Realigning operator assertions as specified in Section 5
+- If implementation differs materially from this amendment, amendment remains Proposed pending further review
+
+**No merge** of this documentation PR until implementation PR is ready.
