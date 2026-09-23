@@ -252,6 +252,13 @@ class Settings(BaseSettings):
                 or session_secret_decoded == audit_key
             ):
                 raise ValueError('AUDIT_IP_HASH_KEY_B64 must be independent from SESSION_SECRET')
+        if service == 'ai-intelligence-worker' and not self.HYPERLIQUID_MASTER_ADDRESS:
+            # Profit Exit mode is database-authoritative after first runtime toggle.
+            # Requiring the public source address at startup prevents an OFF boot
+            # configuration from becoming broken later when SHADOW/ON is enabled.
+            raise ValueError(
+                'HYPERLIQUID_MASTER_ADDRESS is required for production ai-intelligence-worker'
+            )
 
     @property
     def admin_addresses(self) -> set[str]:
