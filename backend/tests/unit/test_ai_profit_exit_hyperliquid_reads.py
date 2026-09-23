@@ -55,7 +55,7 @@ async def test_user_funding_history_uses_conservative_history_read_lane():
                 "weight": WEIGHT_USER_FILLS_MAX,
                 "priority": Priority.RECONCILE,
                 "timeout": 30,
-                "response_weight": _variable_info_response_weight,
+                "response_weight": _user_funding_response_weight,
             },
         )
     ]
