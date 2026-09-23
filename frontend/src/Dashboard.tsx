@@ -8,7 +8,7 @@ type SharpeStatus='collecting'|'ready'|'zero_variance';
 type Dash={equity:number|null;collateral_balance:number|null;unrealized_pnl:number|null;free_margin:number|null;account_mode:string|null;snapshot_at:string|null;snapshot_age_seconds:number|null;pnl_absolute:number;max_drawdown_pct:number;sharpe:number|null;sharpe_observations:number;sharpe_min_observations:number;sharpe_window_days:number;sharpe_status:SharpeStatus;sharpe_method:'realized_net_daily_utc';positions:number;user:{copy_state:string;risk_state:string}};
 type Pos={asset:string;current_size:string;target_size:string;delta:string;mark_price:string;delta_notional:string;status:'READY'|'BELOW_MIN'|'UNAVAILABLE'|'ON_TARGET';reason:string|null;managed:boolean;master_leverage:number|null;master_is_cross:boolean|null;follower_leverage:number|null;follower_is_cross:boolean|null;exchange_verified_at:string|null};
 type LiveLev={asset:string;master_leverage:number|null;master_is_cross:boolean|null;follower_leverage:number|null;follower_is_cross:boolean|null};
-type Exec={id:string;asset:string;state:string;is_buy:boolean;requested_size:string;filled_size:string;avg_price:string|null;reduce_only:boolean;reject_reason:string|null;leverage:number|string|null;is_cross:boolean|null;created_at:string};
+type Exec={id:string;asset:string;state:string;is_buy:boolean;requested_size:string;filled_size:string;avg_price:string|null;reduce_only:boolean;reject_reason:string|null;reason_code:string;reason_detail:string|null;origin:string;leverage:number|string|null;is_cross:boolean|null;created_at:string};
 type PnlRange='1d'|'7d'|'30d'|'90d'|'all';
 type PnlPoint={at:string;value:number;bucket_value:number};
 type PnlHistory={range:PnlRange;pnl_absolute:number;pnl_pct:number|null;start_equity:number|null;current_equity:number|null;last_realized_at:string|null;points:PnlPoint[];source:'realized_net'};
@@ -21,6 +21,30 @@ const RANGE_OPTIONS:{key:PnlRange;label:string}[]=[
   {key:'90d',label:'90D'},
   {key:'all',label:'All'},
 ];
+
+const EXECUTION_REASON_LABELS:Record<string,string>={
+  MASTER_OPEN:'Apertura strategia',
+  MASTER_INCREASE:'Incremento strategia',
+  MASTER_REDUCE:'Riduzione strategia',
+  MASTER_CLOSE:'Chiusura strategia',
+  MASTER_REVERSAL:'Reversal strategia',
+  MASTER_STOP_LOSS:'Stop Loss',
+  MASTER_TAKE_PROFIT:'Take Profit',
+  AI_PROFIT_EXIT:'Chiusura AI · Profit Exit',
+  USER_CLOSE_ALL:'Chiusura manuale',
+  RECONCILE:'Riconciliazione strategia',
+  ADMIN_RECONCILE:'Riconciliazione amministrativa',
+  ADMIN_LEVERAGE_SYNC:'Sincronizzazione leva',
+  EXECUTION_REJECTED:'Ordine rifiutato',
+  EXECUTION_CANCELED:'Ordine annullato',
+  EXECUTION_UNRESOLVED:'Esito in riconciliazione',
+  STRATEGY_EVENT:'Operazione strategia',
+  STRATEGY_EXECUTION:'Operazione strategia',
+};
+
+function executionReason(x:Exec){
+  return EXECUTION_REASON_LABELS[x.reason_code]||x.reject_reason||'—';
+}
 
 export default function Dashboard(){
   const {user}=useAuth();
@@ -118,7 +142,7 @@ export default function Dashboard(){
     <PnlChart data={activePnl} range={range} setRange={setRange} error={pnlError}/>
 
     <section className="panel"><div className="panelhead"><h2>Posizionamento strategia</h2><span className="badge">{d?.user.copy_state||user?.copy_state} · {d?.user.risk_state||'NORMAL'}</span></div><table><thead><tr><th>Asset</th><th>Attuale</th><th>Target strategia</th><th>Delta</th><th>Leva strategia → account</th><th>Stato</th><th>Verifica exchange</th></tr></thead><tbody>{pos.length?pos.map(p=><tr key={p.asset}><td><b>{p.asset}</b></td><td>{p.current_size}</td><td>{p.status==='UNAVAILABLE'?'—':p.target_size}</td><td className={p.status==='UNAVAILABLE'?'':Number(p.delta)>=0?'up':'down'}>{p.status==='UNAVAILABLE'?'—':p.delta}</td><td><PositionLeverage p={p} live={liveLeverage[p.asset]}/></td><td><TargetStatus p={p}/></td><td>{p.exchange_verified_at?new Date(p.exchange_verified_at).toLocaleString():'—'}</td></tr>):<tr><td colSpan={7}>Nessuna posizione gestita dalla strategia.</td></tr>}</tbody></table></section>
-    <section className="panel"><div className="panelhead"><h2>Ultime operazioni</h2><span className="muted">Esecuzione persistente + reconciliation</span></div><table><thead><tr><th>Ora</th><th>Asset</th><th>Lato</th><th>Size</th><th>Leva</th><th>Stato</th><th>Motivo</th></tr></thead><tbody>{execs.map(x=><tr key={x.id}><td>{new Date(x.created_at).toLocaleString()}</td><td>{x.asset}</td><td className={x.is_buy?'up':'down'}>{x.is_buy?'BUY':'SELL'}{x.reduce_only?' RO':''}</td><td>{x.requested_size}</td><td>{formatLeverage(x.leverage,x.is_cross)}</td><td><span className="badge">{x.state}</span></td><td>{x.reject_reason||'—'}</td></tr>)}</tbody></table></section>
+    <section className="panel"><div className="panelhead"><h2>Ultime operazioni</h2><span className="muted">Esecuzione persistente + reconciliation</span></div><table><thead><tr><th>Ora</th><th>Asset</th><th>Lato</th><th>Size</th><th>Leva</th><th>Stato</th><th>Motivo</th></tr></thead><tbody>{execs.map(x=><tr key={x.id}><td>{new Date(x.created_at).toLocaleString()}</td><td>{x.asset}</td><td className={x.is_buy?'up':'down'}>{x.is_buy?'BUY':'SELL'}{x.reduce_only?' RO':''}</td><td>{x.requested_size}</td><td>{formatLeverage(x.leverage,x.is_cross)}</td><td><span className="badge">{x.state}</span></td><td title={x.reason_detail||undefined}>{executionReason(x)}</td></tr>)}</tbody></table></section>
   </>;
 }
 
