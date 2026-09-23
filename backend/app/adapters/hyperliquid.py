@@ -409,8 +409,10 @@ class HyperliquidAdapter:
                     )
 
             reservation = None
-            if self.limiter is not None and response_weight is not None:
-                reservation = await self.limiter.reserve(
+            limiter = self.limiter
+            weight_fn = response_weight
+            if limiter is not None and weight_fn is not None:
+                reservation = await limiter.reserve(
                     weight,
                     priority,
                     timeout=timeout,
@@ -422,11 +424,15 @@ class HyperliquidAdapter:
                     self._call(func, *args),
                     timeout=float(timeout),
                 )
-                if reservation is not None:
+                if (
+                    reservation is not None
+                    and limiter is not None
+                    and weight_fn is not None
+                ):
                     try:
-                        actual_weight = int(response_weight(response))
+                        actual_weight = int(weight_fn(response))
                         if 0 <= actual_weight <= reservation.reserved_weight:
-                            await self.limiter.settle(
+                            await limiter.settle(
                                 reservation,
                                 actual_weight,
                             )
