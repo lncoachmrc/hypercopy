@@ -739,6 +739,25 @@ class HyperliquidAdapter:
             weight=WEIGHT_CHEAP_INFO, priority=Priority.ORDER, timeout=10,
         )
 
+    async def query_order_by_oid(
+        self,
+        account: str,
+        oid: int,
+        *,
+        priority: Priority = Priority.DIAGNOSTIC,
+    ) -> dict:
+        value = await self._read(
+            self.info.query_order_by_oid,
+            account,
+            int(oid),
+            weight=WEIGHT_CHEAP_INFO,
+            priority=priority,
+            timeout=10,
+        )
+        if not isinstance(value, dict):
+            raise ValueError("Malformed Hyperliquid order status response")
+        return value
+
     async def user_fills_by_time(self, account: str, start_ms: int, end_ms: int | None = None) -> list[dict]:
         return await self._read(
             self.info.user_fills_by_time,
