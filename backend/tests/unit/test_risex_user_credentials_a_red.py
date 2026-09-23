@@ -76,7 +76,8 @@ def test_risex_logical_generation_is_distinct_from_envelope_key_version() -> Non
     server_default = columns.generation.server_default
     default_value = getattr(default, "arg", None)
     server_default_text = str(getattr(server_default, "arg", "")) if server_default else ""
-    assert default_value == 1 or server_default_text.strip("'"") == "1", (
+    normalized_server_default = server_default_text.replace("'", "").replace('"', "").strip()
+    assert default_value == 1 or normalized_server_default == "1", (
         "RED: logical credential generation must start at 1"
     )
 
