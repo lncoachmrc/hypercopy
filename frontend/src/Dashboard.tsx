@@ -43,7 +43,14 @@ const EXECUTION_REASON_LABELS:Record<string,string>={
 };
 
 function executionReason(x:Exec){
-  return EXECUTION_REASON_LABELS[x.reason_code]||x.reject_reason||'—';
+  const label=EXECUTION_REASON_LABELS[x.reason_code]||'Operazione strategia';
+  if(
+    x.reason_detail
+    && ['EXECUTION_REJECTED','EXECUTION_CANCELED','EXECUTION_UNRESOLVED'].includes(x.reason_code)
+  ){
+    return `${label}: ${x.reason_detail}`;
+  }
+  return label;
 }
 
 export default function Dashboard(){
