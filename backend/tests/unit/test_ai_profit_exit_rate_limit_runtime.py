@@ -31,6 +31,7 @@ def test_variable_info_weight_matches_hyperliquid_item_accounting() -> None:
 
 class _DynamicLimiter:
     def __init__(self, *, fail_settlement: bool = False) -> None:
+        self._redis = object()
         self.fail_settlement = fail_settlement
         self.reserved: list[tuple[int, Priority, float]] = []
         self.settled: list[tuple[RateLimitReservation, int]] = []
