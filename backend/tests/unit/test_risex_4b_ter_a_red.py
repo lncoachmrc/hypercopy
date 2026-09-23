@@ -23,7 +23,7 @@ def test_execution_model_persists_risex_nonce_identity() -> None:
 
 
 def test_schema_head_and_release_preflight_preserve_0015_nonce_migration() -> None:
-    assert db_schema.EXPECTED_REVISION == "0017_master_event_causal_order", (
+    assert db_schema.EXPECTED_REVISION == "0018_shadow_position_ledger", (
         "schema head must match the current additive migration chain"
     )
 
@@ -47,6 +47,7 @@ def test_schema_head_and_release_preflight_preserve_0015_nonce_migration() -> No
         "'0015_risex_execution_nonce.py'",
         "'0016_ai_profit_exit_decisions.py'",
         "'0017_master_event_causal_order.py'",
+        "'0018_shadow_position_ledger.py'",
     ):
         assert expected in preflight
 
