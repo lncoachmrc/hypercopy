@@ -423,21 +423,34 @@ class HyperliquidAdapter:
                     timeout=float(timeout),
                 )
                 if reservation is not None:
-                    actual_weight = int(response_weight(response))
-                    if 0 <= actual_weight <= reservation.reserved_weight:
-                        await self.limiter.settle(
-                            reservation,
-                            actual_weight,
-                        )
-                    else:
+                    try:
+                        actual_weight = int(response_weight(response))
+                        if 0 <= actual_weight <= reservation.reserved_weight:
+                            await self.limiter.settle(
+                                reservation,
+                                actual_weight,
+                            )
+                        else:
+                            log.warning(
+                                'Hyperliquid variable-weight response exceeded reservation',
+                                extra={
+                                    'event_code': 'HL_READ_WEIGHT_UNDERRESERVED',
+                                    'network': self.network,
+                                    'reserved_weight': reservation.reserved_weight,
+                                    'actual_weight': actual_weight,
+                                },
+                            )
+                    except Exception:
+                        # The exchange response is already authoritative. A
+                        # bookkeeping failure must keep the pessimistic
+                        # reservation and must never replay the external read.
                         log.warning(
-                            'Hyperliquid variable-weight response exceeded reservation',
+                            'Hyperliquid rate-limit reservation settlement failed',
                             extra={
-                                'event_code': 'HL_READ_WEIGHT_UNDERRESERVED',
+                                'event_code': 'HL_READ_WEIGHT_SETTLEMENT_FAILED',
                                 'network': self.network,
-                                'reserved_weight': reservation.reserved_weight,
-                                'actual_weight': actual_weight,
                             },
+                            exc_info=True,
                         )
                 return response
             except TimeoutError as exc:
