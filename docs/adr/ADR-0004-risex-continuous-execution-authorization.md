@@ -933,3 +933,131 @@ The readiness PASS and Operational Execution Window remain non-persistent. Postg
 - `backend/app/security/risex_signed_testnet_runner.py`
 - `backend/app/services/risex_signed_execution.py`
 - `backend/app/adapters/risex.py`
+
+---
+
+## Amendment: Proposed — multi-user runtime window and per-user credentials
+
+**Status**: Proposed
+**Decision date**: 2026-09-23
+**Transitional rule**: Until a separate implementation PR is merged, current single-account ADR-0004 semantics and code remain authoritative.
+**Acceptance rule**: This amendment becomes Accepted/operative only in the implementation PR that implements it; if implementation materially differs from this proposal, it remains Proposed and requires further amendment.
+
+This amendment does not alter the top-level Status of ADR-0004, which remains **Accepted**. It proposes a future direction for extending the continuous execution authorization model described above to support multiple end users, each with their own RISEx credential, while preserving every fail-closed control already defined. The amendment is documentation-only. No runtime behavior described above changes as a result of adding this section.
+
+### A. Window/Fingerprint scope
+
+Under this amendment, the `RISEx Operational Execution Window` and its security-relevant context fingerprint (section 10) continue to authorize **worker-global runtime only**. The window is not, and does not become, a per-user construct.
+
+The fingerprint continues to include:
+
+- `worker_id`;
+- process-local `boot_id`;
+- application build/deployment identity;
+- provider/network identity;
+- API/RPC/transport configuration;
+- pinned deployment identity;
+- singleton invariant state;
+- global signed-write/kill-switch/security configuration;
+- control/invalidation state (`authorization_invalidation_epoch`, control generation).
+
+Once this amendment is implemented, the fingerprint **excludes**:
+
+- per-user account identity;
+- per-user signer/session-key identity;
+- per-user private key material;
+- per-user credential id or credential version;
+- per-user credential expiry;
+- per-user permission scope.
+
+Account, signer, credential and permission identity move out of the worker-global window and into per-order, per-user authorization as described in section B below.
+
+### B. Per-user authorization
+
+Under this amendment, every RISEx order resolves its credential independently, at order time, from:
+
+- `CopyJob.user_id`; and
+- the exact active `ExecutionEpoch` for that job.
+
+Resolution requires an exact match on `provider = risex` together with the matching `account_address` and `credential_version` recorded for that user/epoch. The credential is decrypted only at the point of use; the signer is derived from the decrypted key immediately before use and is never cached in a persistent, reusable form.
+
+Before any provider POST, the order path must:
+
+1. validate that the resolved account/signer are bound to the exact `CopyJob.user_id` and active `ExecutionEpoch`;
+2. check a fresh, authoritative on-chain query for active/unexpired/required permissions, fail-closed on any negative, ambiguous or unreachable-with-doubt result;
+3. re-check the worker-global window and the final local fences defined in sections 8A/10B before the POST is issued.
+
+**Key principle**: the worker-global window gate and the per-user credential gate are independent controls. Both must pass. Neither may substitute for the other, and neither may be inferred from the other's success.
+
+### C. Security rationale
+
+Per-order, point-of-use account/signer verification, performed against the exact credential resolved for that `user_id` + `ExecutionEpoch`, is at least as strong a security property as the current ARM-time identity binding described in section 10A, because it:
+
+- verifies the exact credential actually used for that specific order, rather than a credential bound at window-open time; and
+- is temporally closer to the provider POST than any check performed at ARM/finalization time, which narrows the window in which a change to permissions or credential state could go undetected.
+
+The worker-global ARM/window mechanism continues to protect the properties that are inherently global and process-scoped, and this amendment does not weaken any of them:
+
+- explicit operator intent (ARM/DISARM);
+- process/boot identity (`boot_id`);
+- restart as a hard authorization boundary;
+- the execution-worker singleton invariant;
+- ARM/DISARM ordering and the finalization fence (section 8A);
+- deployment/runtime integrity (build, provider, network, transport configuration);
+- the bounded 24-hour window.
+
+### D. Realign ADR wording
+
+Implementing this amendment realigns the wording of ADR-0004 as follows:
+
+- the runtime epoch (the `RISEx Operational Execution Window` and its fingerprint) becomes explicitly **worker-global**, not account-scoped;
+- account identity, signer identity and permission verification become an explicit **per-user, per-order authorization** step, resolved from `CopyJob.user_id` and the active `ExecutionEpoch`, independent of the worker-global window;
+- the existing short-lived manual/test attestation mode (section 2A, mode 1) is preserved **unchanged**: it remains account/signer-bound and its 300-second TTL remains fully enforced. This amendment does not modify the manual/test attestation path.
+
+### E. Current ARM assertions (exact implementation)
+
+The current, exactly-implemented set of hard-required assertions for single-account continuous ARM readiness is:
+
+- `disposable_account_asserted`;
+- `dedicated_signer_asserted`;
+- `operatorhub_bypass_disabled`;
+- `fund_movement_path_absent`.
+
+These four assertions remain the authoritative, implemented behavior of ADR-0004 today and are unaffected by this amendment unless and until a separate implementation PR merges.
+
+**Future continuous multi-user behavior (post-implementation)**, proposed by this amendment:
+
+- **`disposable_account_asserted`** — DROPS from worker-global readiness. This assertion is specific to the single test/faucet-funded account model and has no equivalent meaning once accounts are per-user.
+- **`dedicated_signer_asserted`** — DROPS as a worker-global operator assertion. A dedicated signer per user remains **mandatory**, governed by ADR-0006 §0, and is verified per order from the stored per-user credential plus the authoritative account/signer binding described in section B, rather than asserted once at worker-global ARM time.
+- **`fund_movement_path_absent`** — DROPS as a worker-global assertion. Real-capital `MoveFund` risk for multi-user continuous execution is governed by ADR-0006 §1, together with the current per-user, per-order permission evidence obtained at point of use (section B, step 2).
+- **`operatorhub_bypass_disabled`** — REMAINS a worker-global assertion, unchanged.
+- The existing forbidden main-wallet-key protections remain worker-global and fail-closed, unchanged by this amendment.
+
+### F. Future global continuous readiness
+
+A future worker-global continuous readiness check that has no worker-global signer must still, at minimum:
+
+- establish an explicit ARM for the exact `worker_id` + `boot_id` incarnation, as in section 7;
+- include a fresh heartbeat/identity check, the singleton invariant (section 9), deployment/build identity and provider/network identity;
+- include the pinned deployment preflight and API/RPC/transport configuration checks;
+- include the signed-write/kill-switch gates, `operatorhub_bypass_disabled`, and the global finalization fences described in sections 8A and 10B.
+
+Such a readiness check **MUST NOT** load or require a worker-global user RISEx account or signer. Per-user account/signer/permission verification is performed exclusively at the per-order authorization step described in section B.
+
+### G. Existing single-account assertion path
+
+The existing `run_signed_testnet_readiness()` single-account assertion path, and the four assertions in section E, remain authoritative and unchanged **until a separate implementation PR is merged**.
+
+A follow-up TDD PR must introduce or refactor continuous readiness to remove the worker-global user credential requirement described in section E, while preserving the short-lived manual/test attestation semantics of section 2A, mode 1, unchanged.
+
+### H. MoveFund (ADR-0002 / ADR-0003)
+
+- The ADR-0002 and ADR-0003 testnet assertions, including `fund_movement_path_absent` and the negative-probe applicability rules, remain relevant and unchanged for the isolated manual/test readiness model.
+- For real-user, multi-user continuous execution, ADR-0006 §1 governs `MoveFund`/real-capital risk, as described in section E above.
+- Worker-global operator assertions never substitute for the current, fresh, on-chain per-user permission evidence required at point of use (section B).
+
+### I. Implementation boundary
+
+This amendment is **documentation-only**. It makes no runtime, code, test, migration, workflow, configuration, environment or deployment changes. Every behavior described in the main body of ADR-0004 above, including the four current ARM assertions in section E, remains exactly as implemented today.
+
+Implementation of this amendment, if and when undertaken, requires a separate, dedicated follow-up TDD PR. That implementation PR is the only mechanism by which this amendment can transition from Proposed to Accepted/operative.
