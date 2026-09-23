@@ -214,6 +214,8 @@ async def evaluate_profit_exit_portfolio(
 
     evaluated = decisions = queued = abstained = 0
     active_evaluated = shadow_evaluated = shadow_decisions = 0
+    shadow_mids_by_network: dict[Network, dict[str, str]] = {}
+    shadow_fee_by_account: dict[tuple[Network, str], Decimal] = {}
     now = datetime.now(UTC)
     evaluation_slot = int(now.timestamp()) // settings.AI_PROFIT_EXIT_EVAL_SECONDS
 
@@ -287,12 +289,33 @@ async def evaluate_profit_exit_portfolio(
             continue
 
         if shadow_position is not None:
+            mids = shadow_mids_by_network.get(destination.network)
+            if mids is None:
+                try:
+                    mids = await follower_hl.mids(
+                        priority=Priority.RECONCILE,
+                    )
+                except Exception:
+                    abstained += 1
+                    continue
+                shadow_mids_by_network[destination.network] = mids
+
+            fee_key = (destination.network, account.account_address.lower())
+            cached_fee = shadow_fee_by_account.get(fee_key)
             observation = await collect_shadow_profit_exit_economics(
                 follower_hl,
                 account_address=account.account_address,
                 position=shadow_position,
                 slippage_bps=risk.max_slippage_bps,
+                market_mids=mids,
+                taker_fee_rate=cached_fee,
             )
+            if (
+                cached_fee is None
+                and observation.taker_fee_rate is not None
+            ):
+                shadow_fee_by_account[fee_key] = observation.taker_fee_rate
+
             observation_valid = bool(
                 observation.eligible
                 and observation.current_position is not None
