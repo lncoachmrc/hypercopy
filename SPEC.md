@@ -1273,6 +1273,22 @@ dashboard **senza inviare ordini**. L'utente vede esattamente cosa sarebbe
 successo prima che succeda. Nessuno dei quattro output lo prevede, ed è il modo
 più diretto per rendere comprensibile un rischio che altrimenti resta astratto.
 
+Lo SHADOW mantiene inoltre un **virtual position ledger separato dal ledger
+exchange-authoritative**. Il virtual ledger è scoped alla singola sessione
+`shadow_started_at`, applica solo piani ammessi dal Risk Engine e simula fill
+completi al limite IOC conservativo. Aperture, scale-in, riduzioni e reversal
+aggiornano size virtuale, prezzo medio e notional residuo; `PositionLedger.size`
+continua invece a rappresentare esclusivamente la posizione reale osservata
+sull'exchange.
+
+AI Profit Exit può analizzare il virtual ledger quando il copy state è SHADOW.
+Queste decisioni sono **record-only per costruzione**: non generano `CopyJob`,
+non decrittano credenziali e non raggiungono alcun metodo di submission.
+L'economia SHADOW usa prezzo di uscita IOC conservativo e fee correnti; il
+funding virtuale non viene inventato ed è marcato esplicitamente come non
+incluso. Solo il percorso ACTIVE con economics exchange-complete può diventare
+operativo quando AI Profit Exit è ON.
+
 Il passaggio più delicato è l'autorizzazione agent. La UI non chiede "incolla la
 chiave privata": guida a creare un'API wallet su Hyperliquid, spiega in una riga
 che può piazzare ordini e **non** può prelevare, e mostra la data di scadenza
