@@ -22,6 +22,7 @@ from app.db.session import SessionLocal
 from app.db.schema import assert_schema
 from app.models.entities import MasterEvent, SystemFlag, SystemIncident
 from app.services.copy import persist_master_fill_and_jobs
+from app.services.execution_reason import order_provenance_from_status
 from app.services.master_leverage_cache import cache_master_configs, cached_master_config
 from app.services.queue import publish_job
 
@@ -89,6 +90,48 @@ class Watcher:
 
     def _spawn_ai_trigger(self,payload:dict):
         task=asyncio.create_task(self._publish_ai_trigger(payload))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _enrich_master_event_order_provenance(self,event_id,oid:object):
+        try:
+            parsed_oid=int(oid)
+        except (TypeError,ValueError):
+            return
+
+        for attempt in range(3):
+            try:
+                response=await self.hl.query_order_by_oid(
+                    settings.HYPERLIQUID_MASTER_ADDRESS,
+                    parsed_oid,
+                    priority=Priority.DIAGNOSTIC,
+                )
+                provenance=order_provenance_from_status(response)
+                if provenance is None:
+                    return
+                async with SessionLocal() as db:
+                    event=await db.get(MasterEvent,event_id)
+                    if event is None:
+                        return
+                    raw=dict(event.raw or {})
+                    raw['_hypercopy_order_provenance']=provenance
+                    event.raw=raw
+                    await db.commit()
+                return
+            except Exception:
+                if attempt>=2:
+                    log.warning(
+                        'Master order provenance enrichment failed; generic execution reason remains available',
+                        extra={'master_event_id':str(event_id),'oid':parsed_oid},
+                        exc_info=True,
+                    )
+                    return
+                await asyncio.sleep(2**attempt)
+
+    def _spawn_order_provenance_enrichment(self,event_id,oid:object):
+        task=asyncio.create_task(
+            self._enrich_master_event_order_provenance(event_id,oid)
+        )
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
@@ -189,6 +232,7 @@ class Watcher:
 
         cid=uuid.uuid4().hex
         ai_payload=None
+        provenance_payload=None
         async with SessionLocal() as db:
             event,jobs=await persist_master_fill_and_jobs(
                 db,fill=fill,master_equity=equity,fencing_token=self.lease.token,
@@ -212,11 +256,15 @@ class Watcher:
                 'event_ts':event.event_ts.isoformat(),
                 'network':settings.master_network,
             }
+            if create_copy_jobs and fill.get('oid') is not None:
+                provenance_payload=(event.id,fill.get('oid'))
 
         # Fire-and-forget by design. Copy jobs were already persisted/published,
         # so an unavailable AI subsystem cannot add latency to trading.
         if ai_payload:
             self._spawn_ai_trigger(ai_payload)
+        if provenance_payload:
+            self._spawn_order_provenance_enrichment(*provenance_payload)
 
         try: await self.redis.publish(f'{settings.REALTIME_CHANNEL_PREFIX}:system',json.dumps({'type':'master_fill','asset':event.asset,'price':str(event.price),'size':str(event.size),'at':event.event_ts.isoformat(),'network':settings.master_network}))
         except Exception: pass
