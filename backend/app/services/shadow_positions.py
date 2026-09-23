@@ -275,6 +275,8 @@ async def collect_shadow_profit_exit_economics(
     account_address: str,
     position: ShadowPositionLedger,
     slippage_bps: int,
+    market_mids: dict[str, str] | None = None,
+    taker_fee_rate: Decimal | None = None,
 ) -> ProfitExitObservation:
     asset = str(position.asset).upper()
     current = _decimal(position.size)
@@ -313,9 +315,21 @@ async def collect_shadow_profit_exit_economics(
         )
 
     try:
-        mids = await hl.mids(priority=Priority.RECONCILE)
+        mids = (
+            market_mids
+            if market_mids is not None
+            else await hl.mids(priority=Priority.RECONCILE)
+        )
         spec = await hl.asset_spec(asset)
-        raw_fees = await hl.user_fees(account_address)
+        if taker_fee_rate is None:
+            raw_fees = await hl.user_fees(account_address)
+            fee_rate = (
+                _decimal(raw_fees.get("userCrossRate"))
+                if isinstance(raw_fees, dict)
+                else None
+            )
+        else:
+            fee_rate = _decimal(taker_fee_rate)
     except Exception as exc:
         return ProfitExitObservation(
             asset=asset,
@@ -333,11 +347,6 @@ async def collect_shadow_profit_exit_economics(
         )
 
     mark = _decimal(mids.get(asset)) if isinstance(mids, dict) else None
-    fee_rate = (
-        _decimal(raw_fees.get("userCrossRate"))
-        if isinstance(raw_fees, dict)
-        else None
-    )
     if mark is None or mark <= 0 or fee_rate is None or fee_rate < 0:
         return ProfitExitObservation(
             asset=asset,
