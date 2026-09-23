@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Callable
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.hyperliquid import HyperliquidAdapter
@@ -35,7 +35,10 @@ from app.services.ai_profit_exit import (
     read_current_source_cycle,
     read_operational_profit_exit_memory,
 )
-from app.services.ai_profit_exit_collector import collect_profit_exit_economics
+from app.services.ai_profit_exit_collector import (
+    collect_profit_exit_economics,
+    collect_shadow_profit_exit_economics,
+)
 from app.services.ai_profit_exit_mode import read_profit_exit_mode
 from app.services.master_source_identity import is_master_source_user
 from app.services.networking import user_network_state
@@ -78,7 +81,10 @@ async def _decide_with_ai(payload: dict) -> tuple[ProfitExitAction, str, dict]:
         "Do not propose entries, scale-ins, reversals, leverage changes, stop changes, "
         "fixed take-profit thresholds, fixed retracement rules, or time-based exits. "
         "CLOSE_PROFIT means close the full residual follower position now. Deterministic "
-        "TRAXION safety controls independently decide whether that action is admissible."
+        "TRAXION safety controls independently decide whether that action is admissible. "
+        "When evaluation_basis is copy_shadow_estimate the position is hypothetical, "
+        "funding is not modeled and the result is record-only. Treat material uncertainty "
+        "conservatively and use ABSTAIN when that uncertainty prevents a reliable choice."
     )
     try:
         raw, runtime = await call_llm_with_failover(
@@ -97,10 +103,21 @@ async def _decide_with_ai(payload: dict) -> tuple[ProfitExitAction, str, dict]:
     return action, reason, runtime
 
 
-def _decision_inputs(observation, cycle, intelligence: dict, evaluation_slot: int) -> dict:
+def _decision_inputs(
+    observation,
+    cycle,
+    intelligence: dict,
+    evaluation_slot: int,
+    *,
+    copy_state: CopyState,
+) -> dict:
     economics = observation.economics
     return {
         "evaluation_slot": evaluation_slot,
+        "copy_state": copy_state.value,
+        "evaluation_basis": observation.basis,
+        "pnl_complete": observation.pnl_complete,
+        "funding_model": observation.funding_model,
         "source_cycle_id": cycle.source_cycle_id,
         "source_state_version": cycle.state_version,
         "master_position": str(cycle.master_position),
@@ -153,14 +170,23 @@ async def evaluate_profit_exit_portfolio(
         .join(RiskProfile, RiskProfile.user_id == User.id)
         .where(
             User.state == UserState.ACTIVE,
-            User.copy_state == CopyState.ACTIVE,
             PositionLedger.managed.is_(True),
-            PositionLedger.size != 0,
+            or_(
+                and_(
+                    User.copy_state == CopyState.ACTIVE,
+                    PositionLedger.size != 0,
+                ),
+                and_(
+                    User.copy_state == CopyState.SHADOW,
+                    PositionLedger.target_size != 0,
+                ),
+            ),
         )
         .order_by(User.id, PositionLedger.asset)
     )).all()
 
     evaluated = decisions = queued = abstained = 0
+    shadow_candidates = shadow_profitable = shadow_decisions = 0
     now = datetime.now(UTC)
     evaluation_slot = int(now.timestamp()) // settings.AI_PROFIT_EXIT_EVAL_SECONDS
 
@@ -193,21 +219,22 @@ async def evaluate_profit_exit_portfolio(
             abstained += 1
             continue
 
-        memory = await read_operational_profit_exit_memory(
-            db,
-            user_id=user.id,
-            execution_epoch_id=destination.epoch_id,
-            execution_provider=destination.provider,
-            execution_network=destination.network,
-            asset=ledger.asset,
-            source_cycle_id=cycle.source_cycle_id,
-        )
-        if memory is not None and memory.intent_state in {
-            ProfitExitIntentState.PENDING.value,
-            ProfitExitIntentState.AMBIGUOUS.value,
-            ProfitExitIntentState.COMPLETED.value,
-        }:
-            continue
+        if user.copy_state == CopyState.ACTIVE:
+            memory = await read_operational_profit_exit_memory(
+                db,
+                user_id=user.id,
+                execution_epoch_id=destination.epoch_id,
+                execution_provider=destination.provider,
+                execution_network=destination.network,
+                asset=ledger.asset,
+                source_cycle_id=cycle.source_cycle_id,
+            )
+            if memory is not None and memory.intent_state in {
+                ProfitExitIntentState.PENDING.value,
+                ProfitExitIntentState.AMBIGUOUS.value,
+                ProfitExitIntentState.COMPLETED.value,
+            }:
+                continue
 
         open_event = await db.get(MasterEvent, cycle.open_event_id)
         if open_event is None:
@@ -218,13 +245,31 @@ async def evaluate_profit_exit_portfolio(
         if follower_hl.limiter is None:
             abstained += 1
             continue
-        observation = await collect_profit_exit_economics(
-            follower_hl,
-            account_address=account.account_address,
-            asset=ledger.asset,
-            history_start_ms=max(0, int(open_event.event_ts.timestamp() * 1000)),
-            history_end_ms=None,
-            slippage_bps=risk.max_slippage_bps,
+
+        if user.copy_state == CopyState.SHADOW:
+            shadow_candidates += 1
+            observation = await collect_shadow_profit_exit_economics(
+                follower_hl,
+                account_address=account.account_address,
+                asset=ledger.asset,
+                shadow_position=Decimal(str(ledger.target_size)),
+                master_perp_state=master_snapshot.perp_state,
+                slippage_bps=risk.max_slippage_bps,
+            )
+        else:
+            observation = await collect_profit_exit_economics(
+                follower_hl,
+                account_address=account.account_address,
+                asset=ledger.asset,
+                history_start_ms=max(0, int(open_event.event_ts.timestamp() * 1000)),
+                history_end_ms=None,
+                slippage_bps=risk.max_slippage_bps,
+            )
+
+        position_matches = (
+            Decimal(str(ledger.target_size)) == observation.current_position
+            if user.copy_state == CopyState.SHADOW
+            else Decimal(str(ledger.size)) == observation.current_position
         )
         if (
             not observation.complete
@@ -233,12 +278,20 @@ async def evaluate_profit_exit_portfolio(
             or observation.economics is None
             or observation.economics.net_pnl is None
             or observation.economics.net_pnl <= 0
-            or Decimal(str(ledger.size)) != observation.current_position
+            or not position_matches
         ):
             abstained += 1
             continue
+        if user.copy_state == CopyState.SHADOW:
+            shadow_profitable += 1
 
-        inputs = _decision_inputs(observation, cycle, intelligence, evaluation_slot)
+        inputs = _decision_inputs(
+            observation,
+            cycle,
+            intelligence,
+            evaluation_slot,
+            copy_state=user.copy_state,
+        )
         decision_id = profit_exit_decision_id(
             user_id=user.id,
             execution_epoch_id=destination.epoch_id,
@@ -257,6 +310,7 @@ async def evaluate_profit_exit_portfolio(
         decision_now = datetime.now(UTC)
         operational = (
             mode is ProfitExitFeatureMode.ON
+            and user.copy_state == CopyState.ACTIVE
             and action is ProfitExitAction.CLOSE_PROFIT
         )
         job_id = profit_exit_job_id(decision_id) if operational else None
@@ -276,7 +330,7 @@ async def evaluate_profit_exit_portfolio(
             action=action.value,
             intent_state=ProfitExitIntentState.PENDING.value if operational else None,
             net_pnl=observation.economics.net_pnl,
-            pnl_complete=True,
+            pnl_complete=observation.pnl_complete,
             position_verified_at=decision_now,
             decision_inputs=inputs,
             decision_reason=reason,
@@ -315,6 +369,8 @@ async def evaluate_profit_exit_portfolio(
         # Commit durable intent before the Redis delivery side effect.
         await db.commit()
         decisions += 1
+        if user.copy_state == CopyState.SHADOW:
+            shadow_decisions += 1
 
         if job is not None:
             try:
@@ -340,4 +396,7 @@ async def evaluate_profit_exit_portfolio(
         "decisions": decisions,
         "queued": queued,
         "abstained": abstained,
+        "shadow_candidates": shadow_candidates,
+        "shadow_profitable": shadow_profitable,
+        "shadow_decisions": shadow_decisions,
     }
