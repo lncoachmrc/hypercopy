@@ -4,12 +4,14 @@ import json
 import os
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Callable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.hyperliquid import HyperliquidAdapter
-from app.core.config import settings
+from app.adapters.ratelimit import Priority
+from app.core.config import Network, settings
 from app.models.entities import (
     AIProfitExitDecision,
     CopyJob,
@@ -124,14 +126,24 @@ def _decision_inputs(observation, cycle, intelligence: dict, evaluation_slot: in
     }
 
 
-async def evaluate_profit_exit_portfolio(db: AsyncSession, redis) -> dict:
+async def evaluate_profit_exit_portfolio(
+    db: AsyncSession,
+    redis,
+    *,
+    master_hl: HyperliquidAdapter,
+    follower_hl_for_network: Callable[[Network], HyperliquidAdapter],
+) -> dict:
     mode = await read_profit_exit_mode(db)
     if mode is ProfitExitFeatureMode.OFF:
         return {"mode": mode.value, "evaluated": 0, "decisions": 0, "queued": 0, "abstained": 0}
 
     snapshot_started_order = await master_snapshot_started_order(required=True)
-    master_hl = HyperliquidAdapter(None, network=settings.master_network)
-    master_snapshot = await master_hl.account_snapshot(settings.HYPERLIQUID_MASTER_ADDRESS)
+    if master_hl.limiter is None:
+        raise RuntimeError("AI Profit Exit master reader requires shared Hyperliquid limiter")
+    master_snapshot = await master_hl.account_snapshot(
+        settings.HYPERLIQUID_MASTER_ADDRESS,
+        priority=Priority.MASTER_STATE,
+    )
     intelligence = await read_ai_intelligence(db)
 
     rows = (await db.execute(
@@ -202,7 +214,10 @@ async def evaluate_profit_exit_portfolio(db: AsyncSession, redis) -> dict:
             abstained += 1
             continue
 
-        follower_hl = HyperliquidAdapter(None, network=destination.network)
+        follower_hl = follower_hl_for_network(destination.network)
+        if follower_hl.limiter is None:
+            abstained += 1
+            continue
         observation = await collect_profit_exit_economics(
             follower_hl,
             account_address=account.account_address,
