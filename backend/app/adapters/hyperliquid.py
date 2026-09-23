@@ -141,6 +141,23 @@ def _unrealized_pnl(state: dict) -> Decimal:
     return total
 
 
+def _variable_info_response_weight(response: object) -> int:
+    """Actual Hyperliquid weight for item-counted info responses.
+
+    Hyperliquid charges the standard info weight plus one additional unit per
+    20 returned items. The caller still reserves WEIGHT_USER_FILLS_MAX before
+    the request; this helper is used only to settle that reservation downward
+    after a successful response is known.
+    """
+    if not isinstance(response, list):
+        return WEIGHT_USER_FILLS_MAX
+    additional = (len(response) + 19) // 20
+    return min(
+        WEIGHT_USER_FILLS_MAX,
+        WEIGHT_STANDARD_INFO + additional,
+    )
+
+
 def _transient_read_error(exc: Exception) -> bool:
     """Whether an idempotent REST read is safe and useful to retry."""
     msg = str(exc).lower()
@@ -364,7 +381,15 @@ class HyperliquidAdapter:
             return
         await self.limiter.acquire(weight, priority, timeout=timeout)
 
-    async def _read(self, func, *args, weight: int, priority: Priority, timeout: int | float):
+    async def _read(
+        self,
+        func,
+        *args,
+        weight: int,
+        priority: Priority,
+        timeout: int | float,
+        response_weight: Callable[[object], int] | None = None,
+    ):
         """Retry only bounded, idempotent Hyperliquid reads.
 
         The rate-limiter wait and the synchronous SDK call have independent
@@ -383,12 +408,38 @@ class HyperliquidAdapter:
                         f'Hyperliquid read cooldown active for {remaining:.1f}s after rate limit'
                     )
 
-            await self._acquire(weight, priority, timeout=timeout)
+            reservation = None
+            if self.limiter is not None and response_weight is not None:
+                reservation = await self.limiter.reserve(
+                    weight,
+                    priority,
+                    timeout=timeout,
+                )
+            else:
+                await self._acquire(weight, priority, timeout=timeout)
             try:
-                return await asyncio.wait_for(
+                response = await asyncio.wait_for(
                     self._call(func, *args),
                     timeout=float(timeout),
                 )
+                if reservation is not None:
+                    actual_weight = int(response_weight(response))
+                    if 0 <= actual_weight <= reservation.reserved_weight:
+                        await self.limiter.settle(
+                            reservation,
+                            actual_weight,
+                        )
+                    else:
+                        log.warning(
+                            'Hyperliquid variable-weight response exceeded reservation',
+                            extra={
+                                'event_code': 'HL_READ_WEIGHT_UNDERRESERVED',
+                                'network': self.network,
+                                'reserved_weight': reservation.reserved_weight,
+                                'actual_weight': actual_weight,
+                            },
+                        )
+                return response
             except TimeoutError as exc:
                 await self._metric_incr('hl_read_timeout_count')
                 log.warning(
@@ -657,8 +708,14 @@ class HyperliquidAdapter:
 
     async def user_fills_by_time(self, account: str, start_ms: int, end_ms: int | None = None) -> list[dict]:
         return await self._read(
-            self.info.user_fills_by_time, account, start_ms, end_ms,
-            weight=WEIGHT_USER_FILLS_MAX, priority=Priority.RECONCILE, timeout=30,
+            self.info.user_fills_by_time,
+            account,
+            start_ms,
+            end_ms,
+            weight=WEIGHT_USER_FILLS_MAX,
+            priority=Priority.RECONCILE,
+            timeout=30,
+            response_weight=_variable_info_response_weight,
         )
 
     async def user_funding_history(
@@ -677,6 +734,7 @@ class HyperliquidAdapter:
             weight=WEIGHT_USER_FILLS_MAX,
             priority=Priority.RECONCILE,
             timeout=30,
+            response_weight=_variable_info_response_weight,
         )
         if not isinstance(value, list) or any(
             not isinstance(row, dict) for row in value
