@@ -62,6 +62,15 @@ class Priority(IntEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class RateLimitReservation:
+    """One pessimistic weighted reservation that can later be settled downward."""
+
+    member: str
+    priority: Priority
+    reserved_weight: int
+
+
+@dataclass(frozen=True, slots=True)
 class Budget:
     """Per-consumer share of the per-minute IP budget.
 
@@ -144,10 +153,23 @@ class WeightedRateLimiter:
             ),
         )
 
-    async def try_acquire(self, weight: int, priority: Priority) -> bool:
-        """Atomically take weighted capacity from global and priority lanes."""
+    async def try_reserve(
+        self,
+        weight: int,
+        priority: Priority,
+    ) -> RateLimitReservation | None:
+        """Atomically reserve pessimistic weighted capacity.
+
+        Variable-size Hyperliquid responses are charged by item count. Callers
+        may reserve the documented worst case before the request and settle the
+        reservation downward after the response size is known.
+        """
         if weight <= 0:
-            return True
+            return RateLimitReservation(
+                member="0:noop",
+                priority=priority,
+                reserved_weight=0,
+            )
         now = time.time()
         lane_key = f"{self._key}:{priority.name}"
         member = f"{weight}:{uuid.uuid4().hex}"
@@ -186,7 +208,86 @@ class WeightedRateLimiter:
             self._budget.total_per_minute, self._budget.allowance(priority),
             self._budget.reserve, member,
         )
-        return bool(result)
+        if not result:
+            return None
+        return RateLimitReservation(
+            member=member,
+            priority=priority,
+            reserved_weight=weight,
+        )
+
+    async def try_acquire(self, weight: int, priority: Priority) -> bool:
+        """Atomically take weighted capacity from global and priority lanes."""
+        return await self.try_reserve(weight, priority) is not None
+
+    async def reserve(
+        self,
+        weight: int,
+        priority: Priority,
+        *,
+        timeout: float = 30.0,
+        poll: float = 0.25,
+    ) -> RateLimitReservation:
+        """Wait for headroom, then return a reservation token."""
+        deadline = time.monotonic() + timeout
+        while True:
+            reservation = await self.try_reserve(weight, priority)
+            if reservation is not None:
+                return reservation
+            if time.monotonic() >= deadline:
+                raise RateLimitExhausted(
+                    f"No headroom for weight {weight} on the "
+                    f"{priority.name} lane after {timeout:g}s"
+                )
+            await asyncio.sleep(poll)
+
+    async def settle(
+        self,
+        reservation: RateLimitReservation,
+        actual_weight: int,
+    ) -> None:
+        """Reduce a pessimistic reservation to the exchange's actual weight.
+
+        Settlement is downward-only. Failed/unknown requests intentionally keep
+        their full reservation because their server-side accounting is unknown.
+        """
+        actual = int(actual_weight)
+        if actual < 0 or actual > reservation.reserved_weight:
+            raise ValueError(
+                f"Cannot settle reserved weight {reservation.reserved_weight} "
+                f"to {actual}"
+            )
+        if reservation.reserved_weight == 0 or actual == reservation.reserved_weight:
+            return
+
+        lane_key = f"{self._key}:{reservation.priority.name}"
+        suffix = reservation.member.split(":", 1)[-1]
+        replacement = f"{actual}:{suffix}"
+        script = """
+        local global_key=KEYS[1]
+        local lane_key=KEYS[2]
+        local old_member=ARGV[1]
+        local new_member=ARGV[2]
+        local actual=tonumber(ARGV[3])
+        local global_score=redis.call('ZSCORE',global_key,old_member)
+        local lane_score=redis.call('ZSCORE',lane_key,old_member)
+        redis.call('ZREM',global_key,old_member)
+        redis.call('ZREM',lane_key,old_member)
+        if actual > 0 then
+          if global_score then redis.call('ZADD',global_key,global_score,new_member) end
+          if lane_score then redis.call('ZADD',lane_key,lane_score,new_member) end
+        end
+        return 1
+        """
+        await self._redis.eval(
+            script,
+            2,
+            self._key,
+            lane_key,
+            reservation.member,
+            replacement,
+            actual,
+        )
 
     async def acquire(
         self,
@@ -197,16 +298,12 @@ class WeightedRateLimiter:
         poll: float = 0.25,
     ) -> None:
         """Wait for headroom, then take it."""
-        deadline = time.monotonic() + timeout
-        while True:
-            if await self.try_acquire(weight, priority):
-                return
-            if time.monotonic() >= deadline:
-                raise RateLimitExhausted(
-                    f"No headroom for weight {weight} on the "
-                    f"{priority.name} lane after {timeout:g}s"
-                )
-            await asyncio.sleep(poll)
+        await self.reserve(
+            weight,
+            priority,
+            timeout=timeout,
+            poll=poll,
+        )
 
     async def snapshot(self) -> dict[str, object]:
         """Current usage plus authoritative capacities for the admin control room."""
