@@ -46,6 +46,7 @@ def test_master_order_provenance_overrides_generic_close_reason() -> None:
             "_hypercopy_order_provenance": {
                 "reason_code": "STOP_LOSS",
                 "order_type": "Stop Market",
+                "is_position_tpsl": True,
             }
         },
     )
@@ -53,6 +54,60 @@ def test_master_order_provenance_overrides_generic_close_reason() -> None:
 
     event.raw["_hypercopy_order_provenance"]["reason_code"] = "TAKE_PROFIT"
     assert master_transition_reason(event) == "MASTER_TAKE_PROFIT"
+
+
+def test_tp_sl_labels_require_position_tpsl_and_reducing_transition() -> None:
+    opening = _event(
+        "0",
+        "1",
+        {
+            "_hypercopy_order_provenance": {
+                "reason_code": "STOP_LOSS",
+                "order_type": "Stop Market",
+                "is_position_tpsl": True,
+            }
+        },
+    )
+    assert master_transition_reason(opening) == "MASTER_OPEN"
+
+    increasing = _event(
+        "1",
+        "2",
+        {
+            "_hypercopy_order_provenance": {
+                "reason_code": "TAKE_PROFIT",
+                "order_type": "Take Profit Market",
+                "is_position_tpsl": False,
+            }
+        },
+    )
+    assert master_transition_reason(increasing) == "MASTER_INCREASE"
+
+    reducing_not_position_tpsl = _event(
+        "2",
+        "1",
+        {
+            "_hypercopy_order_provenance": {
+                "reason_code": "TAKE_PROFIT",
+                "order_type": "Take Profit Market",
+                "is_position_tpsl": False,
+            }
+        },
+    )
+    assert master_transition_reason(reducing_not_position_tpsl) == "MASTER_REDUCE"
+
+    reducing_position_tpsl = _event(
+        "2",
+        "1",
+        {
+            "_hypercopy_order_provenance": {
+                "reason_code": "TAKE_PROFIT",
+                "order_type": "Take Profit Market",
+                "is_position_tpsl": True,
+            }
+        },
+    )
+    assert master_transition_reason(reducing_position_tpsl) == "MASTER_TAKE_PROFIT"
 
 
 def test_execution_reason_codes_cover_ai_manual_reconcile_and_failures() -> None:
