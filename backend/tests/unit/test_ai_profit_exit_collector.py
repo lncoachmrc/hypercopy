@@ -5,6 +5,7 @@ import pytest
 
 from app.services.ai_profit_exit_collector import (
     collect_profit_exit_economics,
+    collect_shadow_profit_exit_economics,
 )
 
 
@@ -466,3 +467,85 @@ async def test_invalid_history_window_fails_closed():
 
     assert observed.complete is False
     assert observed.eligible is False
+
+@pytest.mark.asyncio
+async def test_collect_shadow_long_uses_copy_target_and_master_entry_estimate():
+    hl = FakeHL(
+        mids={"BTC": "110"},
+        fees={"userCrossRate": "0.001"},
+    )
+
+    observed = await collect_shadow_profit_exit_economics(
+        hl,
+        account_address="0x" + "dd" * 20,
+        asset="BTC",
+        shadow_position=D("0.5"),
+        master_perp_state=_snapshot(size="2", entry="100").perp_state,
+        slippage_bps=50,
+    )
+
+    assert observed.complete is True
+    assert observed.eligible is True
+    assert observed.current_position == D("0.5")
+    assert observed.entry_price == D("100")
+    assert observed.mark_price == D("110")
+    assert observed.executable_exit_price == D("109.45")
+    assert observed.basis == "copy_shadow_estimate"
+    assert observed.pnl_complete is False
+    assert observed.funding_model == "not_modeled"
+
+    assert observed.economics is not None
+    assert observed.economics.gross_price_pnl == D("4.725")
+    assert observed.economics.residual_entry_fees == D("0.0500")
+    assert observed.economics.residual_funding == D("0")
+    assert observed.economics.estimated_exit_fee == D("0.054725")
+    assert observed.economics.net_pnl == D("4.620275")
+
+    assert not any(
+        call[0] in {"snapshot", "fills", "funding"}
+        for call in hl.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_collect_shadow_short_uses_conservative_buy_exit():
+    hl = FakeHL(
+        mids={"BTC": "90"},
+        fees={"userCrossRate": "0.001"},
+    )
+
+    observed = await collect_shadow_profit_exit_economics(
+        hl,
+        account_address="0x" + "ee" * 20,
+        asset="BTC",
+        shadow_position=D("-2"),
+        master_perp_state=_snapshot(size="-4", entry="100").perp_state,
+        slippage_bps=50,
+    )
+
+    assert observed.complete is True
+    assert observed.executable_exit_price == D("90.45")
+    assert observed.economics is not None
+    assert observed.economics.gross_price_pnl == D("19.10")
+    assert observed.economics.net_pnl == D("18.71910")
+    assert observed.pnl_complete is False
+
+
+@pytest.mark.asyncio
+async def test_collect_shadow_rejects_master_target_side_mismatch():
+    hl = FakeHL()
+
+    observed = await collect_shadow_profit_exit_economics(
+        hl,
+        account_address="0x" + "ff" * 20,
+        asset="BTC",
+        shadow_position=D("-1"),
+        master_perp_state=_snapshot(size="1", entry="100").perp_state,
+        slippage_bps=50,
+    )
+
+    assert observed.complete is False
+    assert observed.eligible is False
+    assert "inconsistent" in observed.reason.lower()
+    assert hl.calls == []
+
