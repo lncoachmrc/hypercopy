@@ -7,6 +7,8 @@ import pytest
 
 from app.adapters.hyperliquid import (
     HyperliquidAdapter,
+    WEIGHT_USER_FUNDING_MAX,
+    _user_funding_response_weight,
     _variable_info_response_weight,
 )
 from app.adapters.ratelimit import (
@@ -27,6 +29,34 @@ def test_variable_info_weight_matches_hyperliquid_item_accounting() -> None:
     assert _variable_info_response_weight([{}] * 21) == 22
     assert _variable_info_response_weight([{}] * 2000) == WEIGHT_USER_FILLS_MAX
     assert _variable_info_response_weight({"malformed": True}) == WEIGHT_USER_FILLS_MAX
+
+
+def test_reconcile_lane_fits_one_bounded_cold_profit_exit_cycle() -> None:
+    budget = Budget()
+
+    # RECONCILE-lane worst case for one usable observation:
+    # clearinghouseState(2) + userAbstraction(20) + allMids(2)
+    # + max non-truncated fills(120) + max non-truncated funding(45)
+    # + userFees(20) = 209.
+    assert WEIGHT_USER_FUNDING_MAX == 45
+    assert budget.reconcile >= 209
+    assert budget.orders == 560
+    assert budget.master_state == 300
+    assert (
+        budget.orders
+        + budget.reconcile
+        + budget.diagnostic
+        + budget.master_state
+        + budget.metadata
+        + budget.reserve
+        == budget.total_per_minute
+    )
+
+
+def test_funding_weight_is_bounded_to_500_row_endpoint_limit() -> None:
+    assert _user_funding_response_weight([]) == 20
+    assert _user_funding_response_weight([{}] * 499) == 45
+    assert _user_funding_response_weight([{}] * 500) == 45
 
 
 class _DynamicLimiter:
