@@ -31,6 +31,8 @@ class ProfitExitObservation:
     taker_fee_rate: Decimal | None
     economics: ProfitExitEconomicsResult | None
     reason: str
+    economics_basis: str = "LIVE_EXCHANGE"
+    funding_included: bool = True
 
 
 def _fail(
