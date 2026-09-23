@@ -74,19 +74,9 @@ def upgrade() -> None:
         ["shadow_started_at"],
         unique=False,
     )
-    op.create_index(
-        "ix_shadow_position_current_session",
-        "shadow_position_ledger",
-        ["user_id", "shadow_started_at", "asset"],
-        unique=False,
-    )
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "ix_shadow_position_current_session",
-        table_name="shadow_position_ledger",
-    )
     op.drop_index(
         "ix_shadow_position_ledger_shadow_started_at",
         table_name="shadow_position_ledger",
