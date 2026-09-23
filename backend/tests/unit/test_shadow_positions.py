@@ -198,3 +198,36 @@ async def test_shadow_profit_exit_does_not_call_profitable_when_price_regresses(
     assert observed.eligible is False
     assert observed.economics is not None
     assert observed.economics.net_pnl < 0
+
+
+@pytest.mark.asyncio
+async def test_shadow_profit_exit_reuses_cycle_market_and_fee_inputs() -> None:
+    class CachedInputHL:
+        async def mids(self, **_kwargs):
+            raise AssertionError("mids should be reused from evaluator cycle cache")
+
+        async def asset_spec(self, _asset):
+            return SimpleNamespace(sz_decimals=4)
+
+        async def user_fees(self, _account):
+            raise AssertionError("user_fees should be reused per account")
+
+    position = SimpleNamespace(
+        asset="BTC",
+        size=D("1"),
+        avg_entry_price=D("100"),
+        residual_entry_notional=D("100"),
+    )
+
+    observed = await collect_shadow_profit_exit_economics(
+        CachedInputHL(),
+        account_address="0x" + "33" * 20,
+        position=position,
+        slippage_bps=50,
+        market_mids={"BTC": "110"},
+        taker_fee_rate=D("0.001"),
+    )
+
+    assert observed.eligible is True
+    assert observed.mark_price == D("110")
+    assert observed.taker_fee_rate == D("0.001")
