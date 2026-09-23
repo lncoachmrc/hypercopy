@@ -12,6 +12,8 @@ watchPatterns = [
   "/backend/app/services/ai_profit_exit_mode.py",
   "/backend/app/services/master_source_identity.py",
   "/backend/app/services/networking.py",
+  "/backend/app/services/execution_destination.py",
+  "/backend/app/services/destination_switch.py",
   "/backend/app/services/queue.py",
   "/backend/app/services/reconcile.py",
   "/backend/app/services/strategy_intents.py",
