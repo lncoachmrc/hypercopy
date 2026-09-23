@@ -141,20 +141,34 @@ def _unrealized_pnl(state: dict) -> Decimal:
     return total
 
 
-def _variable_info_response_weight(response: object) -> int:
+WEIGHT_USER_FUNDING_MAX = WEIGHT_STANDARD_INFO + 25  # 500 rows => +25 weight
+
+
+def _variable_info_response_weight(
+    response: object,
+    *,
+    max_weight: int = WEIGHT_USER_FILLS_MAX,
+) -> int:
     """Actual Hyperliquid weight for item-counted info responses.
 
     Hyperliquid charges the standard info weight plus one additional unit per
-    20 returned items. The caller still reserves WEIGHT_USER_FILLS_MAX before
-    the request; this helper is used only to settle that reservation downward
-    after a successful response is known.
+    20 returned items. Callers reserve their endpoint-specific documented worst
+    case before the request, then settle downward only after a successful
+    response is known.
     """
     if not isinstance(response, list):
-        return WEIGHT_USER_FILLS_MAX
+        return max_weight
     additional = (len(response) + 19) // 20
     return min(
-        WEIGHT_USER_FILLS_MAX,
+        max_weight,
         WEIGHT_STANDARD_INFO + additional,
+    )
+
+
+def _user_funding_response_weight(response: object) -> int:
+    return _variable_info_response_weight(
+        response,
+        max_weight=WEIGHT_USER_FUNDING_MAX,
     )
 
 
@@ -750,10 +764,10 @@ class HyperliquidAdapter:
             account,
             start_ms,
             end_ms,
-            weight=WEIGHT_USER_FILLS_MAX,
+            weight=WEIGHT_USER_FUNDING_MAX,
             priority=Priority.RECONCILE,
             timeout=30,
-            response_weight=_variable_info_response_weight,
+            response_weight=_user_funding_response_weight,
         )
         if not isinstance(value, list) or any(
             not isinstance(row, dict) for row in value
