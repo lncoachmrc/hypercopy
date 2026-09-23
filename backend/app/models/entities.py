@@ -412,6 +412,49 @@ class PositionLedger(BaseUuid, Base):
     __table_args__ = (UniqueConstraint('user_id', 'asset', name='uq_ledger_user_asset'),)
 
 
+class ShadowPositionLedger(BaseUuid, Timestamped, Base):
+    __tablename__ = 'shadow_position_ledger'
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey('users.id', ondelete='CASCADE'),
+        nullable=False,
+        index=True,
+    )
+    execution_epoch_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey('execution_epochs.id', ondelete='RESTRICT'),
+        nullable=False,
+        index=True,
+    )
+    execution_provider: Mapped[str] = mapped_column(String(24), nullable=False)
+    execution_network: Mapped[str] = mapped_column(String(16), nullable=False)
+    shadow_started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+    )
+    asset: Mapped[str] = mapped_column(String(24), nullable=False)
+    size: Mapped[Decimal] = mapped_column(D, default=Decimal(0), nullable=False)
+    avg_entry_price: Mapped[Decimal] = mapped_column(D, default=Decimal(0), nullable=False)
+    residual_entry_notional: Mapped[Decimal] = mapped_column(D, default=Decimal(0), nullable=False)
+    mark_price: Mapped[Decimal] = mapped_column(D, default=Decimal(0), nullable=False)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_simulated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint(
+            'user_id',
+            'shadow_started_at',
+            'asset',
+            name='uq_shadow_position_session_asset',
+        ),
+        Index(
+            'ix_shadow_position_current_session',
+            'user_id',
+            'shadow_started_at',
+            'asset',
+        ),
+    )
+
+
 class EquitySnapshot(BaseUuid, Base):
     __tablename__ = 'equity_snapshots'
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'))
