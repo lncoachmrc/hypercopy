@@ -795,6 +795,10 @@ async def _reconcile_user_locked(
                 'reconcile_reserved_total_exposure': str(reserved_total_exposure),
                 'reconcile_reserved_open_positions': reserved_open_positions,
             }
+            if user.copy_state == CopyState.SHADOW:
+                if user.shadow_started_at is None:
+                    continue
+                context['shadow_started_at'] = user.shadow_started_at.isoformat()
             if master_snapshot_started_order is not None:
                 context['master_snapshot_started_order'] = master_snapshot_started_order
                 context['master_intent_order'] = master_snapshot_started_order
