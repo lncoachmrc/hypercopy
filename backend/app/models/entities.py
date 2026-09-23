@@ -446,12 +446,6 @@ class ShadowPositionLedger(BaseUuid, Timestamped, Base):
             'asset',
             name='uq_shadow_position_session_asset',
         ),
-        Index(
-            'ix_shadow_position_current_session',
-            'user_id',
-            'shadow_started_at',
-            'asset',
-        ),
     )
 
 
