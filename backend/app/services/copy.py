@@ -91,7 +91,7 @@ async def persist_master_fill_and_jobs(
     # realtime intents so simulation remains representative.
     master_address = settings.HYPERLIQUID_MASTER_ADDRESS or ''
     eligible = (await db.execute(text("""
-        SELECT u.id, u.execution_network
+        SELECT u.id, u.execution_network, u.copy_state, u.shadow_started_at
         FROM users AS u
         JOIN trading_accounts AS ta ON ta.user_id = u.id
         WHERE u.state = 'ACTIVE'
@@ -100,7 +100,7 @@ async def persist_master_fill_and_jobs(
     """), {'master_address': master_address})).all()
 
     jobs: list[CopyJob] = []
-    for user_id, raw_network in eligible:
+    for user_id, raw_network, raw_copy_state, shadow_started_at in eligible:
         follower_network = str(raw_network or settings.follower_network).lower()
         if follower_network not in {'testnet', 'mainnet'}:
             log.error('Skipping user with invalid execution network', extra={'user_id': str(user_id), 'network': follower_network})
@@ -115,6 +115,14 @@ async def persist_master_fill_and_jobs(
             'master_network': source_network or settings.master_network,
             'follower_network': follower_network,
         }
+        if str(raw_copy_state) == 'SHADOW':
+            if shadow_started_at is None:
+                log.warning(
+                    'Skipping SHADOW follower without session timestamp',
+                    extra={'user_id': str(user_id)},
+                )
+                continue
+            context['shadow_started_at'] = shadow_started_at.isoformat()
         if master_intent_order is not None:
             context['master_intent_order'] = master_intent_order
         if master_leverage is not None:
