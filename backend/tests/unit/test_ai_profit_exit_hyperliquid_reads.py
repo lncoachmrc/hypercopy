@@ -10,7 +10,6 @@ from app.adapters.hyperliquid import (
 from app.adapters.ratelimit import (
     Priority,
     WEIGHT_STANDARD_INFO,
-    WEIGHT_USER_FILLS_MAX,
 )
 
 
@@ -52,7 +51,7 @@ async def test_user_funding_history_uses_conservative_history_read_lane():
             funding_method,
             ("0x" + "11" * 20, 100, 200),
             {
-                "weight": WEIGHT_USER_FILLS_MAX,
+                "weight": WEIGHT_USER_FUNDING_MAX,
                 "priority": Priority.RECONCILE,
                 "timeout": 30,
                 "response_weight": _user_funding_response_weight,
