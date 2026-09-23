@@ -17,13 +17,14 @@ from app.core.security import hash_ip, normalize_address
 from app.db.redis import redis_client
 from app.db.session import get_db
 from app.engine.sizing import EXCHANGE_MIN_NOTIONAL
-from app.models.entities import CopyJob, CopyState, CredentialStatus, Execution, ExecutionState, JobState, PositionLedger, RiskHalt, RiskProfile, RiskState, SigningCredential, TradingAccount, User
+from app.models.entities import AIProfitExitDecision, CopyJob, CopyState, CredentialStatus, Execution, ExecutionState, JobState, MasterEvent, PositionLedger, RiskHalt, RiskProfile, RiskState, SigningCredential, TradingAccount, User
 from app.schemas.trading import ClosePositionsIn
 from app.schemas.user import RiskProfileIn, TradingAccountIn, TradingNetworkIn, TradingProviderIn
 from app.services.audit import audit
 from app.services.destination_switch import DestinationSwitchBlocked, destination_switch_blockers
 from app.services.entitlement import entitlement
 from app.services.execution import live_trading_allowed
+from app.services.execution_reason import execution_reason_code, execution_reason_detail
 from app.services.execution_destination import close_user_destination_epoch, set_user_destination, user_destination_state
 from app.services.master_source_identity import (
     MASTER_SOURCE_FOLLOWER_BLOCK_REASON,
@@ -337,20 +338,51 @@ async def positions(user: User = Depends(current_user), db: AsyncSession = Depen
 @router.get('/executions')
 async def executions(user: User = Depends(current_user), db: AsyncSession = Depends(get_db), limit: int = 50, offset: int = 0, state: str | None = None, asset: str | None = None):
     network_state = await user_network_state(db, user.id)
-    q = select(Execution, CopyJob).join(CopyJob, CopyJob.id == Execution.copy_job_id).where(
-        Execution.user_id == user.id,
-        CopyJob.created_at >= network_state.started_at,
+    q = (
+        select(Execution, CopyJob, MasterEvent)
+        .join(CopyJob, CopyJob.id == Execution.copy_job_id)
+        .outerjoin(MasterEvent, MasterEvent.id == CopyJob.master_event_id)
+        .where(
+            Execution.user_id == user.id,
+            CopyJob.created_at >= network_state.started_at,
+        )
     )
     if state: q = q.where(Execution.state == state)
     if asset: q = q.where(Execution.asset == asset)
     rows = (await db.execute(q.order_by(Execution.created_at.desc()).offset(offset).limit(min(limit, 200)))).all()
+
+    ai_job_ids = [
+        job.id
+        for _execution, job, _master_event in rows
+        if str(job.origin or '').upper() == 'AI_PROFIT_EXIT'
+    ]
+    ai_reasons: dict = {}
+    if ai_job_ids:
+        decision_rows = (await db.execute(
+            select(
+                AIProfitExitDecision.copy_job_id,
+                AIProfitExitDecision.decision_reason,
+                AIProfitExitDecision.decided_at,
+            )
+            .where(AIProfitExitDecision.copy_job_id.in_(ai_job_ids))
+            .order_by(AIProfitExitDecision.decided_at.desc())
+        )).all()
+        for job_id, decision_reason, _decided_at in decision_rows:
+            if job_id is not None and job_id not in ai_reasons:
+                ai_reasons[job_id] = decision_reason
+
     out = []
-    for execution, job in rows:
+    for execution, job, master_event in rows:
         ctx = job.context or {}
         leverage = ctx.get('desired_follower_leverage', ctx.get('master_leverage'))
         is_cross = ctx.get('desired_follower_is_cross')
         if is_cross is None:
             is_cross = ctx.get('master_is_cross')
+        reason_code = execution_reason_code(execution, job, master_event)
+        reason_detail = execution_reason_detail(
+            execution,
+            ai_decision_reason=ai_reasons.get(job.id),
+        )
         out.append({
             'id': str(execution.id),
             'asset': execution.asset,
@@ -361,6 +393,9 @@ async def executions(user: User = Depends(current_user), db: AsyncSession = Depe
             'avg_price': execution.avg_price,
             'reduce_only': execution.reduce_only,
             'reject_reason': execution.reject_reason,
+            'reason_code': reason_code,
+            'reason_detail': reason_detail,
+            'origin': job.origin,
             'cloid': execution.cloid,
             'leverage': leverage,
             'is_cross': is_cross,
