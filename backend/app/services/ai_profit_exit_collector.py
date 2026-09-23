@@ -327,18 +327,10 @@ async def collect_profit_exit_economics(
             history_start_ms,
             history_end_ms,
         )
-        raw_funding = await hl.user_funding_history(
-            account_address,
-            history_start_ms,
-            history_end_ms,
-        )
-        raw_fees = await hl.user_fees(
-            account_address,
-        )
     except Exception as exc:
         return _fail(
             normalized_asset,
-            f"Profit-exit accounting data unavailable: {type(exc).__name__}",
+            f"Profit-exit fill history unavailable: {type(exc).__name__}",
             current_position=current_position,
             entry_price=entry_price,
             mark_price=mark_price,
@@ -355,10 +347,29 @@ async def collect_profit_exit_economics(
             executable_exit_price=executable_exit_price,
         )
 
+    # Hyperliquid caps this endpoint at 2000 rows. A full page cannot prove the
+    # entire position history, so fail closed immediately and do not spend more
+    # reconciliation budget on funding/fees for an unusable observation.
     if len(raw_fills) >= _MAX_FILLS_BY_TIME:
         return _fail(
             normalized_asset,
             "Follower fill history may be truncated",
+            current_position=current_position,
+            entry_price=entry_price,
+            mark_price=mark_price,
+            executable_exit_price=executable_exit_price,
+        )
+
+    try:
+        raw_funding = await hl.user_funding_history(
+            account_address,
+            history_start_ms,
+            history_end_ms,
+        )
+    except Exception as exc:
+        return _fail(
+            normalized_asset,
+            f"Profit-exit funding history unavailable: {type(exc).__name__}",
             current_position=current_position,
             entry_price=entry_price,
             mark_price=mark_price,
@@ -375,10 +386,25 @@ async def collect_profit_exit_economics(
             executable_exit_price=executable_exit_price,
         )
 
+    # Same fail-closed rule for the bounded 500-row funding window.
     if len(raw_funding) >= _MAX_TIME_RANGE_ROWS:
         return _fail(
             normalized_asset,
             "Follower funding history may be truncated",
+            current_position=current_position,
+            entry_price=entry_price,
+            mark_price=mark_price,
+            executable_exit_price=executable_exit_price,
+        )
+
+    try:
+        raw_fees = await hl.user_fees(
+            account_address,
+        )
+    except Exception as exc:
+        return _fail(
+            normalized_asset,
+            f"Profit-exit fee schedule unavailable: {type(exc).__name__}",
             current_position=current_position,
             entry_price=entry_price,
             mark_price=mark_price,

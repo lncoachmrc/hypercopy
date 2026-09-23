@@ -2,11 +2,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.adapters.hyperliquid import HyperliquidAdapter
+from app.adapters.hyperliquid import (
+    HyperliquidAdapter,
+    WEIGHT_USER_FUNDING_MAX,
+    _user_funding_response_weight,
+)
 from app.adapters.ratelimit import (
     Priority,
     WEIGHT_STANDARD_INFO,
-    WEIGHT_USER_FILLS_MAX,
 )
 
 
@@ -48,9 +51,10 @@ async def test_user_funding_history_uses_conservative_history_read_lane():
             funding_method,
             ("0x" + "11" * 20, 100, 200),
             {
-                "weight": WEIGHT_USER_FILLS_MAX,
+                "weight": WEIGHT_USER_FUNDING_MAX,
                 "priority": Priority.RECONCILE,
                 "timeout": 30,
+                "response_weight": _user_funding_response_weight,
             },
         )
     ]
@@ -83,7 +87,8 @@ async def test_user_funding_history_allows_open_end_time():
     assert result == []
     assert captured["method"] is funding_method
     assert captured["args"] == ("0x" + "22" * 20, 100, None)
-    assert captured["kwargs"]["weight"] == WEIGHT_USER_FILLS_MAX
+    assert captured["kwargs"]["weight"] == WEIGHT_USER_FUNDING_MAX
+    assert captured["kwargs"]["response_weight"] is _user_funding_response_weight
 
 
 @pytest.mark.asyncio
