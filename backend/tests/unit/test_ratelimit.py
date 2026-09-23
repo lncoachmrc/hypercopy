@@ -21,9 +21,9 @@ def test_master_state_has_dedicated_headroom_for_bursty_sources():
 def test_admin_observability_exposes_authoritative_lane_limits():
     budget=Budget()
     assert budget.lane_limits()=={
-        'reconcile': 180,
-        'diagnostic': 40,
-        'metadata': 80,
+        'reconcile': 210,
+        'diagnostic': 20,
+        'metadata': 70,
         'master_state': 300,
         'order': 560,
     }
