@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -356,7 +357,7 @@ async def executions(user: User = Depends(current_user), db: AsyncSession = Depe
         for _execution, job, _master_event in rows
         if str(job.origin or '').upper() == 'AI_PROFIT_EXIT'
     ]
-    ai_reasons: dict = {}
+    ai_reasons: dict[uuid.UUID, str] = {}
     if ai_job_ids:
         decision_rows = (await db.execute(
             select(
