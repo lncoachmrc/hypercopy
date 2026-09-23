@@ -188,10 +188,12 @@ def profit_exit_decision_id(
     state_version: int,
     follower_position: Decimal,
     evaluation_slot: int,
+    evaluation_basis: str,
 ) -> uuid.UUID:
     """Deterministic semantic identity for one evaluated follower snapshot."""
-    if evaluation_slot < 0 or state_version <= 0:
-        raise ValueError("Profit-exit identity requires positive causal evidence")
+    normalized_basis = str(evaluation_basis or "").strip().lower()
+    if evaluation_slot < 0 or state_version <= 0 or not normalized_basis:
+        raise ValueError("Profit-exit identity requires positive causal evidence and evaluation basis")
     material = "|".join(
         (
             str(user_id),
@@ -203,6 +205,7 @@ def profit_exit_decision_id(
             str(state_version),
             format(follower_position, "f"),
             str(evaluation_slot),
+            normalized_basis,
         )
     )
     return uuid.uuid5(_PROFIT_EXIT_DECISION_NAMESPACE, material)

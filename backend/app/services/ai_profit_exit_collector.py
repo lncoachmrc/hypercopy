@@ -31,6 +31,9 @@ class ProfitExitObservation:
     taker_fee_rate: Decimal | None
     economics: ProfitExitEconomicsResult | None
     reason: str
+    basis: str = "live_exact"
+    pnl_complete: bool = True
+    funding_model: str = "exact_user_history"
 
 
 def _fail(
@@ -551,3 +554,267 @@ async def collect_profit_exit_economics(
             )
         ),
     )
+
+async def collect_shadow_profit_exit_economics(
+    hl,
+    *,
+    account_address: str,
+    asset: str,
+    shadow_position: Decimal,
+    master_perp_state: dict,
+    slippage_bps: int,
+) -> ProfitExitObservation:
+    """
+    Build a record-only economic estimate for CopyState.SHADOW.
+
+    The simulated position comes from the copy engine's persisted target_size.
+    Entry price follows the authoritative current master position so scale-ins
+    and reductions remain aligned with the source strategy. Entry/exit fees use
+    the follower's current taker rate. Funding is deliberately not inferred:
+    the observation is marked pnl_complete=False and can never authorize an
+    exchange write.
+    """
+
+    normalized_asset = str(asset).upper()
+    current_position = _decimal(shadow_position)
+    if current_position is None or current_position == 0:
+        return ProfitExitObservation(
+            asset=normalized_asset,
+            complete=False,
+            eligible=False,
+            current_position=current_position,
+            entry_price=None,
+            mark_price=None,
+            executable_exit_price=None,
+            taker_fee_rate=None,
+            economics=None,
+            reason="Shadow target position is flat or invalid",
+            basis="copy_shadow_estimate",
+            pnl_complete=False,
+            funding_model="not_modeled",
+        )
+
+    if (
+        isinstance(slippage_bps, bool)
+        or not isinstance(slippage_bps, int)
+        or slippage_bps < 0
+        or slippage_bps >= 10_000
+    ):
+        return ProfitExitObservation(
+            asset=normalized_asset,
+            complete=False,
+            eligible=False,
+            current_position=current_position,
+            entry_price=None,
+            mark_price=None,
+            executable_exit_price=None,
+            taker_fee_rate=None,
+            economics=None,
+            reason="Invalid profit-exit slippage",
+            basis="copy_shadow_estimate",
+            pnl_complete=False,
+            funding_model="not_modeled",
+        )
+
+    master_position = _position_row(master_perp_state, normalized_asset)
+    if master_position is None:
+        return ProfitExitObservation(
+            asset=normalized_asset,
+            complete=False,
+            eligible=False,
+            current_position=current_position,
+            entry_price=None,
+            mark_price=None,
+            executable_exit_price=None,
+            taker_fee_rate=None,
+            economics=None,
+            reason="Master position is unavailable for shadow estimate",
+            basis="copy_shadow_estimate",
+            pnl_complete=False,
+            funding_model="not_modeled",
+        )
+
+    master_size = _decimal(master_position.get("szi"))
+    entry_price = _decimal(master_position.get("entryPx"))
+    if (
+        master_size is None
+        or master_size == 0
+        or entry_price is None
+        or entry_price <= 0
+        or master_size * current_position <= 0
+    ):
+        return ProfitExitObservation(
+            asset=normalized_asset,
+            complete=False,
+            eligible=False,
+            current_position=current_position,
+            entry_price=entry_price,
+            mark_price=None,
+            executable_exit_price=None,
+            taker_fee_rate=None,
+            economics=None,
+            reason="Master/shadow position identity is incomplete or inconsistent",
+            basis="copy_shadow_estimate",
+            pnl_complete=False,
+            funding_model="not_modeled",
+        )
+
+    try:
+        mids = await hl.mids(priority=Priority.RECONCILE)
+    except Exception as exc:
+        return ProfitExitObservation(
+            asset=normalized_asset,
+            complete=False,
+            eligible=False,
+            current_position=current_position,
+            entry_price=entry_price,
+            mark_price=None,
+            executable_exit_price=None,
+            taker_fee_rate=None,
+            economics=None,
+            reason=f"Shadow market data unavailable: {type(exc).__name__}",
+            basis="copy_shadow_estimate",
+            pnl_complete=False,
+            funding_model="not_modeled",
+        )
+
+    mark_price = _decimal(mids.get(normalized_asset)) if isinstance(mids, dict) else None
+    if mark_price is None or mark_price <= 0:
+        return ProfitExitObservation(
+            asset=normalized_asset,
+            complete=False,
+            eligible=False,
+            current_position=current_position,
+            entry_price=entry_price,
+            mark_price=mark_price,
+            executable_exit_price=None,
+            taker_fee_rate=None,
+            economics=None,
+            reason="Shadow market price is unavailable",
+            basis="copy_shadow_estimate",
+            pnl_complete=False,
+            funding_model="not_modeled",
+        )
+
+    try:
+        spec = await hl.asset_spec(normalized_asset)
+        sz_decimals = int(spec.sz_decimals)
+    except Exception as exc:
+        return ProfitExitObservation(
+            asset=normalized_asset,
+            complete=False,
+            eligible=False,
+            current_position=current_position,
+            entry_price=entry_price,
+            mark_price=mark_price,
+            executable_exit_price=None,
+            taker_fee_rate=None,
+            economics=None,
+            reason=f"Shadow asset specification unavailable: {type(exc).__name__}",
+            basis="copy_shadow_estimate",
+            pnl_complete=False,
+            funding_model="not_modeled",
+        )
+
+    slip = Decimal(slippage_bps) / Decimal(10_000)
+    aggressive = (
+        mark_price * (Decimal(1) - slip)
+        if current_position > 0
+        else mark_price * (Decimal(1) + slip)
+    )
+    try:
+        executable_exit_price = round_price(aggressive, sz_decimals)
+    except Exception as exc:
+        return ProfitExitObservation(
+            asset=normalized_asset,
+            complete=False,
+            eligible=False,
+            current_position=current_position,
+            entry_price=entry_price,
+            mark_price=mark_price,
+            executable_exit_price=None,
+            taker_fee_rate=None,
+            economics=None,
+            reason=f"Shadow executable exit price unavailable: {type(exc).__name__}",
+            basis="copy_shadow_estimate",
+            pnl_complete=False,
+            funding_model="not_modeled",
+        )
+
+    try:
+        raw_fees = await hl.user_fees(account_address)
+    except Exception as exc:
+        return ProfitExitObservation(
+            asset=normalized_asset,
+            complete=False,
+            eligible=False,
+            current_position=current_position,
+            entry_price=entry_price,
+            mark_price=mark_price,
+            executable_exit_price=executable_exit_price,
+            taker_fee_rate=None,
+            economics=None,
+            reason=f"Shadow fee schedule unavailable: {type(exc).__name__}",
+            basis="copy_shadow_estimate",
+            pnl_complete=False,
+            funding_model="not_modeled",
+        )
+
+    taker_fee_rate = (
+        _decimal(raw_fees.get("userCrossRate"))
+        if isinstance(raw_fees, dict)
+        else None
+    )
+    if taker_fee_rate is None or taker_fee_rate < 0:
+        return ProfitExitObservation(
+            asset=normalized_asset,
+            complete=False,
+            eligible=False,
+            current_position=current_position,
+            entry_price=entry_price,
+            mark_price=mark_price,
+            executable_exit_price=executable_exit_price,
+            taker_fee_rate=taker_fee_rate,
+            economics=None,
+            reason="Shadow taker fee rate is unavailable",
+            basis="copy_shadow_estimate",
+            pnl_complete=False,
+            funding_model="not_modeled",
+        )
+
+    absolute_size = abs(current_position)
+    gross = (
+        (executable_exit_price - entry_price) * current_position
+        if current_position > 0
+        else (entry_price - executable_exit_price) * absolute_size
+    )
+    estimated_entry_fee = absolute_size * entry_price * taker_fee_rate
+    estimated_exit_fee = absolute_size * executable_exit_price * taker_fee_rate
+    estimated_net = gross - estimated_entry_fee - estimated_exit_fee
+
+    economics = ProfitExitEconomicsResult(
+        complete=True,
+        eligible=estimated_net > 0,
+        gross_price_pnl=gross,
+        residual_entry_fees=estimated_entry_fee,
+        residual_funding=Decimal(0),
+        estimated_exit_fee=estimated_exit_fee,
+        net_pnl=estimated_net,
+        reason=None if estimated_net > 0 else "Estimated shadow net PnL is not strictly positive",
+    )
+    return ProfitExitObservation(
+        asset=normalized_asset,
+        complete=True,
+        eligible=economics.eligible,
+        current_position=current_position,
+        entry_price=entry_price,
+        mark_price=mark_price,
+        executable_exit_price=executable_exit_price,
+        taker_fee_rate=taker_fee_rate,
+        economics=economics,
+        reason=economics.reason or "",
+        basis="copy_shadow_estimate",
+        pnl_complete=False,
+        funding_model="not_modeled",
+    )
+
