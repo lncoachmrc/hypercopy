@@ -74,19 +74,21 @@ class RateLimitReservation:
 class Budget:
     """Per-consumer share of the per-minute IP budget.
 
-    The previous 120-weight MASTER_STATE lane could be exhausted by a bursty
-    master plus the reconciler. Once exhausted, opening jobs had no verified
-    leverage and correctly failed closed. Give master-state reads 25% of the
-    global budget and trim lower-priority lanes instead. The sum remains exactly
-    1200, including a 40-weight emergency reserve.
+    MASTER_STATE remains protected at 25% of the global budget because every
+    follower target depends on a trustworthy master snapshot. RECONCILE is sized
+    to 210 so one cold AI Profit Exit evaluation can complete its bounded
+    follower snapshot, fills, funding and fee reads without borrowing from ORDER
+    or MASTER_STATE. The extra reconciliation capacity is taken only from the
+    lower-priority diagnostic and metadata lanes. The sum remains exactly 1200,
+    including a 40-weight emergency reserve.
     """
 
     total_per_minute: int = 1200
     orders: int = 560
-    reconcile: int = 180
-    diagnostic: int = 40
+    reconcile: int = 210
+    diagnostic: int = 20
     master_state: int = 300
-    metadata: int = 80
+    metadata: int = 70
     reserve: int = 40
 
     def allowance(self, priority: Priority) -> int:
