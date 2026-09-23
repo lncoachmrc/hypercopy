@@ -302,6 +302,7 @@ async def evaluate_profit_exit_portfolio(
             state_version=cycle.state_version,
             follower_position=observation.current_position,
             evaluation_slot=evaluation_slot,
+            evaluation_basis=observation.basis,
         )
         if await db.get(AIProfitExitDecision, decision_id) is not None:
             continue
