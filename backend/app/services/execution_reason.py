@@ -17,26 +17,39 @@ def master_transition_reason(event: MasterEvent | None) -> str:
     if event is None:
         return "STRATEGY_EVENT"
 
+    start = _decimal(event.start_position)
+    after = _decimal(event.position_after)
+
+    reducing_same_side = (
+        start != 0
+        and after != 0
+        and (start > 0) == (after > 0)
+        and abs(after) < abs(start)
+    )
+    closes_position = start != 0 and after == 0
+
     raw = event.raw or {}
     provenance = raw.get("_hypercopy_order_provenance")
     if isinstance(provenance, dict):
         code = str(provenance.get("reason_code") or "").upper()
-        if code in {"STOP_LOSS", "TAKE_PROFIT"}:
+        is_position_tpsl = provenance.get("is_position_tpsl") is True
+        if (
+            code in {"STOP_LOSS", "TAKE_PROFIT"}
+            and is_position_tpsl
+            and (reducing_same_side or closes_position)
+        ):
             return f"MASTER_{code}"
-
-    start = _decimal(event.start_position)
-    after = _decimal(event.position_after)
 
     if start == 0 and after != 0:
         return "MASTER_OPEN"
-    if start != 0 and after == 0:
+    if closes_position:
         return "MASTER_CLOSE"
     if start != 0 and after != 0 and (start > 0) != (after > 0):
         return "MASTER_REVERSAL"
     if start != 0 and after != 0 and (start > 0) == (after > 0):
         if abs(after) > abs(start):
             return "MASTER_INCREASE"
-        if abs(after) < abs(start):
+        if reducing_same_side:
             return "MASTER_REDUCE"
     return "STRATEGY_EVENT"
 
