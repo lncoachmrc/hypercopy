@@ -27,6 +27,7 @@ def test_profit_exit_semantic_identity_is_deterministic_per_evaluation_slot() ->
         state_version=42,
         follower_position=Decimal("0.1"),
         evaluation_slot=123,
+        evaluation_basis="live_exact",
     )
     first=profit_exit_decision_id(**kwargs)
     second=profit_exit_decision_id(**kwargs)
@@ -35,6 +36,11 @@ def test_profit_exit_semantic_identity_is_deterministic_per_evaluation_slot() ->
 
     changed=profit_exit_decision_id(**{**kwargs,"evaluation_slot":124})
     assert changed != first
+
+    shadow=profit_exit_decision_id(
+        **{**kwargs,"evaluation_basis":"copy_shadow_estimate"}
+    )
+    assert shadow != first
 
 
 def test_profit_exit_llm_contract_is_closed() -> None:
