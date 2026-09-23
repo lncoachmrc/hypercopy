@@ -125,9 +125,14 @@ def _decision_inputs(
         "taker_fee_rate": str(observation.taker_fee_rate),
         "gross_price_pnl": str(economics.gross_price_pnl) if economics else None,
         "residual_entry_fees": str(economics.residual_entry_fees) if economics else None,
-        "residual_funding": str(economics.residual_funding) if economics else None,
+        "residual_funding": (
+            str(economics.residual_funding)
+            if economics and observation.funding_included
+            else None
+        ),
         "estimated_exit_fee": str(economics.estimated_exit_fee) if economics else None,
         "net_pnl": str(economics.net_pnl) if economics else None,
+        "economics_note": observation.reason or None,
         "capital_intelligence": {
             "status": intelligence.get("status"),
             "summary": (intelligence.get("analysis") or {}).get("summary")
