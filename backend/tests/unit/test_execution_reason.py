@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 from app.models.entities import ExecutionState
 from app.services.execution_reason import (
@@ -10,7 +11,7 @@ from app.services.execution_reason import (
 )
 
 
-def _event(start: str, after: str, raw: dict | None = None):
+def _event(start: str, after: str, raw: dict | None = None) -> Any:
     return SimpleNamespace(
         start_position=start,
         position_after=after,
@@ -18,14 +19,14 @@ def _event(start: str, after: str, raw: dict | None = None):
     )
 
 
-def _execution(state: ExecutionState = ExecutionState.FILLED):
+def _execution(state: ExecutionState = ExecutionState.FILLED) -> Any:
     return SimpleNamespace(
         state=state,
         reject_reason=None,
     )
 
 
-def _job(origin: str):
+def _job(origin: str) -> Any:
     return SimpleNamespace(origin=origin)
 
 
