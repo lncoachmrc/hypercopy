@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -42,12 +44,14 @@ from app.services.master_source_identity import (
 from app.services.metrics import dashboard_for_user
 from app.services.networking import set_user_network, user_network_state
 from app.services.queue import publish_job
+from app.services.risex_order_preparation import assert_risex_environment_allowed
 from app.services.reconcile import master_snapshot, reconcile_user
 from app.security.risex_authorization_session import (
     RISExAuthorizationSessionEvidence,
     collect_authorization_session_evidence,
 )
 from app.security.risex_deployment_preflight import evaluate_pinned_deployment_preflight
+from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
 from app.security.risex_deployment_runtime import (
     PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
     RISExReadOnlyRPCTransport,
@@ -100,6 +104,77 @@ async def _verify_risex_signer_binding(
     if evidence.perps_permission is not True:
         raise RuntimeError('RISEx signer lacks required Perps permission')
     return evidence
+
+
+@dataclass(frozen=True, slots=True)
+class _RISExCredentialBinding:
+    account_id: uuid.UUID
+    credential_id: uuid.UUID
+    account_address: str
+    signer_address: str
+    generation: int
+    status: CredentialStatus
+    expires_at: datetime | None
+
+
+async def _risex_credential_binding(
+    db: AsyncSession,
+    user_id: uuid.UUID,
+    *,
+    for_update: bool = False,
+) -> _RISExCredentialBinding | None:
+    stmt = (
+        select(
+            RISExTradingAccount.id.label('account_id'),
+            RISExSigningCredential.id.label('credential_id'),
+            RISExTradingAccount.account_address.label('account_address'),
+            RISExSigningCredential.signer_address.label('signer_address'),
+            RISExSigningCredential.generation.label('generation'),
+            RISExSigningCredential.status.label('status'),
+            RISExSigningCredential.expires_at.label('expires_at'),
+        )
+        .join(
+            RISExSigningCredential,
+            RISExSigningCredential.risex_trading_account_id == RISExTradingAccount.id,
+        )
+        .where(RISExTradingAccount.user_id == user_id)
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+    row = (await db.execute(stmt)).mappings().one_or_none()
+    if row is None:
+        return None
+    return _RISExCredentialBinding(
+        account_id=row['account_id'],
+        credential_id=row['credential_id'],
+        account_address=str(row['account_address']),
+        signer_address=str(row['signer_address']),
+        generation=int(row['generation']),
+        status=row['status'],
+        expires_at=row['expires_at'],
+    )
+
+
+def _require_usable_risex_credential(binding: _RISExCredentialBinding) -> None:
+    if binding.status not in {CredentialStatus.ACTIVE, CredentialStatus.EXPIRING}:
+        raise HTTPException(409, 'RISEx credential is not active')
+    if binding.expires_at is None or binding.expires_at <= datetime.now(UTC):
+        raise HTTPException(409, 'RISEx credential is expired or has no verifiable expiry')
+
+
+def _same_risex_binding(
+    before: _RISExCredentialBinding,
+    after: _RISExCredentialBinding,
+) -> bool:
+    return (
+        before.account_id == after.account_id
+        and before.credential_id == after.credential_id
+        and before.account_address.lower() == after.account_address.lower()
+        and before.signer_address.lower() == after.signer_address.lower()
+        and before.generation == after.generation
+        and before.status == after.status
+        and before.expires_at == after.expires_at
+    )
 
 
 router = APIRouter(tags=['user'])
@@ -290,6 +365,74 @@ async def trading_provider(body: TradingProviderIn, user: User = Depends(current
         current_network = current_row['execution_network']
         current_epoch_id = None
 
+    risex_binding: _RISExCredentialBinding | None = None
+    if body.provider == 'risex':
+        try:
+            assert_risex_environment_allowed(
+                network=current_network,
+                env=os.environ,
+            )
+        except SignedTestnetBlocked as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+        snapshot = await _risex_credential_binding(db, user.id)
+        if snapshot is None:
+            raise HTTPException(409, 'Connect and verify a RISEx credential before selecting RISEx')
+        _require_usable_risex_credential(snapshot)
+
+        try:
+            await _verify_risex_signer_binding(
+                account_address=snapshot.account_address,
+                signer_address=snapshot.signer_address,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                409,
+                'RISEx account/signer authorization could not be verified',
+            ) from exc
+
+        # Do not hold the user row lock across the live provider read above.
+        # From this point through destination creation, serialize credential
+        # rotation and provider switching, then force a fresh locked reread.
+        await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+        locked_binding = await _risex_credential_binding(
+            db,
+            user.id,
+            for_update=True,
+        )
+        if locked_binding is None or not _same_risex_binding(snapshot, locked_binding):
+            raise HTTPException(
+                409,
+                'RISEx credential changed during verification; retry with the current binding',
+            )
+        _require_usable_risex_credential(locked_binding)
+        risex_binding = locked_binding
+
+        if current_provider == 'risex':
+            if current_epoch_id is None:
+                raise HTTPException(409, 'RISEx destination has no active execution epoch')
+            epoch_binding = (
+                await db.execute(
+                    text(
+                        'SELECT account_address, credential_version '
+                        'FROM execution_epochs WHERE id = :epoch_id AND ended_at IS NULL'
+                    ),
+                    {'epoch_id': current_epoch_id},
+                )
+            ).mappings().one_or_none()
+            if (
+                epoch_binding is None
+                or not epoch_binding['account_address']
+                or str(epoch_binding['account_address']).lower()
+                != locked_binding.account_address.lower()
+                or epoch_binding['credential_version'] != locked_binding.generation
+            ):
+                raise HTTPException(
+                    409,
+                    'Active RISEx epoch does not match the verified current credential',
+                )
+            return await _serialize_user(db, user)
+
     if body.provider == current_provider:
         return await _serialize_user(db, user)
 
@@ -303,6 +446,8 @@ async def trading_provider(body: TradingProviderIn, user: User = Depends(current
             user.id,
             provider=body.provider,
             network=current_network,
+            account_address=risex_binding.account_address if risex_binding else None,
+            credential_version=risex_binding.generation if risex_binding else None,
         )
     except DestinationSwitchBlocked as exc:
         blockers = [
@@ -350,7 +495,6 @@ async def trading_provider(body: TradingProviderIn, user: User = Depends(current
     )
     await db.commit()
     return await _serialize_user(db, user)
-
 
 @router.get('/dashboard')
 async def dashboard(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
@@ -690,6 +834,20 @@ async def link_risex_trading_account(
 ):
     _require_follower_user(user)
 
+    admission_network = (
+        await db.execute(
+            text('SELECT execution_network FROM users WHERE id = :user_id'),
+            {'user_id': user.id},
+        )
+    ).scalar_one()
+    try:
+        assert_risex_environment_allowed(
+            network=admission_network,
+            env=os.environ,
+        )
+    except SignedTestnetBlocked as exc:
+        raise HTTPException(409, str(exc)) from exc
+
     try:
         account_address = normalize_address(body.account_address)
         authenticated_wallet = normalize_address(user.auth_wallet)
@@ -731,6 +889,8 @@ async def link_risex_trading_account(
     # user_network_state() may bootstrap a missing execution epoch, so call it only
     # after every 422-producing credential check has succeeded.
     network = (await user_network_state(db, user.id)).network
+    if network != admission_network:
+        raise HTTPException(409, 'Execution network changed during RISEx verification')
     if network != 'testnet':
         raise HTTPException(
             409,
@@ -738,6 +898,14 @@ async def link_risex_trading_account(
         )
 
     await db.execute(select(User).where(User.id == user.id).with_for_update())
+    locked_network = (
+        await db.execute(
+            text('SELECT execution_network FROM users WHERE id = :user_id'),
+            {'user_id': user.id},
+        )
+    ).scalar_one()
+    if locked_network != admission_network:
+        raise HTTPException(409, 'Execution network changed during RISEx verification')
 
     shared_account_owner = (
         await db.execute(
