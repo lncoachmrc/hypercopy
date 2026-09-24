@@ -894,13 +894,21 @@ No user with real capital may enter RISEx mainnet until the RISEx-to-Hyperliquid
 
 A RISEx-to-Hyperliquid exit is always an explicit user action. It must never be an automatic fallback after an incident, outage or unreadable provider state. The exit does not migrate collateral or positions between venues and remains subject to every provider-switch invariant listed above.
 
-#### G2 — bound RISEx epoch with no activity
+#### G2 — bound RISEx epoch with no TRAXION activity
 
-For RISEx only, TRAXION may allow an exit without any RISEx provider read when the source RISEx epoch has **zero `Execution` rows in every state**.
+G2 applies when the source RISEx epoch has **zero `Execution` rows in every state**.
 
-This rule is intentionally narrower than `NEVER_ACTIVATED` and does not change Hyperliquid semantics. A Hyperliquid epoch with a non-NULL `account_address` remains activated even when it has no `Execution` rows.
+Because RISEx `Execution` is durably persisted before the signed provider POST, zero `Execution` proves that TRAXION has never submitted an order on that epoch. There is therefore no TRAXION submission ambiguity to reconcile, and G2 does not depend on 4C. This is the distinction between G2 and G3.
 
-The zero-`Execution` check and closure of the source epoch must be serialized against creation of `Execution` rows for that same epoch. No `Execution` may become associated with the source epoch after the zero-row check and before the epoch is closed. A concurrency test must prove this invariant.
+Zero `Execution` does **not** prove that the RISEx account is flat. The RISEx account is the user's authenticated wallet and may be used outside TRAXION.
+
+Exit therefore requires fresh reads from verified RISEx endpoints establishing that the exact source account has zero positions and zero open or conditional orders. This is consistent with the §11 provider-switch invariants and with the existing Hyperliquid path, which verifies provider-side positions and open/conditional orders from fresh provider reads.
+
+Any indeterminate provider state blocks the exit, including an error, timeout, or internally inconsistent data.
+
+TRAXION-generated activity must be excluded by serialization: no `Execution` may become associated with the source epoch after the zero-`Execution` check and provider-state verification and before the epoch is closed. A concurrency test must prove this invariant.
+
+Out-of-TRAXION activity after the fresh provider read cannot be prevented by TRAXION. The read establishes flatness only at the time it is observed; the exit therefore relies on the freshest verified provider state available within the serialized switch operation and fails closed if that verification cannot be established.
 
 #### G3 — RISEx epoch with activity
 
