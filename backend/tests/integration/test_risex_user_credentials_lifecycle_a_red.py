@@ -5,7 +5,6 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
-import pytest_asyncio
 from eth_account import Account
 from fastapi import HTTPException
 from sqlalchemy import select, text
@@ -23,13 +22,6 @@ pytestmark = pytest.mark.skipif(
     os.getenv("RUN_INTEGRATION") != "1",
     reason="requires CI PostgreSQL",
 )
-
-
-@pytest_asyncio.fixture(autouse=True, loop_scope="module")
-async def _dispose_pool_after_test():
-    """Keep this module on one loop and never share pooled asyncpg connections between tests."""
-    yield
-    await engine.dispose()
 
 
 MAIN_PRIVATE_KEY = "11" * 32
@@ -161,7 +153,7 @@ async def _risex_counts(db, user_id: uuid.UUID) -> tuple[int, int]:
     return int(accounts), int(credentials)
 
 
-@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.asyncio
 async def test_account_must_equal_authenticated_siwe_wallet_before_crypto_or_persistence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -203,9 +195,10 @@ async def test_account_must_equal_authenticated_siwe_wallet_before_crypto_or_per
             assert epoch_count == 0
         finally:
             await _cleanup_user(db, user.id)
+            await engine.dispose()
 
 
-@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.asyncio
 async def test_main_wallet_private_key_is_rejected_before_provider_io_and_encryption(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -240,9 +233,10 @@ async def test_main_wallet_private_key_is_rejected_before_provider_io_and_encryp
             assert await _risex_counts(db, user.id) == (0, 0)
         finally:
             await _cleanup_user(db, user.id)
+            await engine.dispose()
 
 
-@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("session_active", "session_not_expired", "perps_permission"),
     [
@@ -290,9 +284,10 @@ async def test_onchain_binding_failures_are_fail_closed_before_crypto_or_persist
             assert await _risex_counts(db, user.id) == (0, 0)
         finally:
             await _cleanup_user(db, user.id)
+            await engine.dispose()
 
 
-@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.asyncio
 async def test_success_encrypts_with_record_aad_and_binds_epoch_to_logical_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -367,9 +362,10 @@ async def test_success_encrypts_with_record_aad_and_binds_epoch_to_logical_gener
             assert SIGNER_1.address.lower() in verification_call
         finally:
             await _cleanup_user(db, user.id)
+            await engine.dispose()
 
 
-@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.asyncio
 async def test_encryption_failure_leaves_no_account_credential_or_epoch_partial_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -402,9 +398,10 @@ async def test_encryption_failure_leaves_no_account_credential_or_epoch_partial_
             assert epoch_count == 0
         finally:
             await _cleanup_user(db, user_id)
+            await engine.dispose()
 
 
-@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.asyncio
 async def test_rotation_increments_logical_generation_and_rejects_old_epoch_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -500,3 +497,4 @@ async def test_rotation_increments_logical_generation_and_rejects_old_epoch_job(
             assert await job_matches_active_destination(db, job) is False
         finally:
             await _cleanup_user(db, user.id)
+            await engine.dispose()
