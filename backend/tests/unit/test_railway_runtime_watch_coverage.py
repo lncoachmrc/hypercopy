@@ -132,7 +132,7 @@ def _repository_path(path: Path) -> str:
     return "/backend/" + path.relative_to(BACKEND_ROOT).as_posix()
 
 
-def _covered(repository_path: str, patterns: list[str]) -> bool:
+def watch_pattern_covers_path(repository_path: str, patterns: list[str]) -> bool:
     for pattern in patterns:
         if pattern.endswith("/**"):
             if repository_path.startswith(pattern[:-2]):
@@ -160,7 +160,7 @@ def test_runtime_import_graph_is_covered_by_railway_watch_patterns(
     uncovered = sorted(
         _repository_path(module.path)
         for module in modules.values()
-        if not _covered(_repository_path(module.path), patterns)
+        if not watch_pattern_covers_path(_repository_path(module.path), patterns)
     )
 
     assert uncovered == [], (
