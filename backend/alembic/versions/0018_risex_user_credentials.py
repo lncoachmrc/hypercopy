@@ -111,7 +111,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(
-        "ix_risex_signing_credentials_account_id",
+        "ix_risex_signing_credentials_risex_trading_account_id",
         "risex_signing_credentials",
         ["risex_trading_account_id"],
         unique=True,
@@ -150,7 +150,7 @@ def downgrade() -> None:
         table_name="risex_signing_credentials",
     )
     op.drop_index(
-        "ix_risex_signing_credentials_account_id",
+        "ix_risex_signing_credentials_risex_trading_account_id",
         table_name="risex_signing_credentials",
     )
     op.drop_table("risex_signing_credentials")
