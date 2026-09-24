@@ -35,6 +35,11 @@ class TradingAccountIn(BaseModel):
     agent_private_key: str = Field(min_length=32, max_length=100)
 
 
+class RISExTradingAccountIn(BaseModel):
+    account_address: str = Field(min_length=42, max_length=42)
+    signer_private_key: str = Field(min_length=64, max_length=66)
+
+
 class RiskProfileIn(BaseModel):
     multiplier: Decimal = Field(default=Decimal('1'), gt=0, le=10)
     max_notional_per_trade: Decimal = Field(default=Decimal('1000'), gt=0)
