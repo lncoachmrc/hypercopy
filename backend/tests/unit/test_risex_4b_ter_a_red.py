@@ -5,6 +5,9 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+
 from app.db import schema as db_schema
 from app.models.entities import Execution
 from app.services import risex_copy_execution
@@ -23,9 +26,11 @@ def test_execution_model_persists_risex_nonce_identity() -> None:
 
 
 def test_schema_head_and_release_preflight_preserve_0015_nonce_migration() -> None:
-    assert db_schema.EXPECTED_REVISION == "0017_master_event_causal_order", (
-        "schema head must match the current additive migration chain"
-    )
+    backend_root = Path(__file__).resolve().parents[2]
+    alembic_config = Config(str(backend_root / "alembic.ini"))
+    alembic_config.set_main_option("script_location", str(backend_root / "alembic"))
+    actual_head = ScriptDirectory.from_config(alembic_config).get_current_head()
+    assert db_schema.EXPECTED_REVISION == actual_head
 
     repo_root = Path(__file__).resolve().parents[3]
     migration = (
