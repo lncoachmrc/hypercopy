@@ -246,7 +246,7 @@ async def test_put_risex_uses_verified_account_and_logical_generation(
         "ADR_0006_MAINNET_GATE_ACCEPTED",
         False,
     )
-    _set_live_env(monkeypatch, "false")
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     observed: dict = {}
     _stub_flat_hyperliquid(monkeypatch, observed)
     _stub_valid_risex_verification(monkeypatch, observed)
@@ -314,7 +314,7 @@ async def test_put_risex_without_linked_credential_is_409_and_keeps_source_epoch
         "ADR_0006_MAINNET_GATE_ACCEPTED",
         False,
     )
-    _set_live_env(monkeypatch, "false")
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     observed: dict = {}
     _stub_flat_hyperliquid(monkeypatch, observed)
 
@@ -363,7 +363,7 @@ async def test_put_risex_rejects_nonusable_credential_status(
         "ADR_0006_MAINNET_GATE_ACCEPTED",
         False,
     )
-    _set_live_env(monkeypatch, "false")
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     observed: dict = {}
     _stub_flat_hyperliquid(monkeypatch, observed)
     _stub_valid_risex_verification(monkeypatch, observed)
@@ -404,7 +404,7 @@ async def test_put_risex_rejects_expired_timestamp_even_if_status_is_active(
         "ADR_0006_MAINNET_GATE_ACCEPTED",
         False,
     )
-    _set_live_env(monkeypatch, "false")
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     observed: dict = {}
     _stub_flat_hyperliquid(monkeypatch, observed)
     _stub_valid_risex_verification(monkeypatch, observed)
@@ -445,7 +445,7 @@ async def test_put_risex_fails_closed_when_live_binding_cannot_be_verified(
         "ADR_0006_MAINNET_GATE_ACCEPTED",
         False,
     )
-    _set_live_env(monkeypatch, "false")
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     observed: dict = {}
     _stub_flat_hyperliquid(monkeypatch, observed)
 
@@ -620,7 +620,7 @@ async def test_put_risex_detects_concurrent_credential_rotation_after_live_verif
         "ADR_0006_MAINNET_GATE_ACCEPTED",
         False,
     )
-    _set_live_env(monkeypatch, "false")
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     observed: dict = {}
     _stub_flat_hyperliquid(monkeypatch, observed)
 
@@ -706,7 +706,7 @@ async def test_put_risex_idempotent_path_reverifies_active_credential(
         "ADR_0006_MAINNET_GATE_ACCEPTED",
         False,
     )
-    _set_live_env(monkeypatch, "false")
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     observed: dict = {}
     _stub_valid_risex_verification(monkeypatch, observed)
 
@@ -741,7 +741,7 @@ async def test_put_risex_idempotent_path_rejects_revoked_credential(
         "ADR_0006_MAINNET_GATE_ACCEPTED",
         False,
     )
-    _set_live_env(monkeypatch, "false")
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     observed: dict = {}
     _stub_valid_risex_verification(monkeypatch, observed)
 
@@ -815,7 +815,7 @@ async def test_put_risex_rejects_low_level_identity_evidence_mismatch(
         "ADR_0006_MAINNET_GATE_ACCEPTED",
         False,
     )
-    _set_live_env(monkeypatch, "false")
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     observed: dict = {}
     _stub_flat_hyperliquid(monkeypatch, observed)
 
