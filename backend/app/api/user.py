@@ -689,12 +689,6 @@ async def link_risex_trading_account(
     db: AsyncSession = Depends(get_db),
 ):
     _require_follower_user(user)
-    network = (await user_network_state(db, user.id)).network
-    if network != 'testnet':
-        raise HTTPException(
-            409,
-            'RISEx credential onboarding remains testnet-only until the mainnet gate is accepted',
-        )
 
     try:
         account_address = normalize_address(body.account_address)
@@ -731,6 +725,16 @@ async def link_risex_trading_account(
         raise HTTPException(
             422,
             'RISEx signer authorization is inactive, expired, or lacks Perps permission',
+        )
+
+    # Validation and provider verification above are deliberately side-effect free.
+    # user_network_state() may bootstrap a missing execution epoch, so call it only
+    # after every 422-producing credential check has succeeded.
+    network = (await user_network_state(db, user.id)).network
+    if network != 'testnet':
+        raise HTTPException(
+            409,
+            'RISEx credential onboarding remains testnet-only until the mainnet gate is accepted',
         )
 
     await db.execute(select(User).where(User.id == user.id).with_for_update())
