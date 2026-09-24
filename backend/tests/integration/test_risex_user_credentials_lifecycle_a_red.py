@@ -11,7 +11,7 @@ from sqlalchemy import select, text
 from starlette.requests import Request
 
 from app.api import user as user_api
-from app.db.session import SessionLocal, engine
+from app.db.session import SessionLocal
 from app.models import entities
 from app.models.entities import CopyJob, JobState, User
 from app.schemas import user as user_schemas
@@ -49,8 +49,13 @@ def _request() -> Request:
     return Request({"type": "http", "client": ("127.0.0.1", 12345), "headers": []})
 
 
-async def _insert_user(db, *, wallet: str = MAIN_ACCOUNT.address.lower()) -> User:
+def _unique_wallet() -> str:
+    return "0x" + uuid.uuid4().hex + uuid.uuid4().hex[:8]
+
+
+async def _insert_user(db, *, wallet: str | None = None) -> User:
     user_id = uuid.uuid4()
+    wallet = wallet or _unique_wallet()
     await db.execute(
         text(
             """
@@ -71,13 +76,10 @@ async def _insert_user(db, *, wallet: str = MAIN_ACCOUNT.address.lower()) -> Use
 
 
 async def _cleanup_user(db, user_id: uuid.UUID) -> None:
+    # Integration PostgreSQL is ephemeral. Keep committed users/audit history in
+    # place instead of deleting across the append-only audit trigger boundary.
+    del user_id
     await db.rollback()
-    await db.execute(
-        text("UPDATE users SET active_execution_epoch_id = NULL WHERE id = :user_id"),
-        {"user_id": user_id},
-    )
-    await db.execute(text("DELETE FROM users WHERE id = :user_id"), {"user_id": user_id})
-    await db.commit()
 
 
 def _valid_evidence(account: str, signer: str) -> SimpleNamespace:
@@ -195,7 +197,6 @@ async def test_account_must_equal_authenticated_siwe_wallet_before_crypto_or_per
             assert epoch_count == 0
         finally:
             await _cleanup_user(db, user.id)
-            await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -217,7 +218,7 @@ async def test_main_wallet_private_key_is_rejected_before_provider_io_and_encryp
     _stub_crypto(monkeypatch, observed)
 
     async with SessionLocal() as db:
-        user = await _insert_user(db)
+        user = await _insert_user(db, wallet=MAIN_ACCOUNT.address.lower())
         try:
             body = schema.model_validate(
                 {
@@ -233,7 +234,6 @@ async def test_main_wallet_private_key_is_rejected_before_provider_io_and_encryp
             assert await _risex_counts(db, user.id) == (0, 0)
         finally:
             await _cleanup_user(db, user.id)
-            await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -284,7 +284,6 @@ async def test_onchain_binding_failures_are_fail_closed_before_crypto_or_persist
             assert await _risex_counts(db, user.id) == (0, 0)
         finally:
             await _cleanup_user(db, user.id)
-            await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -362,7 +361,6 @@ async def test_success_encrypts_with_record_aad_and_binds_epoch_to_logical_gener
             assert SIGNER_1.address.lower() in verification_call
         finally:
             await _cleanup_user(db, user.id)
-            await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -397,7 +395,6 @@ async def test_encryption_failure_leaves_no_account_credential_or_epoch_partial_
             assert epoch_count == 0
         finally:
             await _cleanup_user(db, user.id)
-            await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -496,4 +493,3 @@ async def test_rotation_increments_logical_generation_and_rejects_old_epoch_job(
             assert await job_matches_active_destination(db, job) is False
         finally:
             await _cleanup_user(db, user.id)
-            await engine.dispose()
