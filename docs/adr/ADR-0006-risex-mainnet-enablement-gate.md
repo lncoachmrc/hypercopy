@@ -908,7 +908,7 @@ Any indeterminate provider state blocks the exit, including an error, timeout, o
 
 TRAXION-generated activity must be excluded by serialization: no `Execution` may become associated with the source epoch after the zero-`Execution` check and provider-state verification and before the epoch is closed. A concurrency test must prove this invariant.
 
-Out-of-TRAXION activity after the fresh provider read cannot be prevented by TRAXION. The read establishes flatness only at the time it is observed; the exit therefore relies on the freshest verified provider state available within the serialized switch operation and fails closed if that verification cannot be established.
+Out-of-TRAXION activity after the fresh provider read cannot be prevented by TRAXION. The read establishes flatness only at the time it is observed. G2 requires the fresh RISEx read performed inside that same serialized switch operation; an earlier or cached read never satisfies G2. If that fresh read cannot establish the required provider state, the exit fails closed. This is the same temporal limitation as the Hyperliquid switch path.
 
 #### G3 — RISEx epoch with activity
 
@@ -927,6 +927,7 @@ Implementing G2 changes `backend/app/services/destination_switch.py` and therefo
 The following remain out of scope for this gate:
 
 - retaining the Hyperliquid `TradingAccount` when changing execution provider; that is a separate design decision;
+- whether RISEx entry must require a flat account; out-of-band positions at entry are a separate decision;
 - any change to Hyperliquid safe-switch or activation rules.
 
 ## 12. Evidence package required for `Accepted`
@@ -949,7 +950,7 @@ At minimum the review must be able to verify:
 | Post-revoke | behavioral PASS |
 | 4B-bis | complete |
 | 4C reconciliation | complete |
-| G2 — unused bound RISEx epoch safe exit | PASS; zero-`Execution` proof serialized against `Execution` creation |
+| G2 — unused bound RISEx epoch safe exit | PASS; fresh verified RISEx reads show zero positions and zero open/conditional orders for the exact source account; indeterminate state blocked; zero-`Execution` and provider-state verification serialized against `Execution` creation |
 | G3 — active RISEx epoch safe exit | PASS; verified zero positions/orders, indeterminate state blocked, 4C ambiguity resolved |
 | G4 — RISEx-to-Hyperliquid testnet E2E | PASS with reproducible enter → order → close → exit evidence |
 | Ambiguity resolution | proven fail-closed |
