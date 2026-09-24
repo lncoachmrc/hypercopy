@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -19,6 +22,8 @@ from app.models.entities import (
     CredentialStatus,
     JobState,
     PositionLedger,
+    RISExSigningCredential,
+    RISExTradingAccount,
     RiskState,
     SigningCredential,
     TradingAccount,
@@ -130,6 +135,79 @@ async def _activate_hyperliquid_user(user_id: uuid.UUID):
         return destination
 
 
+async def _add_valid_risex_credential(db, user: User) -> None:
+    account = RISExTradingAccount(
+        user_id=user.id,
+        account_address=user.auth_wallet.lower(),
+    )
+    db.add(account)
+    await db.flush()
+    db.add(
+        RISExSigningCredential(
+            risex_trading_account_id=account.id,
+            signer_address='0x'
+            + hashlib.sha256(user.id.bytes + b'provider-selection-risex').hexdigest()[:40],
+            ciphertext_b64='risex-ciphertext',
+            nonce_b64='risex-nonce',
+            wrapped_dek_b64='risex-wrapped',
+            wrap_nonce_b64='risex-wrapnonce',
+            key_provider='test',
+            key_reference='risex-test-key',
+            key_version=91,
+            generation=4,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+            status=CredentialStatus.ACTIVE,
+        )
+    )
+    await db.commit()
+
+
+def _stub_valid_risex_onchain_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _AsyncContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, _exc_type, _exc, _tb):
+            return False
+
+    monkeypatch.setattr(
+        user_api,
+        'RISExReadOnlyHTTPTransport',
+        lambda **_kwargs: _AsyncContext(),
+    )
+    monkeypatch.setattr(
+        user_api,
+        'RISExReadOnlyRPCTransport',
+        lambda **_kwargs: _AsyncContext(),
+    )
+
+    async def collect_runtime(*_args, **_kwargs):
+        return SimpleNamespace(
+            domain_verifying_contract='0x' + ('77' * 20),
+            block_number=1,
+        )
+
+    def evaluate_preflight(*_args, **_kwargs):
+        return SimpleNamespace(
+            verdict='PASS',
+            deployment_identity_verified=True,
+        )
+
+    async def collect_authorization(*_args, **kwargs):
+        return SimpleNamespace(
+            account=str(kwargs['account']),
+            signer=str(kwargs['signer']),
+            session_active=True,
+            session_not_expired=True,
+            perps_permission=True,
+            move_fund_permission=True,
+        )
+
+    monkeypatch.setattr(user_api, 'collect_runtime_deployment_evidence', collect_runtime)
+    monkeypatch.setattr(user_api, 'evaluate_pinned_deployment_preflight', evaluate_preflight)
+    monkeypatch.setattr(user_api, 'collect_authorization_session_evidence', collect_authorization)
+
+
 @pytest.mark.asyncio
 async def test_first_login_destination_default_remains_hyperliquid() -> None:
     user_id = await _insert_user()
@@ -145,7 +223,11 @@ async def test_first_login_destination_default_remains_hyperliquid() -> None:
 
 
 @pytest.mark.asyncio
-async def test_never_activated_hyperliquid_switches_to_risex_in_new_epoch() -> None:
+async def test_never_activated_hyperliquid_switches_to_risex_in_new_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENABLE_LIVE_TRADING', 'false')
+    _stub_valid_risex_onchain_evidence(monkeypatch)
     user_id = await _insert_user()
     try:
         first = await _bootstrap_hyperliquid(user_id)
@@ -154,6 +236,7 @@ async def test_never_activated_hyperliquid_switches_to_risex_in_new_epoch() -> N
             assert user is not None
             db.add(RiskState(user_id=user_id))
             await db.commit()
+            await _add_valid_risex_credential(db, user)
 
             payload = await _call_provider(db, user, 'risex')
             current = await user_destination_state(db, user_id)
@@ -205,7 +288,11 @@ async def test_never_activated_hyperliquid_switches_to_risex_in_new_epoch() -> N
 
 
 @pytest.mark.asyncio
-async def test_provider_selection_is_owner_scoped() -> None:
+async def test_provider_selection_is_owner_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENABLE_LIVE_TRADING', 'false')
+    _stub_valid_risex_onchain_evidence(monkeypatch)
     user_a = await _insert_user()
     user_b = await _insert_user()
     try:
@@ -214,6 +301,7 @@ async def test_provider_selection_is_owner_scoped() -> None:
         async with SessionLocal() as db:
             actor = await db.get(User, user_a)
             assert actor is not None
+            await _add_valid_risex_credential(db, actor)
             payload = await _call_provider(db, actor, 'risex')
             state_a = await user_destination_state(db, user_a)
             state_b = await user_destination_state(db, user_b)
@@ -260,13 +348,18 @@ async def test_same_provider_is_idempotent_and_does_not_rotate_epoch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_central_switch_block_is_translated_to_structured_409_without_epoch_mutation() -> None:
+async def test_central_switch_block_is_translated_to_structured_409_without_epoch_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENABLE_LIVE_TRADING', 'false')
+    _stub_valid_risex_onchain_evidence(monkeypatch)
     user_id = await _insert_user(copy_state=CopyState.ACTIVE)
     try:
         first = await _bootstrap_hyperliquid(user_id)
         async with SessionLocal() as db:
             user = await db.get(User, user_id)
             assert user is not None
+            await _add_valid_risex_credential(db, user)
             with pytest.raises(HTTPException) as exc_info:
                 await _call_provider(db, user, 'risex')
             await db.rollback()
@@ -313,6 +406,8 @@ async def test_serialization_reports_canonical_provider_and_local_readiness_with
 async def test_activated_flat_hyperliquid_switches_to_risex_then_cleans_provider_local_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv('ENABLE_LIVE_TRADING', 'false')
+    _stub_valid_risex_onchain_evidence(monkeypatch)
     async def provider_state(*_args, **_kwargs):
         return {'assetPositions': []}
 
@@ -340,6 +435,7 @@ async def test_activated_flat_hyperliquid_switches_to_risex_then_cleans_provider
             await db.commit()
             user = await db.get(User, user_id)
             assert user is not None
+            await _add_valid_risex_credential(db, user)
 
             payload = await _call_provider(db, user, 'risex')
             current = await user_destination_state(db, user_id)
@@ -489,7 +585,11 @@ async def test_never_activated_risex_can_switch_back_to_hyperliquid() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pre_switch_terminal_job_is_stale_after_provider_switch() -> None:
+async def test_pre_switch_terminal_job_is_stale_after_provider_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENABLE_LIVE_TRADING', 'false')
+    _stub_valid_risex_onchain_evidence(monkeypatch)
     user_id = await _insert_user()
     try:
         first = await _bootstrap_hyperliquid(user_id)
@@ -511,6 +611,7 @@ async def test_pre_switch_terminal_job_is_stale_after_provider_switch() -> None:
 
             user = await db.get(User, user_id)
             assert user is not None
+            await _add_valid_risex_credential(db, user)
             await _call_provider(db, user, 'risex')
             assert await job_matches_active_destination(db, job) is False
             current = await user_destination_state(db, user_id)
