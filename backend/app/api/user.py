@@ -9,8 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from eth_account import Account
+
 from app.adapters.hyperliquid import HyperliquidAdapter
 from app.adapters.ratelimit import Budget, WeightedRateLimiter
+from app.adapters.risex_http import RISExReadOnlyHTTPTransport
 from app.api.deps import current_user, require_csrf
 from app.core.config import Network, settings
 from app.core.crypto import crypto
@@ -19,8 +22,10 @@ from app.db.redis import redis_client
 from app.db.session import get_db
 from app.engine.sizing import EXCHANGE_MIN_NOTIONAL
 from app.models.entities import AIProfitExitDecision, CopyJob, CopyState, CredentialStatus, Execution, ExecutionState, JobState, MasterEvent, PositionLedger, RiskHalt, RiskProfile, RiskState, SigningCredential, TradingAccount, User
+from app.models.entities import RISExSigningCredential, RISExTradingAccount
 from app.schemas.trading import ClosePositionsIn
 from app.schemas.user import RiskProfileIn, TradingAccountIn, TradingNetworkIn, TradingProviderIn
+from app.schemas.user import RISExTradingAccountIn
 from app.services.audit import audit
 from app.services.destination_switch import DestinationSwitchBlocked, destination_switch_blockers
 from app.services.entitlement import entitlement
@@ -38,6 +43,16 @@ from app.services.metrics import dashboard_for_user
 from app.services.networking import set_user_network, user_network_state
 from app.services.queue import publish_job
 from app.services.reconcile import master_snapshot, reconcile_user
+from app.security.risex_authorization_session import (
+    RISExAuthorizationSessionEvidence,
+    collect_authorization_session_evidence,
+)
+from app.security.risex_deployment_preflight import evaluate_pinned_deployment_preflight
+from app.security.risex_deployment_runtime import (
+    PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
+    RISExReadOnlyRPCTransport,
+    collect_runtime_deployment_evidence,
+)
 
 router = APIRouter(tags=['user'])
 
