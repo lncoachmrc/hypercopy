@@ -27,9 +27,13 @@ pytestmark = pytest.mark.skipif(
 MAIN_PRIVATE_KEY = "11" * 32
 SIGNER_PRIVATE_KEY_1 = "22" * 32
 SIGNER_PRIVATE_KEY_2 = "33" * 32
+SIGNER_PRIVATE_KEY_3 = "44" * 32
+SIGNER_PRIVATE_KEY_4 = "55" * 32
 MAIN_ACCOUNT = Account.from_key(MAIN_PRIVATE_KEY)
 SIGNER_1 = Account.from_key(SIGNER_PRIVATE_KEY_1)
 SIGNER_2 = Account.from_key(SIGNER_PRIVATE_KEY_2)
+SIGNER_3 = Account.from_key(SIGNER_PRIVATE_KEY_3)
+SIGNER_4 = Account.from_key(SIGNER_PRIVATE_KEY_4)
 
 
 def _require_contract():
@@ -71,7 +75,7 @@ async def _insert_user(db, *, wallet: str | None = None) -> User:
         ),
         {"user_id": user_id, "wallet": wallet},
     )
-    await db.flush()
+    await db.commit()
     return (await db.execute(select(User).where(User.id == user_id))).scalar_one()
 
 
@@ -97,17 +101,10 @@ def _stub_valid_verification(monkeypatch: pytest.MonkeyPatch, observed: dict) ->
     async def verify(*args, **kwargs):
         observed["verification_args"] = args
         observed["verification_kwargs"] = kwargs
-        flattened = " ".join(str(value) for value in (*args, *kwargs.values())).lower()
-        account = next(
-            (
-                value
-                for value in (MAIN_ACCOUNT.address.lower(),)
-                if value.lower() in flattened
-            ),
-            MAIN_ACCOUNT.address.lower(),
+        return _valid_evidence(
+            str(kwargs["account_address"]),
+            str(kwargs["signer_address"]),
         )
-        signer = SIGNER_2.address if SIGNER_2.address.lower() in flattened else SIGNER_1.address
-        return _valid_evidence(account, signer)
 
     monkeypatch.setattr(user_api, "_verify_risex_signer_binding", verify, raising=False)
 
@@ -412,7 +409,7 @@ async def test_rotation_increments_logical_generation_and_rejects_old_epoch_job(
             first_body = schema.model_validate(
                 {
                     "account_address": user.auth_wallet,
-                    "signer_private_key": SIGNER_PRIVATE_KEY_1,
+                    "signer_private_key": SIGNER_PRIVATE_KEY_3,
                 }
             )
             await endpoint(first_body, _request(), user, db)
@@ -454,7 +451,7 @@ async def test_rotation_increments_logical_generation_and_rejects_old_epoch_job(
             second_body = schema.model_validate(
                 {
                     "account_address": user.auth_wallet,
-                    "signer_private_key": SIGNER_PRIVATE_KEY_2,
+                    "signer_private_key": SIGNER_PRIVATE_KEY_4,
                 }
             )
             await endpoint(second_body, _request(), user, db)
@@ -478,7 +475,7 @@ async def test_rotation_increments_logical_generation_and_rejects_old_epoch_job(
             latest_credential = (
                 await db.execute(
                     select(credential_type)
-                    .where(credential_type.signer_address == SIGNER_2.address)
+                    .where(credential_type.signer_address == SIGNER_4.address)
                     .order_by(credential_type.generation.desc())
                 )
             ).scalars().first()
