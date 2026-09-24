@@ -886,6 +886,50 @@ Switching execution provider requires the existing provider-switch invariants:
 
 Provider switching never migrates collateral or positions.
 
+### G1. Safe exit from RISEx back to Hyperliquid is mandatory
+
+`_never_activated()` treats the user as activated once any Hyperliquid trading account, Hyperliquid signing credential, or historically bound execution epoch exists. The current `PUT /trading-provider` path binds a RISEx epoch to the verified RISEx account and credential generation, so that epoch no longer qualifies for `NEVER_ACTIVATED`. The switch assessment evaluates the persisted source provider, but the current activated-destination identity checks are Hyperliquid-specific: a bound RISEx source first fails when no matching `trading_accounts` identity exists and, even if that check were satisfied, fails because a non-Hyperliquid provider does not yet expose complete safe-switch read verification. Current RISEx entry is therefore operationally one-way.
+
+No user with real capital may enter RISEx mainnet until the RISEx-to-Hyperliquid exit path exists and is proven.
+
+A RISEx-to-Hyperliquid exit is always an explicit user action. It must never be an automatic fallback after an incident, outage or unreadable provider state. The exit does not migrate collateral or positions between venues and remains subject to every provider-switch invariant listed above.
+
+#### G2 — bound RISEx epoch with no TRAXION activity
+
+G2 applies when the source RISEx epoch has **zero `Execution` rows in every state**.
+
+Because RISEx `Execution` is durably persisted before the signed provider POST, zero `Execution` proves that TRAXION has never submitted an order on that epoch. There is therefore no TRAXION submission ambiguity to reconcile, and G2 does not depend on 4C. This is the distinction between G2 and G3.
+
+Zero `Execution` does **not** prove that the RISEx account is flat. The RISEx account is the user's authenticated wallet and may be used outside TRAXION.
+
+Exit therefore requires fresh reads from verified RISEx endpoints establishing that the exact source account has zero positions and zero open or conditional orders. This is consistent with the §11 provider-switch invariants and with the existing Hyperliquid path, which verifies provider-side positions and open/conditional orders from fresh provider reads.
+
+Any indeterminate provider state blocks the exit, including an error, timeout, or internally inconsistent data.
+
+TRAXION-generated activity must be excluded by serialization: no `Execution` may become associated with the source epoch after the zero-`Execution` check and provider-state verification and before the epoch is closed. A concurrency test must prove this invariant.
+
+Out-of-TRAXION activity after the fresh provider read cannot be prevented by TRAXION. The read establishes flatness only at the time it is observed. G2 requires the fresh RISEx read performed inside that same serialized switch operation; an earlier or cached read never satisfies G2. If that fresh read cannot establish the required provider state, the exit fails closed. This is the same temporal limitation as the Hyperliquid switch path.
+
+#### G3 — RISEx epoch with activity
+
+If the source RISEx epoch has any `Execution` row, exit is permitted only after fresh reads from verified RISEx endpoints establish that the exact source account has zero positions and zero open or conditional orders.
+
+Any indeterminate state blocks the exit, including provider error, timeout, an unresolved ambiguous execution, or internally inconsistent provider data. G3 depends on complete 4C reconciliation under §7, including resolution of ambiguous submissions through the persisted on-chain nonce evidence because `client_order_id` is not queryable from RISEx provider reads.
+
+#### G4 — testnet end-to-end exit proof
+
+Before RISEx mainnet can be enabled, testnet evidence must demonstrate the complete sequence: enter RISEx, submit an order, close the resulting provider position/order state, and exit explicitly back to Hyperliquid. The evidence must identify the source epoch, the relevant `Execution` record(s), the provider-state verification used by G3, and the successful destination transition.
+
+#### Implementation boundary and out of scope
+
+Implementing G2 changes `backend/app/services/destination_switch.py` and therefore requires a dedicated Pull Request for that central boundary. `test_bound_risex_epoch_cannot_switch_back_until_safe_exit_exists` must be updated deliberately in that implementation PR, not before it.
+
+The following remain out of scope for this gate:
+
+- retaining the Hyperliquid `TradingAccount` when changing execution provider; that is a separate design decision;
+- whether RISEx entry must require a flat account; out-of-band positions at entry are a separate decision;
+- any change to Hyperliquid safe-switch or activation rules.
+
 ## 12. Evidence package required for `Accepted`
 
 The Pull Request that changes this ADR from `Proposed` to `Accepted` must contain or link to reviewable evidence for every gate.
@@ -906,6 +950,9 @@ At minimum the review must be able to verify:
 | Post-revoke | behavioral PASS |
 | 4B-bis | complete |
 | 4C reconciliation | complete |
+| G2 — unused bound RISEx epoch safe exit | PASS; fresh verified RISEx reads show zero positions and zero open/conditional orders for the exact source account; indeterminate state blocked; zero-`Execution` and provider-state verification serialized against `Execution` creation |
+| G3 — active RISEx epoch safe exit | PASS; verified zero positions/orders, indeterminate state blocked, 4C ambiguity resolved |
+| G4 — RISEx-to-Hyperliquid testnet E2E | PASS with reproducible enter → order → close → exit evidence |
 | Ambiguity resolution | proven fail-closed |
 | Duplicate-order controls | PASS |
 | Kill switch exposure pause | PASS |
@@ -924,6 +971,7 @@ This ADR remains `Proposed` throughout:
 
 - 4B-bis implementation;
 - 4C implementation;
+- G2, G3 and G4 safe-exit implementation and evidence;
 - option-(c) monitor/enforcement implementation if needed;
 - replay live testing;
 - post-revoke testing;
@@ -931,7 +979,7 @@ This ADR remains `Proposed` throughout:
 - mainnet deployment investigation;
 - security audit remediation.
 
-It transitions to `Accepted` only in the PR whose explicit purpose is to enable RISEx mainnet and only if every mandatory gate above is already satisfied.
+It transitions to `Accepted` only in the PR whose explicit purpose is to enable RISEx mainnet and only if every mandatory gate above is already satisfied, including G2, G3 and G4.
 
 The acceptance PR must identify the exact:
 
@@ -957,6 +1005,7 @@ After mainnet activation, RISEx execution must return to BLOCKED if any of the f
 - a revoked signer successfully executes;
 - unresolved duplicate-order behavior is observed;
 - 4C cannot reconcile provider truth reliably;
+- the RISEx-to-Hyperliquid safe-exit path regresses, including a return permitted without the evidence required by G2/G3 or the exit path becoming unavailable;
 - a provider response ambiguity causes or risks blind resubmission;
 - kill switch does not prevent new writes within its verified operational bound;
 - mainnet network/account/deployment identity becomes uncertain;
