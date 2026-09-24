@@ -309,24 +309,20 @@ def assert_risex_execution_network_allowed(network: Network = 'testnet') -> Netw
     raise RuntimeError(f'Unsupported RISEx execution network: {network!r}')
 
 
-def assert_risex_worker_write_allowed(
+def assert_risex_environment_allowed(
     *,
     network: Network,
     env: Mapping[str, str],
 ) -> Network:
-    """Fail closed on environment identity before any RISEx worker signing.
+    """Fail closed on environment identity before RISEx user or worker admission.
 
-    ENABLE_LIVE_TRADING is parsed strictly: only the exact string 'false'
-    identifies an isolated test stack. Missing, empty, differently-cased or
-    malformed values are treated as a real-capital environment under ADR-0002.
+    Only the exact raw string 'false' identifies the isolated test stack.
+    Missing, empty, differently-cased or malformed ENABLE_LIVE_TRADING values
+    are treated as a real-capital/live environment.
     """
 
     if network not in {'testnet', 'mainnet'}:
         raise SignedTestnetBlocked(f'Unsupported RISEx execution network: {network!r}')
-    if env.get('RISEX_SIGNED_WRITES_ENABLED') != 'true':
-        raise SignedTestnetBlocked(
-            'RISEX_SIGNED_WRITES_ENABLED must be explicitly true for RISEx worker writes'
-        )
 
     isolated_test_stack = env.get('ENABLE_LIVE_TRADING') == 'false'
     if isolated_test_stack:
@@ -338,10 +334,24 @@ def assert_risex_worker_write_allowed(
 
     if ADR_0006_MAINNET_GATE_ACCEPTED is not True:
         raise SignedTestnetBlocked(
-            'ADR-0002 blocks RISEx signing in a real-capital/live environment '
+            'ADR-0002 blocks RISEx admission in a real-capital/live environment '
             'until ADR-0006 mainnet gate is accepted'
         )
     return network
+
+
+def assert_risex_worker_write_allowed(
+    *,
+    network: Network,
+    env: Mapping[str, str],
+) -> Network:
+    """Apply worker-only write opt-in on top of the shared RISEx admission gate."""
+
+    if env.get('RISEX_SIGNED_WRITES_ENABLED') != 'true':
+        raise SignedTestnetBlocked(
+            'RISEX_SIGNED_WRITES_ENABLED must be explicitly true for RISEx worker writes'
+        )
+    return assert_risex_environment_allowed(network=network, env=env)
 
 
 def assert_risex_plan_matches_intent(
