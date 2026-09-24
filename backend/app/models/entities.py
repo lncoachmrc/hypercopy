@@ -143,6 +143,85 @@ class SigningCredential(BaseUuid, Timestamped, Base):
     trading_account: Mapped[TradingAccount] = relationship(back_populates='credential')
 
 
+class RISExTradingAccount(BaseUuid, Timestamped, Base):
+    __tablename__ = 'risex_trading_accounts'
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey('users.id', ondelete='CASCADE'),
+        unique=True,
+        index=True,
+        nullable=False,
+    )
+    account_address: Mapped[str] = mapped_column(
+        String(42),
+        unique=True,
+        index=True,
+        nullable=False,
+    )
+    verified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    credential: Mapped['RISExSigningCredential | None'] = relationship(
+        back_populates='trading_account',
+        uselist=False,
+        cascade='all, delete-orphan',
+    )
+
+
+class RISExSigningCredential(BaseUuid, Timestamped, Base):
+    __tablename__ = 'risex_signing_credentials'
+    risex_trading_account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey('risex_trading_accounts.id', ondelete='CASCADE'),
+        unique=True,
+        index=True,
+        nullable=False,
+    )
+    signer_address: Mapped[str] = mapped_column(
+        String(42),
+        unique=True,
+        index=True,
+        nullable=False,
+    )
+    ciphertext_b64: Mapped[str] = mapped_column(Text, nullable=False)
+    nonce_b64: Mapped[str] = mapped_column(String(64), nullable=False)
+    wrapped_dek_b64: Mapped[str] = mapped_column(Text, nullable=False)
+    wrap_nonce_b64: Mapped[str | None] = mapped_column(String(64))
+    key_provider: Mapped[str] = mapped_column(String(24), nullable=False)
+    key_reference: Mapped[str] = mapped_column(String(255), nullable=False)
+    key_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    generation: Mapped[int] = mapped_column(
+        Integer,
+        default=1,
+        server_default='1',
+        nullable=False,
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        index=True,
+    )
+    status: Mapped[CredentialStatus] = mapped_column(
+        Enum(
+            CredentialStatus,
+            name='risex_credential_status_enum',
+            native_enum=False,
+            length=32,
+        ),
+        default=CredentialStatus.ACTIVE,
+        index=True,
+        nullable=False,
+    )
+    trading_account: Mapped[RISExTradingAccount] = relationship(
+        back_populates='credential',
+    )
+    __table_args__ = (
+        CheckConstraint(
+            'generation >= 1',
+            name='ck_risex_signing_credentials_generation_positive',
+        ),
+    )
+
+
 class RiskProfile(BaseUuid, Timestamped, Base):
     __tablename__ = 'risk_profiles'
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'), unique=True)
