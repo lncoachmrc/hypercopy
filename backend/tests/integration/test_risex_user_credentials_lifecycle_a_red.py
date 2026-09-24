@@ -37,6 +37,7 @@ SIGNER_PRIVATE_KEY_1 = "22" * 32
 SIGNER_PRIVATE_KEY_2 = "33" * 32
 SIGNER_PRIVATE_KEY_3 = "44" * 32
 SIGNER_PRIVATE_KEY_4 = "55" * 32
+SIGNER_PRIVATE_KEY_5 = "66" * 32
 MAIN_ACCOUNT = Account.from_key(MAIN_PRIVATE_KEY)
 SIGNER_1 = Account.from_key(SIGNER_PRIVATE_KEY_1)
 SIGNER_2 = Account.from_key(SIGNER_PRIVATE_KEY_2)
@@ -160,7 +161,7 @@ async def _risex_counts(db, user_id: uuid.UUID) -> tuple[int, int]:
     return int(accounts), int(credentials)
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_account_must_equal_authenticated_siwe_wallet_before_crypto_or_persistence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -204,7 +205,7 @@ async def test_account_must_equal_authenticated_siwe_wallet_before_crypto_or_per
             await _cleanup_user(db, user.id)
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_main_wallet_private_key_is_rejected_before_provider_io_and_encryption(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -241,7 +242,7 @@ async def test_main_wallet_private_key_is_rejected_before_provider_io_and_encryp
             await _cleanup_user(db, user.id)
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.parametrize(
     ("session_active", "session_not_expired", "perps_permission"),
     [
@@ -291,7 +292,7 @@ async def test_onchain_binding_failures_are_fail_closed_before_crypto_or_persist
             await _cleanup_user(db, user.id)
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_success_encrypts_with_record_aad_and_binds_epoch_to_logical_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -368,7 +369,7 @@ async def test_success_encrypts_with_record_aad_and_binds_epoch_to_logical_gener
             await _cleanup_user(db, user.id)
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_encryption_failure_leaves_no_account_credential_or_epoch_partial_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -383,7 +384,7 @@ async def test_encryption_failure_leaves_no_account_credential_or_epoch_partial_
             body = schema.model_validate(
                 {
                     "account_address": user.auth_wallet,
-                    "signer_private_key": SIGNER_PRIVATE_KEY_1,
+                    "signer_private_key": SIGNER_PRIVATE_KEY_5,
                 }
             )
             with pytest.raises(RuntimeError, match="synthetic encryption failure"):
@@ -402,7 +403,7 @@ async def test_encryption_failure_leaves_no_account_credential_or_epoch_partial_
             await _cleanup_user(db, user.id)
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_rotation_increments_logical_generation_and_rejects_old_epoch_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
