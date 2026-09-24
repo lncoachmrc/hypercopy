@@ -562,13 +562,18 @@ async def test_activated_risex_source_without_complete_reads_is_fail_closed() ->
 
 
 @pytest.mark.asyncio
-async def test_never_activated_risex_can_switch_back_to_hyperliquid() -> None:
+async def test_never_activated_risex_can_switch_back_to_hyperliquid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENABLE_LIVE_TRADING', 'false')
+    _stub_valid_risex_onchain_evidence(monkeypatch)
     user_id = await _insert_user()
     try:
         await _bootstrap_hyperliquid(user_id)
         async with SessionLocal() as db:
             user = await db.get(User, user_id)
             assert user is not None
+            await _add_valid_risex_credential(db, user)
             first_payload = await _call_provider(db, user, 'risex')
             risex = await user_destination_state(db, user_id)
             second_payload = await _call_provider(db, user, 'hyperliquid')
