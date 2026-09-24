@@ -288,6 +288,107 @@ async def test_onchain_binding_failures_are_fail_closed_before_crypto_or_persist
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["account", "signer"])
+async def test_onchain_identity_evidence_must_match_exact_requested_pair_before_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    schema, endpoint, _account_type, _credential_type = _require_contract()
+    observed: dict = {}
+
+    class _AsyncContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, _exc_type, _exc, _tb):
+            return False
+
+    monkeypatch.setattr(
+        user_api,
+        "RISExReadOnlyHTTPTransport",
+        lambda **_kwargs: _AsyncContext(),
+    )
+    monkeypatch.setattr(
+        user_api,
+        "RISExReadOnlyRPCTransport",
+        lambda **_kwargs: _AsyncContext(),
+    )
+
+    async def collect_runtime(*_args, **_kwargs):
+        return SimpleNamespace(
+            domain_verifying_contract="0x" + ("77" * 20),
+            block_number=1,
+        )
+
+    def evaluate_preflight(*_args, **_kwargs):
+        return SimpleNamespace(
+            verdict="PASS",
+            deployment_identity_verified=True,
+        )
+
+    monkeypatch.setattr(
+        user_api,
+        "collect_runtime_deployment_evidence",
+        collect_runtime,
+    )
+    monkeypatch.setattr(
+        user_api,
+        "evaluate_pinned_deployment_preflight",
+        evaluate_preflight,
+    )
+
+    async with SessionLocal() as db:
+        user = await _insert_user(db)
+        try:
+            evidence_account = (
+                SIGNER_2.address if mismatch == "account" else user.auth_wallet
+            )
+            evidence_signer = (
+                SIGNER_2.address if mismatch == "signer" else SIGNER_1.address
+            )
+
+            async def collect_authorization(*_args, **_kwargs):
+                return SimpleNamespace(
+                    account=evidence_account,
+                    signer=evidence_signer,
+                    session_active=True,
+                    session_not_expired=True,
+                    perps_permission=True,
+                    move_fund_permission=True,
+                )
+
+            monkeypatch.setattr(
+                user_api,
+                "collect_authorization_session_evidence",
+                collect_authorization,
+            )
+            _stub_crypto(monkeypatch, observed)
+
+            body = schema.model_validate(
+                {
+                    "account_address": user.auth_wallet,
+                    "signer_private_key": SIGNER_PRIVATE_KEY_1,
+                }
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                await endpoint(body, _request(), user, db)
+
+            assert exc_info.value.status_code == 422
+            assert observed.get("encrypted", []) == []
+            assert await _risex_counts(db, user.id) == (0, 0)
+            epoch_count = (
+                await db.execute(
+                    text("SELECT count(*) FROM execution_epochs WHERE user_id = :user_id"),
+                    {"user_id": user.id},
+                )
+            ).scalar_one()
+            assert epoch_count == 0
+        finally:
+            await _cleanup_user(db, user.id)
+            await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_success_encrypts_with_record_aad_and_binds_epoch_to_logical_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -405,7 +506,7 @@ async def test_encryption_failure_leaves_no_account_credential_or_epoch_partial_
 async def test_rotation_increments_logical_generation_and_rejects_old_epoch_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    schema, endpoint, _account_type, credential_type = _require_contract()
+    schema, endpoint, account_type, credential_type = _require_contract()
     observed: dict = {}
     _stub_valid_verification(monkeypatch, observed)
     _stub_crypto(monkeypatch, observed)
@@ -486,7 +587,22 @@ async def test_rotation_increments_logical_generation_and_rejects_old_epoch_job(
                     .order_by(credential_type.generation.desc())
                 )
             ).scalars().first()
+            account_count, credential_count = await _risex_counts(db, user.id)
+            signer_addresses = (
+                await db.execute(
+                    select(credential_type.signer_address)
+                    .join(
+                        account_type,
+                        credential_type.risex_trading_account_id == account_type.id,
+                    )
+                    .where(account_type.user_id == user.id)
+                )
+            ).scalars().all()
 
+            assert account_count == 1
+            assert credential_count == 1
+            assert signer_addresses == [SIGNER_4.address]
+            assert SIGNER_3.address not in signer_addresses
             assert latest_credential is not None
             assert first_version == 1
             assert second_version == 2
