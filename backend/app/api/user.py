@@ -679,3 +679,172 @@ async def close_positions(body: ClosePositionsIn, user: User = Depends(current_u
     )
     await db.commit()
     return {'queued': len(jobs), 'paused': True, 'deferred_enqueue': deferred_enqueue}
+
+
+@router.post('/risex-trading-account', dependencies=[Depends(require_csrf)])
+async def link_risex_trading_account(
+    body: RISExTradingAccountIn,
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_follower_user(user)
+    network = (await user_network_state(db, user.id)).network
+    if network != 'testnet':
+        raise HTTPException(
+            409,
+            'RISEx credential onboarding remains testnet-only until the mainnet gate is accepted',
+        )
+
+    try:
+        account_address = normalize_address(body.account_address)
+        authenticated_wallet = normalize_address(user.auth_wallet)
+    except Exception as exc:
+        raise HTTPException(422, 'Invalid RISEx account address') from exc
+    if account_address != authenticated_wallet:
+        raise HTTPException(422, 'RISEx account must match the authenticated wallet')
+
+    try:
+        signer_address = normalize_address(Account.from_key(body.signer_private_key).address)
+    except Exception as exc:
+        raise HTTPException(422, 'Invalid RISEx signer credential') from exc
+    if signer_address == account_address:
+        raise HTTPException(422, 'The authenticated wallet cannot also be the RISEx signer')
+
+    try:
+        verification = await _verify_risex_signer_binding(
+            account_address=account_address,
+            signer_address=signer_address,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            422,
+            'RISEx account/signer authorization could not be verified',
+        ) from exc
+
+    if (
+        verification.session_active is not True
+        or verification.session_not_expired is not True
+        or verification.perps_permission is not True
+    ):
+        raise HTTPException(
+            422,
+            'RISEx signer authorization is inactive, expired, or lacks Perps permission',
+        )
+
+    await db.execute(select(User).where(User.id == user.id).with_for_update())
+
+    shared_account_owner = (
+        await db.execute(
+            select(RISExTradingAccount.user_id).where(
+                RISExTradingAccount.account_address == account_address,
+                RISExTradingAccount.user_id != user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if shared_account_owner is not None:
+        raise HTTPException(409, 'RISEx account is already linked to another user')
+
+    shared_signer_owner = (
+        await db.execute(
+            select(RISExTradingAccount.user_id)
+            .join(
+                RISExSigningCredential,
+                RISExSigningCredential.risex_trading_account_id == RISExTradingAccount.id,
+            )
+            .where(
+                RISExSigningCredential.signer_address == signer_address,
+                RISExTradingAccount.user_id != user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if shared_signer_owner is not None:
+        raise HTTPException(409, 'RISEx signer is already linked to another user')
+
+    account = (
+        await db.execute(
+            select(RISExTradingAccount)
+            .where(RISExTradingAccount.user_id == user.id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if account is None:
+        account = RISExTradingAccount(
+            user_id=user.id,
+            account_address=account_address,
+            verified_at=datetime.now(UTC),
+        )
+        db.add(account)
+        await db.flush()
+        generation = 1
+    else:
+        account.account_address = account_address
+        account.verified_at = datetime.now(UTC)
+        previous = (
+            await db.execute(
+                select(RISExSigningCredential).where(
+                    RISExSigningCredential.risex_trading_account_id == account.id
+                )
+            )
+        ).scalar_one_or_none()
+        generation = 1 if previous is None else previous.generation + 1
+        if previous is not None:
+            await db.delete(previous)
+            await db.flush()
+
+    blob = crypto.encrypt(
+        body.signer_private_key,
+        user_id=str(user.id),
+        account_id=str(account.id),
+    )
+    session_expiration = getattr(verification, 'session_expiration', None)
+    expires_at = (
+        datetime.fromtimestamp(int(session_expiration), UTC)
+        if session_expiration
+        else None
+    )
+    db.add(
+        RISExSigningCredential(
+            risex_trading_account_id=account.id,
+            signer_address=signer_address,
+            ciphertext_b64=blob.ciphertext_b64,
+            nonce_b64=blob.nonce_b64,
+            wrapped_dek_b64=blob.wrapped_dek_b64,
+            wrap_nonce_b64=blob.wrap_nonce_b64,
+            key_provider=blob.key_provider,
+            key_reference=blob.key_reference,
+            key_version=blob.key_version,
+            generation=generation,
+            expires_at=expires_at,
+            status=CredentialStatus.ACTIVE,
+        )
+    )
+    await db.flush()
+
+    await close_user_destination_epoch(db, user.id)
+    destination = await set_user_destination(
+        db,
+        user.id,
+        provider='risex',
+        network=network,
+        account_address=account_address,
+        credential_version=generation,
+    )
+
+    await audit(
+        db,
+        action='RISEX_TRADING_ACCOUNT_LINKED',
+        actor_id=user.id,
+        subject_id=user.id,
+        ip_hash=hash_ip(request.client.host if request.client else None),
+        after={
+            'account': account_address[:8] + '…',
+            'signer': signer_address[:8] + '…',
+            'network': network,
+            'credential_generation': generation,
+            'execution_epoch_id': str(destination.epoch_id),
+            'expires_at': expires_at.isoformat() if expires_at else None,
+        },
+    )
+    await db.commit()
+    return await _serialize_user(db, user)
