@@ -2,9 +2,9 @@
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 watchPatterns = [
-  "/backend/app/workers/watcher.py", "/backend/app/adapters/hyperliquid.py",
-  "/backend/app/adapters/ratelimit.py", "/backend/app/core/**", "/backend/app/db/**",
-  "/backend/app/models/**", "/backend/app/services/copy.py", "/backend/app/services/queue.py",
+  "/backend/app/workers/watcher.py", "/backend/app/adapters/**",
+  "/backend/app/core/**", "/backend/app/db/**", "/backend/app/engine/**",
+  "/backend/app/models/**", "/backend/app/services/**",
   "/backend/alembic/**", "/backend/requirements.txt", "/backend/Dockerfile",
   "/backend/railway.watcher.toml"
 ]

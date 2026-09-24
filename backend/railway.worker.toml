@@ -4,8 +4,7 @@ dockerfilePath = "Dockerfile"
 watchPatterns = [
   "/backend/app/workers/execution_worker.py", "/backend/app/workers/resilient_execution_worker.py", "/backend/app/engine/**",
   "/backend/app/adapters/**", "/backend/app/core/**", "/backend/app/db/**",
-  "/backend/app/models/**", "/backend/app/services/execution.py", "/backend/app/services/reconcile.py",
-  "/backend/app/services/queue.py", "/backend/app/services/audit.py", "/backend/app/services/entitlement.py",
+  "/backend/app/models/**", "/backend/app/services/**", "/backend/app/security/**",
   "/backend/alembic/**", "/backend/requirements.txt", "/backend/Dockerfile",
   "/backend/railway.worker.toml"
 ]
