@@ -584,3 +584,333 @@ async def test_put_risex_environment_gate_is_409_before_verification_or_switch(
             assert await _epoch_count(db, user.id) == 1
     finally:
         await engine.dispose()
+
+
+async def _activate_risex(
+    db,
+    user: User,
+    *,
+    generation: int = 4,
+) -> tuple[uuid.UUID, RISExTradingAccount, RISExSigningCredential]:
+    account, credential, _private_key = await _add_risex_credential(
+        db,
+        user,
+        status=CredentialStatus.ACTIVE,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        generation=generation,
+    )
+    destination = await set_user_destination(
+        db,
+        user.id,
+        provider="risex",
+        network="testnet",
+        account_address=account.account_address,
+        credential_version=credential.generation,
+    )
+    await db.commit()
+    return destination.epoch_id, account, credential
+
+
+@pytest.mark.asyncio
+async def test_put_risex_detects_concurrent_credential_rotation_after_live_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        risex_order_preparation,
+        "ADR_0006_MAINNET_GATE_ACCEPTED",
+        False,
+    )
+    _set_live_env(monkeypatch, "false")
+    observed: dict = {}
+    _stub_flat_hyperliquid(monkeypatch, observed)
+
+    try:
+        async with SessionLocal() as db:
+            user = await _insert_user(db, network="testnet")
+            source_epoch = await _activate_hyperliquid(db, user, network="testnet")
+            account, credential, _private_key = await _add_risex_credential(
+                db,
+                user,
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                generation=4,
+            )
+            await db.commit()
+
+            original_signer = credential.signer_address
+            rotated_signer = Account.from_key(
+                hashlib.sha256(user.id.bytes + b"risex-b-red-rotated").hexdigest()
+            ).address
+
+            async def verify_then_rotate(*_args, **kwargs):
+                assert str(kwargs["account_address"]).lower() == account.account_address.lower()
+                assert str(kwargs["signer_address"]).lower() == original_signer.lower()
+                async with SessionLocal() as concurrent_db:
+                    await concurrent_db.execute(
+                        text(
+                            """
+                            UPDATE risex_signing_credentials
+                            SET signer_address = :rotated_signer,
+                                generation = generation + 1,
+                                updated_at = now()
+                            WHERE id = :credential_id
+                            """
+                        ),
+                        {
+                            "rotated_signer": rotated_signer,
+                            "credential_id": credential.id,
+                        },
+                    )
+                    await concurrent_db.commit()
+                observed["rotated"] = True
+                return SimpleNamespace(
+                    account=account.account_address,
+                    signer=original_signer,
+                    session_active=True,
+                    session_not_expired=True,
+                    perps_permission=True,
+                    move_fund_permission=True,
+                    session_expiration=int(
+                        (datetime.now(UTC) + timedelta(hours=1)).timestamp()
+                    ),
+                )
+
+            monkeypatch.setattr(
+                user_api,
+                "_verify_risex_signer_binding",
+                verify_then_rotate,
+            )
+
+            with pytest.raises(HTTPException) as exc_info:
+                await user_api.trading_provider(
+                    TradingProviderIn(provider="risex"),
+                    user=user,
+                    db=db,
+                )
+
+            assert exc_info.value.status_code == 409
+            assert observed.get("rotated") is True
+            current = await user_destination_state(db, user.id)
+            assert current.epoch_id == source_epoch
+            assert current.provider == "hyperliquid"
+            assert await _epoch_count(db, user.id) == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_put_risex_idempotent_path_reverifies_active_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        risex_order_preparation,
+        "ADR_0006_MAINNET_GATE_ACCEPTED",
+        False,
+    )
+    _set_live_env(monkeypatch, "false")
+    observed: dict = {}
+    _stub_valid_risex_verification(monkeypatch, observed)
+
+    try:
+        async with SessionLocal() as db:
+            user = await _insert_user(db, network="testnet")
+            epoch_id, account, credential = await _activate_risex(db, user)
+
+            await user_api.trading_provider(
+                TradingProviderIn(provider="risex"),
+                user=user,
+                db=db,
+            )
+
+            current = await user_destination_state(db, user.id)
+            assert current.epoch_id == epoch_id
+            assert current.provider == "risex"
+            assert observed.get("verification_calls") == [
+                (account.account_address, credential.signer_address)
+            ]
+            assert await _epoch_count(db, user.id) == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_put_risex_idempotent_path_rejects_revoked_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        risex_order_preparation,
+        "ADR_0006_MAINNET_GATE_ACCEPTED",
+        False,
+    )
+    _set_live_env(monkeypatch, "false")
+    observed: dict = {}
+    _stub_valid_risex_verification(monkeypatch, observed)
+
+    try:
+        async with SessionLocal() as db:
+            user = await _insert_user(db, network="testnet")
+            epoch_id, _account, credential = await _activate_risex(db, user)
+            credential.status = CredentialStatus.REVOKED
+            await db.commit()
+
+            with pytest.raises(HTTPException) as exc_info:
+                await user_api.trading_provider(
+                    TradingProviderIn(provider="risex"),
+                    user=user,
+                    db=db,
+                )
+
+            assert exc_info.value.status_code == 409
+            current = await user_destination_state(db, user.id)
+            assert current.epoch_id == epoch_id
+            assert current.provider == "risex"
+            assert observed.get("verification_calls", []) == []
+            assert await _epoch_count(db, user.id) == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_put_risex_idempotent_path_rejects_closed_environment_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        risex_order_preparation,
+        "ADR_0006_MAINNET_GATE_ACCEPTED",
+        False,
+    )
+    _set_live_env(monkeypatch, "true")
+    observed: dict = {}
+    _stub_valid_risex_verification(monkeypatch, observed)
+
+    try:
+        async with SessionLocal() as db:
+            user = await _insert_user(db, network="testnet")
+            epoch_id, _account, _credential = await _activate_risex(db, user)
+
+            with pytest.raises(HTTPException) as exc_info:
+                await user_api.trading_provider(
+                    TradingProviderIn(provider="risex"),
+                    user=user,
+                    db=db,
+                )
+
+            assert exc_info.value.status_code == 409
+            current = await user_destination_state(db, user.id)
+            assert current.epoch_id == epoch_id
+            assert current.provider == "risex"
+            assert observed.get("verification_calls", []) == []
+            assert await _epoch_count(db, user.id) == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["account", "signer"])
+async def test_put_risex_rejects_low_level_identity_evidence_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    monkeypatch.setattr(
+        risex_order_preparation,
+        "ADR_0006_MAINNET_GATE_ACCEPTED",
+        False,
+    )
+    _set_live_env(monkeypatch, "false")
+    observed: dict = {}
+    _stub_flat_hyperliquid(monkeypatch, observed)
+
+    class _AsyncContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, _exc_type, _exc, _tb):
+            return False
+
+    monkeypatch.setattr(
+        user_api,
+        "RISExReadOnlyHTTPTransport",
+        lambda **_kwargs: _AsyncContext(),
+    )
+    monkeypatch.setattr(
+        user_api,
+        "RISExReadOnlyRPCTransport",
+        lambda **_kwargs: _AsyncContext(),
+    )
+
+    async def collect_runtime(*_args, **_kwargs):
+        return SimpleNamespace(
+            domain_verifying_contract="0x" + ("77" * 20),
+            block_number=1,
+        )
+
+    def evaluate_preflight(*_args, **_kwargs):
+        return SimpleNamespace(
+            verdict="PASS",
+            deployment_identity_verified=True,
+        )
+
+    monkeypatch.setattr(
+        user_api,
+        "collect_runtime_deployment_evidence",
+        collect_runtime,
+    )
+    monkeypatch.setattr(
+        user_api,
+        "evaluate_pinned_deployment_preflight",
+        evaluate_preflight,
+    )
+
+    try:
+        async with SessionLocal() as db:
+            user = await _insert_user(db, network="testnet")
+            source_epoch = await _activate_hyperliquid(db, user, network="testnet")
+            account, credential, _private_key = await _add_risex_credential(
+                db,
+                user,
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+            await db.commit()
+
+            evidence_account = (
+                "0x" + ("88" * 20)
+                if mismatch == "account"
+                else account.account_address
+            )
+            evidence_signer = (
+                "0x" + ("99" * 20)
+                if mismatch == "signer"
+                else credential.signer_address
+            )
+
+            async def collect_authorization(*_args, **_kwargs):
+                observed["low_level_evidence_called"] = True
+                return SimpleNamespace(
+                    account=evidence_account,
+                    signer=evidence_signer,
+                    session_active=True,
+                    session_not_expired=True,
+                    perps_permission=True,
+                    move_fund_permission=True,
+                )
+
+            monkeypatch.setattr(
+                user_api,
+                "collect_authorization_session_evidence",
+                collect_authorization,
+            )
+
+            with pytest.raises(HTTPException) as exc_info:
+                await user_api.trading_provider(
+                    TradingProviderIn(provider="risex"),
+                    user=user,
+                    db=db,
+                )
+
+            assert exc_info.value.status_code == 409
+            assert observed.get("low_level_evidence_called") is True
+            current = await user_destination_state(db, user.id)
+            assert current.epoch_id == source_epoch
+            assert current.provider == "hyperliquid"
+            assert await _epoch_count(db, user.id) == 1
+    finally:
+        await engine.dispose()
