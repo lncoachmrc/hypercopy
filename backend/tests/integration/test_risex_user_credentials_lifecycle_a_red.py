@@ -5,13 +5,14 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 from eth_account import Account
 from fastapi import HTTPException
 from sqlalchemy import select, text
 from starlette.requests import Request
 
 from app.api import user as user_api
-from app.db.session import SessionLocal
+from app.db.session import SessionLocal, engine
 from app.models import entities
 from app.models.entities import CopyJob, JobState, User
 from app.schemas import user as user_schemas
@@ -22,6 +23,13 @@ pytestmark = pytest.mark.skipif(
     os.getenv("RUN_INTEGRATION") != "1",
     reason="requires CI PostgreSQL",
 )
+
+
+@pytest_asyncio.fixture(autouse=True, loop_scope="module")
+async def _dispose_pool_after_test():
+    """Keep this module on one loop and never share pooled asyncpg connections between tests."""
+    yield
+    await engine.dispose()
 
 
 MAIN_PRIVATE_KEY = "11" * 32
