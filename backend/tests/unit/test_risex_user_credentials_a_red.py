@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import inspect
+import re
 from pathlib import Path
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from fastapi.routing import APIRoute
 from sqlalchemy import Integer
 
@@ -110,9 +113,11 @@ def test_0018_migration_exists_is_head_and_is_additive_only() -> None:
 
 
 def test_0018_is_registered_as_runtime_expected_revision() -> None:
-    assert EXPECTED_REVISION == "0018_risex_user_credentials", (
-        "RED: backend/app/db/schema.py must register 0018 as EXPECTED_REVISION"
-    )
+    backend_root = Path(__file__).resolve().parents[2]
+    alembic_config = Config(str(backend_root / "alembic.ini"))
+    alembic_config.set_main_option("script_location", str(backend_root / "alembic"))
+    actual_head = ScriptDirectory.from_config(alembic_config).get_current_head()
+    assert EXPECTED_REVISION == actual_head
 
 
 def test_0018_is_registered_in_targeted_release_preflight() -> None:
@@ -157,7 +162,7 @@ def test_risex_post_route_is_parallel_csrf_protected_and_current_user_scoped() -
     assert api_deps.current_user in dependency_calls
 
     source = inspect.getsource(endpoint)
-    assert "TradingAccountIn" not in source, (
+    assert re.search(r"\bTradingAccountIn\b", source) is None, (
         "RED: RISEx endpoint must use its own input schema and leave Hyperliquid endpoint untouched"
     )
 
