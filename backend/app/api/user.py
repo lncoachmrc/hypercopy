@@ -9,8 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from eth_account import Account
+
 from app.adapters.hyperliquid import HyperliquidAdapter
 from app.adapters.ratelimit import Budget, WeightedRateLimiter
+from app.adapters.risex_http import RISExReadOnlyHTTPTransport
 from app.api.deps import current_user, require_csrf
 from app.core.config import Network, settings
 from app.core.crypto import crypto
@@ -19,8 +22,10 @@ from app.db.redis import redis_client
 from app.db.session import get_db
 from app.engine.sizing import EXCHANGE_MIN_NOTIONAL
 from app.models.entities import AIProfitExitDecision, CopyJob, CopyState, CredentialStatus, Execution, ExecutionState, JobState, MasterEvent, PositionLedger, RiskHalt, RiskProfile, RiskState, SigningCredential, TradingAccount, User
+from app.models.entities import RISExSigningCredential, RISExTradingAccount
 from app.schemas.trading import ClosePositionsIn
 from app.schemas.user import RiskProfileIn, TradingAccountIn, TradingNetworkIn, TradingProviderIn
+from app.schemas.user import RISExTradingAccountIn
 from app.services.audit import audit
 from app.services.destination_switch import DestinationSwitchBlocked, destination_switch_blockers
 from app.services.entitlement import entitlement
@@ -38,6 +43,64 @@ from app.services.metrics import dashboard_for_user
 from app.services.networking import set_user_network, user_network_state
 from app.services.queue import publish_job
 from app.services.reconcile import master_snapshot, reconcile_user
+from app.security.risex_authorization_session import (
+    RISExAuthorizationSessionEvidence,
+    collect_authorization_session_evidence,
+)
+from app.security.risex_deployment_preflight import evaluate_pinned_deployment_preflight
+from app.security.risex_deployment_runtime import (
+    PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
+    RISExReadOnlyRPCTransport,
+    collect_runtime_deployment_evidence,
+)
+
+
+_RISEX_TESTNET_API_URL = 'https://api.testnet.rise.trade'
+_RISEX_TESTNET_RPC_URL = 'https://testnet.riselabs.xyz'
+
+
+async def _verify_risex_signer_binding(
+    *,
+    account_address: str,
+    signer_address: str,
+) -> RISExAuthorizationSessionEvidence:
+    async with RISExReadOnlyHTTPTransport(base_url=_RISEX_TESTNET_API_URL) as api:
+        async with RISExReadOnlyRPCTransport(rpc_url=_RISEX_TESTNET_RPC_URL) as rpc:
+            deployment = await collect_runtime_deployment_evidence(
+                api,
+                rpc,
+                network='testnet',
+            )
+            preflight = evaluate_pinned_deployment_preflight(
+                deployment,
+                expected_fingerprint=PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
+            )
+            if (
+                preflight.verdict != 'PASS'
+                or preflight.deployment_identity_verified is not True
+            ):
+                raise RuntimeError('RISEx deployment identity is not verified')
+
+            evidence = await collect_authorization_session_evidence(
+                rpc,
+                authorization_address=deployment.domain_verifying_contract,
+                account=account_address,
+                signer=signer_address,
+                block_tag=hex(deployment.block_number),
+            )
+
+    if evidence.account.lower() != account_address.lower():
+        raise RuntimeError('RISEx authorization account binding mismatch')
+    if evidence.signer.lower() != signer_address.lower():
+        raise RuntimeError('RISEx authorization signer binding mismatch')
+    if evidence.session_active is not True:
+        raise RuntimeError('RISEx signer session is not active')
+    if evidence.session_not_expired is not True:
+        raise RuntimeError('RISEx signer session is expired')
+    if evidence.perps_permission is not True:
+        raise RuntimeError('RISEx signer lacks required Perps permission')
+    return evidence
+
 
 router = APIRouter(tags=['user'])
 
@@ -616,3 +679,177 @@ async def close_positions(body: ClosePositionsIn, user: User = Depends(current_u
     )
     await db.commit()
     return {'queued': len(jobs), 'paused': True, 'deferred_enqueue': deferred_enqueue}
+
+
+@router.post('/risex-trading-account', dependencies=[Depends(require_csrf)])
+async def link_risex_trading_account(
+    body: RISExTradingAccountIn,
+    request: Request,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    _require_follower_user(user)
+
+    try:
+        account_address = normalize_address(body.account_address)
+        authenticated_wallet = normalize_address(user.auth_wallet)
+    except Exception as exc:
+        raise HTTPException(422, 'Invalid RISEx account address') from exc
+    if account_address != authenticated_wallet:
+        raise HTTPException(422, 'RISEx account must match the authenticated wallet')
+
+    try:
+        signer_address = Account.from_key(body.signer_private_key).address
+        normalized_signer_address = normalize_address(signer_address)
+    except Exception as exc:
+        raise HTTPException(422, 'Invalid RISEx signer credential') from exc
+    if normalized_signer_address == account_address:
+        raise HTTPException(422, 'The authenticated wallet cannot also be the RISEx signer')
+
+    try:
+        verification = await _verify_risex_signer_binding(
+            account_address=account_address,
+            signer_address=signer_address,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            422,
+            'RISEx account/signer authorization could not be verified',
+        ) from exc
+
+    if (
+        verification.session_active is not True
+        or verification.session_not_expired is not True
+        or verification.perps_permission is not True
+    ):
+        raise HTTPException(
+            422,
+            'RISEx signer authorization is inactive, expired, or lacks Perps permission',
+        )
+
+    # Validation and provider verification above are deliberately side-effect free.
+    # user_network_state() may bootstrap a missing execution epoch, so call it only
+    # after every 422-producing credential check has succeeded.
+    network = (await user_network_state(db, user.id)).network
+    if network != 'testnet':
+        raise HTTPException(
+            409,
+            'RISEx credential onboarding remains testnet-only until the mainnet gate is accepted',
+        )
+
+    await db.execute(select(User).where(User.id == user.id).with_for_update())
+
+    shared_account_owner = (
+        await db.execute(
+            select(RISExTradingAccount.user_id).where(
+                RISExTradingAccount.account_address == account_address,
+                RISExTradingAccount.user_id != user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if shared_account_owner is not None:
+        raise HTTPException(409, 'RISEx account is already linked to another user')
+
+    shared_signer_owner = (
+        await db.execute(
+            select(RISExTradingAccount.user_id)
+            .join(
+                RISExSigningCredential,
+                RISExSigningCredential.risex_trading_account_id == RISExTradingAccount.id,
+            )
+            .where(
+                RISExSigningCredential.signer_address == signer_address,
+                RISExTradingAccount.user_id != user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if shared_signer_owner is not None:
+        raise HTTPException(409, 'RISEx signer is already linked to another user')
+
+    account = (
+        await db.execute(
+            select(RISExTradingAccount)
+            .where(RISExTradingAccount.user_id == user.id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if account is None:
+        account = RISExTradingAccount(
+            user_id=user.id,
+            account_address=account_address,
+            verified_at=datetime.now(UTC),
+        )
+        db.add(account)
+        await db.flush()
+        generation = 1
+    else:
+        account.account_address = account_address
+        account.verified_at = datetime.now(UTC)
+        previous = (
+            await db.execute(
+                select(RISExSigningCredential).where(
+                    RISExSigningCredential.risex_trading_account_id == account.id
+                )
+            )
+        ).scalar_one_or_none()
+        generation = 1 if previous is None else previous.generation + 1
+        if previous is not None:
+            await db.delete(previous)
+            await db.flush()
+
+    blob = crypto.encrypt(
+        body.signer_private_key,
+        user_id=str(user.id),
+        account_id=str(account.id),
+    )
+    session_expiration = getattr(verification, 'session_expiration', None)
+    expires_at = (
+        datetime.fromtimestamp(int(session_expiration), UTC)
+        if session_expiration
+        else None
+    )
+    db.add(
+        RISExSigningCredential(
+            risex_trading_account_id=account.id,
+            signer_address=signer_address,
+            ciphertext_b64=blob.ciphertext_b64,
+            nonce_b64=blob.nonce_b64,
+            wrapped_dek_b64=blob.wrapped_dek_b64,
+            wrap_nonce_b64=blob.wrap_nonce_b64,
+            key_provider=blob.key_provider,
+            key_reference=blob.key_reference,
+            key_version=blob.key_version,
+            generation=generation,
+            expires_at=expires_at,
+            status=CredentialStatus.ACTIVE,
+        )
+    )
+    await db.flush()
+
+    await close_user_destination_epoch(db, user.id)
+    destination = await set_user_destination(
+        db,
+        user.id,
+        provider='risex',
+        network=network,
+        account_address=account_address,
+        credential_version=generation,
+    )
+
+    await audit(
+        db,
+        action='RISEX_TRADING_ACCOUNT_LINKED',
+        actor_id=user.id,
+        subject_id=user.id,
+        ip_hash=hash_ip(request.client.host if request.client else None),
+        after={
+            'account': account_address[:8] + '…',
+            'signer': signer_address[:8] + '…',
+            'network': network,
+            'credential_generation': generation,
+            'execution_epoch_id': str(destination.epoch_id),
+            'expires_at': expires_at.isoformat() if expires_at else None,
+        },
+    )
+    await db.commit()
+    return await _serialize_user(db, user)
