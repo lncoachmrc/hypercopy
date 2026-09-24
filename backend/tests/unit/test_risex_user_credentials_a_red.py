@@ -168,6 +168,7 @@ def test_risex_post_route_is_parallel_csrf_protected_and_current_user_scoped() -
 
 
 def test_risex_endpoint_contract_reuses_authorization_collector_and_logical_generation() -> None:
+    """Static guard only; tests 7 and 9 prove generation != envelope key_version with key_version=91."""
     endpoint = _require(user_api, "link_risex_trading_account")
     source = inspect.getsource(endpoint)
 
@@ -181,6 +182,6 @@ def test_risex_endpoint_contract_reuses_authorization_collector_and_logical_gene
     assert "generation" in source, (
         "RED: logical credential generation must become ExecutionEpoch.credential_version"
     )
-    assert "blob.key_version" not in source, (
-        "RED: envelope key_version must never be used as RISEx credential_version"
+    assert re.search(r"credential_version\s*=\s*blob\.key_version", source) is None, (
+        "RED: envelope key_version must never be bound as RISEx credential_version"
     )
