@@ -380,6 +380,7 @@ async def test_encryption_failure_leaves_no_account_credential_or_epoch_partial_
 
     async with SessionLocal() as db:
         user = await _insert_user(db)
+        user_id = user.id
         try:
             body = schema.model_validate(
                 {
@@ -391,16 +392,16 @@ async def test_encryption_failure_leaves_no_account_credential_or_epoch_partial_
                 await endpoint(body, _request(), user, db)
 
             await db.rollback()
-            assert await _risex_counts(db, user.id) == (0, 0)
+            assert await _risex_counts(db, user_id) == (0, 0)
             epoch_count = (
                 await db.execute(
                     text("SELECT count(*) FROM execution_epochs WHERE user_id = :user_id"),
-                    {"user_id": user.id},
+                    {"user_id": user_id},
                 )
             ).scalar_one()
             assert epoch_count == 0
         finally:
-            await _cleanup_user(db, user.id)
+            await _cleanup_user(db, user_id)
 
 
 @pytest.mark.asyncio(loop_scope="module")
