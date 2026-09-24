@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 
 import pytest
 
@@ -22,6 +23,14 @@ def _env(live: str | None) -> dict[str, str]:
     if live is not None:
         values["ENABLE_LIVE_TRADING"] = live
     return values
+
+
+def test_ci_process_environment_keeps_risex_blocked_by_default() -> None:
+    """Guard CI's fail-closed default against workflow-level test-stack overrides."""
+
+    gate = _shared_environment_gate()
+    with pytest.raises(SignedTestnetBlocked):
+        gate(network="testnet", env=os.environ)
 
 
 def test_shared_risex_environment_gate_matches_worker_fail_closed_matrix(

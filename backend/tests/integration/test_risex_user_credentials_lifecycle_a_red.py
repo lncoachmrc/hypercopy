@@ -157,6 +157,7 @@ async def _risex_counts(db, user_id: uuid.UUID) -> tuple[int, int]:
 async def test_account_must_equal_authenticated_siwe_wallet_before_crypto_or_persistence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     schema, endpoint, _account_type, _credential_type = _require_contract()
     observed: dict = {}
 
@@ -202,6 +203,7 @@ async def test_account_must_equal_authenticated_siwe_wallet_before_crypto_or_per
 async def test_main_wallet_private_key_is_rejected_before_provider_io_and_encryption(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     schema, endpoint, _account_type, _credential_type = _require_contract()
     observed: dict = {}
 
@@ -252,6 +254,7 @@ async def test_onchain_binding_failures_are_fail_closed_before_crypto_or_persist
     session_not_expired: bool,
     perps_permission: bool,
 ) -> None:
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     schema, endpoint, _account_type, _credential_type = _require_contract()
     observed: dict = {}
 
@@ -293,6 +296,7 @@ async def test_onchain_identity_evidence_must_match_exact_requested_pair_before_
     monkeypatch: pytest.MonkeyPatch,
     mismatch: str,
 ) -> None:
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     schema, endpoint, _account_type, _credential_type = _require_contract()
     observed: dict = {}
 
@@ -392,6 +396,7 @@ async def test_onchain_identity_evidence_must_match_exact_requested_pair_before_
 async def test_success_encrypts_with_record_aad_and_binds_epoch_to_logical_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     schema, endpoint, account_type, credential_type = _require_contract()
     observed: dict = {}
     _stub_valid_verification(monkeypatch, observed)
@@ -470,6 +475,7 @@ async def test_success_encrypts_with_record_aad_and_binds_epoch_to_logical_gener
 async def test_encryption_failure_leaves_no_account_credential_or_epoch_partial_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     schema, endpoint, _account_type, _credential_type = _require_contract()
     observed: dict = {}
     _stub_valid_verification(monkeypatch, observed)
@@ -506,6 +512,7 @@ async def test_encryption_failure_leaves_no_account_credential_or_epoch_partial_
 async def test_rotation_increments_logical_generation_and_rejects_old_epoch_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     schema, endpoint, account_type, credential_type = _require_contract()
     observed: dict = {}
     _stub_valid_verification(monkeypatch, observed)
