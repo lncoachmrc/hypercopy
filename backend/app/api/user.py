@@ -705,10 +705,11 @@ async def link_risex_trading_account(
         raise HTTPException(422, 'RISEx account must match the authenticated wallet')
 
     try:
-        signer_address = normalize_address(Account.from_key(body.signer_private_key).address)
+        signer_address = Account.from_key(body.signer_private_key).address
+        normalized_signer_address = normalize_address(signer_address)
     except Exception as exc:
         raise HTTPException(422, 'Invalid RISEx signer credential') from exc
-    if signer_address == account_address:
+    if normalized_signer_address == account_address:
         raise HTTPException(422, 'The authenticated wallet cannot also be the RISEx signer')
 
     try:
