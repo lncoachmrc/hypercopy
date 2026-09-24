@@ -562,9 +562,17 @@ async def test_activated_risex_source_without_complete_reads_is_fail_closed() ->
 
 
 @pytest.mark.asyncio
-async def test_never_activated_risex_can_switch_back_to_hyperliquid(
+async def test_bound_risex_epoch_cannot_switch_back_until_safe_exit_exists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Replace the legacy unbound-RISEx return contract.
+
+    The previous test stayed green only because provider selection created an
+    unbound RISEx epoch. Part (b) now binds every RISEx epoch to account +
+    credential generation, so safe exit is intentionally owned by 4C. When
+    that path exists, this test must be updated deliberately rather than
+    recreating the legacy unbound state.
+    """
     monkeypatch.setenv('ENABLE_LIVE_TRADING', 'false')
     _stub_valid_risex_onchain_evidence(monkeypatch)
     user_id = await _insert_user()
@@ -574,17 +582,44 @@ async def test_never_activated_risex_can_switch_back_to_hyperliquid(
             user = await db.get(User, user_id)
             assert user is not None
             await _add_valid_risex_credential(db, user)
+
             first_payload = await _call_provider(db, user, 'risex')
             risex = await user_destination_state(db, user_id)
-            second_payload = await _call_provider(db, user, 'hyperliquid')
-            hyperliquid = await user_destination_state(db, user_id)
+            epoch_count_before = (
+                await db.execute(
+                    text(
+                        'SELECT count(*) FROM execution_epochs WHERE user_id = :user_id'
+                    ),
+                    {'user_id': user_id},
+                )
+            ).scalar_one()
+
+            with pytest.raises(HTTPException) as exc_info:
+                await _call_provider(db, user, 'hyperliquid')
+            await db.rollback()
+
+            current = await user_destination_state(db, user_id)
+            epoch_count_after = (
+                await db.execute(
+                    text(
+                        'SELECT count(*) FROM execution_epochs WHERE user_id = :user_id'
+                    ),
+                    {'user_id': user_id},
+                )
+            ).scalar_one()
 
         assert first_payload['execution_provider'] == 'risex'
-        assert second_payload['execution_provider'] == 'hyperliquid'
-        assert risex.provider == 'risex'
-        assert hyperliquid.provider == 'hyperliquid'
-        assert hyperliquid.network == risex.network == 'testnet'
-        assert hyperliquid.epoch_id != risex.epoch_id
+        assert exc_info.value.status_code == 409
+        assert isinstance(exc_info.value.detail, dict)
+        assert exc_info.value.detail['code'] == 'destination_switch_blocked'
+        assert exc_info.value.detail['state'] == 'UNREADABLE'
+        assert exc_info.value.detail['reason'] == (
+            'Stored trading-account identity is missing or disagrees with the source epoch.'
+        )
+        assert current.epoch_id == risex.epoch_id
+        assert current.provider == 'risex'
+        assert current.network == risex.network == 'testnet'
+        assert epoch_count_after == epoch_count_before
     finally:
         await _cleanup_user(user_id)
 
