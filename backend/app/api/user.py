@@ -375,29 +375,6 @@ async def trading_provider(body: TradingProviderIn, user: User = Depends(current
         except SignedTestnetBlocked as exc:
             raise HTTPException(409, str(exc)) from exc
 
-        # Preserve the existing structured destination-switch contract before
-        # RISEx credential admission. These DB-local prerequisites are part of
-        # the central safe-switch boundary and require no provider I/O.
-        if current_provider != 'risex':
-            local_blockers = await destination_switch_blockers(
-                db,
-                user.id,
-                current_epoch_id,
-            )
-            if local_blockers:
-                raise HTTPException(
-                    409,
-                    detail={
-                        'code': 'destination_switch_blocked',
-                        'state': 'UNREADABLE',
-                        'reason': 'DB-local safe-switch prerequisites are not satisfied.',
-                        'blockers': [
-                            {'code': blocker.code, 'message': blocker.message}
-                            for blocker in local_blockers
-                        ],
-                    },
-                )
-
         snapshot = await _risex_credential_binding(db, user.id)
         if snapshot is None:
             raise HTTPException(409, 'Connect and verify a RISEx credential before selecting RISEx')
