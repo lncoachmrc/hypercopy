@@ -157,7 +157,7 @@ def _material(
     account: str,
     signer: str,
     cloid: str,
-    client_order_id: int = 77,
+    client_order_id: int,
 ):
     market = risex_order_preparation.RISExMarketMetadata(
         market_id=1,
@@ -227,6 +227,7 @@ async def _seed_pre_post(
     job_id = uuid.uuid4()
     execution_id = uuid.uuid4()
     cloid = "0x" + uuid.uuid4().hex
+    client_order_id = 1 + (uuid.uuid4().int % ((1 << 63) - 1))
     async with SessionLocal() as db:
         db.add(
             CopyJob(
@@ -254,7 +255,7 @@ async def _seed_pre_post(
                 execution_network="testnet",
                 attempt_kind="o",
                 cloid=cloid,
-                client_order_id=77,
+                client_order_id=client_order_id,
                 nonce_anchor=7,
                 nonce_bitmap_index=13,
                 state=ExecutionState.SUBMITTING,
@@ -276,11 +277,13 @@ async def _seed_pre_post(
         "account": account,
         "signer": signer,
         "cloid": cloid,
+        "client_order_id": client_order_id,
         "submission": _material(
             execution_id=execution_id,
             account=account,
             signer=signer,
             cloid=cloid,
+            client_order_id=client_order_id,
         ),
     }
 
