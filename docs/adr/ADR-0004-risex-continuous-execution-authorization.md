@@ -949,7 +949,7 @@ This amendment does not alter the top-level Status of ADR-0004, which remains **
 
 Under this amendment, the `RISEx Operational Execution Window` and its security-relevant context fingerprint (section 10) continue to authorize **worker-global runtime only**. The window is not, and does not become, a per-user construct.
 
-The fingerprint continues to include:
+The fingerprint itself includes:
 
 - `worker_id`;
 - process-local `boot_id`;
@@ -957,9 +957,18 @@ The fingerprint continues to include:
 - provider/network identity;
 - API/RPC/transport configuration;
 - pinned deployment identity;
-- singleton invariant state;
-- global signed-write/kill-switch/security configuration;
-- control/invalidation state (`authorization_invalidation_epoch`, control generation).
+- global signed-write and security configuration;
+- the worker-global ARM assertion `operatorhub_bypass_disabled`.
+
+The following state is bound to the operational window and is verified at every relevant point of use, but is deliberately **not** part of the fingerprint hash:
+
+- the execution-worker singleton invariant: `_singleton_matches_worker()` is checked during ARM finalization in `risex_execution_worker_extension.py`, again for each RISEx CopyJob, and again by the final authorizer in `execution_worker.py`;
+- control generation: `_poll_risex_control_once()` computes the fingerprint before `begin_arm()`, while `begin_arm()` advances `last_control_generation`; finalization is instead protected by `arm_finalization_fence()` and `RISExOperationalWindowController.can_finalize_arm()`;
+- `authorization_invalidation_epoch`: `can_finalize_arm()` compares the ARM attempt snapshot with the current invalidation epoch, and the continuous writer snapshots and re-checks the same epoch in `RISExAdapter._continuous_final_fence()` immediately before submission.
+
+Hashing this state would not add protection beyond those explicit live fences and would make legitimate authorization transitions invalidate the fingerprint mechanically. In particular, hashing control generation would make the ARM that created the fingerprint disagree with itself after `begin_arm()` advances the generation.
+
+Runtime kill-switch values such as `global_pause` and `emergency_stop` are also **not** fingerprint material. They are read and enforced per order by the RISEx worker risk path. A pause therefore blocks or constrains order execution according to the risk rules without destroying the otherwise valid operational window.
 
 Once this amendment is implemented, the fingerprint **excludes**:
 
@@ -985,7 +994,8 @@ Before any provider POST, the order path must:
 
 1. validate that the resolved account/signer are bound to the exact `CopyJob.user_id` and active `ExecutionEpoch`;
 2. check a fresh, authoritative on-chain query for active/unexpired/required permissions, fail-closed on any negative, ambiguous or unreachable-with-doubt result;
-3. re-check the worker-global window and the final local fences defined in sections 8A/10B before the POST is issued.
+3. immediately before the provider POST, inside the submission boundary, revalidate that the job's exact `ExecutionEpoch` is still the user's active epoch and that its `credential_version` still matches the generation of the currently stored RISEx signing credential. A credential superseded by credential rotation or by a destination change must never be used for a POST, even if its on-chain session remains active. A concurrency test must demonstrate this property by completing credential rotation and destination-epoch change between credential resolution and the would-be POST and proving that submission is blocked;
+4. re-check the worker-global window and the final local fences defined in sections 8A/10B before the POST is issued.
 
 **Key principle**: the worker-global window gate and the per-user credential gate are independent controls. Both must pass. Neither may substitute for the other, and neither may be inferred from the other's success.
 
