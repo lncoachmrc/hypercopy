@@ -214,9 +214,7 @@ def _material(
     )
 
 
-async def _seed_pre_post(
-    monkeypatch: pytest.MonkeyPatch,
-) -> dict[str, object]:
+async def _seed_job(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     user_id = await _insert_user()
     key = _private_key()
     epoch_id, account, signer = await _link_or_rotate(
@@ -225,9 +223,6 @@ async def _seed_pre_post(
         private_key=key,
     )
     job_id = uuid.uuid4()
-    execution_id = uuid.uuid4()
-    cloid = "0x" + uuid.uuid4().hex
-    client_order_id = 1 + (uuid.uuid4().int % ((1 << 63) - 1))
     async with SessionLocal() as db:
         db.add(
             CopyJob(
@@ -245,12 +240,27 @@ async def _seed_pre_post(
                 context={"execution_provider": "risex", "follower_network": "testnet"},
             )
         )
+        await db.commit()
+    return {
+        "user_id": user_id,
+        "old_epoch_id": epoch_id,
+        "job_id": job_id,
+        "account": account,
+        "signer": signer,
+    }
+
+
+async def _persist_pre_post(seeded: dict[str, object]) -> dict[str, object]:
+    execution_id = uuid.uuid4()
+    cloid = "0x" + uuid.uuid4().hex
+    client_order_id = 1 + (uuid.uuid4().int % ((1 << 63) - 1))
+    async with SessionLocal() as db:
         db.add(
             Execution(
                 id=execution_id,
-                copy_job_id=job_id,
-                user_id=user_id,
-                execution_epoch_id=epoch_id,
+                copy_job_id=seeded["job_id"],
+                user_id=seeded["user_id"],
+                execution_epoch_id=seeded["old_epoch_id"],
                 execution_provider="risex",
                 execution_network="testnet",
                 attempt_kind="o",
@@ -269,23 +279,25 @@ async def _seed_pre_post(
             )
         )
         await db.commit()
-    return {
-        "user_id": user_id,
-        "old_epoch_id": epoch_id,
-        "job_id": job_id,
-        "execution_id": execution_id,
-        "account": account,
-        "signer": signer,
-        "cloid": cloid,
-        "client_order_id": client_order_id,
-        "submission": _material(
-            execution_id=execution_id,
-            account=account,
-            signer=signer,
-            cloid=cloid,
-            client_order_id=client_order_id,
-        ),
-    }
+    seeded.update(
+        {
+            "execution_id": execution_id,
+            "cloid": cloid,
+            "client_order_id": client_order_id,
+            "submission": _material(
+                execution_id=execution_id,
+                account=str(seeded["account"]),
+                signer=str(seeded["signer"]),
+                cloid=cloid,
+                client_order_id=client_order_id,
+            ),
+        }
+    )
+    return seeded
+
+
+async def _seed_pre_post(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    return await _persist_pre_post(await _seed_job(monkeypatch))
 
 
 async def _allow_strategy_intent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -300,10 +312,34 @@ async def _allow_strategy_intent(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class _NoPostAdapter:
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def place_ioc(self, **_kwargs):
+        self.calls += 1
         raise AssertionError(
             "RED: superseded credential reached the provider POST path"
         )
+
+
+async def _assert_definitive_skip(
+    *,
+    job_id: object,
+    execution_id: object,
+    adapter: _NoPostAdapter,
+) -> None:
+    async with SessionLocal() as db:
+        job = await db.get(CopyJob, job_id)
+        execution = await db.get(Execution, execution_id)
+        assert job is not None
+        assert execution is not None
+        assert job.state == JobState.SKIPPED
+        assert adapter.calls == 0
+        assert execution.state not in {
+            ExecutionState.SUBMITTING,
+            ExecutionState.UNKNOWN,
+        }
+        assert "awaiting provider-truth reconciliation" not in str(job.last_error or "")
 
 
 @pytest.mark.asyncio
@@ -311,22 +347,34 @@ async def test_rotation_completes_first_blocks_old_epoch_post_integration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     try:
-        seeded = await _seed_pre_post(monkeypatch)
+        seeded = await _seed_job(monkeypatch)
+
+        # Outcome (a) is specifically rotation after signing but before the durable
+        # PRE_POST_COMMITTED row. Once that row exists it is an unresolved execution,
+        # and the GREEN rotation path must reject instead of completing the rotation.
         await _link_or_rotate(
             monkeypatch,
             user_id=seeded["user_id"],
             private_key=_private_key(),
         )
+        seeded = await _persist_pre_post(seeded)
+
         await _allow_strategy_intent(monkeypatch)
+        adapter = _NoPostAdapter()
         async with SessionLocal() as worker_db:
             job = await worker_db.get(CopyJob, seeded["job_id"])
             result = await risex_copy_execution.process_risex_job(
                 worker_db,
-                _NoPostAdapter(),
+                adapter,
                 job,
                 submission=seeded["submission"],
             )
         assert result == JobState.SKIPPED.value
+        await _assert_definitive_skip(
+            job_id=seeded["job_id"],
+            execution_id=seeded["execution_id"],
+            adapter=adapter,
+        )
     finally:
         await engine.dispose()
 
@@ -395,15 +443,21 @@ async def test_destination_epoch_changes_first_blocks_old_epoch_post_integration
             await api_db.commit()
 
         await _allow_strategy_intent(monkeypatch)
+        adapter = _NoPostAdapter()
         async with SessionLocal() as worker_db:
             job = await worker_db.get(CopyJob, seeded["job_id"])
             result = await risex_copy_execution.process_risex_job(
                 worker_db,
-                _NoPostAdapter(),
+                adapter,
                 job,
                 submission=seeded["submission"],
             )
         assert result == JobState.SKIPPED.value
+        await _assert_definitive_skip(
+            job_id=seeded["job_id"],
+            execution_id=seeded["execution_id"],
+            adapter=adapter,
+        )
     finally:
         await engine.dispose()
 
@@ -445,24 +499,45 @@ async def test_database_serialization_locks_are_released_before_fake_post_integr
 ) -> None:
     try:
         seeded = await _seed_pre_post(monkeypatch)
+        await _allow_strategy_intent(monkeypatch)
+        observed = {"user_lock": False, "execution_lock": False}
+
+        class _LockObservingAdapter:
+            async def place_ioc(self, **_kwargs):
+                async with SessionLocal() as observer:
+                    await observer.execute(
+                        text("SELECT id FROM users WHERE id = :user_id FOR UPDATE NOWAIT"),
+                        {"user_id": seeded["user_id"]},
+                    )
+                    observed["user_lock"] = True
+                    await observer.execute(
+                        text(
+                            "SELECT id FROM executions "
+                            "WHERE id = :execution_id FOR UPDATE NOWAIT"
+                        ),
+                        {"execution_id": seeded["execution_id"]},
+                    )
+                    observed["execution_lock"] = True
+                    await observer.rollback()
+                return {
+                    "order_id": "fake-terminal-no-fill",
+                    "filled_quantity": "0",
+                }
+
+        async def persist_provider_truth(_db, _execution):
+            return {"provider_truth_persisted": True}
+
         async with SessionLocal() as worker_db:
             job = await worker_db.get(CopyJob, seeded["job_id"])
-            claimed = await risex_copy_execution.claim_risex_first_post(
+            result = await risex_copy_execution.process_risex_job(
                 worker_db,
-                job=job,
+                _LockObservingAdapter(),
+                job,
                 submission=seeded["submission"],
+                persist_provider_truth=persist_provider_truth,
             )
-            assert claimed is not None
 
-        async with SessionLocal() as observer:
-            await observer.execute(
-                text("SELECT id FROM users WHERE id = :user_id FOR UPDATE NOWAIT"),
-                {"user_id": seeded["user_id"]},
-            )
-            await observer.execute(
-                text("SELECT id FROM executions WHERE id = :execution_id FOR UPDATE NOWAIT"),
-                {"execution_id": seeded["execution_id"]},
-            )
-            await observer.rollback()
+        assert observed == {"user_lock": True, "execution_lock": True}
+        assert result == JobState.SKIPPED.value
     finally:
         await engine.dispose()
