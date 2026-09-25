@@ -230,6 +230,10 @@ async def _patch_real_verifiers_with_fake_transports(
 
 
 def _configure_real_envelope(monkeypatch: pytest.MonkeyPatch) -> EnvelopeCrypto:
+    # The admission gate intentionally reads the raw process environment rather
+    # than the parsed settings object. Make the test an explicit isolated-testnet
+    # context before exercising the real POST /risex-trading-account path.
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
     monkeypatch.setattr(settings, "APP_ENV", "development")
     monkeypatch.setattr(settings, "ENABLE_LIVE_TRADING", False)
     monkeypatch.setattr(settings, "KEK_PROVIDER", "env")
