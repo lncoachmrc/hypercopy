@@ -897,7 +897,24 @@ async def link_risex_trading_account(
             'RISEx credential onboarding remains testnet-only until the mainnet gate is accepted',
         )
 
-    await db.execute(select(User).where(User.id == user.id).with_for_update())
+    locked_user = (
+        await db.execute(select(User).where(User.id == user.id).with_for_update())
+    ).scalar_one()
+    if (
+        locked_user.execution_provider == 'risex'
+        and locked_user.active_execution_epoch_id is not None
+    ):
+        rotation_blockers = await destination_switch_blockers(
+            db,
+            user.id,
+            locked_user.active_execution_epoch_id,
+        )
+        if any(blocker.code == 'unresolved_executions' for blocker in rotation_blockers):
+            raise HTTPException(
+                409,
+                'RISEx credential rotation is blocked while the active epoch has unresolved executions',
+            )
+
     locked_network = (
         await db.execute(
             text('SELECT execution_network FROM users WHERE id = :user_id'),
