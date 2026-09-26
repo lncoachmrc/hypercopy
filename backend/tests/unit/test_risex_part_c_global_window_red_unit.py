@@ -9,7 +9,11 @@ from pydantic import ValidationError
 
 from app.schemas.admin import RISExExecutionControlAction
 from app.services import risex_admin_extension, risex_execution_worker_extension
-from app.services.risex_execution_window import RISExOperationalWindowController
+from app.services.risex_execution_window import (
+    RISExExecutionState,
+    RISExOperationalWindowController,
+)
+from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
 from app.workers import execution_worker
 
 
@@ -227,3 +231,75 @@ def test_manual_signer_bound_readiness_remains_unchanged_unit() -> None:
     assert "env" in inspect.signature(
         risex_signed_testnet_runner.run_signed_testnet_readiness
     ).parameters
+
+
+@pytest.mark.asyncio
+async def test_global_readiness_rejects_main_wallet_key_and_arm_never_opens_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, _attestation = _require_global_readiness_contract()
+    monkeypatch.setenv("MAIN_WALLET_PRIVATE_KEY", "forbidden-test-value")
+    monkeypatch.setenv("RISEX_SIGNED_WRITES_ENABLED", "true")
+    monkeypatch.setattr(
+        risex_execution_worker_extension,
+        "ADR_0006_MAINNET_GATE_ACCEPTED",
+        True,
+    )
+    monkeypatch.setattr(
+        risex_execution_worker_extension,
+        "PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT",
+        "test-fingerprint",
+    )
+
+    with pytest.raises(SignedTestnetBlocked, match="main-wallet private key"):
+        await runner(
+            api=object(),
+            rpc=object(),
+            operatorhub_bypass_disabled=True,
+        )
+
+    window = RISExOperationalWindowController(
+        worker_id="worker-a",
+        boot_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+    )
+    request_id = uuid.uuid4()
+    fingerprint = "static-context"
+    assert window.begin_arm(
+        request_id=request_id,
+        control_generation=7,
+        context_fingerprint=fingerprint,
+    )
+
+    async def blocked_readiness(_assertions):
+        return await runner(
+            api=object(),
+            rpc=object(),
+            operatorhub_bypass_disabled=True,
+        )
+
+    async def heartbeat() -> None:
+        return None
+
+    worker = SimpleNamespace(
+        id="worker-a",
+        boot_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+        risex_window=window,
+        heartbeat=heartbeat,
+    )
+    request = SimpleNamespace(
+        request_id=request_id,
+        control_generation=7,
+    )
+    monkeypatch.setattr(
+        risex_execution_worker_extension,
+        "_run_readiness",
+        blocked_readiness,
+    )
+
+    await risex_execution_worker_extension._run_risex_arm_attempt(
+        worker,
+        request,
+        {"operatorhub_bypass_disabled": True},
+        fingerprint,
+    )
+    assert window.state != RISExExecutionState.ENABLED
