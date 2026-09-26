@@ -305,16 +305,21 @@ class Worker:
                 f'RISEx preparation failed before provider submission: {type(exc).__name__}',
             )
 
+        public_binding = (
+            prepared.submission.request.permit
+            if prepared is not None
+            else None
+        )
         continuous_authorization = SimpleNamespace(
             window=self.risex_window,
             account_address=(
-                prepared.account_address
-                if prepared is not None
+                public_binding.account_address
+                if public_binding is not None
                 else None
             ),
             signer_address=(
-                prepared.signer_address
-                if prepared is not None
+                public_binding.signer_address
+                if public_binding is not None
                 else None
             ),
             credential_generation=(
