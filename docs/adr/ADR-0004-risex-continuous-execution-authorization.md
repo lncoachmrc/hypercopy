@@ -944,10 +944,10 @@ The readiness PASS and Operational Execution Window remain non-persistent. Postg
 
 **Status**: Accepted — Implemented in PR #217
 **Decision date**: 2026-09-23
-**Transitional rule**: Until a separate implementation PR is merged, current single-account ADR-0004 semantics and code remain authoritative.
+**Transitional rule**: PR #217 implements this amendment for continuous multi-user execution. The pre-existing single-account semantics remain authoritative only for the unchanged manual/test path described in section 2A, mode 1.
 **Acceptance rule**: This amendment becomes Accepted/operative only in the implementation PR that implements it; if implementation materially differs from this proposal, it remains Proposed and requires further amendment.
 
-This amendment does not alter the top-level Status of ADR-0004, which remains **Accepted**. It proposes a future direction for extending the continuous execution authorization model described above to support multiple end users, each with their own RISEx credential, while preserving every fail-closed control already defined. The amendment is documentation-only. No runtime behavior described above changes as a result of adding this section.
+This amendment does not alter the top-level Status of ADR-0004, which remains **Accepted**. PR #217 implements the continuous multi-user authorization model described below, supporting multiple end users with per-user RISEx credentials while preserving the fail-closed controls defined by this ADR. The unchanged manual/test path remains governed by section 2A, mode 1.
 
 ### A. Window/Fingerprint scope
 
@@ -1039,7 +1039,7 @@ The current, exactly-implemented set of hard-required assertions for single-acco
 
 These four assertions remain the authoritative, implemented behavior of ADR-0004 today and are unaffected by this amendment unless and until a separate implementation PR merges.
 
-**Future continuous multi-user behavior (post-implementation)**, proposed by this amendment:
+**Current continuous multi-user behavior (implemented in PR #217)**:
 
 - **`disposable_account_asserted`** — DROPS from worker-global readiness. This assertion is specific to the single test/faucet-funded account model and has no equivalent meaning once accounts are per-user.
 - **`dedicated_signer_asserted`** — DROPS as a worker-global operator assertion. A dedicated signer per user remains **mandatory**, governed by ADR-0006 §0, and is verified per order from the stored per-user credential plus the authoritative account/signer binding described in section B, rather than asserted once at worker-global ARM time.
@@ -1060,9 +1060,9 @@ Such a readiness check **MUST NOT** load or require a worker-global user RISEx a
 
 ### G. Existing single-account assertion path
 
-The existing `run_signed_testnet_readiness()` single-account assertion path, and the four assertions in section E, remain authoritative and unchanged **until a separate implementation PR is merged**.
+The existing `run_signed_testnet_readiness()` single-account assertion path and its four single-account assertions remain authoritative and unchanged for the manual/test path in section 2A, mode 1.
 
-A follow-up TDD PR must introduce or refactor continuous readiness to remove the worker-global user credential requirement described in section E, while preserving the short-lived manual/test attestation semantics of section 2A, mode 1, unchanged.
+PR #217 provides the signerless worker-global continuous readiness path described in section F while preserving the short-lived manual/test attestation semantics of section 2A, mode 1, unchanged.
 
 ### H. MoveFund (ADR-0002 / ADR-0003)
 
@@ -1072,6 +1072,6 @@ A follow-up TDD PR must introduce or refactor continuous readiness to remove the
 
 ### I. Implementation boundary
 
-This amendment is **documentation-only**. It makes no runtime, code, test, migration, workflow, configuration, environment or deployment changes. Every behavior described in the main body of ADR-0004 above, including the four current ARM assertions in section E, remains exactly as implemented today.
+This amendment is implemented by PR #217 through runtime code and tests without migrations, workflow changes, environment changes or deployment actions. The main body of ADR-0004 remains authoritative except where sections 10 and 10A explicitly defer to this Accepted multi-user amendment for continuous execution.
 
-Implementation of this amendment, if and when undertaken, requires a separate, dedicated follow-up TDD PR. That implementation PR is the only mechanism by which this amendment can transition from Proposed to Accepted/operative.
+PR #217 is the dedicated TDD implementation PR that makes this amendment Accepted and operative for continuous multi-user execution.
