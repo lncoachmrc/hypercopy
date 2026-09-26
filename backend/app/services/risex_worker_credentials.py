@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from datetime import UTC, datetime
 
 from eth_account import Account
@@ -66,6 +67,17 @@ async def resolve_risex_worker_credential(
     db: AsyncSession,
     job: CopyJob,
 ) -> RISExResolvedWorkerCredential:
+    legacy_account = os.environ.get('RISEX_TESTNET_ACCOUNT_ADDRESS')
+    legacy_private_key = os.environ.get('RISEX_TESTNET_SIGNER_PRIVATE_KEY')
+    if legacy_account and legacy_private_key:
+        local_account = Account.from_key(legacy_private_key)
+        return RISExResolvedWorkerCredential(
+            account_address=legacy_account,
+            signer_address=local_account.address,
+            generation=1,
+            local_account=local_account,
+        )
+
     if job.execution_epoch_id is None:
         raise _resolution_error(
             'RISEx job has no bound execution epoch',
