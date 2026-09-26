@@ -180,6 +180,12 @@ async def resolve_risex_worker_credential(
     finally:
         del plaintext
 
+    if local_account.address.lower() != credential.signer_address.lower():
+        raise _resolution_error(
+            'RISEx derived signer does not match the stored signer binding',
+            job_state=JobState.DEAD,
+        )
+
     return RISExResolvedWorkerCredential(
         account_address=account.account_address,
         signer_address=credential.signer_address,
