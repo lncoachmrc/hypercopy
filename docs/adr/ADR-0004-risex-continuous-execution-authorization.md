@@ -1037,7 +1037,7 @@ The current, exactly-implemented set of hard-required assertions for single-acco
 - `operatorhub_bypass_disabled`;
 - `fund_movement_path_absent`.
 
-These four assertions remain the authoritative, implemented behavior of ADR-0004 today and are unaffected by this amendment unless and until a separate implementation PR merges.
+For the unchanged manual/test path in section 2A, mode 1, these four single-account assertions remain authoritative. For continuous multi-user execution, PR #217 implements the worker-global assertion set described below.
 
 **Current continuous multi-user behavior (implemented in PR #217)**:
 
@@ -1047,9 +1047,9 @@ These four assertions remain the authoritative, implemented behavior of ADR-0004
 - **`operatorhub_bypass_disabled`** — REMAINS a worker-global assertion, unchanged.
 - The existing forbidden main-wallet-key protections remain worker-global and fail-closed, unchanged by this amendment.
 
-### F. Future global continuous readiness
+### F. Global continuous readiness
 
-A future worker-global continuous readiness check that has no worker-global signer must still, at minimum:
+The worker-global continuous readiness implemented in PR #217 has no worker-global signer and must, at minimum:
 
 - establish an explicit ARM for the exact `worker_id` + `boot_id` incarnation, as in section 7;
 - include a fresh heartbeat/identity check, the singleton invariant (section 9), deployment/build identity and provider/network identity;
