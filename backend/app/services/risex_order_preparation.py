@@ -577,7 +577,7 @@ async def prepare_risex_ioc_request(
 
 async def prepare_risex_ioc_request_from_plan(
     *,
-    credential: RISExTestnetSignerCredential,
+    credential: Any,
     api: PublicAPITransport,
     rpc: PublicRPCTransport,
     plan: RISExIOCPlan,
