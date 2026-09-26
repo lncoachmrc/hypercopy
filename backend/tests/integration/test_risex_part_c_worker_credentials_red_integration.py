@@ -600,6 +600,7 @@ async def test_per_order_resolver_real_envelope_roundtrip_and_cross_user_aad_int
             ).scalars().all()
 
         assert exc.value.job_state == JobState.DEAD
+        assert str(exc.value) == "RISEx credential could not be decrypted"
         exposed = "\n".join(
             [
                 str(exc.value),
