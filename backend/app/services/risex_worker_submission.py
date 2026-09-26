@@ -76,12 +76,15 @@ _RISEX_TOTAL_EXPOSURE_CEILING_USDC = Decimal('75000')
 
 @dataclass(slots=True)
 class RISExWorkerPreparedSubmission:
-    """Own process-local transports plus the exact durable/signed submission."""
+    """Own transports, durable submission and public per-order credential binding."""
 
     transport: RISExSignedTestnetHTTPTransport
     submission: RISExPreparedCopySubmission
     api: RISExReadOnlyHTTPTransport
     rpc: RISExReadOnlyRPCTransport
+    account_address: str
+    signer_address: str
+    generation: int
 
     async def aclose(self) -> None:
         await self.transport.aclose()
@@ -363,6 +366,9 @@ async def prepare_risex_worker_submission(
             submission=submission,
             api=api,
             rpc=rpc,
+            account_address=resolved_credential.account_address,
+            signer_address=resolved_credential.signer_address,
+            generation=resolved_credential.generation,
         )
     except Exception:
         if transport is not None:

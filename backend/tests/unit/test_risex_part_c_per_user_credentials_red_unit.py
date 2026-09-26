@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
+import uuid
 from pathlib import Path
 from time import time
 from types import SimpleNamespace
@@ -10,9 +12,13 @@ import pytest
 from app.security.risex_order_codec import RISExPlaceOrder, build_place_order_action_hash
 from app.security.risex_place_order_permit import RISExPreparedPlaceOrderPermit
 from app.security.risex_place_order_request import prepare_place_order_request
+from app.adapters import risex as risex_adapter_module
+from app.adapters.risex_types import ProviderWriteDisabled
 from app.security.risex_pre_order_gate import authorize_pre_order_probe
 from app.security.risex_signed_testnet_policy import SignedTestnetPolicy
 from app.services import risex_order_preparation, risex_worker_submission
+from app.services.risex_execution_window import RISExOperationalWindowController
+from app.models.entities import JobState
 from app.workers import execution_worker
 from tests.unit.risex_replay_test_support import make_test_replay_architecture_attestation
 
@@ -209,3 +215,134 @@ def test_movefund_true_remains_authorized_under_adr0002_criterion_unit() -> None
     )
     assert gate.authorization_criterion == "perps_permission_and_fund_movement_path_absent"
     assert gate.order_probe_allowed is True
+
+
+@pytest.mark.parametrize("mismatch", ["account", "signer"])
+@pytest.mark.asyncio
+async def test_continuous_writer_rejects_permit_identity_mismatch_against_resolved_binding_unit(
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    context_fingerprint = "part-c-c4-context"
+    boot_id = uuid.UUID("11111111-1111-1111-1111-111111111111")
+    window = RISExOperationalWindowController(
+        worker_id="worker-a",
+        boot_id=boot_id,
+    )
+    request_id = uuid.uuid4()
+    assert window.begin_arm(
+        request_id=request_id,
+        control_generation=1,
+        context_fingerprint=context_fingerprint,
+    )
+    window.open_window(
+        request_id=request_id,
+        control_generation=1,
+        context_fingerprint=context_fingerprint,
+    )
+
+    request = _request()
+    alternate_account = "0x" + ("55" * 20)
+    alternate_signer = "0x" + ("66" * 20)
+    resolved_account = alternate_account if mismatch == "account" else ACCOUNT
+    resolved_signer = alternate_signer if mismatch == "signer" else SIGNER
+
+    class FakeSignedTransport:
+        def __init__(self) -> None:
+            self.post_calls = 0
+
+        async def prepare_place_order_post(self, prepared_request):
+            return {"request": prepared_request}
+
+        async def post_prepared_place_order(self, _payload):
+            self.post_calls += 1
+            return {"success": True}
+
+        async def aclose(self) -> None:
+            return None
+
+    class FakeCloser:
+        async def aclose(self) -> None:
+            return None
+
+    transport = FakeSignedTransport()
+    prepared = risex_worker_submission.RISExWorkerPreparedSubmission(
+        transport=transport,
+        submission=SimpleNamespace(request=request),
+        api=FakeCloser(),
+        rpc=FakeCloser(),
+        account_address=resolved_account,
+        signer_address=resolved_signer,
+        generation=1,
+    )
+
+    async def singleton_ok(_worker, _db) -> bool:
+        return True
+
+    async def prepare_submission(_db, _job, *, readiness_assertions):
+        assert readiness_assertions == {"operatorhub_bypass_disabled": True}
+        return prepared
+
+    async def active_destination(_db, _job) -> bool:
+        return True
+
+    async def process_with_real_writer(db, adapter, job, *, submission):
+        with pytest.raises(
+            ProviderWriteDisabled,
+            match="continuous permit (account|signer) identity mismatch",
+        ):
+            await adapter.place_ioc(
+                db=db,
+                job=job,
+                request=submission.request,
+            )
+        return JobState.SKIPPED.value
+
+    monkeypatch.setenv("RISEX_SIGNED_WRITES_ENABLED", "true")
+    monkeypatch.setattr(
+        execution_worker,
+        "current_risex_context_fingerprint",
+        lambda _worker, _assertions: context_fingerprint,
+    )
+    monkeypatch.setattr(
+        execution_worker,
+        "risex_singleton_matches_worker",
+        singleton_ok,
+    )
+    monkeypatch.setattr(
+        execution_worker,
+        "prepare_risex_worker_submission",
+        prepare_submission,
+    )
+    monkeypatch.setattr(
+        execution_worker,
+        "process_risex_job",
+        process_with_real_writer,
+    )
+    monkeypatch.setattr(
+        risex_adapter_module,
+        "job_matches_active_destination",
+        active_destination,
+    )
+    monkeypatch.setattr(
+        risex_adapter_module,
+        "RISExSignedTestnetHTTPTransport",
+        FakeSignedTransport,
+    )
+
+    worker = SimpleNamespace(
+        id="worker-a",
+        boot_id=boot_id,
+        risex_window=window,
+        risex_submission_lock=asyncio.Lock(),
+    )
+    job = SimpleNamespace(
+        execution_provider="risex",
+        execution_network="testnet",
+        execution_epoch_id=uuid.uuid4(),
+    )
+
+    result = await execution_worker.Worker._run_risex_copy_job(worker, object(), job)
+
+    assert result == JobState.SKIPPED.value
+    assert transport.post_calls == 0
