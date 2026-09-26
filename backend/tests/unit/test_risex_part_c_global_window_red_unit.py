@@ -25,11 +25,8 @@ def _worker() -> SimpleNamespace:
 
 
 def _fingerprint(monkeypatch: pytest.MonkeyPatch, *, account_byte: str = "1", signer_byte: str = "2", assertions=None) -> str:
-    monkeypatch.setattr(
-        risex_execution_worker_extension,
-        "load_testnet_signer_credential",
-        lambda _env: _fixed_credential(account_byte, signer_byte),
-    )
+    monkeypatch.setenv("RISEX_TESTNET_ACCOUNT_ADDRESS", "0x" + (account_byte * 40))
+    monkeypatch.setenv("RISEX_TESTNET_SIGNER_PRIVATE_KEY", signer_byte * 64)
     return risex_execution_worker_extension._current_context_fingerprint(
         _worker(),
         assertions or {"operatorhub_bypass_disabled": True},
@@ -78,11 +75,6 @@ def test_fingerprint_changes_with_static_global_material_unit(
     first: str,
     second: str,
 ) -> None:
-    monkeypatch.setattr(
-        risex_execution_worker_extension,
-        "load_testnet_signer_credential",
-        lambda _env: _fixed_credential("1", "2"),
-    )
     monkeypatch.setenv(env_name, first)
     one = risex_execution_worker_extension._current_context_fingerprint(
         _worker(), {"operatorhub_bypass_disabled": True}
