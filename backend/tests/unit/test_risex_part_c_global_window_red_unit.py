@@ -251,6 +251,28 @@ async def test_global_readiness_rejects_main_wallet_key_and_arm_never_opens_unit
         "test-fingerprint",
     )
 
+    async def valid_deployment(_api, _rpc, *, network):
+        assert network == "testnet"
+        return SimpleNamespace()
+
+    def passing_preflight(_deployment, *, expected_fingerprint):
+        assert expected_fingerprint == "test-fingerprint"
+        return SimpleNamespace(
+            verdict="PASS",
+            deployment_identity_verified=True,
+        )
+
+    monkeypatch.setattr(
+        risex_execution_worker_extension,
+        "collect_runtime_deployment_evidence",
+        valid_deployment,
+    )
+    monkeypatch.setattr(
+        risex_execution_worker_extension,
+        "evaluate_pinned_deployment_preflight",
+        passing_preflight,
+    )
+
     with pytest.raises(SignedTestnetBlocked, match="main-wallet private key"):
         await runner(
             api=object(),
