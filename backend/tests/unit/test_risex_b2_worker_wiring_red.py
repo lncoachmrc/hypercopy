@@ -113,14 +113,6 @@ async def test_request_from_plan_signs_exact_order_and_preserves_reduce_only(
 
     monkeypatch.setattr(
         risex_order_preparation,
-        "load_testnet_signer_credential",
-        lambda _env: SimpleNamespace(
-            account_address=ACCOUNT,
-            signer_address=SIGNER,
-        ),
-    )
-    monkeypatch.setattr(
-        risex_order_preparation,
         "collect_runtime_deployment_evidence",
         AsyncMock(
             return_value=SimpleNamespace(
@@ -169,7 +161,10 @@ async def test_request_from_plan_signs_exact_order_and_preserves_reduce_only(
     )
 
     request = await helper(
-        env={},
+        credential=SimpleNamespace(
+            account_address=ACCOUNT,
+            signer_address=SIGNER,
+        ),
         api=object(),
         rpc=object(),
         plan=plan,

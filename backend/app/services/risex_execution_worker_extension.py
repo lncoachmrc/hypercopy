@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypeVar
@@ -16,16 +17,17 @@ from sqlalchemy import select
 from app.adapters.risex_http import RISExReadOnlyHTTPTransport
 from app.adapters.risex_types import ProviderDataMalformed, ProviderReadUnavailable
 from app.models.entities import RISExExecutionControl, WorkerHeartbeat
+from app.security.risex_deployment_preflight import evaluate_pinned_deployment_preflight
 from app.security.risex_deployment_runtime import (
     PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
     RISExReadOnlyRPCTransport,
+    collect_runtime_deployment_evidence,
 )
-from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
-from app.security.risex_signed_testnet_runner import (
-    assert_runtime_readiness_attested,
-    run_signed_testnet_readiness,
+from app.security.risex_signed_testnet_policy import (
+    SignedTestnetBlocked,
+    reject_main_wallet_key_inputs,
 )
-from app.security.risex_testnet_signer import load_testnet_signer_credential
+from app.services.risex_order_preparation import ADR_0006_MAINNET_GATE_ACCEPTED
 from app.services.risex_execution_control import (
     arm_finalization_fence,
     claim_control_request,
@@ -42,10 +44,7 @@ _RISEX_TESTNET_API_URL = 'https://api.testnet.rise.trade'
 _RISEX_TESTNET_RPC_URL = 'https://testnet.riselabs.xyz'
 _RISEX_READINESS_TIMEOUT_SECONDS = 60.0
 _REQUIRED_ARM_ASSERTIONS = (
-    'disposable_account_asserted',
-    'dedicated_signer_asserted',
     'operatorhub_bypass_disabled',
-    'fund_movement_path_absent',
 )
 _T = TypeVar('_T')
 
@@ -70,14 +69,6 @@ def _current_context_fingerprint(
     worker: Any,
     readiness_assertions: dict[str, bool],
 ) -> str:
-    try:
-        credential = load_testnet_signer_credential(os.environ)
-        account_address = credential.account_address.lower()
-        signer_address = credential.signer_address.lower()
-    except SignedTestnetBlocked:
-        account_address = str(os.environ.get('RISEX_TESTNET_ACCOUNT_ADDRESS') or '').lower()
-        signer_address = '<unavailable>'
-
     material = {
         'worker_id': worker.id,
         'boot_id': str(worker.boot_id),
@@ -85,13 +76,14 @@ def _current_context_fingerprint(
         'provider': 'risex',
         'environment': os.environ.get('RAILWAY_ENVIRONMENT_NAME') or os.environ.get('APP_ENV') or '',
         'network': 'testnet',
-        'account_address': account_address,
-        'signer_address': signer_address,
         'api_url': _RISEX_TESTNET_API_URL,
         'rpc_url': _RISEX_TESTNET_RPC_URL,
         'deployment_fingerprint': PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
         'signed_writes_env': os.environ.get('RISEX_SIGNED_WRITES_ENABLED') or '',
-        'readiness_assertions': {key: readiness_assertions.get(key) is True for key in _REQUIRED_ARM_ASSERTIONS},
+        'adr_0006_mainnet_gate_accepted': ADR_0006_MAINNET_GATE_ACCEPTED is True,
+        'operatorhub_bypass_disabled': readiness_assertions.get(
+            'operatorhub_bypass_disabled'
+        ) is True,
     }
     encoded = json.dumps(material, sort_keys=True, separators=(',', ':')).encode('utf-8')
     return hashlib.sha256(encoded).hexdigest()
@@ -124,19 +116,59 @@ def _assertions_from_request(request: RISExExecutionControl) -> dict[str, bool]:
     return {key: raw.get(key) is True for key in _REQUIRED_ARM_ASSERTIONS}
 
 
-async def _run_readiness(readiness_assertions: dict[str, bool]) -> Any:
+@dataclass(frozen=True, slots=True)
+class RISExGlobalContinuousReadinessAttestation:
+    issued_at: float
+    deployment_fingerprint: str
+    operatorhub_bypass_disabled: bool
+
+
+async def run_global_risex_continuous_readiness(
+    *,
+    api: RISExReadOnlyHTTPTransport,
+    rpc: RISExReadOnlyRPCTransport,
+    operatorhub_bypass_disabled: bool,
+) -> RISExGlobalContinuousReadinessAttestation:
+    reject_main_wallet_key_inputs(os.environ)
+    if not PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT:
+        raise SignedTestnetBlocked('RISEx pinned deployment fingerprint is unavailable')
+    if os.environ.get('RISEX_SIGNED_WRITES_ENABLED') != 'true':
+        raise SignedTestnetBlocked('RISEX_SIGNED_WRITES_ENABLED must be explicitly true')
+    if ADR_0006_MAINNET_GATE_ACCEPTED is not True:
+        raise SignedTestnetBlocked('ADR-0006 mainnet gate is not accepted')
+    if operatorhub_bypass_disabled is not True:
+        raise SignedTestnetBlocked('operatorhub_bypass_disabled must be explicitly true')
+
+    deployment = await collect_runtime_deployment_evidence(
+        api,
+        rpc,
+        network='testnet',
+    )
+    report = evaluate_pinned_deployment_preflight(
+        deployment,
+        expected_fingerprint=PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
+    )
+    if report.verdict != 'PASS' or report.deployment_identity_verified is not True:
+        raise SignedTestnetBlocked('RISEx global continuous deployment readiness failed')
+
+    return RISExGlobalContinuousReadinessAttestation(
+        issued_at=time.time(),
+        deployment_fingerprint=PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
+        operatorhub_bypass_disabled=True,
+    )
+
+
+async def _run_readiness(
+    readiness_assertions: dict[str, bool],
+) -> RISExGlobalContinuousReadinessAttestation:
     async with RISExReadOnlyHTTPTransport(base_url=_RISEX_TESTNET_API_URL) as api:
         async with RISExReadOnlyRPCTransport(rpc_url=_RISEX_TESTNET_RPC_URL) as rpc:
-            return await run_signed_testnet_readiness(
-                env=os.environ,
+            return await run_global_risex_continuous_readiness(
                 api=api,
                 rpc=rpc,
-                network='testnet',
-                explicit_approval=True,
-                disposable_account_asserted=readiness_assertions['disposable_account_asserted'],
-                dedicated_signer_asserted=readiness_assertions['dedicated_signer_asserted'],
-                operatorhub_bypass_disabled=readiness_assertions['operatorhub_bypass_disabled'],
-                fund_movement_path_absent=readiness_assertions['fund_movement_path_absent'],
+                operatorhub_bypass_disabled=readiness_assertions.get(
+                    'operatorhub_bypass_disabled'
+                ) is True,
             )
 
 
@@ -154,20 +186,13 @@ async def _run_risex_arm_attempt(
             _run_readiness(readiness_assertions),
             timeout=_RISEX_READINESS_TIMEOUT_SECONDS,
         )
-        if result.report.verdict != 'PASS' or result.attestation is None:
+        if not isinstance(result, RISExGlobalContinuousReadinessAttestation):
             worker.risex_window.cancel_arm(
-                'RISEx readiness did not produce a valid PASS attestation',
+                'RISEx global continuous readiness did not produce a valid attestation',
                 locked=True,
             )
             await worker.heartbeat()
             return
-
-        assert_runtime_readiness_attested(
-            result.attestation,
-            account_address=result.report.account_address,
-            signer_address=result.report.signer_address,
-            clock=time.time,
-        )
 
         current_fingerprint = _current_context_fingerprint(worker, readiness_assertions)
         if current_fingerprint != context_fingerprint:
@@ -317,7 +342,7 @@ async def _poll_risex_control_once(worker: Any) -> None:
     await worker.heartbeat()
 
     if not all(readiness_assertions.values()):
-        worker.risex_window.cancel_arm('RISEx ARM is missing explicit ADR-0002 readiness assertions', locked=True)
+        worker.risex_window.cancel_arm('RISEx ARM is missing required global readiness assertions', locked=True)
         await worker.heartbeat()
         return
 

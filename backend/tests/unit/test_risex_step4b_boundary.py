@@ -57,14 +57,6 @@ def _enabled_worker(fixed_now: datetime):
 def _patch_common(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         execution_worker,
-        'load_testnet_signer_credential',
-        lambda _env: SimpleNamespace(
-            account_address=ACCOUNT,
-            signer_address=SIGNER,
-        ),
-    )
-    monkeypatch.setattr(
-        execution_worker,
         'current_risex_context_fingerprint',
         lambda _worker, _assertions: CONTEXT_FINGERPRINT,
     )
@@ -101,8 +93,21 @@ async def test_enabled_risex_worker_passes_exact_prepared_submission_and_request
     _patch_common(monkeypatch)
 
     transport = object()
-    submission = object()
-    prepared = SimpleNamespace(transport=transport, submission=submission)
+    submission = SimpleNamespace(
+        request=SimpleNamespace(
+            permit=SimpleNamespace(
+                account_address=ACCOUNT,
+                signer_address=SIGNER,
+            )
+        )
+    )
+    prepared = SimpleNamespace(
+        transport=transport,
+        submission=submission,
+        account_address=ACCOUNT,
+        signer_address=SIGNER,
+        generation=1,
+    )
     prepare_calls = 0
 
     async def prepare_once(*_args, **_kwargs):

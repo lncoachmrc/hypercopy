@@ -577,17 +577,16 @@ async def prepare_risex_ioc_request(
 
 async def prepare_risex_ioc_request_from_plan(
     *,
-    env: Mapping[str, str],
+    credential: Any,
     api: PublicAPITransport,
     rpc: PublicRPCTransport,
     plan: RISExIOCPlan,
     network: Network = 'testnet',
     deadline_seconds: int = 30,
 ) -> RISExPreparedPlaceOrderRequest:
-    """Sign exactly one already-authorized IOC plan without rebuilding execution fields."""
+    """Sign one authorized IOC plan with the explicitly resolved per-order credential."""
 
     network = assert_risex_execution_network_allowed(network)
-    credential = load_testnet_signer_credential(env)
 
     deployment = await collect_runtime_deployment_evidence(
         api,

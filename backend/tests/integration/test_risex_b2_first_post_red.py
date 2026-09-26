@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -19,6 +19,9 @@ from app.models.entities import (
     ExecutionEpoch,
     ExecutionState,
     JobState,
+    CredentialStatus,
+    RISExSigningCredential,
+    RISExTradingAccount,
     User,
     UserState,
 )
@@ -195,6 +198,40 @@ async def _cleanup(user_id: uuid.UUID) -> None:
 async def test_pre_post_committed_can_be_claimed_exactly_once_under_row_lock() -> None:
     claim = _require("claim_risex_first_post")
     user_id, job_id, execution_id, cloid = await _seed()
+    async with SessionLocal() as db:
+        user = await db.get(User, user_id)
+        job = await db.get(CopyJob, job_id)
+        assert user is not None
+        assert job is not None
+        assert job.execution_epoch_id is not None
+        epoch = await db.get(ExecutionEpoch, job.execution_epoch_id)
+        assert epoch is not None
+        user.active_execution_epoch_id = epoch.id
+        account = RISExTradingAccount(
+            user_id=user_id,
+            account_address=str(epoch.account_address),
+            verified_at=datetime.now(UTC),
+        )
+        db.add(account)
+        await db.flush()
+        db.add(
+            RISExSigningCredential(
+                risex_trading_account_id=account.id,
+                signer_address="0x" + uuid.uuid4().hex + uuid.uuid4().hex[:8],
+                ciphertext_b64="fixture-ciphertext",
+                nonce_b64="fixture-nonce",
+                wrapped_dek_b64="fixture-wrapped-dek",
+                wrap_nonce_b64="fixture-wrap-nonce",
+                key_provider="test",
+                key_reference="b2-first-post-fixture",
+                key_version=1,
+                generation=int(epoch.credential_version),
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                status=CredentialStatus.ACTIVE,
+            )
+        )
+        await db.commit()
+
     submission = _material(
         execution_id=execution_id,
         cloid=cloid,

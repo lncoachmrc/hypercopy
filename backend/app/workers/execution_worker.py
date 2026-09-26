@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import signal
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -33,7 +32,6 @@ from app.models.entities import (
     User,
     WorkerHeartbeat,
 )
-from app.security.risex_testnet_signer import load_testnet_signer_credential
 from app.services.admin_leverage_sync import (
     LeverageSyncAuthorizationError,
     fresh_position_config_sync_authorization,
@@ -48,6 +46,7 @@ from app.services.networking import user_network_state
 from app.services.queue import ensure_group, prepare_job_destination_for_execution, repair_stream
 from app.services.reconcile import master_snapshot, reconcile_active_users, reconcile_user
 from app.services.risex_copy_execution import process_risex_job
+from app.services.risex_worker_credentials import RISExWorkerCredentialResolutionError
 from app.services.risex_worker_submission import prepare_risex_worker_submission
 from app.services.risex_execution_window import RISExExecutionState, RISExOperationalWindowController
 from app.services.risex_execution_worker_extension import (
@@ -236,21 +235,20 @@ class Worker:
             )
 
         readiness_assertions = {
-            'disposable_account_asserted': True,
-            'dedicated_signer_asserted': True,
             'operatorhub_bypass_disabled': True,
-            'fund_movement_path_absent': True,
         }
-        credential = load_testnet_signer_credential(os.environ)
-        context_fingerprint = current_risex_context_fingerprint(self, readiness_assertions)
+        context_fingerprint = current_risex_context_fingerprint(
+            self,
+            readiness_assertions,
+        )
         if context_fingerprint != self.risex_window.context_fingerprint:
             async with self.risex_submission_lock:
                 self.risex_window.lock('RISEx security-relevant runtime context changed before CopyJob')
-            job.state=JobState.DEAD
-            job.last_error='RISEx continuous authorization context mismatch'
-            job.owner=None
-            job.locked_until=None
-            job.next_attempt_at=None
+            job.state = JobState.DEAD
+            job.last_error = 'RISEx continuous authorization context mismatch'
+            job.owner = None
+            job.locked_until = None
+            job.next_attempt_at = None
             await db.commit()
             return JobState.DEAD.value
 
@@ -261,16 +259,19 @@ class Worker:
         if not singleton_ok:
             async with self.risex_submission_lock:
                 self.risex_window.lock('RISEx singleton invariant cannot be established at point of use')
-            job.state=JobState.DEAD
-            job.last_error='RISEx singleton execution-worker invariant is not established'
-            job.owner=None
-            job.locked_until=None
-            job.next_attempt_at=None
+            job.state = JobState.DEAD
+            job.last_error = 'RISEx singleton execution-worker invariant is not established'
+            job.owner = None
+            job.locked_until = None
+            job.next_attempt_at = None
             await db.commit()
             return JobState.DEAD.value
 
         async def _final_authorizer() -> None:
-            fresh_context = current_risex_context_fingerprint(self, readiness_assertions)
+            fresh_context = current_risex_context_fingerprint(
+                self,
+                readiness_assertions,
+            )
             if fresh_context != context_fingerprint:
                 self.risex_window.lock('RISEx security-relevant runtime context changed during submission')
                 raise ProviderWriteDisabled('RISEx continuous authorization context changed')
@@ -278,21 +279,21 @@ class Worker:
                 self.risex_window.lock('RISEx singleton invariant changed during submission')
                 raise ProviderWriteDisabled('RISEx singleton execution-worker invariant changed')
 
-        continuous_authorization=SimpleNamespace(
-            window=self.risex_window,
-            account_address=credential.account_address,
-            signer_address=credential.signer_address,
-            context_fingerprint=context_fingerprint,
-            submission_lock=self.risex_submission_lock,
-            final_authorizer=_final_authorizer,
-        )
-
         try:
             prepared = await prepare_risex_worker_submission(
                 db,
                 job,
                 readiness_assertions=readiness_assertions,
             )
+        except RISExWorkerCredentialResolutionError as exc:
+            job.state = exc.job_state
+            job.last_error = str(exc)
+            job.owner = None
+            job.locked_until = None
+            job.next_attempt_at = None
+            job.enqueued_at = None
+            await db.commit()
+            return job.state.value
         except Exception as exc:
             log.warning(
                 f'RISEx preparation failed before provider submission ({type(exc).__name__})',
@@ -304,10 +305,30 @@ class Worker:
                 f'RISEx preparation failed before provider submission: {type(exc).__name__}',
             )
 
+        continuous_authorization = SimpleNamespace(
+            window=self.risex_window,
+            account_address=(
+                prepared.account_address
+                if prepared is not None
+                else None
+            ),
+            signer_address=(
+                prepared.signer_address
+                if prepared is not None
+                else None
+            ),
+            credential_generation=(
+                prepared.generation
+                if prepared is not None
+                else None
+            ),
+            context_fingerprint=context_fingerprint,
+            submission_lock=self.risex_submission_lock,
+            final_authorizer=_final_authorizer,
+        )
+
         if prepared is None:
             # ADR-0006 is not accepted yet, so b2 is intentionally testnet-only.
-            # If ADR_0006_MAINNET_GATE_ACCEPTED ever becomes True, this hard-coded
-            # adapter network must be redesigned before mainnet can be enabled.
             adapter = RISExAdapter(
                 network='testnet',
                 gate3_mode='continuous_window',
@@ -321,8 +342,6 @@ class Worker:
             )
 
         # ADR-0006 is not accepted yet, so b2 is intentionally testnet-only.
-        # If ADR_0006_MAINNET_GATE_ACCEPTED ever becomes True, this hard-coded
-        # adapter network must be redesigned before mainnet can be enabled.
         adapter = RISExAdapter(
             network='testnet',
             transport=prepared.transport,
@@ -330,15 +349,14 @@ class Worker:
             continuous_authorization=continuous_authorization,
         )
         try:
-            result=await process_risex_job(
+            return await process_risex_job(
                 db,
                 adapter,
                 job,
                 submission=prepared.submission,
             )
-            return result
         finally:
-            close_prepared=getattr(prepared,'aclose',None)
+            close_prepared = getattr(prepared, 'aclose', None)
             if callable(close_prepared):
                 await close_prepared()
 

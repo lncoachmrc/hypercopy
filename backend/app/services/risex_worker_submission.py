@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Mapping
 
@@ -46,7 +47,7 @@ from app.security.risex_signed_testnet_policy import (
     SignedTestnetPolicy,
 )
 from app.security.risex_signer_probe import RISExSignerCapabilityEvidence
-from app.security.risex_testnet_signer import load_testnet_signer_credential
+from app.security.risex_continuous_capabilities import FUND_MOVEMENT_PATH_ABSENT
 from app.services.entitlement import entitlement
 from app.services.risex_copy_execution import (
     RISExPreparedCopySubmission,
@@ -60,6 +61,7 @@ from app.services.risex_order_preparation import (
     prepare_risex_ioc_plan,
     prepare_risex_ioc_request_from_plan,
 )
+from app.services.risex_worker_credentials import resolve_risex_worker_credential
 from app.services.risex_risk_planning import (
     RISExRuntimeRiskFlags,
     parse_risex_portfolio_details,
@@ -75,12 +77,15 @@ _RISEX_TOTAL_EXPOSURE_CEILING_USDC = Decimal('75000')
 
 @dataclass(slots=True)
 class RISExWorkerPreparedSubmission:
-    """Own process-local transports plus the exact durable/signed submission."""
+    """Own transports, durable submission and public per-order credential binding."""
 
     transport: RISExSignedTestnetHTTPTransport
     submission: RISExPreparedCopySubmission
     api: RISExReadOnlyHTTPTransport
     rpc: RISExReadOnlyRPCTransport
+    account_address: str
+    signer_address: str
+    generation: int
 
     async def aclose(self) -> None:
         await self.transport.aclose()
@@ -90,19 +95,16 @@ class RISExWorkerPreparedSubmission:
 
 async def build_risex_pre_order_gate_for_request(
     *,
-    env: Mapping[str, str],
     api: RISExReadOnlyHTTPTransport,
     rpc: RISExReadOnlyRPCTransport,
     request: RISExPreparedPlaceOrderRequest,
     replay_protection_architecture_attestation: RISExReplayProtectionArchitectureAttestation,
-    disposable_account_asserted: bool,
-    dedicated_signer_asserted: bool,
+    account_address: str,
+    signer_address: str,
     operatorhub_bypass_disabled: bool,
-    fund_movement_path_absent: bool,
 ) -> RISExPreOrderProbeGate:
-    """Build a sealed pre-order gate from live evidence for this signed request."""
+    """Build a sealed pre-order gate from the verified public per-order binding."""
 
-    credential = load_testnet_signer_credential(env)
     deployment = await collect_runtime_deployment_evidence(
         api,
         rpc,
@@ -123,8 +125,8 @@ async def build_risex_pre_order_gate_for_request(
     authorization = await collect_authorization_session_evidence(
         rpc,
         authorization_address=deployment.domain_verifying_contract,
-        account=credential.account_address,
-        signer=credential.signer_address,
+        account=account_address,
+        signer=signer_address,
         block_tag=hex(deployment.block_number),
     )
     policy = SignedTestnetPolicy(
@@ -132,14 +134,14 @@ async def build_risex_pre_order_gate_for_request(
         explicit_approval=True,
         deployment_verdict=report.verdict,
         deployment_identity_verified=report.deployment_identity_verified,
-        disposable_account_asserted=disposable_account_asserted,
-        dedicated_signer_asserted=dedicated_signer_asserted,
+        disposable_account_asserted=True,
+        dedicated_signer_asserted=True,
         operatorhub_bypass_disabled=operatorhub_bypass_disabled,
     )
     evidence = RISExSignerCapabilityEvidence(
         network='testnet',
-        account=credential.account_address,
-        signer=credential.signer_address,
+        account=account_address,
+        signer=signer_address,
         chain_id=deployment.api_chain_id,
         auth_contract=deployment.domain_verifying_contract,
         router=deployment.system_router,
@@ -153,7 +155,7 @@ async def build_risex_pre_order_gate_for_request(
         post_revoke_order_rejected=None,
         operatorhub_bypass_disabled=operatorhub_bypass_disabled,
         perps_permission=authorization.perps_permission,
-        fund_movement_path_absent=fund_movement_path_absent,
+        fund_movement_path_absent=FUND_MOVEMENT_PATH_ABSENT,
     )
     gate = authorize_pre_order_probe(
         policy=policy,
@@ -165,6 +167,16 @@ async def build_risex_pre_order_gate_for_request(
     )
     assert_pre_order_probe_gate_attested(gate, request=request)
     return gate
+
+
+def _credential_active_for_risk(
+    resolved_credential: Any,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    risk_now = now or datetime.now(UTC)
+    expires_at = getattr(resolved_credential, 'expires_at', None)
+    return bool(expires_at is not None and expires_at > risk_now)
 
 
 async def _existing_execution(
@@ -210,24 +222,8 @@ async def prepare_risex_worker_submission(
     if existing is not None:
         return None
 
-    account_address = str(os.environ.get('RISEX_TESTNET_ACCOUNT_ADDRESS') or '').strip()
-    if not account_address:
-        raise SignedTestnetBlocked(
-            'RISEX_TESTNET_ACCOUNT_ADDRESS is required for RISEx portfolio truth'
-        )
-    if job.execution_epoch_id is None:
-        raise SignedTestnetBlocked('RISEx CopyJob has no execution epoch')
-    epoch = await db.get(ExecutionEpoch, job.execution_epoch_id)
-    if (
-        epoch is None
-        or epoch.provider != 'risex'
-        or epoch.network != 'testnet'
-        or not epoch.account_address
-        or epoch.account_address.lower() != account_address.lower()
-    ):
-        raise SignedTestnetBlocked(
-            'RISEx execution epoch account does not match the configured test account'
-        )
+    resolved_credential = await resolve_risex_worker_credential(db, job)
+    account_address = resolved_credential.account_address
 
     api = RISExReadOnlyHTTPTransport(base_url=_RISEX_TESTNET_API_URL)
     rpc = RISExReadOnlyRPCTransport(rpc_url=_RISEX_TESTNET_RPC_URL)
@@ -274,7 +270,7 @@ async def prepare_risex_worker_submission(
             entitlement_active=bool(ent.get('entitled')),
             # Gate 3 readiness already proved the dedicated signer/session; the
             # request-specific gate below revalidates it before provider POST.
-            credential_active=True,
+            credential_active=_credential_active_for_risk(resolved_credential),
             user_paused=user.copy_state == CopyState.PAUSED,
             global_pause=bool(global_pause_flag and global_pause_flag.enabled),
             emergency_stop=bool(emergency_stop_flag and emergency_stop_flag.enabled),
@@ -303,7 +299,7 @@ async def prepare_risex_worker_submission(
         assert_risex_plan_matches_intent(intent=intent, plan=plan)
 
         request = await prepare_risex_ioc_request_from_plan(
-            env=os.environ,
+            credential=resolved_credential,
             api=api,
             rpc=rpc,
             plan=plan,
@@ -315,22 +311,14 @@ async def prepare_risex_worker_submission(
             request=request,
         )
         gate = await build_risex_pre_order_gate_for_request(
-            env=os.environ,
             api=api,
             rpc=rpc,
             request=request,
             replay_protection_architecture_attestation=replay_attestation,
-            disposable_account_asserted=readiness_assertions.get(
-                'disposable_account_asserted'
-            ) is True,
-            dedicated_signer_asserted=readiness_assertions.get(
-                'dedicated_signer_asserted'
-            ) is True,
+            account_address=resolved_credential.account_address,
+            signer_address=resolved_credential.signer_address,
             operatorhub_bypass_disabled=readiness_assertions.get(
                 'operatorhub_bypass_disabled'
-            ) is True,
-            fund_movement_path_absent=readiness_assertions.get(
-                'fund_movement_path_absent'
             ) is True,
         )
         freshness_probe = make_freshness_probe(
@@ -341,9 +329,7 @@ async def prepare_risex_worker_submission(
             operatorhub_bypass_disabled=readiness_assertions.get(
                 'operatorhub_bypass_disabled'
             ) is True,
-            fund_movement_path_absent=readiness_assertions.get(
-                'fund_movement_path_absent'
-            ) is True,
+            fund_movement_path_absent=FUND_MOVEMENT_PATH_ABSENT,
         )
         transport = RISExSignedTestnetHTTPTransport(
             gate=gate,
@@ -391,6 +377,9 @@ async def prepare_risex_worker_submission(
             submission=submission,
             api=api,
             rpc=rpc,
+            account_address=resolved_credential.account_address,
+            signer_address=resolved_credential.signer_address,
+            generation=resolved_credential.generation,
         )
     except Exception:
         if transport is not None:

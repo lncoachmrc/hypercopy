@@ -12,7 +12,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.hyperliquid import deterministic_cloid
 from app.adapters.risex import RISExAdapter
-from app.models.entities import CopyJob, Execution, ExecutionState, JobState
+from app.models.entities import (
+    CopyJob,
+    Execution,
+    ExecutionEpoch,
+    ExecutionState,
+    JobState,
+    RISExSigningCredential,
+    RISExTradingAccount,
+    User,
+)
 from app.security.risex_place_order_request import RISExPreparedPlaceOrderRequest
 from app.services.risex_order_preparation import RISExIOCPlan, RISExOrderIntent
 from app.services.strategy_intents import (
@@ -386,7 +395,60 @@ async def claim_risex_first_post(
     job: CopyJob,
     submission: RISExPreparedCopySubmission,
 ) -> Execution | None:
-    """Atomically consume PRE_POST_COMMITTED for one exact process-local submission."""
+    """Serialize the final per-order credential fence and first provider POST claim."""
+
+    # ADR-0004 B3 lock order is always User -> Execution. FOR SHARE conflicts
+    # with API-side FOR UPDATE while allowing independent readers. The transaction
+    # is committed before any provider network call.
+    user = (
+        await db.execute(
+            select(User)
+            .where(User.id == job.user_id)
+            .execution_options(populate_existing=True)
+            .with_for_update(read=True)
+        )
+    ).scalar_one_or_none()
+    if user is None:
+        raise RuntimeError('RISEx first-POST user is unavailable')
+
+    epoch = (
+        await db.execute(
+            select(ExecutionEpoch)
+            .where(ExecutionEpoch.id == job.execution_epoch_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    binding = (
+        await db.execute(
+            select(
+                RISExTradingAccount.account_address,
+                RISExSigningCredential.generation,
+            )
+            .join(
+                RISExSigningCredential,
+                RISExSigningCredential.risex_trading_account_id
+                == RISExTradingAccount.id,
+            )
+            .where(RISExTradingAccount.user_id == job.user_id)
+        )
+    ).one_or_none()
+
+    superseded = (
+        job.execution_provider != 'risex'
+        or job.execution_network != 'testnet'
+        or job.execution_epoch_id is None
+        or user.active_execution_epoch_id != job.execution_epoch_id
+        or epoch is None
+        or epoch.user_id != job.user_id
+        or epoch.ended_at is not None
+        or epoch.provider != 'risex'
+        or epoch.network != 'testnet'
+        or binding is None
+        or not epoch.account_address
+        or str(binding[0]).lower() != epoch.account_address.lower()
+        or epoch.credential_version is None
+        or int(binding[1]) != int(epoch.credential_version)
+    )
 
     execution = (
         await db.execute(
@@ -437,6 +499,22 @@ async def claim_risex_first_post(
     if not identity_matches:
         await db.rollback()
         raise RuntimeError('RISEx first-POST submission identity mismatch')
+
+    if superseded:
+        risex_status['submission_status'] = 'PRE_SUBMIT_BLOCKED'
+        response['risex_4b_bis'] = risex_status
+        execution.response = response
+        execution.state = ExecutionState.CANCELED
+        execution.reject_reason = 'RISEx execution epoch or credential was superseded before provider POST'
+        execution.resolved_at = datetime.now(UTC)
+        job.state = JobState.SKIPPED
+        job.last_error = 'RISEx execution epoch or credential was superseded before provider POST'
+        job.owner = None
+        job.locked_until = None
+        job.next_attempt_at = None
+        job.enqueued_at = None
+        await db.commit()
+        return None
 
     risex_status['submission_status'] = 'POST_IN_FLIGHT'
     response['risex_4b_bis'] = risex_status
@@ -554,6 +632,23 @@ async def process_risex_job(
         fresh_job = await db.get(CopyJob, job_id_before_claim)
         if fresh_job is None:
             raise RuntimeError('RISEx CopyJob disappeared after first-POST claim fence')
+        fresh_execution = (
+            await db.execute(
+                select(Execution).where(
+                    Execution.copy_job_id == fresh_job.id,
+                    Execution.attempt_kind == 'o',
+                )
+            )
+        ).scalar_one_or_none()
+        if (
+            fresh_job.state == JobState.SKIPPED
+            and fresh_execution is not None
+            and fresh_execution.state == ExecutionState.CANCELED
+            and (fresh_execution.response or {}).get('risex_4b_bis', {}).get(
+                'submission_status'
+            ) == 'PRE_SUBMIT_BLOCKED'
+        ):
+            return JobState.SKIPPED.value
         return await _defer_for_resolution(
             db,
             fresh_job,
