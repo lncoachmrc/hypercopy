@@ -78,13 +78,13 @@ def install_risex_admin(
             }:
                 raise HTTPException(409, f'RISEx ARM is not allowed while worker reports {reported_state}')
             readiness_assertions = {
-                'disposable_account_asserted': body.disposable_account_asserted,
-                'dedicated_signer_asserted': body.dedicated_signer_asserted,
                 'operatorhub_bypass_disabled': body.operatorhub_bypass_disabled,
-                'fund_movement_path_absent': body.fund_movement_path_absent,
             }
-            if not all(readiness_assertions.values()):
-                raise HTTPException(422, 'RISEx ARM requires all explicit ADR-0002 readiness assertions')
+            if body.operatorhub_bypass_disabled is not True:
+                raise HTTPException(
+                    422,
+                    'RISEx ARM requires operatorhub_bypass_disabled=true',
+                )
         else:
             readiness_assertions = {}
             live_same_worker = [heartbeat for heartbeat in live if heartbeat.worker_id == body.target_worker_id]
