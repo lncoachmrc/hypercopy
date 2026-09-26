@@ -101,7 +101,7 @@ class EnvelopeCrypto:
         raise ValueError('Unsupported key provider')
 
     def decrypt(self, blob: EncryptedCredential, *, user_id: str, account_id: str) -> str:
-        aad = None
+        aad = f'hypercopy:credential:{user_id}:{account_id}:v1'.encode()
         if (
             settings.APP_ENV == 'production'
             and settings.ENABLE_LIVE_TRADING
