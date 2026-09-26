@@ -27,7 +27,10 @@ from app.security.risex_signed_testnet_policy import (
     SignedTestnetBlocked,
     reject_main_wallet_key_inputs,
 )
-from app.services.risex_order_preparation import ADR_0006_MAINNET_GATE_ACCEPTED
+from app.services.risex_order_preparation import (
+    ADR_0006_MAINNET_GATE_ACCEPTED,
+    assert_risex_worker_write_allowed,
+)
 from app.services.risex_execution_control import (
     arm_finalization_fence,
     claim_control_request,
@@ -132,10 +135,10 @@ async def run_global_risex_continuous_readiness(
     reject_main_wallet_key_inputs(os.environ)
     if not PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT:
         raise SignedTestnetBlocked('RISEx pinned deployment fingerprint is unavailable')
-    if os.environ.get('RISEX_SIGNED_WRITES_ENABLED') != 'true':
-        raise SignedTestnetBlocked('RISEX_SIGNED_WRITES_ENABLED must be explicitly true')
-    if ADR_0006_MAINNET_GATE_ACCEPTED is not True:
-        raise SignedTestnetBlocked('ADR-0006 mainnet gate is not accepted')
+    assert_risex_worker_write_allowed(
+        network='testnet',
+        env=os.environ,
+    )
     if operatorhub_bypass_disabled is not True:
         raise SignedTestnetBlocked('operatorhub_bypass_disabled must be explicitly true')
 

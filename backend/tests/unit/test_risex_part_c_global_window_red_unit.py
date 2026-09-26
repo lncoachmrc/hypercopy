@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import uuid
 from types import SimpleNamespace
 
@@ -8,7 +9,11 @@ import pytest
 from pydantic import ValidationError
 
 from app.schemas.admin import RISExExecutionControlAction
-from app.services import risex_admin_extension, risex_execution_worker_extension
+from app.services import (
+    risex_admin_extension,
+    risex_execution_worker_extension,
+    risex_order_preparation,
+)
 from app.services.risex_execution_window import (
     RISExExecutionState,
     RISExOperationalWindowController,
@@ -203,8 +208,6 @@ def test_global_readiness_never_loads_user_identity_unit() -> None:
     "required_material",
     [
         "PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT",
-        "RISEX_SIGNED_WRITES_ENABLED",
-        "ADR_0006_MAINNET_GATE_ACCEPTED",
         "operatorhub_bypass_disabled",
     ],
 )
@@ -214,6 +217,160 @@ def test_global_readiness_contains_required_fail_closed_gate_unit(required_mater
     assert required_material in source, (
         f"RED: global continuous readiness does not enforce {required_material}"
     )
+
+
+def _set_gate_latch(monkeypatch: pytest.MonkeyPatch, accepted: bool) -> None:
+    monkeypatch.setattr(
+        risex_execution_worker_extension,
+        "ADR_0006_MAINNET_GATE_ACCEPTED",
+        accepted,
+    )
+    monkeypatch.setattr(
+        risex_order_preparation,
+        "ADR_0006_MAINNET_GATE_ACCEPTED",
+        accepted,
+    )
+
+
+def _stub_passing_global_readiness(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        risex_execution_worker_extension,
+        "PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT",
+        "test-fingerprint",
+    )
+
+    async def valid_deployment(_api, _rpc, *, network):
+        assert network == "testnet"
+        return SimpleNamespace()
+
+    def passing_preflight(_deployment, *, expected_fingerprint):
+        assert expected_fingerprint == "test-fingerprint"
+        return SimpleNamespace(
+            verdict="PASS",
+            deployment_identity_verified=True,
+        )
+
+    monkeypatch.setattr(
+        risex_execution_worker_extension,
+        "collect_runtime_deployment_evidence",
+        valid_deployment,
+    )
+    monkeypatch.setattr(
+        risex_execution_worker_extension,
+        "evaluate_pinned_deployment_preflight",
+        passing_preflight,
+    )
+
+
+@pytest.mark.asyncio
+async def test_global_readiness_allows_isolated_testnet_gate_matrix_with_latch_false_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, attestation = _require_global_readiness_contract()
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
+    monkeypatch.setenv("RISEX_SIGNED_WRITES_ENABLED", "true")
+    _set_gate_latch(monkeypatch, False)
+    _stub_passing_global_readiness(monkeypatch)
+
+    result = await runner(
+        api=object(),
+        rpc=object(),
+        operatorhub_bypass_disabled=True,
+    )
+
+    assert isinstance(result, attestation)
+
+
+@pytest.mark.asyncio
+async def test_global_readiness_blocks_live_environment_when_latch_false_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, _attestation = _require_global_readiness_contract()
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "true")
+    monkeypatch.setenv("RISEX_SIGNED_WRITES_ENABLED", "true")
+    _set_gate_latch(monkeypatch, False)
+
+    with pytest.raises(SignedTestnetBlocked):
+        await runner(
+            api=object(),
+            rpc=object(),
+            operatorhub_bypass_disabled=True,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("live_value", [None, "False"])
+async def test_global_readiness_blocks_missing_or_malformed_live_environment_unit(
+    monkeypatch: pytest.MonkeyPatch,
+    live_value: str | None,
+) -> None:
+    runner, _attestation = _require_global_readiness_contract()
+    monkeypatch.setenv("RISEX_SIGNED_WRITES_ENABLED", "true")
+    if live_value is None:
+        monkeypatch.setenv("ENABLE_LIVE_TRADING", "temporary")
+        monkeypatch.delenv("ENABLE_LIVE_TRADING")
+    else:
+        monkeypatch.setenv("ENABLE_LIVE_TRADING", live_value)
+    _set_gate_latch(monkeypatch, False)
+
+    with pytest.raises(SignedTestnetBlocked):
+        await runner(
+            api=object(),
+            rpc=object(),
+            operatorhub_bypass_disabled=True,
+        )
+
+
+def test_risex_worker_gate_blocks_mainnet_on_isolated_test_stack_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
+    monkeypatch.setenv("RISEX_SIGNED_WRITES_ENABLED", "true")
+    _set_gate_latch(monkeypatch, False)
+
+    with pytest.raises(SignedTestnetBlocked):
+        risex_order_preparation.assert_risex_worker_write_allowed(
+            network="mainnet",
+            env=os.environ,
+        )
+
+
+@pytest.mark.asyncio
+async def test_global_readiness_blocks_without_signed_write_opt_in_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, _attestation = _require_global_readiness_contract()
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
+    monkeypatch.setenv("RISEX_SIGNED_WRITES_ENABLED", "false")
+    _set_gate_latch(monkeypatch, False)
+
+    with pytest.raises(SignedTestnetBlocked):
+        await runner(
+            api=object(),
+            rpc=object(),
+            operatorhub_bypass_disabled=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_global_readiness_preserves_operatorhub_bypass_guard_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, _attestation = _require_global_readiness_contract()
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
+    monkeypatch.setenv("RISEX_SIGNED_WRITES_ENABLED", "true")
+    _set_gate_latch(monkeypatch, False)
+    _stub_passing_global_readiness(monkeypatch)
+
+    with pytest.raises(
+        SignedTestnetBlocked,
+        match="operatorhub_bypass_disabled must be explicitly true",
+    ):
+        await runner(
+            api=object(),
+            rpc=object(),
+            operatorhub_bypass_disabled=False,
+        )
 
 
 def test_continuous_readiness_no_longer_calls_manual_signer_bound_runner_unit() -> None:
