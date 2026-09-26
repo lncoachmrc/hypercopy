@@ -620,7 +620,7 @@ Current RISEx evidence records that verified source/ABI provenance for important
 
 Selector compatibility and runtime fingerprinting prove compatibility only for the surfaces tested. They do not prove absence of additional functions, hidden authorization paths, upgrade behavior or fund-movement capabilities.
 
-Before mainnet acceptance, TRAXION must request from RISEx authoritative information covering at least:
+Before mainnet acceptance, TRAXION should request from RISEx authoritative information covering at least:
 
 - complete ABI for the production Authorization and Router deployments;
 - source verification or reproducible source/build information where available;
@@ -633,19 +633,16 @@ Before mainnet acceptance, TRAXION must request from RISEx authoritative informa
 - provider error semantics for consumed/replayed permits;
 - formal upgrade/change-notification mechanism or changelog.
 
-Full public source verification is the preferred state.
+Full public source verification remains the preferred state, and a provider response remains recommended evidence, but neither is a blocking prerequisite for this gate.
 
-If full source provenance remains unavailable, `provenance = UNKNOWN` may only be accepted as an explicit residual risk if all of the following compensating conditions hold:
+If full source provenance remains unavailable, `provenance = UNKNOWN` is explicitly accepted as a residual risk by the decision owner on 2026-09-26, provided all of the following TRAXION-verifiable compensating conditions hold:
 
-- RISEx supplies authoritative ABI/interface and deployment information;
 - TRAXION independently fingerprints the exact production runtime;
 - one of the accepted §1 risk treatments is active;
 - replay and revocation are behaviorally proven;
 - deployment drift fails closed;
 - any provider upgrade invalidates the authorization immediately;
 - the residual provenance limitation is recorded in the final Accepted ADR.
-
-If authoritative interface/deployment information is unavailable as well as verified source, the gate remains **BLOCKED**.
 
 ## 4. Replay rejection must be proven behaviorally
 
@@ -665,15 +662,16 @@ The evidence must establish:
 - second submission rejected;
 - no second order, fill or transaction side effect created.
 
-For the ADR-0006 mainnet gate, `REPLAY_REJECTED_UNSPECIFIED` is **insufficient** to mark behavioral replay protection as proven.
+For the ADR-0006 mainnet gate, `REPLAY_REJECTED_UNSPECIFIED` is sufficient to mark behavioral replay rejection as proven when all of the following are established by TRAXION:
 
-To pass, the captured provider/on-chain evidence must support an explicit reviewed conclusion that the rejection was caused by replay/consumed-permit protection.
+- the exact identical second signed payload is actually submitted;
+- the second submission is rejected;
+- read-only evidence confirms that no second order, fill or transaction was created;
+- the security-relevant deployment is unchanged from the reviewed deployment.
 
-Until such attribution exists:
+Causal attribution of that rejection specifically to nonce/consumed-permit protection is not required. The residual attribution risk is explicitly accepted by the decision owner on 2026-09-26.
 
-`behavioral_replay_rejection_proven = false`
-
-and mainnet remains blocked.
+The negative replay probe's existing `behavioral_replay_rejection_proven` field remains a raw attribution-oriented diagnostic and may remain `false` for `REPLAY_REJECTED_UNSPECIFIED`. For ADR-0006 acceptance, that field is not itself the gate decision: the acceptance review maps `REPLAY_REJECTED_UNSPECIFIED` to behavioral replay PASS only when every condition above is independently evidenced.
 
 No fabricated provider error code, guessed message string or synthetic fixture may satisfy this condition.
 
@@ -770,6 +768,8 @@ Before the first RISEx mainnet write:
 - no unresolved reconciliation/design defect.
 
 ### Phase 1 — operator canary
+
+Before enabling any user capital, the first RISEx mainnet operation must be executed on the decision owner's own account with a deliberately small amount.
 
 Initial writes are restricted to:
 
@@ -945,8 +945,8 @@ At minimum the review must be able to verify:
 | Option-(c) exposure monitor, if used | PASS |
 | Option-(c) pre-POST exposure enforcement, if used | PASS |
 | Option-(c) in-flow disclosure + explicit persisted acknowledgement, if used | PASS |
-| Provenance | resolved or explicitly accepted under §3 compensating controls |
-| Replay | behavioral PASS |
+| Provenance | `UNKNOWN` explicitly risk-accepted under §3 with all TRAXION-verifiable compensating controls satisfied; an authoritative RISEx response is recommended but not required |
+| Replay | behavioral PASS under §4; `REPLAY_REJECTED_UNSPECIFIED` is sufficient when the identical replay is submitted and rejected, read-only evidence shows no second order/fill/transaction, and the reviewed deployment is unchanged; the probe's raw `behavioral_replay_rejection_proven` attribution field is not itself the ADR-0006 gate decision |
 | Post-revoke | behavioral PASS |
 | 4B-bis | complete |
 | 4C reconciliation | complete |
@@ -1009,7 +1009,7 @@ After mainnet activation, RISEx execution must return to BLOCKED if any of the f
 - a provider response ambiguity causes or risks blind resubmission;
 - kill switch does not prevent new writes within its verified operational bound;
 - mainnet network/account/deployment identity becomes uncertain;
-- provenance/interface information supplied by RISEx is contradicted by runtime behavior;
+- a §3 compensating control ceases to hold, or runtime/provider evidence contradicts the independently verified deployment assumptions; absence of RISEx-supplied provenance alone is not an invalidation;
 - a new fund-movement path invalidates ADR-0002/ADR-0003 assumptions;
 - option (c), when active, exceeds its aggregate observed ceiling;
 - option (c), when active, cannot establish sufficiently fresh exposure state.
@@ -1020,9 +1020,10 @@ Re-enable requires explicit review. No automatic recovery may reopen RISEx mainn
 
 Even after ADR-0006 becomes Accepted, TRAXION will not claim that it has proven:
 
-- complete semantic correctness of RISEx contracts for code whose source remains unavailable;
+- complete ABI/source provenance or complete semantic correctness of RISEx contracts when provenance remains `UNKNOWN` under §3;
 - absence of undisclosed or future provider contract functionality;
 - absence of provider/admin upgrade risk;
+- causal attribution of a rejected identical replay to the provider's nonce/consumed-permit mechanism when §4 behavioral conditions are satisfied;
 - absence of future RISEx regressions;
 - economic solvency or availability of RISEx;
 - guaranteed fill quality, liquidity or slippage;
@@ -1059,8 +1060,8 @@ It is not a blanket assertion that RISEx or TRAXION is risk-free.
 - Option (c) does not prevent out-of-band user deposits and therefore cannot guarantee its observed ceilings continuously.
 - During healthy telemetry an external exposure increase may remain undetected for up to 5 minutes under the defined cadence/timeout.
 - During provider-read outage the duration of unknown external exposure cannot be bounded, although TRAXION exposure-increasing writes fail closed once evidence becomes stale.
-- The replay gate may remain blocked if RISEx rejects replay but does not provide evidence sufficient to attribute the rejection to permit replay protection.
-- Source provenance may remain a residual external dependency on RISEx.
+- Replay rejection may remain causally unattributed to nonce/consumed-permit protection; that attribution uncertainty is an explicitly accepted residual risk under §4 when all required behavioral conditions pass.
+- Source provenance may remain `UNKNOWN`; that uncertainty is an explicitly accepted residual risk under §3, and RISEx-supplied provenance remains recommended evidence rather than a blocking dependency.
 - The initial mainnet rollout is deliberately slower and capital-constrained.
 
 These residuals are intentional and must remain visible in the final mainnet decision.
