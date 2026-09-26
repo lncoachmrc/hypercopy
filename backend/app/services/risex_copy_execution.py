@@ -495,22 +495,6 @@ async def claim_risex_first_post(
         await db.rollback()
         raise RuntimeError('RISEx first-POST submission identity mismatch')
 
-    if superseded:
-        risex_status['submission_status'] = 'PRE_SUBMIT_BLOCKED'
-        response['risex_4b_bis'] = risex_status
-        execution.response = response
-        execution.state = ExecutionState.CANCELED
-        execution.reject_reason = 'RISEx execution epoch or credential was superseded before provider POST'
-        execution.resolved_at = datetime.now(UTC)
-        job.state = JobState.SKIPPED
-        job.last_error = 'RISEx execution epoch or credential was superseded before provider POST'
-        job.owner = None
-        job.locked_until = None
-        job.next_attempt_at = None
-        job.enqueued_at = None
-        await db.commit()
-        return None
-
     risex_status['submission_status'] = 'POST_IN_FLIGHT'
     response['risex_4b_bis'] = risex_status
     execution.response = response
