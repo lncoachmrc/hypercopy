@@ -328,6 +328,7 @@ class Worker:
         )
 
         if prepared is None:
+            # ADR-0006 is not accepted yet, so b2 is intentionally testnet-only.
             adapter = RISExAdapter(
                 network='testnet',
                 gate3_mode='continuous_window',
@@ -340,6 +341,7 @@ class Worker:
                 submission=None,
             )
 
+        # ADR-0006 is not accepted yet, so b2 is intentionally testnet-only.
         adapter = RISExAdapter(
             network='testnet',
             transport=prepared.transport,
