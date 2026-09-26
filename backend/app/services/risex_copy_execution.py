@@ -402,7 +402,10 @@ async def claim_risex_first_post(
     # is committed before any provider network call.
     user = (
         await db.execute(
-            select(User).where(User.id == job.user_id).with_for_update(read=True)
+            select(User)
+            .where(User.id == job.user_id)
+            .execution_options(populate_existing=True)
+            .with_for_update(read=True)
         )
     ).scalar_one_or_none()
     if user is None:
@@ -410,7 +413,9 @@ async def claim_risex_first_post(
 
     epoch = (
         await db.execute(
-            select(ExecutionEpoch).where(ExecutionEpoch.id == job.execution_epoch_id)
+            select(ExecutionEpoch)
+            .where(ExecutionEpoch.id == job.execution_epoch_id)
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     binding = (

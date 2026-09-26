@@ -21,7 +21,11 @@ from app.security.risex_deployment_runtime import collect_runtime_deployment_evi
 from app.security.risex_order_codec import RISExPlaceOrder, build_place_order_action_hash
 from app.security.risex_place_order_permit import RISExPreparedPlaceOrderPermit
 from app.security.risex_place_order_request import prepare_place_order_request
-from app.services import risex_copy_execution, risex_order_preparation
+from app.services import (
+    risex_copy_execution,
+    risex_order_preparation,
+    risex_worker_credentials,
+)
 from app.services.destination_switch import destination_switch_blockers
 from tests.unit.test_risex_signed_testnet_runner import FakeAPI, FakeRPC
 
@@ -539,5 +543,81 @@ async def test_database_serialization_locks_are_released_before_fake_post_integr
 
         assert observed == {"user_lock": True, "execution_lock": True}
         assert result == JobState.SKIPPED.value
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_claim_refreshes_cached_user_and_epoch_before_superseded_fence_integration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    try:
+        seeded = await _seed_pre_post(monkeypatch)
+        await _allow_strategy_intent(monkeypatch)
+        adapter = _NoPostAdapter()
+
+        async with SessionLocal() as worker_db:
+            job = await worker_db.get(CopyJob, seeded["job_id"])
+            assert job is not None
+
+            resolved = await risex_worker_credentials.resolve_risex_worker_credential(
+                worker_db,
+                job,
+            )
+            assert resolved.account_address.lower() == str(seeded["account"]).lower()
+
+            cached_user = await worker_db.get(User, seeded["user_id"])
+            cached_epoch = await worker_db.get(ExecutionEpoch, seeded["old_epoch_id"])
+            assert cached_user is not None
+            assert cached_epoch is not None
+            assert cached_user.active_execution_epoch_id == seeded["old_epoch_id"]
+            assert cached_epoch.ended_at is None
+
+            replacement_epoch_id = uuid.uuid4()
+            async with SessionLocal() as api_db:
+                current_epoch = await api_db.get(
+                    ExecutionEpoch,
+                    seeded["old_epoch_id"],
+                )
+                assert current_epoch is not None
+                current_epoch.ended_at = datetime.now(UTC)
+                api_db.add(
+                    ExecutionEpoch(
+                        id=replacement_epoch_id,
+                        user_id=seeded["user_id"],
+                        provider="risex",
+                        network="testnet",
+                        account_address=current_epoch.account_address,
+                        credential_version=current_epoch.credential_version,
+                        started_at=datetime.now(UTC),
+                    )
+                )
+                await api_db.flush()
+                await api_db.execute(
+                    text(
+                        "UPDATE users "
+                        "SET active_execution_epoch_id = :new_epoch "
+                        "WHERE id = :user_id"
+                    ),
+                    {
+                        "new_epoch": replacement_epoch_id,
+                        "user_id": seeded["user_id"],
+                    },
+                )
+                await api_db.commit()
+
+            result = await risex_copy_execution.process_risex_job(
+                worker_db,
+                adapter,
+                job,
+                submission=seeded["submission"],
+            )
+            assert result == JobState.SKIPPED.value
+            assert adapter.calls == 0
+
+            execution = await worker_db.get(Execution, seeded["execution_id"])
+            assert execution is not None
+            assert execution.state == ExecutionState.CANCELED
+            assert job.state == JobState.SKIPPED
     finally:
         await engine.dispose()

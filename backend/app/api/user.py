@@ -898,7 +898,12 @@ async def link_risex_trading_account(
         )
 
     locked_user = (
-        await db.execute(select(User).where(User.id == user.id).with_for_update())
+        await db.execute(
+            select(User)
+            .where(User.id == user.id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
     ).scalar_one()
     if (
         locked_user.execution_provider == 'risex'
