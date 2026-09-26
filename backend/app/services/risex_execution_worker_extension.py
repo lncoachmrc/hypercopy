@@ -23,7 +23,10 @@ from app.security.risex_deployment_runtime import (
     RISExReadOnlyRPCTransport,
     collect_runtime_deployment_evidence,
 )
-from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+from app.security.risex_signed_testnet_policy import (
+    SignedTestnetBlocked,
+    reject_main_wallet_key_inputs,
+)
 from app.services.risex_order_preparation import ADR_0006_MAINNET_GATE_ACCEPTED
 from app.services.risex_execution_control import (
     arm_finalization_fence,
@@ -126,6 +129,7 @@ async def run_global_risex_continuous_readiness(
     rpc: RISExReadOnlyRPCTransport,
     operatorhub_bypass_disabled: bool,
 ) -> RISExGlobalContinuousReadinessAttestation:
+    reject_main_wallet_key_inputs(os.environ)
     if not PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT:
         raise SignedTestnetBlocked('RISEx pinned deployment fingerprint is unavailable')
     if os.environ.get('RISEX_SIGNED_WRITES_ENABLED') != 'true':
