@@ -121,6 +121,20 @@ async def resolve_risex_worker_credential(
             job_state=JobState.DEAD,
         )
 
+    if (
+        epoch.credential_version is None
+        or credential.generation != epoch.credential_version
+    ):
+        job_state = await _generation_mismatch_state(
+            db,
+            user_id=job.user_id,
+            epoch_id=epoch.id,
+        )
+        raise _resolution_error(
+            'RISEx credential generation does not match the active execution epoch',
+            job_state=job_state,
+        )
+
     if credential.status not in {
         CredentialStatus.ACTIVE,
         CredentialStatus.EXPIRING,
