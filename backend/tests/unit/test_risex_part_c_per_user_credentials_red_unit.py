@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import time
 from types import SimpleNamespace
@@ -86,11 +87,25 @@ def test_worker_submission_does_not_read_global_account_env_unit() -> None:
 
 
 def test_worker_submission_does_not_hardcode_credential_active_unit() -> None:
+    resolver_time = datetime(2030, 1, 1, tzinfo=UTC)
+    resolved = SimpleNamespace(expires_at=resolver_time + timedelta(seconds=1))
+    risk_time = resolver_time + timedelta(seconds=2)
+
+    assert risex_worker_submission._credential_active_for_risk(
+        resolved,
+        now=resolver_time,
+    ) is True
+    assert risex_worker_submission._credential_active_for_risk(
+        resolved,
+        now=risk_time,
+    ) is False
+
     source = _source(risex_worker_submission.prepare_risex_worker_submission)
     compact = source.replace(" ", "").replace("\n", "")
-    assert "credential_active=True" not in compact, (
-        "RED: worker risk flags still hard-code credential_active=True"
-    )
+    assert (
+        "credential_active=_credential_active_for_risk(resolved_credential)"
+        in compact
+    ), "RED: worker risk flags do not re-evaluate credential expiry at risk time"
 
 
 def test_worker_submission_uses_resolved_credential_for_portfolio_unit() -> None:

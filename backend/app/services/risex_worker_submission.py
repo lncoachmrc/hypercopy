@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Mapping
 
@@ -168,6 +169,16 @@ async def build_risex_pre_order_gate_for_request(
     return gate
 
 
+def _credential_active_for_risk(
+    resolved_credential: Any,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    risk_now = now or datetime.now(UTC)
+    expires_at = getattr(resolved_credential, 'expires_at', None)
+    return bool(expires_at is not None and expires_at > risk_now)
+
+
 async def _existing_execution(
     db: AsyncSession,
     job: CopyJob,
@@ -259,7 +270,7 @@ async def prepare_risex_worker_submission(
             entitlement_active=bool(ent.get('entitled')),
             # Gate 3 readiness already proved the dedicated signer/session; the
             # request-specific gate below revalidates it before provider POST.
-            credential_active=resolved_credential.generation > 0,
+            credential_active=_credential_active_for_risk(resolved_credential),
             user_paused=user.copy_state == CopyState.PAUSED,
             global_pause=bool(global_pause_flag and global_pause_flag.enabled),
             emergency_stop=bool(emergency_stop_flag and emergency_stop_flag.enabled),

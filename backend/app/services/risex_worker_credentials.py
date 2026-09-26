@@ -31,6 +31,7 @@ class RISExResolvedWorkerCredential:
     account_address: str
     signer_address: str
     generation: int
+    expires_at: datetime
     local_account: LocalAccount = field(repr=False, compare=False)
 
     def local_account_for_signing(self) -> LocalAccount:
@@ -143,7 +144,8 @@ async def resolve_risex_worker_credential(
             'RISEx credential is not usable',
             job_state=JobState.SKIPPED,
         )
-    if credential.expires_at is None or credential.expires_at <= datetime.now(UTC):
+    expires_at = credential.expires_at
+    if expires_at is None or expires_at <= datetime.now(UTC):
         raise _resolution_error(
             'RISEx credential is expired or has no verifiable expiry',
             job_state=JobState.SKIPPED,
@@ -190,5 +192,6 @@ async def resolve_risex_worker_credential(
         account_address=account.account_address,
         signer_address=credential.signer_address,
         generation=credential.generation,
+        expires_at=expires_at,
         local_account=local_account,
     )
