@@ -395,6 +395,8 @@ There is a documented limit: while the consume loop is synchronously processing 
 
 ### 10. Bind the window to the security-relevant runtime context
 
+> **Multi-user implementation note:** the Accepted amendment below supersedes the account/signer fingerprint wording in this section for continuous multi-user execution (Implemented in PR #217).
+
 An operational window is valid only for the process and context in which it was opened.
 
 Its context identity must include at least:
@@ -416,6 +418,8 @@ Naturally dynamic per-operation values such as balances, nonces or market state 
 Any change or mismatch in a security-relevant context component invalidates the current window and any in-flight ARM attempt.
 
 ### 10A. Continuous gate 3 preserves the per-order account/signer binding
+
+> **Multi-user implementation note:** the Accepted amendment below supersedes the window-bound account/signer wording here with per-order binding for continuous multi-user execution (Implemented in PR #217).
 
 The Operational Execution Window's context fingerprint includes the account/owner identity and the session-key public identity used at ARM/finalization. That fingerprint is necessary to bind the window to the runtime context, but **an opaque fingerprint checked only at window creation is not by itself equivalent to the per-order identity binding enforced by the short-lived attestation path**.
 
@@ -936,9 +940,9 @@ The readiness PASS and Operational Execution Window remain non-persistent. Postg
 
 ---
 
-## Amendment: Proposed — multi-user runtime window and per-user credentials
+## Amendment: Accepted — multi-user runtime window and per-user credentials
 
-**Status**: Proposed
+**Status**: Accepted — Implemented in PR #217
 **Decision date**: 2026-09-23
 **Transitional rule**: Until a separate implementation PR is merged, current single-account ADR-0004 semantics and code remain authoritative.
 **Acceptance rule**: This amendment becomes Accepted/operative only in the implementation PR that implements it; if implementation materially differs from this proposal, it remains Proposed and requires further amendment.
