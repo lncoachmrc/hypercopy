@@ -101,7 +101,13 @@ async def test_enabled_risex_worker_passes_exact_prepared_submission_and_request
             )
         )
     )
-    prepared = SimpleNamespace(transport=transport, submission=submission)
+    prepared = SimpleNamespace(
+        transport=transport,
+        submission=submission,
+        account_address=ACCOUNT,
+        signer_address=SIGNER,
+        generation=1,
+    )
     prepare_calls = 0
 
     async def prepare_once(*_args, **_kwargs):

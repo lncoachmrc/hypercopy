@@ -251,6 +251,7 @@ async def _seed_job(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         "job_id": job_id,
         "account": account,
         "signer": signer,
+        "private_key": key,
     }
 
 
@@ -560,6 +561,11 @@ async def test_claim_refreshes_cached_user_and_epoch_before_superseded_fence_int
             job = await worker_db.get(CopyJob, seeded["job_id"])
             assert job is not None
 
+            monkeypatch.setattr(
+                risex_worker_credentials.crypto,
+                "decrypt",
+                lambda *_args, **_kwargs: str(seeded["private_key"]),
+            )
             resolved = await risex_worker_credentials.resolve_risex_worker_credential(
                 worker_db,
                 job,
