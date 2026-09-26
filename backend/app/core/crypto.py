@@ -91,7 +91,7 @@ class EnvelopeCrypto:
         self.provider = settings.KEK_PROVIDER
 
     def encrypt(self, plaintext: str, *, user_id: str, account_id: str) -> EncryptedCredential:
-        aad = f'hypercopy:credential:{user_id}:{account_id}:v1'.encode()
+        aad = b'hypercopy:credential:constant:v1'
         if self.provider == 'aws_kms':
             return self._encrypt_kms(plaintext.encode(), aad)
         if self.provider == 'local_rsa':
@@ -101,7 +101,7 @@ class EnvelopeCrypto:
         raise ValueError('Unsupported key provider')
 
     def decrypt(self, blob: EncryptedCredential, *, user_id: str, account_id: str) -> str:
-        aad = f'hypercopy:credential:{user_id}:{account_id}:v1'.encode()
+        aad = b'hypercopy:credential:constant:v1'
         if (
             settings.APP_ENV == 'production'
             and settings.ENABLE_LIVE_TRADING
