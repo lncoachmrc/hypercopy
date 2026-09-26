@@ -129,7 +129,6 @@ async def run_global_risex_continuous_readiness(
     rpc: RISExReadOnlyRPCTransport,
     operatorhub_bypass_disabled: bool,
 ) -> RISExGlobalContinuousReadinessAttestation:
-    reject_main_wallet_key_inputs(os.environ)
     if not PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT:
         raise SignedTestnetBlocked('RISEx pinned deployment fingerprint is unavailable')
     if os.environ.get('RISEX_SIGNED_WRITES_ENABLED') != 'true':
