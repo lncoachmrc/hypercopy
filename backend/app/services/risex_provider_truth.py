@@ -301,7 +301,7 @@ async def persist_risex_provider_truth(
             )
         )
 
-    async with position_ledger_lock(user_id):
+    if True:  # sensitivity mutation: position ledger lock removed
         current_execution = await db.get(Execution, execution_id)
         if current_execution is None:
             await db.rollback()
