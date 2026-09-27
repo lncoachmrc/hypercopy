@@ -483,7 +483,7 @@ async def read_hyperliquid_reconcile_observation(
         unmanaged_margin=unmanaged_margin,
         follower_configs=follower_configs,
         asset_specs={},
-        asset_spec_resolver=hl.asset_spec,
+        asset_spec_resolver=getattr(hl, 'asset_spec', None),
         fills_synced=synced_fills,
     )
 

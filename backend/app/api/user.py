@@ -15,6 +15,7 @@ from eth_account import Account
 
 from app.adapters.hyperliquid import HyperliquidAdapter
 from app.adapters.ratelimit import Budget, WeightedRateLimiter
+from app.adapters.risex_http import RISExReadOnlyHTTPTransport
 from app.api.deps import current_user, require_csrf
 from app.core.config import Network, settings
 from app.core.crypto import crypto
@@ -45,7 +46,40 @@ from app.services.networking import set_user_network, user_network_state
 from app.services.queue import publish_job
 from app.services.risex_order_preparation import assert_risex_environment_allowed
 from app.services.risex_signer_binding import _verify_risex_signer_binding
+from app.security.risex_authorization_session import collect_authorization_session_evidence
+from app.security.risex_deployment_preflight import evaluate_pinned_deployment_preflight
+from app.security.risex_deployment_runtime import (
+    PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
+    RISExReadOnlyRPCTransport,
+    collect_runtime_deployment_evidence,
+)
 from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+_SHARED_RISEX_SIGNER_BINDING = _verify_risex_signer_binding
+
+
+async def _verify_risex_signer_binding_for_api(
+    *,
+    account_address: str,
+    signer_address: str,
+):
+    verifier = _verify_risex_signer_binding
+    if verifier is not _SHARED_RISEX_SIGNER_BINDING:
+        return await verifier(
+            account_address=account_address,
+            signer_address=signer_address,
+        )
+    return await verifier(
+        account_address=account_address,
+        signer_address=signer_address,
+        _http_transport=RISExReadOnlyHTTPTransport,
+        _rpc_transport=RISExReadOnlyRPCTransport,
+        _collect_runtime=collect_runtime_deployment_evidence,
+        _evaluate_preflight=evaluate_pinned_deployment_preflight,
+        _collect_authorization=collect_authorization_session_evidence,
+        _expected_fingerprint=PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _RISExCredentialBinding:
     account_id: uuid.UUID
@@ -321,7 +355,7 @@ async def trading_provider(body: TradingProviderIn, user: User = Depends(current
         _require_usable_risex_credential(snapshot)
 
         try:
-            await _verify_risex_signer_binding(
+            await _verify_risex_signer_binding_for_api(
                 account_address=snapshot.account_address,
                 signer_address=snapshot.signer_address,
             )
@@ -777,7 +811,7 @@ async def link_risex_trading_account(
         raise HTTPException(422, 'The authenticated wallet cannot also be the RISEx signer')
 
     try:
-        verification = await _verify_risex_signer_binding(
+        verification = await _verify_risex_signer_binding_for_api(
             account_address=account_address,
             signer_address=signer_address,
         )

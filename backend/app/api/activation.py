@@ -390,10 +390,7 @@ async def resume_copy_immediate(
             )
             master_positions = _positions(source_snapshot.perp_state)
             master_configs = position_configs(source_snapshot.perp_state)
-            master_mids = observed_master_mids(
-                await master_hl.mids(),
-                snapshot_started_order,
-            )
+            master_mids = observed_master_mids(await master_hl.mids(), snapshot_started_order)
             observation = await read_risex_reconcile_observation(
                 account_address=binding.account_address,
                 epoch_id=network_state.epoch_id,
@@ -562,10 +559,7 @@ async def resume_copy_immediate(
         )
         master_positions = _positions(source_snapshot.perp_state)
         master_configs = position_configs(source_snapshot.perp_state)
-        master_mids = observed_master_mids(
-            await master_hl.mids(),
-            snapshot_started_order,
-        )
+        master_mids = observed_master_mids(await master_hl.mids(), snapshot_started_order)
         follower_mids = (
             master_mids
             if settings.master_network == network

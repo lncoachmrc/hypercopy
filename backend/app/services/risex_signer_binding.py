@@ -21,21 +21,27 @@ async def _verify_risex_signer_binding(
     *,
     account_address: str,
     signer_address: str,
+    _http_transport=RISExReadOnlyHTTPTransport,
+    _rpc_transport=RISExReadOnlyRPCTransport,
+    _collect_runtime=collect_runtime_deployment_evidence,
+    _evaluate_preflight=evaluate_pinned_deployment_preflight,
+    _collect_authorization=collect_authorization_session_evidence,
+    _expected_fingerprint=PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
 ) -> RISExAuthorizationSessionEvidence:
-    async with RISExReadOnlyHTTPTransport(
+    async with _http_transport(
         base_url=_RISEX_TESTNET_API_URL
     ) as api:
-        async with RISExReadOnlyRPCTransport(
+        async with _rpc_transport(
             rpc_url=_RISEX_TESTNET_RPC_URL
         ) as rpc:
-            deployment = await collect_runtime_deployment_evidence(
+            deployment = await _collect_runtime(
                 api,
                 rpc,
                 network='testnet',
             )
-            preflight = evaluate_pinned_deployment_preflight(
+            preflight = _evaluate_preflight(
                 deployment,
-                expected_fingerprint=PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
+                expected_fingerprint=_expected_fingerprint,
             )
             if (
                 preflight.verdict != 'PASS'
@@ -43,7 +49,7 @@ async def _verify_risex_signer_binding(
             ):
                 raise RuntimeError('RISEx deployment identity is not verified')
 
-            evidence = await collect_authorization_session_evidence(
+            evidence = await _collect_authorization(
                 rpc,
                 authorization_address=deployment.domain_verifying_contract,
                 account=account_address,
