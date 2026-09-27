@@ -291,6 +291,12 @@ class RISExAdapter:
                 job=job,
             )
 
+        # job_matches_active_destination() is read-only but AsyncSession autobegins
+        # a transaction. Close it before the signed transport runs live freshness
+        # HTTP/RPC reads. Test doubles without a session commit remain supported.
+        if callable(getattr(db, 'commit', None)):
+            await db.commit()
+
         execution_provider = getattr(job, 'execution_provider', None)
         execution_network = getattr(job, 'execution_network', None)
         execution_epoch_id = getattr(job, 'execution_epoch_id', None)

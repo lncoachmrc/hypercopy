@@ -33,6 +33,14 @@ _FORBIDDEN_AUTH_HEADERS = frozenset(
 RISExPreOrderFreshnessProbe = Callable[[], Awaitable[RISExSignerCapabilityEvidence]]
 
 
+class RISExSignedHTTPResponse(dict[str, Any]):
+    """Provider JSON body plus the received HTTP status code."""
+
+    def __init__(self, payload: dict[str, Any], *, status_code: int) -> None:
+        super().__init__(payload)
+        self.status_code = int(status_code)
+
+
 def _reject_ambient_auth(client: httpx.AsyncClient) -> None:
     header_names = {name.lower() for name in client.headers.keys()}
     has_request_hooks = bool(client.event_hooks.get('request'))
@@ -168,9 +176,14 @@ class RISExSignedTestnetHTTPTransport:
                 f'{_TESTNET_BASE_URL}{normalized_path}',
                 json=json,
             )
-            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise SignedTestnetBlocked(
+                f'RISEx signed testnet POST failed at {normalized_path}: {type(exc).__name__}'
+            ) from exc
+
+        try:
             payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
+        except ValueError as exc:
             raise SignedTestnetBlocked(
                 f'RISEx signed testnet POST failed at {normalized_path}: {type(exc).__name__}'
             ) from exc
@@ -179,7 +192,7 @@ class RISExSignedTestnetHTTPTransport:
             raise SignedTestnetBlocked(
                 f'RISEx signed testnet POST at {normalized_path} did not return a JSON object'
             )
-        return payload
+        return RISExSignedHTTPResponse(payload, status_code=response.status_code)
 
     async def aclose(self) -> None:
         if self._owns_client:

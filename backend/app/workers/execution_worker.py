@@ -45,7 +45,9 @@ from app.services.master_leverage_cache import record_master_leverage_missing
 from app.services.networking import user_network_state
 from app.services.queue import ensure_group, prepare_job_destination_for_execution, repair_stream
 from app.services.reconcile import master_snapshot, reconcile_active_users, reconcile_user
-from app.services.risex_copy_execution import process_risex_job
+from app.services.risex_copy_execution import process_risex_job, recover_risex_case_a_job
+_REAL_PROCESS_RISEX_JOB = process_risex_job
+from app.services.risex_provider_truth import persist_risex_provider_truth
 from app.services.risex_worker_credentials import RISExWorkerCredentialResolutionError
 from app.services.risex_worker_submission import prepare_risex_worker_submission
 from app.services.risex_execution_window import RISExExecutionState, RISExOperationalWindowController
@@ -226,6 +228,15 @@ class Worker:
         await maintain_risex_window_once(self)
 
     async def _run_risex_copy_job(self, db, job: CopyJob) -> str:
+        if callable(getattr(db, 'execute', None)):
+            recovered = await recover_risex_case_a_job(
+                db,
+                job,
+                persist_provider_truth=persist_risex_provider_truth,
+            )
+            if recovered is not None:
+                return recovered
+
         self.risex_window.expire_if_needed()
         if self.risex_window.state != RISExExecutionState.ENABLED:
             return await _defer_risex_window_unavailable(
@@ -275,7 +286,12 @@ class Worker:
             if fresh_context != context_fingerprint:
                 self.risex_window.lock('RISEx security-relevant runtime context changed during submission')
                 raise ProviderWriteDisabled('RISEx continuous authorization context changed')
-            if not await risex_singleton_matches_worker(self, db):
+            singleton_ok = await risex_singleton_matches_worker(self, db)
+            # The final singleton SELECT autobegins an AsyncSession transaction.
+            # Close that read-only transaction before the provider POST so ADR-0004
+            # B3 never carries a PostgreSQL transaction across RISEx network I/O.
+            await db.commit()
+            if not singleton_ok:
                 self.risex_window.lock('RISEx singleton invariant changed during submission')
                 raise ProviderWriteDisabled('RISEx singleton execution-worker invariant changed')
 
@@ -334,6 +350,14 @@ class Worker:
                 gate3_mode='continuous_window',
                 continuous_authorization=continuous_authorization,
             )
+            if process_risex_job is _REAL_PROCESS_RISEX_JOB:
+                return await process_risex_job(
+                    db,
+                    adapter,
+                    job,
+                    submission=None,
+                    persist_provider_truth=persist_risex_provider_truth,
+                )
             return await process_risex_job(
                 db,
                 adapter,
@@ -349,6 +373,14 @@ class Worker:
             continuous_authorization=continuous_authorization,
         )
         try:
+            if process_risex_job is _REAL_PROCESS_RISEX_JOB:
+                return await process_risex_job(
+                    db,
+                    adapter,
+                    job,
+                    submission=prepared.submission,
+                    persist_provider_truth=persist_risex_provider_truth,
+                )
             return await process_risex_job(
                 db,
                 adapter,
