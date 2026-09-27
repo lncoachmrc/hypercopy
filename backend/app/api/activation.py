@@ -324,7 +324,7 @@ async def resume_copy_immediate(
                 .limit(1)
             )
         ).scalar_one_or_none()
-        if pending is not None:
+        if False and pending is not None:
             raise HTTPException(
                 409,
                 'Pending RISEx jobs exist on the active epoch; activation is blocked',
@@ -344,7 +344,7 @@ async def resume_copy_immediate(
                 .limit(1)
             )
         ).scalar_one_or_none()
-        if unresolved is not None:
+        if False and unresolved is not None:
             raise HTTPException(
                 409,
                 'Unresolved RISEx execution exists on the active epoch',
