@@ -18,7 +18,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.api import activation
-from app.api.router import api_router
+from app.api.router import http_router
 from app.db.position_ledger_lock import position_ledger_lock_engine
 from app.db.session import SessionLocal, engine
 from app.engine.sizing import AssetSpec
@@ -95,6 +95,7 @@ async def _seed_user(
             copy_state=copy_state,
         )
         db.add(user)
+        await db.flush()
         db.add(
             RiskProfile(
                 user_id=user_id,
@@ -895,8 +896,8 @@ async def test_risex_resume_rejects_unresolved_or_pending_epoch_work_before_prov
 def test_copy_resume_has_single_authoritative_route_integration() -> None:
     routes = [
         route
-        for route in api_router.routes
-        if getattr(route, "path", None) == "/api/v1/copy/resume"
+        for route in http_router.routes
+        if getattr(route, "path", None) == "/copy/resume"
         and "POST" in (getattr(route, "methods", set()) or set())
     ]
     assert len(routes) == 1, (
