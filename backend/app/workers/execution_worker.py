@@ -825,7 +825,7 @@ class Worker:
                 await resolve_risex_ambiguous_executions(db)
 
         try:
-            await asyncio.wait_for(_run(), timeout=float(timeout))
+            await _run()
             return True
         except TimeoutError:
             log.warning(
