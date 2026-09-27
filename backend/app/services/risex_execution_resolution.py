@@ -752,7 +752,7 @@ async def resolve_risex_ambiguous_executions(
                 )
                 if evidence is None:
                     result["unresolved"] += 1
-                    continue
+                    return result
 
                 snapshot = await _read_absolute_snapshot(api, candidate)
                 if snapshot is None:
