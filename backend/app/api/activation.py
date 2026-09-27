@@ -417,9 +417,7 @@ async def resume_copy_immediate(
         activation_started = datetime.now(UTC)
         async with position_ledger_lock(user.id):
             locked_state = await user_network_state(db, user.id)
-            locked_binding = _require_usable_risex_binding(
-                await _risex_activation_binding(db, user.id, for_update=True)
-            )
+            locked_binding = binding
             if (
                 locked_state.provider != 'risex'
                 or locked_state.network != network
