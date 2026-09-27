@@ -25,6 +25,7 @@ from app.models.entities import (
     ExecutionState,
     JobState,
     PositionLedger,
+    TradingAccount,
     User,
     UserState,
 )
@@ -321,10 +322,10 @@ class FakeRPC:
         assert request.get("to") == AUTHORIZATION
         assert block_tag == "0x64"
         self.eth_call_count += 1
-        if self.eth_call_count == 1:
+        phase = ((self.eth_call_count - 1) % 2) + 1
+        if phase == 1:
             assert request.get("data") == _expected_nonce_call_data(used=True)
             return "0x" + (1 if self.consumed else 0).to_bytes(32, "big").hex()
-        assert self.eth_call_count == 2
         assert request.get("data") == _expected_nonce_call_data(used=False)
         bitmap = (1 << self.nonce_bitmap_index) if self.consumed else 0
         return "0x" + (
@@ -1283,3 +1284,345 @@ def test_i20_hyperliquid_ambiguity_resolver_and_loop_remain_unchanged_integratio
     assert "follower_hl=self.follower_hl(network)" in source
     assert "resolution=await resolve_ambiguous_executions(db,follower_hl)" in source
     assert "reconcile_active_users(" in source
+
+
+@pytest.mark.asyncio
+async def test_i21_no_candidates_builds_no_transports_and_performs_zero_provider_io_integration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module, resolver = _require_symbol("resolve_risex_ambiguous_executions")
+    signature = inspect.signature(resolver)
+    for name in ("api", "rpc", "authorization_address", "user_id"):
+        assert signature.parameters[name].default is None
+    assert "max_history_pages" in signature.parameters
+    assert "batch_limit" in signature.parameters
+
+    constructed = {"api": 0, "rpc": 0}
+
+    def fail_api(**_kwargs):
+        constructed["api"] += 1
+        raise AssertionError("RED: HTTP transport must not be built without candidates")
+
+    def fail_rpc(**_kwargs):
+        constructed["rpc"] += 1
+        raise AssertionError("RED: RPC transport must not be built without candidates")
+
+    monkeypatch.setattr(module, "RISExReadOnlyHTTPTransport", fail_api, raising=False)
+    monkeypatch.setattr(module, "RISExReadOnlyRPCTransport", fail_rpc, raising=False)
+
+    async with SessionLocal() as db:
+        result = await resolver(
+            db,
+            user_id=uuid.uuid4(),
+            max_history_pages=3,
+            batch_limit=10,
+        )
+
+    assert constructed == {"api": 0, "rpc": 0}
+    assert result.get("candidates", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_i22_global_candidate_selection_starts_from_risex_execution_without_trading_account_integration() -> None:
+    user_id, _epoch_id, job_id, execution_id = await _seed_case(
+        suffix="global-selection-no-trading-account"
+    )
+    api = FakeAPI(
+        orders_pages={1: _orders_page([_history_order()])},
+        position_size="0.5",
+    )
+    rpc = FakeRPC(consumed=True)
+
+    try:
+        async with SessionLocal() as db:
+            trading_account = (
+                await db.execute(
+                    select(TradingAccount).where(TradingAccount.user_id == user_id)
+                )
+            ).scalar_one_or_none()
+            assert trading_account is None
+
+            _module, resolver = _require_symbol("resolve_risex_ambiguous_executions")
+            await resolver(
+                db,
+                api=api,
+                rpc=rpc,
+                authorization_address=AUTHORIZATION,
+                user_id=None,
+                max_history_pages=3,
+                batch_limit=20,
+            )
+
+        execution, job, ledger = await _durable(
+            execution_id=execution_id,
+            job_id=job_id,
+            user_id=user_id,
+        )
+        assert execution.state == ExecutionState.FILLED
+        assert job.state == JobState.DONE
+        assert ledger.last_execution_id == execution_id
+    finally:
+        await _cleanup(user_id)
+
+
+@pytest.mark.asyncio
+async def test_i23_one_candidate_failure_does_not_block_another_user_in_same_batch_integration() -> None:
+    first_user, _first_epoch, first_job, first_execution = await _seed_case(
+        suffix="batch-isolation-first"
+    )
+    second_user, _second_epoch, second_job, second_execution = await _seed_case(
+        suffix="batch-isolation-second",
+        client_order_id=int(OTHER_OBSERVED_CLIENT_ORDER_ID_TEXT),
+    )
+
+    class IsolatingAPI(FakeAPI):
+        def __init__(self) -> None:
+            super().__init__(position_size="0.5")
+            self.order_reads = 0
+
+        async def get_json(self, path: str, *, params=None):
+            if path == "/v1/orders":
+                self.order_reads += 1
+                if self.order_reads == 1:
+                    return {
+                        "data": {
+                            "orders": "malformed",
+                            "page": 1,
+                            "has_next_page": False,
+                        }
+                    }
+                return _orders_page(
+                    [
+                        _history_order(),
+                        _history_order(
+                            client_order_id=OTHER_OBSERVED_CLIENT_ORDER_ID_TEXT,
+                            order_id="order-observed-second",
+                        ),
+                    ]
+                )
+            return await super().get_json(path, params=params)
+
+    api = IsolatingAPI()
+    rpc = FakeRPC(consumed=True)
+
+    try:
+        async with SessionLocal() as db:
+            _module, resolver = _require_symbol("resolve_risex_ambiguous_executions")
+            result = await resolver(
+                db,
+                api=api,
+                rpc=rpc,
+                authorization_address=AUTHORIZATION,
+                user_id=None,
+                max_history_pages=3,
+                batch_limit=20,
+            )
+
+        async with SessionLocal() as db:
+            first = await db.get(Execution, first_execution)
+            second = await db.get(Execution, second_execution)
+            first_durable_job = await db.get(CopyJob, first_job)
+            second_durable_job = await db.get(CopyJob, second_job)
+            assert first is not None and second is not None
+            assert first_durable_job is not None and second_durable_job is not None
+
+            states = {first.state, second.state}
+            assert ExecutionState.FILLED in states
+            assert (
+                ExecutionState.SUBMITTING in states
+                or ExecutionState.UNKNOWN in states
+            )
+            assert JobState.DONE in {
+                first_durable_job.state,
+                second_durable_job.state,
+            }
+            assert JobState.RETRYING in {
+                first_durable_job.state,
+                second_durable_job.state,
+            }
+        assert result.get("resolved", 0) == 1
+        assert result.get("unresolved", 0) >= 1
+    finally:
+        await _cleanup(first_user)
+        await _cleanup(second_user)
+
+
+@pytest.mark.asyncio
+async def test_i24_maintenance_times_out_4c_resolver_and_still_repairs_and_heartbeats_integration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolver_started = 0
+    repair_calls = 0
+    heartbeat_calls = 0
+    test_stop = execution_worker.asyncio.Event()
+    original_sleep = execution_worker.asyncio.sleep
+
+    async def hanging_resolver(*_args: object, **_kwargs: object) -> dict[str, int]:
+        nonlocal resolver_started
+        resolver_started += 1
+        await execution_worker.asyncio.Event().wait()
+        return {"resolved": 0}
+
+    async def fake_repair(*_args: object, **_kwargs: object) -> int:
+        nonlocal repair_calls
+        repair_calls += 1
+        return 0
+
+    async def fake_heartbeat(*_args: object, **_kwargs: object) -> None:
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+        test_stop.set()
+
+    async def no_op(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def no_reconcile(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    async def yielding_sleep(_seconds: float) -> None:
+        await original_sleep(0)
+
+    monkeypatch.setattr(
+        execution_worker,
+        "resolve_risex_ambiguous_executions",
+        hanging_resolver,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        execution_worker,
+        "_RISEX_4C_RESOLUTION_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+    monkeypatch.setattr(execution_worker, "stop", test_stop)
+    monkeypatch.setattr(execution_worker, "repair_stream", fake_repair)
+    monkeypatch.setattr(
+        execution_worker,
+        "_quarantine_stale_admin_leverage_jobs",
+        no_op,
+    )
+    monkeypatch.setattr(execution_worker, "release_stale_jobs", no_op)
+    monkeypatch.setattr(execution_worker, "monitor_credential_expiry", no_op)
+    monkeypatch.setattr(execution_worker.Worker, "_poll_risex_control_once", no_op)
+    monkeypatch.setattr(execution_worker.Worker, "_maintain_risex_window_once", no_op)
+    monkeypatch.setattr(
+        execution_worker.Worker,
+        "_run_reconcile_with_deadline",
+        no_reconcile,
+    )
+    monkeypatch.setattr(execution_worker.Worker, "heartbeat", fake_heartbeat)
+    monkeypatch.setattr(execution_worker.asyncio, "sleep", yielding_sleep)
+
+    worker = object.__new__(execution_worker.Worker)
+    worker.redis = None
+
+    try:
+        await execution_worker.asyncio.wait_for(worker.maintenance(), timeout=0.5)
+    except TimeoutError:
+        pytest.fail(
+            "RED: a hung RISEx 4C resolver must not stall maintenance",
+            pytrace=False,
+        )
+
+    assert resolver_started == 1
+    assert repair_calls == 2, (
+        "RED: the same maintenance cycle must execute both repair_stream phases"
+    )
+    assert heartbeat_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_epoch",
+    ["network", "provider", "account"],
+)
+async def test_i25_invalid_risex_epoch_is_skipped_without_provider_io_or_writes_integration(
+    invalid_epoch: str,
+) -> None:
+    user_id, epoch_id, job_id, execution_id = await _seed_case(
+        suffix=f"invalid-epoch-{invalid_epoch}"
+    )
+
+    async with SessionLocal() as db:
+        epoch = await db.get(ExecutionEpoch, epoch_id)
+        assert epoch is not None
+        if invalid_epoch == "network":
+            epoch.network = "mainnet"
+        elif invalid_epoch == "provider":
+            epoch.provider = "hyperliquid"
+        else:
+            epoch.account_address = None
+        await db.commit()
+
+    api = FakeAPI(orders_pages={1: _orders_page([_history_order()])})
+    rpc = FakeRPC(consumed=True)
+
+    try:
+        async with SessionLocal() as db:
+            _module, resolver = _require_symbol("resolve_risex_ambiguous_executions")
+            await resolver(
+                db,
+                api=api,
+                rpc=rpc,
+                authorization_address=AUTHORIZATION,
+                user_id=user_id,
+                max_history_pages=3,
+                batch_limit=10,
+            )
+
+        execution, job, ledger = await _durable(
+            execution_id=execution_id,
+            job_id=job_id,
+            user_id=user_id,
+        )
+        assert execution.state in {
+            ExecutionState.SUBMITTING,
+            ExecutionState.UNKNOWN,
+        }
+        assert job.state == JobState.RETRYING
+        assert ledger.size == Decimal("0.1")
+        assert api.calls == []
+        assert rpc.calls == 0
+    finally:
+        await _cleanup(user_id)
+
+
+@pytest.mark.asyncio
+async def test_i26_terminal_resolution_persists_nonsecret_4c_audit_evidence_integration() -> None:
+    user_id, _epoch_id, job_id, execution_id = await _seed_case(
+        suffix="audit-evidence"
+    )
+    order = _history_order()
+    api = FakeAPI(
+        orders_pages={1: _orders_page([order])},
+        position_size="0.5",
+    )
+    rpc = FakeRPC(consumed=True)
+
+    try:
+        async with SessionLocal() as db:
+            await _run_resolver(db, api=api, rpc=rpc, user_id=user_id)
+
+        execution, job, _ledger = await _durable(
+            execution_id=execution_id,
+            job_id=job_id,
+            user_id=user_id,
+        )
+        assert execution.state == ExecutionState.FILLED
+        assert execution.exchange_oid == order["id"]
+        assert job.state == JobState.DONE
+
+        evidence = (execution.response or {}).get("risex_4c")
+        assert evidence == {
+            "nonce_block_number": 100,
+            "tx_hash": order["tx_hash"],
+            "order_block_number": order["block_number"],
+            "status": order["status"],
+            "source": "/v1/orders",
+        }
+        serialized = repr(evidence).lower()
+        assert "signature" not in serialized
+        assert "private" not in serialized
+        assert "secret" not in serialized
+    finally:
+        await _cleanup(user_id)
