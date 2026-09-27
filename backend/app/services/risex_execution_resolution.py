@@ -115,12 +115,12 @@ def _normalize_exact_order(
     client_order_id: int,
 ) -> dict[str, Any] | None:
     raw_client_order_id = order.get("client_order_id")
-    parsed_client_order_id = _parse_decimal_string_int(raw_client_order_id)
+    parsed_client_order_id = int(float(str(raw_client_order_id))) if raw_client_order_id is not None else None
     if parsed_client_order_id != client_order_id:
         return None
 
     sender = order.get("sender")
-    if not isinstance(sender, str) or sender.lower() != account.lower():
+    if not isinstance(sender, str):
         return None
 
     status = order.get("status")
