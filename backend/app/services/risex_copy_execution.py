@@ -139,22 +139,9 @@ def classify_risex_submission_response(
                 reason='provider-confirmed IOC completed without fill',
             )
 
-        error = payload.get('error')
-        if (
-            400 <= status_code < 500
-            and payload.get('success') is False
-            and isinstance(error, Mapping)
-            and isinstance(error.get('code'), str)
-            and bool(str(error.get('code')).strip())
-            and isinstance(error.get('message'), str)
-            and bool(str(error.get('message')).strip())
-        ):
-            return RISExSubmissionOutcome(
-                definitive=True,
-                execution_state=ExecutionState.REJECTED,
-                reservation_active=False,
-                reason=f"{error.get('code')}: {error.get('message')}",
-            )
+        # Case (A) rejection whitelist is intentionally empty. Until RISEx
+        # documents and verifies a stable no-effect rejection schema, every HTTP
+        # 4xx remains ambiguous and keeps the durable reservation active.
 
     transition = submission_transition('ACKNOWLEDGED')
     return RISExSubmissionOutcome(
@@ -548,6 +535,138 @@ async def _finish_without_submission(
     return await _defer_for_resolution(db, job, reason)
 
 
+def _terminal_outcome_from_execution(
+    execution: Execution | None,
+) -> RISExSubmissionOutcome | None:
+    if execution is None:
+        return None
+    response = dict(execution.response or {})
+    case_a = response.get('risex_case_a')
+    if not isinstance(case_a, Mapping):
+        return None
+    raw = case_a.get('terminal_outcome')
+    if not isinstance(raw, Mapping) or raw.get('definitive') is not True:
+        return None
+    try:
+        state = ExecutionState(str(raw.get('execution_state') or ''))
+    except ValueError:
+        return None
+    if state not in {
+        ExecutionState.FILLED,
+        ExecutionState.REJECTED,
+        ExecutionState.CANCELED,
+    }:
+        return None
+    filled = _decimal_or_none(raw.get('filled_quantity'))
+    if state == ExecutionState.FILLED and (filled is None or filled <= 0):
+        return None
+    if state == ExecutionState.CANCELED and filled is None:
+        filled = Decimal(0)
+    provider_order_id = raw.get('provider_order_id')
+    reason = raw.get('reason')
+    return RISExSubmissionOutcome(
+        definitive=True,
+        execution_state=state,
+        reservation_active=False,
+        provider_order_id=(
+            str(provider_order_id)
+            if provider_order_id not in (None, '')
+            else None
+        ),
+        filled_quantity=filled,
+        reason=str(reason) if reason not in (None, '') else None,
+    )
+
+
+async def _finish_case_a_job(
+    db: AsyncSession,
+    job: CopyJob,
+    execution: Execution,
+) -> str:
+    if execution.state not in {
+        ExecutionState.FILLED,
+        ExecutionState.REJECTED,
+        ExecutionState.CANCELED,
+    }:
+        raise RuntimeError('RISEx case-A finish requires a terminal execution')
+    job.state = JobState.DONE
+    job.last_error = execution.reject_reason
+    job.owner = None
+    job.locked_until = None
+    job.next_attempt_at = None
+    await db.commit()
+    return JobState.DONE.value
+
+
+async def _settle_case_a_with_provider_truth(
+    db: AsyncSession,
+    *,
+    job: CopyJob,
+    execution: Execution,
+    outcome: RISExSubmissionOutcome,
+    persist_provider_truth: Callable[[AsyncSession, Execution], Any] | None,
+) -> str:
+    if persist_provider_truth is None:
+        return await _defer_for_resolution(
+            db,
+            job,
+            'RISEx terminal provider truth callback is unavailable',
+        )
+
+    try:
+        result = persist_provider_truth(db, execution)
+        if inspect.isawaitable(result):
+            result = await result
+        if not isinstance(result, Mapping):
+            raise RuntimeError('RISEx provider truth callback returned invalid evidence')
+
+        if result.get('provider_truth_settled') is False:
+            return await _defer_for_resolution(
+                db,
+                job,
+                'RISEx terminal provider truth pending: '
+                + str(result.get('reason') or 'retry required'),
+            )
+
+        await db.refresh(execution)
+        if execution.state in {
+            ExecutionState.FILLED,
+            ExecutionState.REJECTED,
+            ExecutionState.CANCELED,
+        }:
+            settled = execution
+        elif result.get('provider_truth_persisted') is True:
+            async def already_persisted(
+                _db: AsyncSession,
+                _execution: Execution,
+            ) -> Mapping[str, Any]:
+                return result
+
+            settled = await settle_risex_execution_under_accounting_lock(
+                db,
+                execution_id=execution.id,
+                outcome=outcome,
+                persist_provider_truth=(
+                    None
+                    if outcome.execution_state == ExecutionState.REJECTED
+                    else already_persisted
+                ),
+            )
+        else:
+            raise RuntimeError('RISEx provider truth is not durably settled')
+    except RuntimeError as exc:
+        fresh_job = await db.get(CopyJob, job.id)
+        if fresh_job is None:
+            raise
+        return await _defer_for_resolution(
+            db,
+            fresh_job,
+            f'RISEx terminal provider truth pending: {exc}',
+        )
+
+    return await _finish_case_a_job(db, job, settled)
+
+
 async def process_risex_job(
     db: AsyncSession,
     adapter: RISExAdapter,
@@ -556,7 +675,7 @@ async def process_risex_job(
     submission: RISExPreparedCopySubmission | None = None,
     persist_provider_truth: Callable[[AsyncSession, Execution], Any] | None = None,
 ) -> str:
-    """Submit at most once; provider truth remains fenced until terminal evidence."""
+    """Submit at most once; durable terminal evidence resumes at provider truth."""
 
     if job.execution_provider != 'risex' or job.execution_network != 'testnet':
         return await _finish_without_submission(
@@ -574,22 +693,38 @@ async def process_risex_job(
         )
     ).scalar_one_or_none()
 
-    if existing is not None and existing.state == ExecutionState.FILLED:
-        job.state = JobState.DONE
-        job.owner = None
-        job.locked_until = None
-        await db.commit()
-        return JobState.DONE.value
+    if existing is not None and existing.state == ExecutionState.CANCELED:
+        if (existing.response or {}).get('risex_4b_bis', {}).get(
+            'submission_status'
+        ) == 'PRE_SUBMIT_BLOCKED':
+            job.state = JobState.SKIPPED
+            job.owner = None
+            job.locked_until = None
+            await db.commit()
+            return JobState.SKIPPED.value
+
     if existing is not None and existing.state in {
+        ExecutionState.FILLED,
         ExecutionState.REJECTED,
         ExecutionState.CANCELED,
-        ExecutionState.QUARANTINED,
     }:
+        return await _finish_case_a_job(db, job, existing)
+    if existing is not None and existing.state == ExecutionState.QUARANTINED:
         job.state = JobState.SKIPPED
         job.owner = None
         job.locked_until = None
         await db.commit()
         return JobState.SKIPPED.value
+
+    recovered_outcome = _terminal_outcome_from_execution(existing)
+    if existing is not None and recovered_outcome is not None:
+        return await _settle_case_a_with_provider_truth(
+            db,
+            job=job,
+            execution=existing,
+            outcome=recovered_outcome,
+            persist_provider_truth=persist_provider_truth,
+        )
 
     if submission is None:
         return await _finish_without_submission(
@@ -656,13 +791,14 @@ async def process_risex_job(
         )
     existing = claimed
 
-    result: dict[str, Any] = await adapter.place_ioc(
+    result: Mapping[str, Any] = await adapter.place_ioc(
         db=db,
         job=job,
         request=submission.request,
     )
+    status_code = int(getattr(result, 'status_code', 200))
     outcome = classify_risex_submission_response(
-        status_code=200,
+        status_code=status_code,
         payload=result,
         requested_size=existing.requested_size,
     )
@@ -670,12 +806,17 @@ async def process_risex_job(
     response = dict(existing.response or {})
     response['risex_4b_bis'] = {
         **dict(response.get('risex_4b_bis') or {}),
-        'submission_status': 'CONFIRMED' if outcome.definitive else 'ACKNOWLEDGED',
+        'submission_status': (
+            'TERMINAL_EVIDENCE_PERSISTED'
+            if outcome.definitive
+            else 'ACKNOWLEDGED'
+        ),
+        'provider_http_status': status_code,
         'provider_response': dict(result),
     }
-    existing.response = response
 
     if not outcome.definitive:
+        existing.response = response
         existing.state = ExecutionState.SUBMITTING
         return await _defer_for_resolution(
             db,
@@ -683,32 +824,31 @@ async def process_risex_job(
             'RISEx provider acknowledgement is not terminal provider truth',
         )
 
-    job_id = job.id
-    try:
-        settled = await settle_risex_execution_under_accounting_lock(
-            db,
-            execution_id=existing.id,
-            outcome=outcome,
-            persist_provider_truth=persist_provider_truth,
-        )
-    except RuntimeError as exc:
-        fresh_job = await db.get(CopyJob, job_id)
-        if fresh_job is None:
-            raise
-        return await _defer_for_resolution(
-            db,
-            fresh_job,
-            f'RISEx terminal outcome awaits serialized provider truth: {exc}',
-        )
-
-    if settled.state == ExecutionState.FILLED:
-        job.state = JobState.DONE
-        job.last_error = None
-    else:
-        job.state = JobState.SKIPPED
-        job.last_error = outcome.reason
-    job.owner = None
-    job.locked_until = None
-    job.next_attempt_at = None
+    response['risex_case_a'] = {
+        'terminal_outcome': {
+            'definitive': True,
+            'execution_state': outcome.execution_state.value,
+            'provider_order_id': outcome.provider_order_id,
+            'filled_quantity': (
+                str(outcome.filled_quantity)
+                if outcome.filled_quantity is not None
+                else None
+            ),
+            'reason': outcome.reason,
+            'status_code': status_code,
+            'provider_response': dict(result),
+        }
+    }
+    existing.response = response
+    # Durable crash fence: terminal provider evidence is committed while the
+    # Execution remains reservation-active. Any restart resumes from provider
+    # truth and must never call place_ioc for this Execution again.
     await db.commit()
-    return job.state.value
+
+    return await _settle_case_a_with_provider_truth(
+        db,
+        job=job,
+        execution=existing,
+        outcome=outcome,
+        persist_provider_truth=persist_provider_truth,
+    )
