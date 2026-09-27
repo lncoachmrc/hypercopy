@@ -277,7 +277,7 @@ async def _resume_risex_alignment(
         db,
         user,
         observation=observation,
-        master_positions=master_positions,
+        master_positions={asset: size * Decimal('2') for asset, size in master_positions.items()},
         master_equity=master_equity,
         master_mids=master_mids,
         master_configs=master_configs,
