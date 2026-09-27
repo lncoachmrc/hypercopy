@@ -142,7 +142,7 @@ def _normalize_exact_order(
             else ExecutionState.CANCELED
         )
     else:
-        return None
+        execution_state = ExecutionState.FILLED
 
     provider_order_id_raw = order.get("id")
     if isinstance(provider_order_id_raw, bool) or provider_order_id_raw is None:
