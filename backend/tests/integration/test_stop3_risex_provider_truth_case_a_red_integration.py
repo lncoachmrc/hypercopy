@@ -9,6 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -607,3 +608,97 @@ async def test_provider_truth_settlement_enters_position_ledger_lock_after_netwo
         assert state == {"network_read": True, "lock_entered": True}
     finally:
         await _cleanup(user_id)
+
+
+@pytest.mark.asyncio
+async def test_provider_truth_retry_reloads_job_after_optimistic_rollback_integration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _provider_truth_module()
+    persist = getattr(module, "persist_risex_provider_truth", None)
+    assert callable(persist)
+    user_id, job_id, execution_id = await _seed_case(suffix="rollback-reload")
+
+    async def read_snapshot(*_args, **_kwargs):
+        async with SessionLocal() as concurrent:
+            ledger = (
+                await concurrent.execute(
+                    select(PositionLedger).where(
+                        PositionLedger.user_id == user_id,
+                        PositionLedger.asset == "BTC",
+                    )
+                )
+            ).scalar_one()
+            ledger.size = Decimal("0.2")
+            await concurrent.commit()
+        return {
+            "market_id": 1,
+            "position_size": Decimal("0.5"),
+            "mark_price": Decimal("101"),
+            "verified_at": datetime.now(UTC),
+        }
+
+    monkeypatch.setattr(module, "read_risex_provider_truth_snapshot", read_snapshot)
+
+    class NoPostAdapter:
+        calls = 0
+
+        async def place_ioc(self, **_kwargs):
+            self.calls += 1
+            raise AssertionError("rollback recovery must never submit again")
+
+    adapter = NoPostAdapter()
+    try:
+        async with SessionLocal() as db:
+            job = await db.get(CopyJob, job_id)
+            assert job is not None
+            result = await risex_copy_execution.process_risex_job(
+                db,
+                adapter,
+                job,
+                submission=None,
+                persist_provider_truth=persist,
+            )
+
+        assert result == JobState.RETRYING.value
+        assert adapter.calls == 0
+        async with SessionLocal() as db:
+            durable = await db.get(Execution, execution_id)
+            durable_job = await db.get(CopyJob, job_id)
+            assert durable is not None and durable_job is not None
+            assert durable.state == ExecutionState.SUBMITTING
+            assert durable_job.state == JobState.RETRYING
+            assert "ledger_baseline_changed" in str(durable_job.last_error)
+    finally:
+        await _cleanup(user_id)
+
+
+@pytest.mark.asyncio
+async def test_worker_terminal_evidence_recovery_precedes_disabled_write_window_integration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def recovered(_db, _job, *, persist_provider_truth):
+        nonlocal calls
+        calls += 1
+        assert persist_provider_truth is execution_worker.persist_risex_provider_truth
+        return JobState.DONE.value
+
+    monkeypatch.setattr(execution_worker, "recover_risex_case_a_job", recovered)
+
+    class WindowMustNotRun:
+        def expire_if_needed(self):
+            raise AssertionError(
+                "terminal-evidence recovery must precede the signed-write window gate"
+            )
+
+    worker = SimpleNamespace(risex_window=WindowMustNotRun())
+    result = await execution_worker.Worker._run_risex_copy_job(
+        worker,
+        object(),
+        SimpleNamespace(),
+    )
+
+    assert result == JobState.DONE.value
+    assert calls == 1
