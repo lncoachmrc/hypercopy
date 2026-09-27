@@ -15,8 +15,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.adapters import risex as risex_adapter
+from app.adapters import risex_signed_testnet_http
 from app.api import activation
-from app.services import reconcile
+from app.core.crypto import crypto
+from app.services import reconcile, risex_copy_execution
 
 
 def _require_symbol(module, name: str):
@@ -84,25 +87,46 @@ async def test_risex_activation_uses_shared_reconciliation_planner_unit(
     )
 
 
-def test_risex_activation_alignment_only_creates_copyjobs_before_worker_unit(
+@pytest.mark.asyncio
+async def test_risex_activation_alignment_only_creates_copyjobs_before_worker_unit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
-    forbidden = {
-        "place_ioc",
-        "claim_risex_first_post",
-        "crypto.decrypt",
-        "resolve_risex_worker_credential",
-        "RISExSignedTestnetHTTPTransport",
-    }
     risex_alignment = _require_symbol(activation, "_resume_risex_alignment")
-    source = inspect.getsource(risex_alignment)
-    endpoint_source = inspect.getsource(activation.resume_copy_immediate)
-    combined = source + "\n" + endpoint_source
-    assert not [name for name in forbidden if name in combined], (
-        "RED: RISEx activation may read provider state and create/publish CopyJobs, "
-        "but signed transport, first-POST claim and credential decryption belong to the worker"
+    _require_symbol(reconcile, "reconcile_observed_follower")
+
+    async def forbidden_async(*_args, **_kwargs):
+        raise AssertionError("RED: activation crossed the worker-only signed-write boundary")
+
+    def forbidden_sync(*_args, **_kwargs):
+        raise AssertionError("RED: activation decrypted a credential or built signed transport")
+
+    async def shared_spy(*_args, **_kwargs):
+        return {"status": "OK", "jobs_created": 1}
+
+    monkeypatch.setattr(risex_adapter.RISExAdapter, "place_ioc", forbidden_async)
+    monkeypatch.setattr(risex_copy_execution, "claim_risex_first_post", forbidden_async)
+    monkeypatch.setattr(crypto, "decrypt", forbidden_sync)
+    monkeypatch.setattr(
+        risex_signed_testnet_http,
+        "RISExSignedTestnetHTTPTransport",
+        forbidden_sync,
     )
+    monkeypatch.setattr(activation, "RISExSignedTestnetHTTPTransport", forbidden_sync, raising=False)
+    monkeypatch.setattr(activation, "reconcile_observed_follower", shared_spy, raising=False)
+    monkeypatch.setattr(reconcile, "reconcile_observed_follower", shared_spy)
+
+    result = await risex_alignment(
+        object(),
+        SimpleNamespace(id=uuid.uuid4()),
+        observation=SimpleNamespace(provider="risex", network="testnet"),
+        master_positions={"BTC": Decimal("0.25")},
+        master_equity=Decimal("1000"),
+        master_mids={"BTC": "100"},
+        master_configs=None,
+        create_jobs=True,
+    )
+    assert result == {"status": "OK", "jobs_created": 1}
 
 
 @pytest.mark.asyncio
