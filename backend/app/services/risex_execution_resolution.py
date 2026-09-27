@@ -27,6 +27,7 @@ from app.models.entities import (
     ExecutionEpoch,
     ExecutionState,
     JobState,
+    TradingAccount,
 )
 from app.services.risex_copy_execution import (
     RISExSubmissionOutcome,
@@ -332,6 +333,7 @@ async def _candidate_ids(
 ) -> list[uuid.UUID]:
     query = (
         select(Execution.id)
+        .join(TradingAccount, TradingAccount.user_id == Execution.user_id)
         .where(
             Execution.execution_provider == "risex",
             Execution.state.in_(_ACTIVE_STATES),
