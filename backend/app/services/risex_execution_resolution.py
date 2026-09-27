@@ -770,6 +770,7 @@ async def resolve_risex_ambiguous_executions(
                         "execution_id": str(execution_id),
                         "error_type": type(exc).__name__,
                     },
+                    exc_info=True,
                 )
                 result["unresolved"] += 1
                 continue
