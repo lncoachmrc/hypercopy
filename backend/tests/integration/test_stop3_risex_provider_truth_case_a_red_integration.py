@@ -17,6 +17,7 @@ import pytest_asyncio
 from sqlalchemy import delete, select
 
 from app.adapters import risex_signed_testnet_http
+from app.adapters.hyperliquid import OrderOutcome, parse_order_response
 from app.db.position_ledger_lock import position_ledger_lock_engine
 from app.db.session import SessionLocal, engine
 from app.models.entities import (
@@ -29,6 +30,7 @@ from app.models.entities import (
     User,
     UserState,
 )
+from app.services import execution as hyperliquid_execution
 from app.services import risex_copy_execution, risex_worker_submission
 from app.workers import execution_worker
 
@@ -750,7 +752,7 @@ async def test_case_b_unresolved_execution_blocks_worker_repreparation_before_pr
     "terminal_state",
     [ExecutionState.REJECTED, ExecutionState.CANCELED],
 )
-async def test_terminal_no_fill_outcomes_refresh_absolute_ledger_and_finish_done_integration(
+async def test_terminal_no_fill_outcomes_refresh_absolute_ledger_and_finish_skipped_integration(
     monkeypatch: pytest.MonkeyPatch,
     terminal_state: ExecutionState,
 ) -> None:
@@ -809,7 +811,7 @@ async def test_terminal_no_fill_outcomes_refresh_absolute_ledger_and_finish_done
                 persist_provider_truth=persist,
             )
 
-        assert result == JobState.DONE.value
+        assert result == JobState.SKIPPED.value
         assert adapter.calls == 0
         async with SessionLocal() as db:
             durable = await db.get(Execution, execution_id)
@@ -824,10 +826,107 @@ async def test_terminal_no_fill_outcomes_refresh_absolute_ledger_and_finish_done
             ).scalar_one()
             assert durable is not None and durable_job is not None
             assert durable.state == terminal_state
-            assert durable_job.state == JobState.DONE
+            assert durable_job.state == JobState.SKIPPED
             assert ledger.size == Decimal("0.2")
             assert ledger.mark_price == Decimal("101")
             assert ledger.last_execution_id == execution_id
             assert ledger.exchange_verified_at == verified_at
+    finally:
+        await _cleanup(user_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_state", "filled_size"),
+    [
+        (ExecutionState.REJECTED, Decimal("0")),
+        (ExecutionState.CANCELED, Decimal("0")),
+        (ExecutionState.FILLED, Decimal("0.2")),
+    ],
+)
+async def test_risex_copyjob_terminal_state_matches_hyperliquid_integration(
+    terminal_state: ExecutionState,
+    filled_size: Decimal,
+) -> None:
+    user_id, job_id, execution_id = await _seed_case(
+        suffix=f"parity-{terminal_state.value.lower()}"
+    )
+
+    try:
+        async with SessionLocal() as db:
+            job = await db.get(CopyJob, job_id)
+            assert job is not None
+
+            if terminal_state == ExecutionState.FILLED:
+                hl_outcome = parse_order_response(
+                    {
+                        "response": {
+                            "data": {
+                                "statuses": [
+                                    {
+                                        "filled": {
+                                            "oid": 7,
+                                            "totalSz": str(filled_size),
+                                            "avgPx": "100",
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                )
+                assert hl_outcome.state == "FILLED"
+                assert hl_outcome.filled_size < Decimal("0.5")
+                hl_result = await hyperliquid_execution._finish(
+                    db,
+                    job,
+                    JobState.DONE,
+                    None,
+                )
+            else:
+                hl_outcome = OrderOutcome(
+                    terminal_state.value,
+                    reason=f"hyperliquid-{terminal_state.value.lower()}",
+                )
+                hl_result = await hyperliquid_execution._finish_action_rejection(
+                    db,
+                    job,
+                    user_id=user_id,
+                    network="testnet",
+                    outcome=hl_outcome,
+                    leg="parity",
+                    rejected_target=Decimal("0.5"),
+                    rejected_real=Decimal("0.1"),
+                )
+
+            hyperliquid_job_state = JobState(hl_result)
+
+            job.state = JobState.PROCESSING
+            job.owner = f"risex-parity-{terminal_state.value.lower()}"
+            job.last_error = None
+            await db.commit()
+
+            execution = await db.get(Execution, execution_id)
+            assert execution is not None
+            execution.state = terminal_state
+            execution.filled_size = filled_size
+            execution.reject_reason = (
+                None
+                if terminal_state == ExecutionState.FILLED
+                else f"risex-{terminal_state.value.lower()}"
+            )
+            await db.commit()
+
+        async with SessionLocal() as db:
+            job = await db.get(CopyJob, job_id)
+            execution = await db.get(Execution, execution_id)
+            assert job is not None and execution is not None
+            risex_result = await risex_copy_execution._finish_case_a_job(
+                db,
+                job,
+                execution,
+            )
+            assert JobState(risex_result) == hyperliquid_job_state
+            assert job.state == hyperliquid_job_state
     finally:
         await _cleanup(user_id)
