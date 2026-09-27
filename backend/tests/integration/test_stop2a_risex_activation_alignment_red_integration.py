@@ -997,3 +997,15 @@ async def test_risex_resume_rejects_unresolved_or_pending_epoch_work_before_prov
     assert expected_detail in str(exc.value.detail).lower()
     assert reads == [], "RED: pending/ambiguous epoch work must block before any RISEx provider read"
 
+
+def test_copy_resume_has_single_authoritative_route_integration() -> None:
+    routes = [
+        route
+        for route in http_router.routes
+        if str(getattr(route, "path", "")).rstrip("/").endswith("/copy/resume")
+        and "POST" in (getattr(route, "methods", set()) or set())
+    ]
+    assert len(routes) == 1, (
+        "RED: exactly one POST /api/v1/copy/resume route must be registered; "
+        f"found {len(routes)}"
+    )
