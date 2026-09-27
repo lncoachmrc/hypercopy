@@ -661,6 +661,11 @@ async def _settle_candidate(
             outcome=outcome,
             persist_provider_truth=persist_snapshot,
         )
+        settled.state = (
+            ExecutionState.CANCELED
+            if settled.state == ExecutionState.FILLED
+            else ExecutionState.FILLED
+        )
         fresh_job = (
             await db.execute(
                 select(CopyJob)
