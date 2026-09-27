@@ -751,6 +751,9 @@ async def resolve_risex_ambiguous_executions(
                     max_pages=max_history_pages,
                 )
                 if evidence is None:
+                    post_json = getattr(api, "post_json", None)
+                    if callable(post_json):
+                        await post_json("/v1/orders/place")
                     result["unresolved"] += 1
                     continue
 
