@@ -625,9 +625,9 @@ async def _finish_case_a_job(
     }:
         raise RuntimeError('RISEx case-A finish requires a terminal execution')
     job.state = (
-        JobState.DONE
+        JobState.SKIPPED
         if execution.state == ExecutionState.FILLED
-        else JobState.SKIPPED
+        else JobState.DONE
     )
     job.last_error = execution.reject_reason
     job.owner = None
