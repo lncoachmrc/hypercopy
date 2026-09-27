@@ -539,7 +539,7 @@ async def _settle_candidate(
     evidence: Mapping[str, Any],
     snapshot: RISExProviderTruthSnapshot,
 ) -> bool:
-    async with position_ledger_lock(candidate.user_id):
+    async with position_ledger_lock(uuid.uuid4()):
         current_execution = (
             await db.execute(
                 select(Execution)
