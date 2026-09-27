@@ -49,7 +49,7 @@ OTHER_OBSERVED_CLIENT_ORDER_ID_TEXT = "1402917565528103158"
 
 
 def _abi_address_hex(address: str) -> str:
-    return bytes.fromhex(address[2:]).rjust(32, b"\\x00").hex()
+    return bytes.fromhex(address[2:]).rjust(32, bytes([0])).hex()
 
 
 def _abi_uint_hex(value: int) -> str:
