@@ -128,9 +128,13 @@ async def _read_ledger(
     asset: str,
     for_update: bool,
 ) -> PositionLedger | None:
-    query = select(PositionLedger).where(
-        PositionLedger.user_id == user_id,
-        PositionLedger.asset == asset,
+    query = (
+        select(PositionLedger)
+        .where(
+            PositionLedger.user_id == user_id,
+            PositionLedger.asset == asset,
+        )
+        .execution_options(populate_existing=True)
     )
     if for_update:
         query = query.with_for_update()
