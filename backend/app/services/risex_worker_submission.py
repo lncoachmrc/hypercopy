@@ -222,23 +222,6 @@ async def prepare_risex_worker_submission(
     if existing is not None:
         return None
 
-    unresolved_same_asset = (
-        await db.execute(
-            select(Execution.id)
-            .where(
-                Execution.user_id == job.user_id,
-                Execution.asset == job.asset,
-                Execution.execution_provider == 'risex',
-                Execution.state.in_(
-                    [ExecutionState.SUBMITTING, ExecutionState.UNKNOWN]
-                ),
-            )
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    if unresolved_same_asset is not None:
-        return None
-
     resolved_credential = await resolve_risex_worker_credential(db, job)
     account_address = resolved_credential.account_address
 
