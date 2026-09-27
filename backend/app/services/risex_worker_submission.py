@@ -225,6 +225,11 @@ async def prepare_risex_worker_submission(
     resolved_credential = await resolve_risex_worker_credential(db, job)
     account_address = resolved_credential.account_address
 
+    # Close the read-only SQLAlchemy transaction before any RISEx HTTP/RPC I/O.
+    # SessionLocal uses expire_on_commit=False, so the verified snapshots remain
+    # available while no database transaction is held across provider latency.
+    await db.commit()
+
     api = RISExReadOnlyHTTPTransport(base_url=_RISEX_TESTNET_API_URL)
     rpc = RISExReadOnlyRPCTransport(rpc_url=_RISEX_TESTNET_RPC_URL)
     transport: RISExSignedTestnetHTTPTransport | None = None
@@ -284,6 +289,10 @@ async def prepare_risex_worker_submission(
             asset_allowed=allowed_asset,
             data_stale=False,
         )
+
+        # The remaining preparation helpers are provider-read/signing code only.
+        # End the local risk snapshot transaction before entering that network phase.
+        await db.commit()
 
         client_order_id = client_order_id_for_job(job.id, 'o')
         intent = plan_risex_order_intent(
