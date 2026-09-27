@@ -864,7 +864,6 @@ class Worker:
                     await repair_stream(self.redis,db)
                     await monitor_credential_expiry(db, self.redis)
 
-                await self._run_risex_4c_resolution_with_deadline()
                 await self._poll_risex_control_once()
                 await self._maintain_risex_window_once()
                 await self._run_reconcile_with_deadline()
