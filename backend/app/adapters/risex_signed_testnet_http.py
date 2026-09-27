@@ -192,7 +192,7 @@ class RISExSignedTestnetHTTPTransport:
             raise SignedTestnetBlocked(
                 f'RISEx signed testnet POST at {normalized_path} did not return a JSON object'
             )
-        return RISExSignedHTTPResponse(payload, status_code=response.status_code)
+        return payload  # sensitivity mutation: HTTP status visibility removed
 
     async def aclose(self) -> None:
         if self._owns_client:
