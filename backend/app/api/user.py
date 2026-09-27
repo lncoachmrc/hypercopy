@@ -45,65 +45,39 @@ from app.services.metrics import dashboard_for_user
 from app.services.networking import set_user_network, user_network_state
 from app.services.queue import publish_job
 from app.services.risex_order_preparation import assert_risex_environment_allowed
-from app.services.reconcile import master_snapshot, reconcile_user
-from app.security.risex_authorization_session import (
-    RISExAuthorizationSessionEvidence,
-    collect_authorization_session_evidence,
-)
+from app.services.risex_signer_binding import _verify_risex_signer_binding
+from app.security.risex_authorization_session import collect_authorization_session_evidence
 from app.security.risex_deployment_preflight import evaluate_pinned_deployment_preflight
-from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
 from app.security.risex_deployment_runtime import (
     PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
     RISExReadOnlyRPCTransport,
     collect_runtime_deployment_evidence,
 )
+from app.security.risex_signed_testnet_policy import SignedTestnetBlocked
+_SHARED_RISEX_SIGNER_BINDING = _verify_risex_signer_binding
 
 
-_RISEX_TESTNET_API_URL = 'https://api.testnet.rise.trade'
-_RISEX_TESTNET_RPC_URL = 'https://testnet.riselabs.xyz'
-
-
-async def _verify_risex_signer_binding(
+async def _verify_risex_signer_binding_for_api(
     *,
     account_address: str,
     signer_address: str,
-) -> RISExAuthorizationSessionEvidence:
-    async with RISExReadOnlyHTTPTransport(base_url=_RISEX_TESTNET_API_URL) as api:
-        async with RISExReadOnlyRPCTransport(rpc_url=_RISEX_TESTNET_RPC_URL) as rpc:
-            deployment = await collect_runtime_deployment_evidence(
-                api,
-                rpc,
-                network='testnet',
-            )
-            preflight = evaluate_pinned_deployment_preflight(
-                deployment,
-                expected_fingerprint=PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
-            )
-            if (
-                preflight.verdict != 'PASS'
-                or preflight.deployment_identity_verified is not True
-            ):
-                raise RuntimeError('RISEx deployment identity is not verified')
-
-            evidence = await collect_authorization_session_evidence(
-                rpc,
-                authorization_address=deployment.domain_verifying_contract,
-                account=account_address,
-                signer=signer_address,
-                block_tag=hex(deployment.block_number),
-            )
-
-    if evidence.account.lower() != account_address.lower():
-        raise RuntimeError('RISEx authorization account binding mismatch')
-    if evidence.signer.lower() != signer_address.lower():
-        raise RuntimeError('RISEx authorization signer binding mismatch')
-    if evidence.session_active is not True:
-        raise RuntimeError('RISEx signer session is not active')
-    if evidence.session_not_expired is not True:
-        raise RuntimeError('RISEx signer session is expired')
-    if evidence.perps_permission is not True:
-        raise RuntimeError('RISEx signer lacks required Perps permission')
-    return evidence
+):
+    verifier = _verify_risex_signer_binding
+    if verifier is not _SHARED_RISEX_SIGNER_BINDING:
+        return await verifier(
+            account_address=account_address,
+            signer_address=signer_address,
+        )
+    return await verifier(
+        account_address=account_address,
+        signer_address=signer_address,
+        _http_transport=RISExReadOnlyHTTPTransport,
+        _rpc_transport=RISExReadOnlyRPCTransport,
+        _collect_runtime=collect_runtime_deployment_evidence,
+        _evaluate_preflight=evaluate_pinned_deployment_preflight,
+        _collect_authorization=collect_authorization_session_evidence,
+        _expected_fingerprint=PINNED_RISEX_TESTNET_DEPLOYMENT_FINGERPRINT,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,7 +355,7 @@ async def trading_provider(body: TradingProviderIn, user: User = Depends(current
         _require_usable_risex_credential(snapshot)
 
         try:
-            await _verify_risex_signer_binding(
+            await _verify_risex_signer_binding_for_api(
                 account_address=snapshot.account_address,
                 signer_address=snapshot.signer_address,
             )
@@ -743,34 +717,6 @@ async def shadow(user: User = Depends(current_user), db: AsyncSession = Depends(
     return await _serialize_user(db, user)
 
 
-@router.post('/copy/resume', dependencies=[Depends(require_csrf)])
-async def resume(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
-    _require_follower_user(user)
-    rs = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
-    if rs and rs.state != RiskHalt.NORMAL: raise HTTPException(409, f'Cannot resume while {rs.state.value} is active')
-    account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
-    if not account: raise HTTPException(409, 'Connect a Hyperliquid trading account first')
-    network = (await user_network_state(db, user.id)).network
-    if not await live_trading_allowed(db, network):
-        raise HTTPException(409, 'Mainnet live-trading gate is closed')
-    try:
-        master_hl = _master_hl()
-        follower_hl = _follower_hl(network)
-        mp, meq, master_mids = await master_snapshot(master_hl)
-        follower_mids = master_mids if settings.master_network == network else await follower_hl.mids()
-        await reconcile_user(
-            db, follower_hl, user,
-            master_positions=mp, master_equity=meq,
-            mids=follower_mids, master_mids=master_mids,
-        )
-    except Exception as exc:
-        raise HTTPException(503, 'Reconciliation must succeed before strategy execution can resume') from exc
-    user.copy_state = CopyState.ACTIVE
-    await audit(db, action='COPY_RESUMED', actor_id=user.id, subject_id=user.id, after={'master_network': settings.master_network, 'follower_network': network})
-    await db.commit()
-    return await _serialize_user(db, user)
-
-
 @router.post('/copy/close-positions', dependencies=[Depends(require_csrf)])
 async def close_positions(body: ClosePositionsIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     _require_follower_user(user)
@@ -865,7 +811,7 @@ async def link_risex_trading_account(
         raise HTTPException(422, 'The authenticated wallet cannot also be the RISEx signer')
 
     try:
-        verification = await _verify_risex_signer_binding(
+        verification = await _verify_risex_signer_binding_for_api(
             account_address=account_address,
             signer_address=signer_address,
         )

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Awaitable, Callable
 from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy import select
@@ -15,7 +17,7 @@ from app.core.config import settings
 from app.db.position_ledger_lock import position_ledger_lock
 from app.db.redis import redis_client
 from app.engine.risk import RiskAction, RiskContext, evaluate
-from app.engine.sizing import EXCHANGE_MIN_NOTIONAL, FollowerState, MasterExposure, compute_target, plan, round_size
+from app.engine.sizing import AssetSpec, EXCHANGE_MIN_NOTIONAL, FollowerState, MasterExposure, compute_target, plan, round_size
 from app.models.entities import CopyJob, CopyState, EquitySnapshot, Execution, ExecutionState, Fill, JobState, PositionLedger, ReconciliationRun, RiskHalt, RiskProfile, RiskState, TradingAccount, User, UserState
 from app.services.ai_mode import read_ai_execution_policy
 from app.services.ai_profit_exit import protected_reconcile_target
@@ -31,6 +33,32 @@ log = __import__('app.core.logging', fromlist=['get_logger']).get_logger(__name_
 _LEDGER_DECIMAL_QUANTUM = Decimal('0.000000000001')
 _ACTIVE_AMBIGUITY_JOB_STATES = {JobState.QUEUED, JobState.PROCESSING, JobState.RETRYING}
 _TERMINAL_AMBIGUITY_JOB_STATES = {JobState.DONE, JobState.SKIPPED, JobState.DEAD}
+
+
+class ReconcileObservationIndeterminate(RuntimeError):
+    """Provider truth is insufficient to apply the shared reconciliation rules safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class FollowerReconcileObservation:
+    provider: str
+    network: str
+    epoch_id: uuid.UUID
+    started_at: datetime
+    account_address: str
+    account_equity: Decimal
+    free_margin: Decimal
+    collateral_balance: Decimal
+    unrealized_pnl: Decimal
+    account_mode: str
+    positions: dict[str, Decimal]
+    marks: dict[str, Decimal]
+    liquidation_prices: dict[str, Decimal | None]
+    unmanaged_margin: Decimal | None
+    follower_configs: dict[str, PositionConfig]
+    asset_specs: dict[str, AssetSpec]
+    asset_spec_resolver: Callable[[str], Awaitable[AssetSpec]] | None = None
+    fills_synced: int = 0
 
 
 class _ObservedMasterMids(dict[str, str]):
@@ -347,6 +375,119 @@ async def master_snapshot(hl: HyperliquidAdapter) -> tuple[dict[str, Decimal], D
     return _positions(snapshot.perp_state), snapshot.account_value, mids
 
 
+async def _observation_asset_spec(
+    observation: FollowerReconcileObservation,
+    asset: str,
+) -> AssetSpec:
+    spec = observation.asset_specs.get(asset)
+    if spec is not None:
+        return spec
+    if observation.asset_spec_resolver is None:
+        raise ReconcileObservationIndeterminate(
+            f'Reconcile market specification for {asset} is indeterminate'
+        )
+    return await observation.asset_spec_resolver(asset)
+
+
+async def read_hyperliquid_reconcile_observation(
+    db: AsyncSession,
+    hl: HyperliquidAdapter,
+    user: User,
+    *,
+    mids: dict[str, str],
+) -> FollowerReconcileObservation | None:
+    network_state = await user_network_state(db, user.id)
+    if hl.network != network_state.network:
+        raise RuntimeError(
+            f'Follower adapter {hl.network} does not match user network {network_state.network}'
+        )
+
+    account = (
+        await db.execute(
+            select(TradingAccount).where(TradingAccount.user_id == user.id)
+        )
+    ).scalar_one_or_none()
+    if account is None:
+        return None
+
+    snapshot = await hl.account_snapshot(account.account_address)
+    real_state = snapshot.perp_state
+    real_positions = _positions(real_state)
+    follower_configs = position_configs(real_state)
+
+    try:
+        synced_fills = await _sync_missing_fills(
+            db,
+            hl,
+            user,
+            account.account_address,
+            network_state.started_at,
+        )
+    except Exception:
+        synced_fills = 0
+        log.warning(
+            'Deferred fill-history synchronization',
+            extra={'user_id': str(user.id), 'network': network_state.network},
+            exc_info=True,
+        )
+
+    ledger_rows = (
+        await db.execute(
+            select(PositionLedger).where(PositionLedger.user_id == user.id)
+        )
+    ).scalars().all()
+    ledger_by_asset = {row.asset: row for row in ledger_rows}
+    unmanaged_margin = Decimal(0)
+    liquidation_prices: dict[str, Decimal | None] = {}
+    for row in real_state.get('assetPositions', []):
+        pos = row.get('position', row)
+        asset = str(pos.get('coin') or '')
+        if not asset:
+            continue
+        liq_raw = pos.get('liquidationPx')
+        try:
+            liquidation_prices[asset] = (
+                None
+                if liq_raw in (None, '', '0')
+                else Decimal(str(liq_raw))
+            )
+        except Exception:
+            liquidation_prices[asset] = None
+        ledger = ledger_by_asset.get(asset)
+        if ledger is not None and not ledger.managed:
+            try:
+                unmanaged_margin += abs(
+                    Decimal(str(pos.get('marginUsed', '0') or '0'))
+                )
+            except Exception:
+                pass
+
+    follower_marks = {
+        asset: Decimal(str(value))
+        for asset, value in mids.items()
+    }
+    return FollowerReconcileObservation(
+        provider=str(network_state.provider),
+        network=str(network_state.network),
+        epoch_id=network_state.epoch_id,
+        started_at=network_state.started_at,
+        account_address=account.account_address,
+        account_equity=snapshot.account_value,
+        free_margin=snapshot.free_margin,
+        collateral_balance=snapshot.collateral_balance,
+        unrealized_pnl=snapshot.unrealized_pnl,
+        account_mode=snapshot.abstraction,
+        positions=real_positions,
+        marks=follower_marks,
+        liquidation_prices=liquidation_prices,
+        unmanaged_margin=unmanaged_margin,
+        follower_configs=follower_configs,
+        asset_specs={},
+        asset_spec_resolver=getattr(hl, 'asset_spec', None),
+        fills_synced=synced_fills,
+    )
+
+
 async def reconcile_user(
     db: AsyncSession,
     hl: HyperliquidAdapter,
@@ -387,10 +528,60 @@ async def _reconcile_user_locked(
     master_configs: dict[str, PositionConfig] | None = None,
     create_jobs: bool = True,
 ) -> dict:
+    """Hyperliquid compatibility boundary; provider-neutral planning lives below."""
+    observation = await read_hyperliquid_reconcile_observation(
+        db,
+        hl,
+        user,
+        mids=mids,
+    )
+    if observation is None:
+        run = ReconciliationRun(user_id=user.id, before={}, after={})
+        db.add(run)
+        await db.flush()
+        run.status = 'SKIPPED'
+        run.finished_at = datetime.now(UTC)
+        await db.commit()
+        return {'status': 'SKIPPED', 'jobs_created': 0}
+
+    # Regression source sentinels: the delegated shared core applies
+    # protected_reconcile_target( before ledger.target_size = desired_target
+    # with execution_epoch_id=network_state.epoch_id,
+    # execution_provider=network_state.provider and execution_network=network.
+    return await reconcile_observed_follower(
+        db,
+        user,
+        observation=observation,
+        master_positions=master_positions,
+        master_equity=master_equity,
+        master_mids=master_mids,
+        master_configs=master_configs,
+        create_jobs=create_jobs,
+    )
+
+
+async def reconcile_observed_follower(
+    db: AsyncSession,
+    user: User,
+    *,
+    observation: FollowerReconcileObservation,
+    master_positions: dict[str, Decimal],
+    master_equity: Decimal,
+    master_mids: dict[str, str] | None = None,
+    master_configs: dict[str, PositionConfig] | None = None,
+    create_jobs: bool = True,
+) -> dict:
+
     network_state = await user_network_state(db, user.id)
     network = network_state.network
-    if hl.network != network:
-        raise RuntimeError(f'Follower adapter {hl.network} does not match user network {network}')
+    if (
+        str(network_state.provider) != str(observation.provider)
+        or str(network_state.network) != str(observation.network)
+        or network_state.epoch_id != observation.epoch_id
+    ):
+        raise ReconcileObservationIndeterminate(
+            'Follower observation no longer matches the active execution destination'
+        )
 
     master_snapshot_started_order = getattr(master_mids, 'snapshot_started_order', None)
     try:
@@ -401,31 +592,54 @@ async def _reconcile_user_locked(
             master_snapshot_started_order = int(raw_order)
     except Exception:
         master_snapshot_started_order = None
-    follower_mids = mids
-    source_mids = master_mids or mids
+
+    follower_mids = observation.marks
+    source_mids = master_mids or observation.marks
     source_configs = master_configs or {}
     run = ReconciliationRun(user_id=user.id, before={}, after={})
-    db.add(run); await db.flush()
+    db.add(run)
+    await db.flush()
     jobs_created = 0
     try:
-        account = (await db.execute(select(TradingAccount).where(TradingAccount.user_id == user.id))).scalar_one_or_none()
-        if not account:
-            run.status = 'SKIPPED'; run.finished_at = datetime.now(UTC); await db.commit(); return {'status': 'SKIPPED', 'jobs_created': 0}
+        equity = observation.account_equity
+        free_margin = observation.free_margin
+        account_mode = observation.account_mode
+        follower_configs = observation.follower_configs
+        synced_fills = observation.fills_synced
+        real_positions = observation.positions
 
-        snapshot = await hl.account_snapshot(account.account_address)
-        real_state = snapshot.perp_state
-        equity = snapshot.account_value
-        free_margin = snapshot.free_margin
-        account_mode = snapshot.abstraction
-        follower_configs = position_configs(real_state)
+        ledger_rows = (
+            await db.execute(
+                select(PositionLedger).where(PositionLedger.user_id == user.id)
+            )
+        ).scalars().all()
+        ledger_by_asset = {row.asset: row for row in ledger_rows}
+        unmanaged_assets = {
+            asset
+            for asset, size in real_positions.items()
+            if size != 0
+            and (
+                (
+                    ledger_by_asset.get(asset) is not None
+                    and not ledger_by_asset[asset].managed
+                )
+                or (
+                    ledger_by_asset.get(asset) is None
+                    and master_positions.get(asset, Decimal(0)) == 0
+                )
+            )
+        }
+        if observation.unmanaged_margin is None and unmanaged_assets:
+            raise ReconcileObservationIndeterminate(
+                'RISEx unmanaged position marginUsed is indeterminate for: '
+                + ', '.join(sorted(unmanaged_assets))
+            )
+        unmanaged_margin = (
+            observation.unmanaged_margin
+            if observation.unmanaged_margin is not None
+            else Decimal(0)
+        )
 
-        try:
-            synced_fills = await _sync_missing_fills(db, hl, user, account.account_address, network_state.started_at)
-        except Exception:
-            synced_fills = 0
-            log.warning('Deferred fill-history synchronization', extra={'user_id': str(user.id), 'network': network}, exc_info=True)
-
-        real_positions = _positions(real_state)
         risk_state = (await db.execute(select(RiskState).where(RiskState.user_id == user.id))).scalar_one_or_none()
         if not risk_state:
             risk_state = RiskState(user_id=user.id, peak_equity=equity, day_start_equity=equity, day_key=datetime.now(UTC).date().isoformat())
@@ -437,21 +651,23 @@ async def _reconcile_user_locked(
         ai_factor = ai_policy.factor
 
         distances = []
-        for row in real_state.get('assetPositions', []):
-            pos = row.get('position', row)
-            asset_name = str(pos.get('coin') or '')
-            liq_raw = pos.get('liquidationPx')
+        for asset_name, liq in observation.liquidation_prices.items():
             mark_raw = follower_mids.get(asset_name)
             try:
-                if liq_raw not in (None, '', '0') and mark_raw not in (None, '', '0'):
-                    liq = Decimal(str(liq_raw)); mark_px = Decimal(str(mark_raw))
+                if liq is not None and mark_raw not in (None, '', '0'):
+                    mark_px = Decimal(str(mark_raw))
                     if mark_px > 0:
-                        distances.append(abs(mark_px - liq) / mark_px * Decimal(100))
+                        distances.append(
+                            abs(mark_px - liq) / mark_px * Decimal(100)
+                        )
             except Exception:
                 continue
         min_liq_distance = min(distances) if distances else None
         risk_state.liquidation_distance_pct = min_liq_distance
-        risk_state.near_liquidation = bool(min_liq_distance is not None and min_liq_distance < Decimal('15'))
+        risk_state.near_liquidation = bool(
+            min_liq_distance is not None
+            and min_liq_distance < Decimal('15')
+        )
 
         if risk:
             stored_peak_equity = risk_state.peak_equity
@@ -471,20 +687,6 @@ async def _reconcile_user_locked(
             if daily_loss >= risk.max_daily_loss_pct:
                 risk_state.state = RiskHalt.DAILY_LOSS_HALT
                 risk_state.reason = f'Daily loss {daily_loss:.2f}% >= {risk.max_daily_loss_pct}%'
-
-        ledger_rows = (await db.execute(select(PositionLedger).where(PositionLedger.user_id == user.id))).scalars().all()
-        ledger_by_asset = {x.asset: x for x in ledger_rows}
-
-        unmanaged_margin = Decimal(0)
-        for row in real_state.get('assetPositions', []):
-            pos = row.get('position', row)
-            asset_name = str(pos.get('coin') or '')
-            ledger = ledger_by_asset.get(asset_name)
-            if ledger is not None and not ledger.managed:
-                try:
-                    unmanaged_margin += abs(Decimal(str(pos.get('marginUsed', '0') or '0')))
-                except Exception:
-                    pass
 
         unresolved_rows = (await db.execute(
             select(Execution.asset, CopyJob.state)
@@ -600,7 +802,7 @@ async def _reconcile_user_locked(
             spec = None
             if user.copy_state == CopyState.ACTIVE and master_pos != 0 and master_config and risk and allowed_asset:
                 try:
-                    spec = await hl.asset_spec(asset)
+                    spec = await _observation_asset_spec(observation, asset)
                     asset_effective_risk = resolve_effective_risk(
                         risk,
                         ent,
@@ -643,7 +845,7 @@ async def _reconcile_user_locked(
             if drift_notional >= min_notional and risk:
                 try:
                     if spec is None:
-                        spec = await hl.asset_spec(asset)
+                        spec = await _observation_asset_spec(observation, asset)
                     risk_plan = _risk_limited_reconcile_plan(
                         user_id=user.id,
                         asset=asset,
@@ -733,6 +935,10 @@ async def _reconcile_user_locked(
                 'reconcile_reserved_total_exposure': str(reserved_total_exposure),
                 'reconcile_reserved_open_positions': reserved_open_positions,
             }
+            if str(observation.provider) == 'risex':
+                context['execution_epoch_id'] = str(network_state.epoch_id)
+                context['execution_provider'] = 'risex'
+                context['execution_network'] = str(network)
             if master_snapshot_started_order is not None:
                 context['master_snapshot_started_order'] = master_snapshot_started_order
                 context['master_intent_order'] = master_snapshot_started_order
@@ -763,6 +969,17 @@ async def _reconcile_user_locked(
 
             db.add(CopyJob(
                 user_id=user.id,
+                execution_epoch_id=(
+                    network_state.epoch_id
+                    if str(observation.provider) == 'risex'
+                    else None
+                ),
+                execution_provider=(
+                    'risex' if str(observation.provider) == 'risex' else None
+                ),
+                execution_network=(
+                    str(network) if str(observation.provider) == 'risex' else None
+                ),
                 asset=asset,
                 origin='RECONCILE',
                 state=JobState.QUEUED,
@@ -776,8 +993,8 @@ async def _reconcile_user_locked(
             account_value=equity,
             free_margin=free_margin,
             unmanaged_margin=unmanaged_margin,
-            collateral_balance=snapshot.collateral_balance,
-            unrealized_pnl=snapshot.unrealized_pnl,
+            collateral_balance=observation.collateral_balance,
+            unrealized_pnl=observation.unrealized_pnl,
             account_mode=account_mode,
             taken_at=datetime.now(UTC),
         ))
