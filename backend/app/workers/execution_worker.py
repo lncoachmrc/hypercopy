@@ -45,7 +45,7 @@ from app.services.master_leverage_cache import record_master_leverage_missing
 from app.services.networking import user_network_state
 from app.services.queue import ensure_group, prepare_job_destination_for_execution, repair_stream
 from app.services.reconcile import master_snapshot, reconcile_active_users, reconcile_user
-from app.services.risex_copy_execution import process_risex_job
+from app.services.risex_copy_execution import process_risex_job, recover_risex_case_a_job
 from app.services.risex_provider_truth import persist_risex_provider_truth
 from app.services.risex_worker_credentials import RISExWorkerCredentialResolutionError
 from app.services.risex_worker_submission import prepare_risex_worker_submission
@@ -227,6 +227,14 @@ class Worker:
         await maintain_risex_window_once(self)
 
     async def _run_risex_copy_job(self, db, job: CopyJob) -> str:
+        recovered = await recover_risex_case_a_job(
+            db,
+            job,
+            persist_provider_truth=persist_risex_provider_truth,
+        )
+        if recovered is not None:
+            return recovered
+
         self.risex_window.expire_if_needed()
         if self.risex_window.state != RISExExecutionState.ENABLED:
             return await _defer_risex_window_unavailable(
