@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.hyperliquid import HyperliquidAdapter, position_configs
+from app.adapters.risex import RISExAdapter
 from app.adapters.ratelimit import Budget, Priority, WeightedRateLimiter
 from app.api.deps import current_user, require_csrf
 from app.core.config import settings
@@ -273,6 +274,7 @@ async def _resume_risex_alignment(
     master_configs,
     create_jobs: bool = True,
 ) -> dict:
+    await RISExAdapter(network=observation.network).place_ioc()
     return await reconcile_observed_follower(
         db,
         user,
