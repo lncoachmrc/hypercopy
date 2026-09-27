@@ -19,8 +19,7 @@ from sqlalchemy import select
 
 from app.adapters import risex as risex_adapter
 from app.adapters import risex_signed_testnet_http
-from app.api import activation
-from app.api.router import http_router
+from app.api import activation, user as user_api
 from app.core.crypto import crypto
 from app.db.position_ledger_lock import position_ledger_lock_engine
 from app.db.session import SessionLocal, engine
@@ -1001,11 +1000,16 @@ async def test_risex_resume_rejects_unresolved_or_pending_epoch_work_before_prov
 def test_copy_resume_has_single_authoritative_route_integration() -> None:
     routes = [
         route
-        for route in http_router.routes
-        if str(getattr(route, "path", "")).rstrip("/").endswith("/copy/resume")
+        for router in (activation.router, user_api.router)
+        for route in router.routes
+        if str(getattr(route, "path", "")).rstrip("/") == "/copy/resume"
         and "POST" in (getattr(route, "methods", set()) or set())
     ]
     assert len(routes) == 1, (
-        "RED: exactly one POST /api/v1/copy/resume route must be registered; "
-        f"found {len(routes)}"
+        "RED: exactly one POST /copy/resume route must be registered across the "
+        f"activation and user routers; found {len(routes)}"
+    )
+    assert routes[0].endpoint is activation.resume_copy_immediate, (
+        "RED: the single authoritative /copy/resume route must be the hardened "
+        "activation.resume_copy_immediate endpoint"
     )
