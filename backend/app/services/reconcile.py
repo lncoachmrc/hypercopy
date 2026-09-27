@@ -969,11 +969,7 @@ async def reconcile_observed_follower(
 
             db.add(CopyJob(
                 user_id=user.id,
-                execution_epoch_id=(
-                    network_state.epoch_id
-                    if str(observation.provider) == 'risex'
-                    else None
-                ),
+                execution_epoch_id=None,
                 execution_provider=(
                     'risex' if str(observation.provider) == 'risex' else None
                 ),
