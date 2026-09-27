@@ -295,7 +295,6 @@ async def _collect_risex_4c_resolution_evidence(
         nonce_evidence.nonce_anchor != nonce_anchor
         or nonce_evidence.nonce_bitmap_index != nonce_bitmap_index
         or nonce_evidence.bitmap_consistent is not True
-        or nonce_evidence.is_nonce_used is not True
     ):
         return None
 
