@@ -1146,16 +1146,78 @@ async def test_i16_resolving_execution_releases_229_same_asset_submission_fence_
         await _cleanup(user_id)
 
 
-def test_i18_risex_resolver_is_wired_only_into_existing_execution_worker_maintenance_integration() -> None:
-    maintenance_source = inspect.getsource(execution_worker.Worker.maintenance)
-    consume_source = inspect.getsource(execution_worker.Worker.consume)
-    job_source = inspect.getsource(execution_worker.Worker._run_risex_copy_job)
-
-    assert "resolve_risex_ambiguous_executions" in maintenance_source, (
-        "RED: existing execution-worker maintenance must invoke the RISEx 4C resolver"
+@pytest.mark.asyncio
+async def test_i18_risex_resolver_is_wired_only_into_existing_execution_worker_maintenance_integration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolver = getattr(execution_worker, "resolve_risex_ambiguous_executions", None)
+    assert callable(resolver), (
+        "RED: execution-worker must import the RISEx 4C resolver into maintenance"
     )
-    assert "resolve_risex_ambiguous_executions" not in consume_source
-    assert "resolve_risex_ambiguous_executions" not in job_source
+
+    calls = 0
+    test_stop = execution_worker.asyncio.Event()
+    original_sleep = execution_worker.asyncio.sleep
+
+    async def fake_resolver(*_args: object, **_kwargs: object) -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        test_stop.set()
+        return {"resolved": 0, "unresolved": 0}
+
+    async def no_op(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    async def no_reconcile(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    async def yielding_sleep(_seconds: float) -> None:
+        await original_sleep(0)
+
+    monkeypatch.setattr(
+        execution_worker,
+        "resolve_risex_ambiguous_executions",
+        fake_resolver,
+    )
+    monkeypatch.setattr(execution_worker, "stop", test_stop)
+    monkeypatch.setattr(
+        execution_worker,
+        "_quarantine_stale_admin_leverage_jobs",
+        no_op,
+    )
+    monkeypatch.setattr(execution_worker, "release_stale_jobs", no_op)
+    monkeypatch.setattr(execution_worker, "repair_stream", no_op)
+    monkeypatch.setattr(execution_worker, "monitor_credential_expiry", no_op)
+    monkeypatch.setattr(execution_worker.Worker, "_poll_risex_control_once", no_op)
+    monkeypatch.setattr(execution_worker.Worker, "_maintain_risex_window_once", no_op)
+    monkeypatch.setattr(
+        execution_worker.Worker,
+        "_run_reconcile_with_deadline",
+        no_reconcile,
+    )
+    monkeypatch.setattr(execution_worker.Worker, "heartbeat", no_op)
+    monkeypatch.setattr(execution_worker.asyncio, "sleep", yielding_sleep)
+
+    worker = object.__new__(execution_worker.Worker)
+    worker.redis = None
+    try:
+        await execution_worker.asyncio.wait_for(worker.maintenance(), timeout=0.5)
+    except TimeoutError:
+        pytest.fail(
+            "RED: maintenance imported the RISEx resolver but never awaited it",
+            pytrace=False,
+        )
+
+    assert calls == 1, (
+        "RED: one execution-worker maintenance cycle must actually await "
+        "resolve_risex_ambiguous_executions"
+    )
+    assert "resolve_risex_ambiguous_executions" not in inspect.getsource(
+        execution_worker.Worker.consume
+    )
+    assert "resolve_risex_ambiguous_executions" not in inspect.getsource(
+        execution_worker.Worker._run_risex_copy_job
+    )
 
 
 def test_i19_no_new_watcher_stream_or_worker_process_for_risex_4c_integration() -> None:
