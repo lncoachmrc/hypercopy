@@ -155,7 +155,7 @@ def _build_observation(
             raise ReconcileObservationIndeterminate(
                 f'RISEx position market_id {position.market_id} is unknown'
             )
-        positions[asset] = position.size
+        positions[asset] = -position.size
         marks[asset] = position.mark_price
         liquidation_prices[asset] = position.liquidation_price
 
