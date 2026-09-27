@@ -739,17 +739,18 @@ async def resolve_risex_ambiguous_executions(
                     result["skipped"] += 1
                     continue
 
-                evidence = await _collect_risex_4c_resolution_evidence(
-                    api,
-                    rpc,
-                    authorization_address=auth_address,
-                    account=candidate.account_address,
-                    nonce_anchor=candidate.nonce_anchor,
-                    nonce_bitmap_index=candidate.nonce_bitmap_index,
-                    client_order_id=candidate.client_order_id,
-                    execution_created_at=candidate.created_at,
-                    max_pages=max_history_pages,
-                )
+                async with db.begin():
+                    evidence = await _collect_risex_4c_resolution_evidence(
+                        api,
+                        rpc,
+                        authorization_address=auth_address,
+                        account=candidate.account_address,
+                        nonce_anchor=candidate.nonce_anchor,
+                        nonce_bitmap_index=candidate.nonce_bitmap_index,
+                        client_order_id=candidate.client_order_id,
+                        execution_created_at=candidate.created_at,
+                        max_pages=max_history_pages,
+                    )
                 if evidence is None:
                     result["unresolved"] += 1
                     continue
