@@ -606,6 +606,7 @@ async def _settle_case_a_with_provider_truth(
     outcome: RISExSubmissionOutcome,
     persist_provider_truth: Callable[[AsyncSession, Execution], Any] | None,
 ) -> str:
+    job_id = job.id
     if persist_provider_truth is None:
         return await _defer_for_resolution(
             db,
@@ -621,9 +622,12 @@ async def _settle_case_a_with_provider_truth(
             raise RuntimeError('RISEx provider truth callback returned invalid evidence')
 
         if result.get('provider_truth_settled') is False:
+            fresh_job = await db.get(CopyJob, job_id)
+            if fresh_job is None:
+                raise RuntimeError('RISEx CopyJob disappeared during provider-truth retry')
             return await _defer_for_resolution(
                 db,
-                job,
+                fresh_job,
                 'RISEx terminal provider truth pending: '
                 + str(result.get('reason') or 'retry required'),
             )
@@ -655,7 +659,7 @@ async def _settle_case_a_with_provider_truth(
         else:
             raise RuntimeError('RISEx provider truth is not durably settled')
     except RuntimeError as exc:
-        fresh_job = await db.get(CopyJob, job.id)
+        fresh_job = await db.get(CopyJob, job_id)
         if fresh_job is None:
             raise
         return await _defer_for_resolution(
@@ -683,6 +687,62 @@ async def _settle_case_a_with_provider_truth(
     return JobState.SKIPPED.value
 
 
+async def recover_risex_case_a_job(
+    db: AsyncSession,
+    job: CopyJob,
+    *,
+    persist_provider_truth: Callable[[AsyncSession, Execution], Any] | None,
+) -> str | None:
+    """Recover durable case-A evidence without requiring signed-write authorization."""
+
+    existing = (
+        await db.execute(
+            select(Execution).where(
+                Execution.copy_job_id == job.id,
+                Execution.attempt_kind == 'o',
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        return None
+
+    if existing.state == ExecutionState.CANCELED and (
+        (existing.response or {}).get('risex_4b_bis', {}).get('submission_status')
+        == 'PRE_SUBMIT_BLOCKED'
+    ):
+        job.state = JobState.SKIPPED
+        job.owner = None
+        job.locked_until = None
+        await db.commit()
+        return JobState.SKIPPED.value
+
+    if existing.state in {
+        ExecutionState.FILLED,
+        ExecutionState.REJECTED,
+        ExecutionState.CANCELED,
+    }:
+        return await _finish_case_a_job(db, job, existing)
+
+    if existing.state == ExecutionState.QUARANTINED:
+        job.state = JobState.SKIPPED
+        job.owner = None
+        job.locked_until = None
+        await db.commit()
+        return JobState.SKIPPED.value
+
+    recovered_outcome = _terminal_outcome_from_execution(existing)
+    if recovered_outcome is None:
+        return None
+
+    return await _settle_case_a_with_provider_truth(
+        db,
+        job=job,
+        execution=existing,
+        outcome=recovered_outcome,
+        persist_provider_truth=persist_provider_truth,
+    )
+
+
 async def process_risex_job(
     db: AsyncSession,
     adapter: RISExAdapter,
@@ -700,6 +760,14 @@ async def process_risex_job(
             'RISEx writer received a job outside the RISEx testnet execution epoch',
         )
 
+    recovered = await recover_risex_case_a_job(
+        db,
+        job,
+        persist_provider_truth=persist_provider_truth,
+    )
+    if recovered is not None:
+        return recovered
+
     existing = (
         await db.execute(
             select(Execution).where(
@@ -708,39 +776,6 @@ async def process_risex_job(
             )
         )
     ).scalar_one_or_none()
-
-    if existing is not None and existing.state == ExecutionState.CANCELED:
-        if (existing.response or {}).get('risex_4b_bis', {}).get(
-            'submission_status'
-        ) == 'PRE_SUBMIT_BLOCKED':
-            job.state = JobState.SKIPPED
-            job.owner = None
-            job.locked_until = None
-            await db.commit()
-            return JobState.SKIPPED.value
-
-    if existing is not None and existing.state in {
-        ExecutionState.FILLED,
-        ExecutionState.REJECTED,
-        ExecutionState.CANCELED,
-    }:
-        return await _finish_case_a_job(db, job, existing)
-    if existing is not None and existing.state == ExecutionState.QUARANTINED:
-        job.state = JobState.SKIPPED
-        job.owner = None
-        job.locked_until = None
-        await db.commit()
-        return JobState.SKIPPED.value
-
-    recovered_outcome = _terminal_outcome_from_execution(existing)
-    if existing is not None and recovered_outcome is not None:
-        return await _settle_case_a_with_provider_truth(
-            db,
-            job=job,
-            execution=existing,
-            outcome=recovered_outcome,
-            persist_provider_truth=persist_provider_truth,
-        )
 
     if submission is None:
         return await _finish_without_submission(
