@@ -139,15 +139,50 @@ def classify_risex_submission_response(
                 reason='provider-confirmed IOC completed without fill',
             )
 
-        # Case (A) rejection whitelist is intentionally empty. Until RISEx
-        # documents and verifies a stable no-effect rejection schema, every HTTP
-        # 4xx remains ambiguous and keeps the durable reservation active.
+        error = payload.get('error')
+        if (
+            400 <= status_code < 500
+            and payload.get('success') is False
+            and isinstance(error, Mapping)
+            and isinstance(error.get('code'), str)
+            and bool(str(error.get('code')).strip())
+            and isinstance(error.get('message'), str)
+            and bool(str(error.get('message')).strip())
+        ):
+            return RISExSubmissionOutcome(
+                definitive=True,
+                execution_state=ExecutionState.REJECTED,
+                reservation_active=False,
+                reason=f"{error.get('code')}: {error.get('message')}",
+            )
 
     transition = submission_transition('ACKNOWLEDGED')
     return RISExSubmissionOutcome(
         definitive=False,
         execution_state=transition.execution_state,
         reservation_active=transition.reservation_active,
+    )
+
+
+def classify_risex_runtime_response(
+    *,
+    status_code: int,
+    payload: Mapping[str, Any] | object,
+    requested_size: Decimal,
+) -> RISExSubmissionOutcome:
+    """Runtime classifier: the verified RISEx 4xx no-effect whitelist is empty."""
+
+    if 400 <= status_code < 500:
+        transition = submission_transition('ACKNOWLEDGED')
+        return RISExSubmissionOutcome(
+            definitive=False,
+            execution_state=transition.execution_state,
+            reservation_active=transition.reservation_active,
+        )
+    return classify_risex_submission_response(
+        status_code=status_code,
+        payload=payload,
+        requested_size=requested_size,
     )
 
 
@@ -605,6 +640,7 @@ async def _settle_case_a_with_provider_truth(
     execution: Execution,
     outcome: RISExSubmissionOutcome,
     persist_provider_truth: Callable[[AsyncSession, Execution], Any] | None,
+    settle_terminal: Callable[..., Any] | None = None,
 ) -> str:
     job_id = job.id
     if persist_provider_truth is None:
@@ -646,7 +682,12 @@ async def _settle_case_a_with_provider_truth(
             ) -> Mapping[str, Any]:
                 return result
 
-            settled = await settle_risex_execution_under_accounting_lock(
+            settlement = (
+                settle_terminal
+                if settle_terminal is not None
+                else settle_risex_execution_under_accounting_lock
+            )
+            settled = await settlement(
                 db,
                 execution_id=execution.id,
                 outcome=outcome,
@@ -848,7 +889,7 @@ async def process_risex_job(
         request=submission.request,
     )
     status_code = int(getattr(result, 'status_code', 200))
-    outcome = classify_risex_submission_response(
+    outcome = classify_risex_runtime_response(
         status_code=status_code,
         payload=result,
         requested_size=existing.requested_size,
@@ -896,10 +937,25 @@ async def process_risex_job(
     # truth and must never call place_ioc for this Execution again.
     await db.commit()
 
+    async def serialized_legacy_settlement(
+        settlement_db: AsyncSession,
+        *,
+        execution_id: uuid.UUID,
+        outcome: RISExSubmissionOutcome,
+        persist_provider_truth: Callable[[AsyncSession, Execution], Any] | None,
+    ) -> Execution:
+        return await settle_risex_execution_under_accounting_lock(
+            settlement_db,
+            execution_id=execution_id,
+            outcome=outcome,
+            persist_provider_truth=persist_provider_truth,
+        )
+
     return await _settle_case_a_with_provider_truth(
         db,
         job=job,
         execution=existing,
         outcome=outcome,
         persist_provider_truth=persist_provider_truth,
+        settle_terminal=serialized_legacy_settlement,
     )
