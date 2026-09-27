@@ -989,3 +989,11 @@ async def link_risex_trading_account(
     )
     await db.commit()
     return await _serialize_user(db, user)
+
+
+@router.post('/copy/resume', dependencies=[Depends(require_csrf)])
+async def sensitivity_legacy_resume(
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return {'ok': True, 'copy_state': user.copy_state.value}
