@@ -686,6 +686,156 @@ async def test_provider_truth_retry_reloads_job_after_optimistic_rollback_integr
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rollback_case", "expected_reason", "expected_ledger_size"),
+    [
+        ("baseline_changed", "ledger_baseline_changed", Decimal("0.2")),
+        (
+            "unresolved_peer",
+            "other_unresolved_execution_same_asset",
+            Decimal("0.1"),
+        ),
+    ],
+)
+async def test_provider_truth_rollback_reloads_job_for_both_retry_branches_integration(
+    monkeypatch: pytest.MonkeyPatch,
+    rollback_case: str,
+    expected_reason: str,
+    expected_ledger_size: Decimal,
+) -> None:
+    module = _provider_truth_module()
+    persist = getattr(module, "persist_risex_provider_truth", None)
+    assert callable(persist)
+    user_id, job_id, execution_id = await _seed_case(
+        suffix=f"rollback-reload-{rollback_case}"
+    )
+
+    if rollback_case == "unresolved_peer":
+        async with SessionLocal() as db:
+            current = await db.get(Execution, execution_id)
+            assert current is not None
+            peer_job_id = uuid.uuid4()
+            db.add(
+                CopyJob(
+                    id=peer_job_id,
+                    user_id=user_id,
+                    execution_epoch_id=current.execution_epoch_id,
+                    execution_provider="risex",
+                    execution_network="testnet",
+                    asset="BTC",
+                    origin="EVENT",
+                    state=JobState.RETRYING,
+                    attempt_count=1,
+                    correlation_id=uuid.uuid4().hex,
+                    context={
+                        "execution_provider": "risex",
+                        "follower_network": "testnet",
+                    },
+                )
+            )
+            await db.flush()
+            db.add(
+                Execution(
+                    copy_job_id=peer_job_id,
+                    user_id=user_id,
+                    execution_epoch_id=current.execution_epoch_id,
+                    execution_provider="risex",
+                    execution_network="testnet",
+                    attempt_kind="o",
+                    cloid="0x" + uuid.uuid4().hex,
+                    client_order_id=1 + (uuid.uuid4().int % ((1 << 63) - 1)),
+                    nonce_anchor=8,
+                    nonce_bitmap_index=14,
+                    state=ExecutionState.UNKNOWN,
+                    asset="BTC",
+                    is_buy=True,
+                    requested_size=Decimal("0.1"),
+                    reduce_only=False,
+                    limit_px=Decimal("100"),
+                    reserved_exposure_usdc=Decimal("10"),
+                    response={
+                        "risex_4b_bis": {"submission_status": "POST_IN_FLIGHT"}
+                    },
+                )
+            )
+            await db.commit()
+
+    async def read_snapshot(*_args, **_kwargs):
+        if rollback_case == "baseline_changed":
+            async with SessionLocal() as concurrent:
+                ledger = (
+                    await concurrent.execute(
+                        select(PositionLedger).where(
+                            PositionLedger.user_id == user_id,
+                            PositionLedger.asset == "BTC",
+                        )
+                    )
+                ).scalar_one()
+                ledger.size = Decimal("0.2")
+                await concurrent.commit()
+        return {
+            "market_id": 1,
+            "position_size": Decimal("0.5"),
+            "mark_price": Decimal("101"),
+            "verified_at": datetime.now(UTC),
+        }
+
+    monkeypatch.setattr(
+        module,
+        "read_risex_provider_truth_snapshot",
+        read_snapshot,
+    )
+
+    class NoPostAdapter:
+        calls = 0
+
+        async def place_ioc(self, **_kwargs):
+            self.calls += 1
+            raise AssertionError("provider-truth rollback must never resubmit")
+
+    adapter = NoPostAdapter()
+    try:
+        async with SessionLocal() as db:
+            job = await db.get(CopyJob, job_id)
+            assert job is not None
+            result = await risex_copy_execution.process_risex_job(
+                db,
+                adapter,
+                job,
+                submission=None,
+                persist_provider_truth=persist,
+            )
+
+        assert result == JobState.RETRYING.value
+        assert adapter.calls == 0
+
+        async with SessionLocal() as db:
+            durable_execution = await db.get(Execution, execution_id)
+            durable_job = await db.get(CopyJob, job_id)
+            ledger = (
+                await db.execute(
+                    select(PositionLedger).where(
+                        PositionLedger.user_id == user_id,
+                        PositionLedger.asset == "BTC",
+                    )
+                )
+            ).scalar_one()
+
+            assert durable_execution is not None
+            assert durable_job is not None
+            assert durable_execution.state == ExecutionState.SUBMITTING
+            assert durable_execution.reserved_exposure_usdc == Decimal("50")
+            assert durable_job.state == JobState.RETRYING
+            assert durable_job.owner is None
+            assert durable_job.locked_until is None
+            assert expected_reason in str(durable_job.last_error)
+            assert ledger.size == expected_ledger_size
+            assert ledger.last_execution_id is None
+    finally:
+        await _cleanup(user_id)
+
+
+@pytest.mark.asyncio
 async def test_worker_terminal_evidence_recovery_precedes_disabled_write_window_integration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
