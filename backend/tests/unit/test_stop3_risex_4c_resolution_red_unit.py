@@ -25,7 +25,7 @@ SEARCH_START_NS = int(SEARCH_START.timestamp() * 1_000_000_000)
 
 
 def _abi_address_hex(address: str) -> str:
-    return bytes.fromhex(address[2:]).rjust(32, b"\\x00").hex()
+    return bytes.fromhex(address[2:]).rjust(32, bytes([0])).hex()
 
 
 def _abi_uint_hex(value: int) -> str:
