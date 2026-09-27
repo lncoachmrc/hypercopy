@@ -629,7 +629,7 @@ async def reconcile_observed_follower(
                 )
             )
         }
-        if observation.unmanaged_margin is None and unmanaged_assets:
+        if observation.unmanaged_margin is None:
             raise ReconcileObservationIndeterminate(
                 'RISEx unmanaged position marginUsed is indeterminate for: '
                 + ', '.join(sorted(unmanaged_assets))
