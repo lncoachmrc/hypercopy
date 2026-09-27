@@ -1021,18 +1021,30 @@ async def test_i13_no_database_transaction_is_open_during_4c_network_reads_integ
         suffix="transaction-boundary"
     )
 
+    observations: list[bool] = []
+
     try:
         async with SessionLocal() as db:
+            def transaction_probe() -> bool:
+                current = db.in_transaction()
+                observations.append(current)
+                return current
+
             api = FakeAPI(
                 orders_pages={1: _orders_page([_history_order()])},
                 position_size="0.5",
-                transaction_probe=db.in_transaction,
+                transaction_probe=transaction_probe,
             )
             rpc = FakeRPC(
                 consumed=True,
-                transaction_probe=db.in_transaction,
+                transaction_probe=transaction_probe,
             )
             await _run_resolver(db, api=api, rpc=rpc, user_id=user_id)
+
+        assert observations, "4C resolver must perform at least one provider/RPC read"
+        assert all(value is False for value in observations), (
+            "RED: no SQLAlchemy transaction may remain open during any 4C network read"
+        )
     finally:
         await _cleanup(user_id)
 
