@@ -8,7 +8,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.models.entities import CopyJob, JobState, User
+from app.models.entities import CopyJob, Execution, ExecutionState, JobState, User
 from app.services.execution_destination import bind_job_to_active_destination
 from app.services.master_leverage_cache import (
     publish_master_leverage_repair,
@@ -227,11 +227,27 @@ def expire_strategy_job(job: CopyJob) -> None:
 async def expire_stale_strategy_jobs(db: AsyncSession, now: datetime | None = None, limit: int = 500) -> int:
     current = now or datetime.now(UTC)
     cutoff = strategy_job_expiry_cutoff(current)
+    unresolved_risex_execution = (
+        select(Execution.id)
+        .where(
+            Execution.copy_job_id == CopyJob.id,
+            Execution.execution_provider == 'risex',
+            Execution.state.in_(
+                [ExecutionState.SUBMITTING, ExecutionState.UNKNOWN]
+            ),
+        )
+        .exists()
+    )
     rows = (await db.execute(
         select(CopyJob).where(
             CopyJob.state.in_([JobState.QUEUED, JobState.RETRYING]),
             CopyJob.origin.in_(STRATEGY_ORIGINS),
             CopyJob.created_at <= cutoff,
+            or_(
+                CopyJob.execution_provider.is_(None),
+                CopyJob.execution_provider != 'risex',
+                ~unresolved_risex_execution,
+            ),
         ).order_by(CopyJob.created_at).limit(limit).with_for_update(skip_locked=True)
     )).scalars().all()
     for job in rows:
