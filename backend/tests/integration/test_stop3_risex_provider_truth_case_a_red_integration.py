@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 import os
@@ -14,7 +15,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 from app.adapters import risex as risex_adapter_module
 from app.adapters import risex_signed_testnet_http
@@ -30,9 +31,14 @@ from app.models.entities import (
     PositionLedger,
     User,
     UserState,
+    WorkerHeartbeat,
 )
 from app.services import execution as hyperliquid_execution
-from app.services import risex_copy_execution, risex_worker_submission
+from app.services import risex_copy_execution, risex_execution_worker_extension, risex_worker_submission
+from app.security.risex_order_codec import RISExPlaceOrder
+from app.security.risex_place_order_permit import RISExPreparedPlaceOrderPermit
+from app.security.risex_place_order_request import RISExPreparedPlaceOrderRequest
+from app.services.risex_execution_window import RISExExecutionState
 from app.workers import execution_worker
 
 
@@ -1002,3 +1008,326 @@ def test_risex_adapter_closes_destination_transaction_before_freshness_reads_int
         "RED: destination verification DB transaction must close before the "
         "signed transport freshness probe performs RISEx network reads"
     )
+
+
+class _B3Window:
+    def __init__(self, context_fingerprint: str) -> None:
+        self.state = RISExExecutionState.ENABLED
+        self.context_fingerprint = context_fingerprint
+        self.authorization_invalidation_epoch = 1
+
+    def expire_if_needed(self) -> None:
+        return None
+
+    def lock(self, _reason: str) -> None:
+        self.state = RISExExecutionState.LOCKED
+
+
+class _B3Transport(risex_signed_testnet_http.RISExSignedTestnetHTTPTransport):
+    def __init__(self, post_hook) -> None:
+        self.post_hook = post_hook
+        self.post_calls = 0
+
+    async def prepare_place_order_post(self, _request):
+        return {"prepared": True}
+
+    async def post_prepared_place_order(self, _payload):
+        self.post_calls += 1
+        await self.post_hook()
+        return risex_signed_testnet_http.RISExSignedHTTPResponse(
+            {"order_id": "b3-fake-order", "filled_quantity": "0"},
+            status_code=200,
+        )
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _b3_request(account: str, signer: str) -> RISExPreparedPlaceOrderRequest:
+    return RISExPreparedPlaceOrderRequest(
+        order=RISExPlaceOrder(
+            market_id=1,
+            size_steps=1,
+            price_ticks=1,
+            side=0,
+            post_only=False,
+            reduce_only=False,
+            stp_mode=0,
+            order_type=1,
+            time_in_force=3,
+            client_order_id=1,
+            ttl_units=0,
+        ),
+        permit=RISExPreparedPlaceOrderPermit(
+            account_address=account,
+            signer_address=signer,
+            action_hash="0x" + ("11" * 32),
+            nonce_anchor=1,
+            nonce_bitmap_index=1,
+            deadline=2_000_000_000,
+            _signature=b"b3",
+        ),
+    )
+
+
+async def _run_b3_worker_path(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    singleton_check,
+    post_hook,
+) -> tuple[str, _B3Transport]:
+    context_fingerprint = "b3-final-fence-context"
+    account = "0x" + ("12" * 20)
+    signer = "0x" + ("34" * 20)
+    transport = _B3Transport(post_hook)
+    request = _b3_request(account, signer)
+    prepared = SimpleNamespace(
+        transport=transport,
+        submission=SimpleNamespace(request=request),
+        account_address=account,
+        signer_address=signer,
+        generation=1,
+        aclose=transport.aclose,
+    )
+    job = SimpleNamespace(
+        id=uuid.uuid4(),
+        user_id=uuid.uuid4(),
+        execution_epoch_id=uuid.uuid4(),
+        execution_provider="risex",
+        execution_network="testnet",
+        asset="BTC",
+    )
+    worker = object.__new__(execution_worker.Worker)
+    worker.id = "b3-worker-" + uuid.uuid4().hex
+    worker.boot_id = uuid.uuid4()
+    worker.risex_window = _B3Window(context_fingerprint)
+    worker.risex_submission_lock = asyncio.Lock()
+
+    async def no_recovery(*_args, **_kwargs):
+        return None
+
+    async def fake_prepare(db, _job, *, readiness_assertions):
+        assert readiness_assertions == {"operatorhub_bypass_disabled": True}
+        await db.commit()
+        return prepared
+
+    async def fake_process(db, adapter, active_job, *, submission=None, **_kwargs):
+        assert submission is prepared.submission
+        await adapter.place_ioc(
+            db=db,
+            job=active_job,
+            request=submission.request,
+        )
+        return JobState.DONE.value
+
+    async def destination_matches(_db, _job):
+        return True
+
+    monkeypatch.setenv("RISEX_SIGNED_WRITES_ENABLED", "true")
+    monkeypatch.setattr(execution_worker, "recover_risex_case_a_job", no_recovery)
+    monkeypatch.setattr(
+        execution_worker,
+        "current_risex_context_fingerprint",
+        lambda *_args, **_kwargs: context_fingerprint,
+    )
+    monkeypatch.setattr(
+        execution_worker,
+        "risex_singleton_matches_worker",
+        singleton_check,
+    )
+    monkeypatch.setattr(
+        execution_worker,
+        "prepare_risex_worker_submission",
+        fake_prepare,
+    )
+    monkeypatch.setattr(execution_worker, "process_risex_job", fake_process)
+    monkeypatch.setattr(
+        risex_adapter_module,
+        "job_matches_active_destination",
+        destination_matches,
+    )
+
+    async with SessionLocal() as db:
+        result = await execution_worker.Worker._run_risex_copy_job(worker, db, job)
+    return result, transport
+
+
+@pytest.mark.asyncio
+async def test_risex_final_singleton_fence_closes_db_transaction_before_post_integration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_id_holder: dict[str, str] = {}
+    final_pid: dict[str, int] = {}
+    singleton_calls = 0
+    post_observation: dict[str, object] = {}
+
+    original_fresh = risex_execution_worker_extension.fresh_execution_worker_heartbeats
+    monkeypatch.setattr(
+        risex_execution_worker_extension,
+        "fresh_execution_worker_heartbeats",
+        lambda rows, *, now: [
+            row for row in original_fresh(rows, now=now)
+            if row.worker_id == worker_id_holder.get("worker_id")
+        ],
+    )
+    real_singleton = execution_worker.risex_singleton_matches_worker
+
+    async def tracked_singleton(worker, db):
+        nonlocal singleton_calls
+        singleton_calls += 1
+        worker_id_holder["worker_id"] = worker.id
+        ok = await real_singleton(worker, db)
+        if singleton_calls == 2:
+            final_pid["pid"] = int(
+                (await db.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+            )
+        return ok
+
+    async def post_hook() -> None:
+        post_observation["worker_in_transaction"] = active_db["db"].in_transaction()
+        async with SessionLocal() as observer:
+            post_observation["pg_state"] = (
+                await observer.execute(
+                    text("SELECT state FROM pg_stat_activity WHERE pid = :pid"),
+                    {"pid": final_pid["pid"]},
+                )
+            ).scalar_one_or_none()
+
+    active_db: dict[str, object] = {}
+
+    async def run_with_tracked_db() -> tuple[str, _B3Transport]:
+        context_fingerprint = "b3-final-fence-context"
+        account = "0x" + ("12" * 20)
+        signer = "0x" + ("34" * 20)
+        transport = _B3Transport(post_hook)
+        request = _b3_request(account, signer)
+        prepared = SimpleNamespace(
+            transport=transport,
+            submission=SimpleNamespace(request=request),
+            account_address=account,
+            signer_address=signer,
+            generation=1,
+            aclose=transport.aclose,
+        )
+        job = SimpleNamespace(
+            id=uuid.uuid4(),
+            user_id=uuid.uuid4(),
+            execution_epoch_id=uuid.uuid4(),
+            execution_provider="risex",
+            execution_network="testnet",
+            asset="BTC",
+        )
+        worker = object.__new__(execution_worker.Worker)
+        worker.id = "b3-worker-" + uuid.uuid4().hex
+        worker.boot_id = uuid.uuid4()
+        worker.risex_window = _B3Window(context_fingerprint)
+        worker.risex_submission_lock = asyncio.Lock()
+        worker_id_holder["worker_id"] = worker.id
+
+        async with SessionLocal() as setup:
+            setup.add(
+                WorkerHeartbeat(
+                    worker_id=worker.id,
+                    service="execution-worker",
+                    seen_at=datetime.now(UTC),
+                    meta={"boot_id": str(worker.boot_id)},
+                )
+            )
+            await setup.commit()
+
+        async def no_recovery(*_args, **_kwargs):
+            return None
+
+        async def fake_prepare(db, _job, *, readiness_assertions):
+            assert readiness_assertions == {"operatorhub_bypass_disabled": True}
+            await db.commit()
+            return prepared
+
+        async def fake_process(db, adapter, active_job, *, submission=None, **_kwargs):
+            assert submission is prepared.submission
+            await adapter.place_ioc(db=db, job=active_job, request=submission.request)
+            return JobState.DONE.value
+
+        async def destination_matches(_db, _job):
+            return True
+
+        monkeypatch.setenv("RISEX_SIGNED_WRITES_ENABLED", "true")
+        monkeypatch.setattr(execution_worker, "recover_risex_case_a_job", no_recovery)
+        monkeypatch.setattr(
+            execution_worker,
+            "current_risex_context_fingerprint",
+            lambda *_args, **_kwargs: context_fingerprint,
+        )
+        monkeypatch.setattr(
+            execution_worker,
+            "risex_singleton_matches_worker",
+            tracked_singleton,
+        )
+        monkeypatch.setattr(
+            execution_worker,
+            "prepare_risex_worker_submission",
+            fake_prepare,
+        )
+        monkeypatch.setattr(execution_worker, "process_risex_job", fake_process)
+        monkeypatch.setattr(
+            risex_adapter_module,
+            "job_matches_active_destination",
+            destination_matches,
+        )
+
+        try:
+            async with SessionLocal() as db:
+                active_db["db"] = db
+                result = await execution_worker.Worker._run_risex_copy_job(
+                    worker,
+                    db,
+                    job,
+                )
+            return result, transport
+        finally:
+            async with SessionLocal() as cleanup:
+                await cleanup.execute(
+                    delete(WorkerHeartbeat).where(
+                        WorkerHeartbeat.worker_id == worker.id
+                    )
+                )
+                await cleanup.commit()
+
+    result, transport = await run_with_tracked_db()
+
+    assert result == JobState.DONE.value
+    assert transport.post_calls == 1
+    assert singleton_calls == 2
+    assert post_observation["worker_in_transaction"] is False, (
+        "RED: the final singleton SELECT must close its worker DB transaction "
+        "before the RISEx POST begins"
+    )
+    assert post_observation["pg_state"] != "idle in transaction", (
+        "RED: the worker PostgreSQL connection must not remain idle in transaction "
+        "during the RISEx POST"
+    )
+
+
+@pytest.mark.asyncio
+async def test_risex_final_singleton_mismatch_blocks_post_integration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    singleton_calls = 0
+
+    async def singleton_check(_worker, _db):
+        nonlocal singleton_calls
+        singleton_calls += 1
+        return singleton_calls == 1
+
+    async def post_hook() -> None:
+        raise AssertionError("POST must not occur after final singleton mismatch")
+
+    with pytest.raises(
+        risex_adapter_module.ProviderWriteDisabled,
+        match="singleton execution-worker invariant changed",
+    ):
+        await _run_b3_worker_path(
+            monkeypatch,
+            singleton_check=singleton_check,
+            post_hook=post_hook,
+        )
