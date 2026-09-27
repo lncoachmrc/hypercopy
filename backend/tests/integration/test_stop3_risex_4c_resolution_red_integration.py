@@ -353,7 +353,7 @@ async def _seed_case(
                 origin="EVENT",
                 state=job_state,
                 attempt_count=1,
-                correlation_id=f"4c-{suffix}-{uuid.uuid4().hex}",
+                correlation_id=uuid.uuid4().hex,
                 context={
                     "execution_provider": "risex",
                     "follower_network": "testnet",
