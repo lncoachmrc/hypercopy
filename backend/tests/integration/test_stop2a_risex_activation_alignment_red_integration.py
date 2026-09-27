@@ -17,8 +17,11 @@ import pytest_asyncio
 from fastapi import HTTPException
 from sqlalchemy import select
 
+from app.adapters import risex as risex_adapter
+from app.adapters import risex_signed_testnet_http
 from app.api import activation
 from app.api.router import http_router
+from app.core.crypto import crypto
 from app.db.position_ledger_lock import position_ledger_lock_engine
 from app.db.session import SessionLocal, engine
 from app.engine.sizing import AssetSpec
@@ -38,7 +41,7 @@ from app.models.entities import (
     User,
     UserState,
 )
-from app.services import reconcile
+from app.services import reconcile, risex_copy_execution
 from app.services.execution_destination import set_user_destination, user_destination_state
 from app.services.queue import publish_job
 
@@ -291,6 +294,24 @@ def _install_common_reconcile_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reconcile, "protected_reconcile_target", protected)
 
 
+def _install_signed_write_tripwires(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def forbidden_async(*_args, **_kwargs):
+        raise AssertionError("RED: /copy/resume performed worker-only signed I/O")
+
+    def forbidden_sync(*_args, **_kwargs):
+        raise AssertionError("RED: /copy/resume decrypted a credential or built signed transport")
+
+    monkeypatch.setattr(risex_adapter.RISExAdapter, "place_ioc", forbidden_async)
+    monkeypatch.setattr(risex_copy_execution, "claim_risex_first_post", forbidden_async)
+    monkeypatch.setattr(crypto, "decrypt", forbidden_sync)
+    monkeypatch.setattr(
+        risex_signed_testnet_http,
+        "RISExSignedTestnetHTTPTransport",
+        forbidden_sync,
+    )
+    monkeypatch.setattr(activation, "RISExSignedTestnetHTTPTransport", forbidden_sync, raising=False)
+
+
 def _install_activation_stubs(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -299,6 +320,12 @@ def _install_activation_stubs(
     follower_positions: dict[str, Decimal],
     provider_reads: list[str] | None = None,
     rotate_after_read: bool = False,
+    session_active: bool = True,
+    session_not_expired: bool = True,
+    perps_permission: bool = True,
+    deployment_identity_verified: bool = True,
+    verified_account: str | None = None,
+    verified_signer: str | None = None,
 ) -> None:
     provider_reads = provider_reads if provider_reads is not None else []
     marks = {asset: Decimal("100") for asset in set(master_positions) | set(follower_positions)}
@@ -353,13 +380,13 @@ def _install_activation_stubs(
         assert str(account).lower() == fixture.wallet.lower()
         assert str(signer).lower() == fixture.signer.lower()
         return SimpleNamespace(
-            account=fixture.wallet,
-            signer=fixture.signer,
-            session_active=True,
-            session_not_expired=True,
-            perps_permission=True,
+            account=verified_account or fixture.wallet,
+            signer=verified_signer or fixture.signer,
+            session_active=session_active,
+            session_not_expired=session_not_expired,
+            perps_permission=perps_permission,
             move_fund_permission=True,
-            deployment_identity_verified=True,
+            deployment_identity_verified=deployment_identity_verified,
         )
 
     class MasterAdapter:
@@ -505,6 +532,7 @@ async def test_risex_resume_nonflat_master_creates_alignment_reconcile_jobs_inte
 ) -> None:
     fixture = await _seed_user(provider="risex", copy_state=CopyState.SHADOW)
     _install_common_reconcile_stubs(monkeypatch)
+    _install_signed_write_tripwires(monkeypatch)
     provider_reads: list[str] = []
     _install_activation_stubs(
         monkeypatch,
@@ -704,6 +732,68 @@ async def test_risex_resume_revalidates_credential_and_session_before_alignment_
     assert "portfolio" in events
     assert events.index("gate") < events.index("session")
     assert events.index("gate") < events.index("portfolio")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "credential-revoked",
+        "credential-expired-at",
+        "session-inactive",
+        "session-expired",
+        "perps-denied",
+        "deployment-unverified",
+        "account-mismatch",
+        "signer-mismatch",
+    ],
+)
+async def test_risex_resume_rejects_invalid_credential_or_session_before_alignment_integration(
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    status = CredentialStatus.REVOKED if scenario == "credential-revoked" else CredentialStatus.ACTIVE
+    expires_at = (
+        datetime.now(UTC) - timedelta(minutes=1)
+        if scenario == "credential-expired-at"
+        else datetime.now(UTC) + timedelta(hours=2)
+    )
+    fixture = await _seed_user(
+        provider="risex",
+        copy_state=CopyState.SHADOW,
+        credential_status=status,
+        expires_at=expires_at,
+    )
+    _install_common_reconcile_stubs(monkeypatch)
+    _install_signed_write_tripwires(monkeypatch)
+    reads: list[str] = []
+    _install_activation_stubs(
+        monkeypatch,
+        fixture=fixture,
+        master_positions={"BTC": Decimal("0.25")},
+        follower_positions={},
+        provider_reads=reads,
+        session_active=scenario != "session-inactive",
+        session_not_expired=scenario != "session-expired",
+        perps_permission=scenario != "perps-denied",
+        deployment_identity_verified=scenario != "deployment-unverified",
+        verified_account=("0x" + ("22" * 20)) if scenario == "account-mismatch" else None,
+        verified_signer=("0x" + ("33" * 20)) if scenario == "signer-mismatch" else None,
+    )
+
+    async with SessionLocal() as db:
+        user = await db.get(User, fixture.user_id)
+        assert user is not None
+        with pytest.raises(HTTPException):
+            await activation.resume_copy_immediate(user=user, db=db)
+
+    async with SessionLocal() as db:
+        user = await db.get(User, fixture.user_id)
+        jobs = (
+            await db.execute(select(CopyJob).where(CopyJob.user_id == fixture.user_id))
+        ).scalars().all()
+    assert user is not None and user.copy_state != CopyState.ACTIVE
+    assert jobs == []
 
 
 @pytest.mark.asyncio
