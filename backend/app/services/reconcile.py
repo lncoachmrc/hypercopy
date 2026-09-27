@@ -862,7 +862,7 @@ async def reconcile_observed_follower(
                         entitlement_data=ent,
                         risk_state=risk_state,
                         allowed_asset=allowed_asset,
-                        current_total_exposure=reserved_total_exposure,
+                        current_total_exposure=(Decimal(0) if str(observation.provider) == 'risex' else reserved_total_exposure),
                         current_open_positions=reserved_open_positions,
                         spec=spec,
                     )
