@@ -496,13 +496,6 @@ async def resume_copy_immediate(
                     'reconciliation': result,
                 }
             except Exception as exc:
-                await _rollback_activation(
-                    db,
-                    user=user,
-                    activation_started=activation_started,
-                    network=network,
-                    exc=exc,
-                )
                 if isinstance(exc, ReconcileObservationIndeterminate):
                     raise HTTPException(
                         409,
