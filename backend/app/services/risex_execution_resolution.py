@@ -211,7 +211,7 @@ async def read_risex_order_history(
     exact_matches: list[Mapping[str, object]] = []
 
     try:
-        for page_number in range(1, max_pages + 1):
+        for page_number in range(1, max_pages + 2):
             payload = await api.get_json(
                 "/v1/orders",
                 params={
@@ -250,7 +250,7 @@ async def read_risex_order_history(
 
             if not has_next_page:
                 break
-            if page_number == max_pages:
+            if page_number > max_pages:
                 return None
         else:
             return None
