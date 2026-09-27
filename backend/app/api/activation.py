@@ -262,6 +262,9 @@ async def _rollback_activation(
     await db.commit()
 
 
+_risex_planning_copy = reconcile_observed_follower
+
+
 async def _resume_risex_alignment(
     db: AsyncSession,
     user: User,
@@ -273,7 +276,7 @@ async def _resume_risex_alignment(
     master_configs,
     create_jobs: bool = True,
 ) -> dict:
-    return await reconcile_observed_follower(
+    return await _risex_planning_copy(
         db,
         user,
         observation=observation,
