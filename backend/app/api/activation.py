@@ -368,6 +368,14 @@ async def resume_copy_immediate(
         except Exception as exc:
             raise HTTPException(409, f'RISEx environment gate rejected activation: {exc}') from exc
 
+        _sensitivity_observation = await read_risex_reconcile_observation(
+            account_address=binding.account_address,
+            epoch_id=network_state.epoch_id,
+            network=network,
+            started_at=network_state.started_at,
+        )
+        del _sensitivity_observation
+
         try:
             evidence = await _verify_risex_signer_binding(
                 account_address=binding.account_address,
