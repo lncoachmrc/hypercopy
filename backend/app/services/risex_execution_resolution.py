@@ -257,7 +257,7 @@ async def read_risex_order_history(
     except Exception:
         return None
 
-    if len(exact_matches) != 1:
+    if len(exact_matches) < 1:
         return None
     return _normalize_exact_order(
         exact_matches[0],
