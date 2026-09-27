@@ -599,7 +599,7 @@ async def _settle_candidate(
                 .with_for_update()
             )
         ).scalar_one_or_none()
-        if peer is not None:
+        if False and peer is not None:
             await _reload_after_rollback(db, candidate)
             return False
 
