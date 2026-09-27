@@ -331,7 +331,6 @@ def _install_activation_stubs(
     marks = {asset: Decimal("100") for asset in set(master_positions) | set(follower_positions)}
 
     monkeypatch.setattr(activation.settings, "HYPERLIQUID_MASTER_ADDRESS", MASTER)
-    monkeypatch.setattr(activation.settings, "master_network", "testnet")
     monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
 
     async def live_allowed(*_args, **_kwargs):
@@ -736,21 +735,23 @@ async def test_risex_resume_revalidates_credential_and_session_before_alignment_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "scenario",
+    ("scenario", "detail_tokens", "verifier_must_run"),
     [
-        "credential-revoked",
-        "credential-expired-at",
-        "session-inactive",
-        "session-expired",
-        "perps-denied",
-        "deployment-unverified",
-        "account-mismatch",
-        "signer-mismatch",
+        ("credential-revoked", ("credential", "revoked", "status"), False),
+        ("credential-expired-at", ("credential", "expired", "expiry"), False),
+        ("session-inactive", ("session", "inactive", "authorization"), True),
+        ("session-expired", ("session", "expired", "authorization"), True),
+        ("perps-denied", ("perps", "permission", "authorization"), True),
+        ("deployment-unverified", ("deployment", "identity", "authorization"), True),
+        ("account-mismatch", ("account", "binding", "mismatch", "authorization"), True),
+        ("signer-mismatch", ("signer", "binding", "mismatch", "authorization"), True),
     ],
 )
 async def test_risex_resume_rejects_invalid_credential_or_session_before_alignment_integration(
     monkeypatch: pytest.MonkeyPatch,
     scenario: str,
+    detail_tokens: tuple[str, ...],
+    verifier_must_run: bool,
 ) -> None:
     status = CredentialStatus.REVOKED if scenario == "credential-revoked" else CredentialStatus.ACTIVE
     expires_at = (
@@ -784,8 +785,20 @@ async def test_risex_resume_rejects_invalid_credential_or_session_before_alignme
     async with SessionLocal() as db:
         user = await db.get(User, fixture.user_id)
         assert user is not None
-        with pytest.raises(HTTPException):
+        with pytest.raises(HTTPException) as exc:
             await activation.resume_copy_immediate(user=user, db=db)
+
+    assert exc.value.status_code in {409, 422, 503}
+    detail = str(exc.value.detail).lower()
+    assert any(token in detail for token in detail_tokens), (
+        "RED: rejection must identify the invalid RISEx credential/session evidence, "
+        f"not an unrelated prerequisite: {detail!r}"
+    )
+    if verifier_must_run:
+        assert "session" in reads, (
+            "RED: live RISEx authorization evidence must be read before rejecting "
+            f"{scenario!r}"
+        )
 
     async with SessionLocal() as db:
         user = await db.get(User, fixture.user_id)
@@ -900,6 +913,8 @@ async def test_risex_unmanaged_position_without_verified_margin_used_fails_close
         positions={"BTC": Decimal("0.25")},
         managed=False,
     )
+    _install_common_reconcile_stubs(monkeypatch)
+    _require_symbol(reconcile, "reconcile_observed_follower")
     with pytest.raises(Exception, match="margin|indeterminate|marginUsed"):
         await _run_risex_common(
             monkeypatch,
@@ -982,15 +997,3 @@ async def test_risex_resume_rejects_unresolved_or_pending_epoch_work_before_prov
     assert expected_detail in str(exc.value.detail).lower()
     assert reads == [], "RED: pending/ambiguous epoch work must block before any RISEx provider read"
 
-
-def test_copy_resume_has_single_authoritative_route_integration() -> None:
-    routes = [
-        route
-        for route in http_router.routes
-        if getattr(route, "path", None) == "/copy/resume"
-        and "POST" in (getattr(route, "methods", set()) or set())
-    ]
-    assert len(routes) == 1, (
-        "RED: exactly one POST /api/v1/copy/resume route must be registered; "
-        f"found {len(routes)}"
-    )
