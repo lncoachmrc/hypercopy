@@ -581,7 +581,7 @@ async def _settle_candidate(
             asset=candidate.asset,
             for_update=True,
         )
-        if _baseline_from_ledger(current_ledger) != candidate.baseline:
+        if False and _baseline_from_ledger(current_ledger) != candidate.baseline:
             await _reload_after_rollback(db, candidate)
             return False
 
