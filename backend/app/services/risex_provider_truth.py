@@ -292,14 +292,12 @@ async def persist_risex_provider_truth(
     # ADR-0004 B3: close the DB transaction before any RISEx network read.
     await db.commit()
 
-    snapshot: RISExProviderTruthSnapshot | None = None
-    if outcome.execution_state != ExecutionState.REJECTED:
-        snapshot = _snapshot_from_result(
-            await read_risex_provider_truth_snapshot(
-                execution,
-                account_address=account_address,
-            )
+    snapshot = _snapshot_from_result(
+        await read_risex_provider_truth_snapshot(
+            execution,
+            account_address=account_address,
         )
+    )
 
     async with position_ledger_lock(user_id):
         current_execution = await db.get(Execution, execution_id)
@@ -353,7 +351,22 @@ async def persist_risex_provider_truth(
                 "reason": "other_unresolved_execution_same_asset",
             }
 
-        if snapshot is None:
+        async def persist_snapshot(
+            settlement_db: AsyncSession,
+            locked_execution: Execution,
+        ) -> Mapping[str, Any]:
+            return await _apply_snapshot_under_settlement_lock(
+                settlement_db,
+                locked_execution,
+                snapshot,
+            )
+
+        if outcome.execution_state == ExecutionState.REJECTED:
+            # The shared settlement helper preserves its historical no-refresh
+            # contract for direct callers. Case A is stricter: every definitive
+            # provider outcome converges the absolute follower ledger before the
+            # reservation is released and the Execution becomes terminal.
+            await persist_snapshot(db, current_execution)
             settled = await settle_risex_execution_under_accounting_lock(
                 db,
                 execution_id=execution_id,
@@ -361,16 +374,6 @@ async def persist_risex_provider_truth(
                 persist_provider_truth=None,
             )
         else:
-            async def persist_snapshot(
-                settlement_db: AsyncSession,
-                locked_execution: Execution,
-            ) -> Mapping[str, Any]:
-                return await _apply_snapshot_under_settlement_lock(
-                    settlement_db,
-                    locked_execution,
-                    snapshot,
-                )
-
             settled = await settle_risex_execution_under_accounting_lock(
                 db,
                 execution_id=execution_id,
