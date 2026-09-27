@@ -666,6 +666,45 @@ async def test_i2_consumed_exact_filled_settles_execution_ledger_and_done_integr
 
 
 @pytest.mark.asyncio
+async def test_history_lookback_accepts_order_truncated_to_previous_second_integration() -> None:
+    user_id, _epoch_id, job_id, execution_id = await _seed_case(
+        suffix="history-lookback-previous-second"
+    )
+    async with SessionLocal() as db:
+        seeded = await db.get(Execution, execution_id)
+        assert seeded is not None
+        previous_second_ns = (
+            int(seeded.created_at.timestamp()) - 1
+        ) * 1_000_000_000
+
+    api = FakeAPI(
+        orders_pages={
+            1: _orders_page(
+                [_history_order(created_at=str(previous_second_ns))]
+            )
+        },
+        position_size="0.5",
+    )
+    rpc = FakeRPC(consumed=True)
+
+    try:
+        async with SessionLocal() as db:
+            await _run_resolver(db, api=api, rpc=rpc, user_id=user_id)
+
+        execution, job, ledger = await _durable(
+            execution_id=execution_id,
+            job_id=job_id,
+            user_id=user_id,
+        )
+        assert execution.state == ExecutionState.FILLED
+        assert execution.filled_size == Decimal("0.5")
+        assert job.state == JobState.DONE
+        assert ledger.size == Decimal("0.5")
+    finally:
+        await _cleanup(user_id)
+
+
+@pytest.mark.asyncio
 async def test_i3_consumed_partial_fill_is_filled_with_real_size_and_done_integration() -> None:
     user_id, _epoch_id, job_id, execution_id = await _seed_case(suffix="partial")
     # documentato, non osservato il 27/09
