@@ -141,6 +141,8 @@ def _normalize_exact_order(
             if filled_size > 0
             else ExecutionState.CANCELED
         )
+    elif status == "ORDER_STATUS_NONE":
+        execution_state = ExecutionState.REJECTED
     else:
         return None
 
