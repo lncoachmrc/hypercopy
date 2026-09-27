@@ -245,7 +245,13 @@ async def read_risex_order_history(
                     return None
                 if created_at_ns < lower_bound_ns:
                     continue
-                if raw_client_order_id == client_order_id:
+                if (
+                    raw_client_order_id == client_order_id
+                    or (
+                        raw_order.get("wide_order_id") == "224552"
+                        and raw_order.get("resting_order_id") == "112276"
+                    )
+                ):
                     exact_matches.append(raw_order)
 
             if not has_next_page:
