@@ -743,3 +743,91 @@ async def test_case_b_unresolved_execution_blocks_worker_repreparation_before_pr
             assert durable.reserved_exposure_usdc == Decimal("50")
     finally:
         await _cleanup(user_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal_state",
+    [ExecutionState.REJECTED, ExecutionState.CANCELED],
+)
+async def test_terminal_no_fill_outcomes_refresh_absolute_ledger_and_finish_done_integration(
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_state: ExecutionState,
+) -> None:
+    module = _provider_truth_module()
+    persist = getattr(module, "persist_risex_provider_truth", None)
+    assert callable(persist), "RED: persist_risex_provider_truth is missing"
+    user_id, job_id, execution_id = await _seed_case(
+        suffix=f"terminal-{terminal_state.value.lower()}"
+    )
+
+    verified_at = datetime.now(UTC)
+
+    async def read_snapshot(*_args, **_kwargs):
+        return {
+            "market_id": 1,
+            "position_size": Decimal("0.2"),
+            "mark_price": Decimal("101"),
+            "verified_at": verified_at,
+        }
+
+    monkeypatch.setattr(
+        module,
+        "read_risex_provider_truth_snapshot",
+        read_snapshot,
+        raising=False,
+    )
+
+    class NoPostAdapter:
+        calls = 0
+
+        async def place_ioc(self, **_kwargs):
+            self.calls += 1
+            raise AssertionError("terminal-evidence recovery must never submit again")
+
+    adapter = NoPostAdapter()
+    try:
+        async with SessionLocal() as db:
+            execution = await db.get(Execution, execution_id)
+            assert execution is not None
+            execution.response = _terminal_evidence(
+                state=terminal_state,
+                order_id="risex-terminal-no-fill",
+                filled="0",
+                reason="provider-confirmed terminal no-fill",
+            )
+            await db.commit()
+
+        async with SessionLocal() as db:
+            job = await db.get(CopyJob, job_id)
+            assert job is not None
+            result = await risex_copy_execution.process_risex_job(
+                db,
+                adapter,
+                job,
+                submission=None,
+                persist_provider_truth=persist,
+            )
+
+        assert result == JobState.DONE.value
+        assert adapter.calls == 0
+        async with SessionLocal() as db:
+            durable = await db.get(Execution, execution_id)
+            durable_job = await db.get(CopyJob, job_id)
+            ledger = (
+                await db.execute(
+                    select(PositionLedger).where(
+                        PositionLedger.user_id == user_id,
+                        PositionLedger.asset == "BTC",
+                    )
+                )
+            ).scalar_one()
+            assert durable is not None and durable_job is not None
+            assert durable.state == terminal_state
+            assert durable_job.state == JobState.DONE
+            assert ledger.size == Decimal("0.2")
+            assert ledger.mark_price == Decimal("101")
+            assert ledger.last_execution_id == execution_id
+            assert ledger.exchange_verified_at == verified_at
+    finally:
+        await _cleanup(user_id)
