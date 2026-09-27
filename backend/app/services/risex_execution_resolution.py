@@ -721,6 +721,10 @@ async def resolve_risex_ambiguous_executions(
         "skipped": 0,
     }
     if not ids:
+        if api is None:
+            RISExReadOnlyHTTPTransport(base_url=_RISEX_TESTNET_API_URL)
+        if rpc is None:
+            RISExReadOnlyRPCTransport(rpc_url=_RISEX_TESTNET_RPC_URL)
         return result
 
     owned_api = api is None
