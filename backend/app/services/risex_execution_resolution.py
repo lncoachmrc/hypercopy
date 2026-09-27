@@ -745,7 +745,7 @@ async def resolve_risex_ambiguous_executions(
                     authorization_address=auth_address,
                     account=candidate.account_address,
                     nonce_anchor=candidate.nonce_anchor,
-                    nonce_bitmap_index=candidate.nonce_bitmap_index,
+                    nonce_bitmap_index=candidate.nonce_bitmap_index + 1,
                     client_order_id=candidate.client_order_id,
                     execution_created_at=candidate.created_at,
                     max_pages=max_history_pages,
