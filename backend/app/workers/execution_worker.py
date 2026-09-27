@@ -232,7 +232,7 @@ class Worker:
             recovered = await recover_risex_case_a_job(
                 db,
                 job,
-                persist_provider_truth=None,
+                persist_provider_truth=persist_risex_provider_truth,
             )
             if recovered is not None:
                 return recovered
@@ -351,7 +351,7 @@ class Worker:
                     adapter,
                     job,
                     submission=None,
-                    persist_provider_truth=None,
+                    persist_provider_truth=persist_risex_provider_truth,
                 )
             return await process_risex_job(
                 db,
@@ -374,7 +374,7 @@ class Worker:
                     adapter,
                     job,
                     submission=prepared.submission,
-                    persist_provider_truth=None,
+                    persist_provider_truth=persist_risex_provider_truth,
                 )
             return await process_risex_job(
                 db,
