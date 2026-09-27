@@ -46,6 +46,7 @@ from app.services.networking import user_network_state
 from app.services.queue import ensure_group, prepare_job_destination_for_execution, repair_stream
 from app.services.reconcile import master_snapshot, reconcile_active_users, reconcile_user
 from app.services.risex_copy_execution import process_risex_job
+from app.services.risex_provider_truth import persist_risex_provider_truth
 from app.services.risex_worker_credentials import RISExWorkerCredentialResolutionError
 from app.services.risex_worker_submission import prepare_risex_worker_submission
 from app.services.risex_execution_window import RISExExecutionState, RISExOperationalWindowController
@@ -339,6 +340,7 @@ class Worker:
                 adapter,
                 job,
                 submission=None,
+                persist_provider_truth=persist_risex_provider_truth,
             )
 
         # ADR-0006 is not accepted yet, so b2 is intentionally testnet-only.
@@ -354,6 +356,7 @@ class Worker:
                 adapter,
                 job,
                 submission=prepared.submission,
+                persist_provider_truth=persist_risex_provider_truth,
             )
         finally:
             close_prepared = getattr(prepared, 'aclose', None)
