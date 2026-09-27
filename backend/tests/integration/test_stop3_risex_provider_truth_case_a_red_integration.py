@@ -848,14 +848,36 @@ async def test_risex_copyjob_terminal_state_matches_hyperliquid_integration(
     terminal_state: ExecutionState,
     filled_size: Decimal,
 ) -> None:
-    user_id, job_id, execution_id = await _seed_case(
+    user_id, risex_job_id, execution_id = await _seed_case(
         suffix=f"parity-{terminal_state.value.lower()}"
     )
+    hyperliquid_job_id = uuid.uuid4()
 
     try:
         async with SessionLocal() as db:
-            job = await db.get(CopyJob, job_id)
-            assert job is not None
+            db.add(
+                CopyJob(
+                    id=hyperliquid_job_id,
+                    user_id=user_id,
+                    execution_provider="hyperliquid",
+                    execution_network="testnet",
+                    asset="BTC",
+                    origin="EVENT",
+                    state=JobState.PROCESSING,
+                    owner=f"hl-parity-{terminal_state.value.lower()}",
+                    attempt_count=1,
+                    correlation_id=uuid.uuid4().hex,
+                    context={
+                        "execution_provider": "hyperliquid",
+                        "follower_network": "testnet",
+                    },
+                )
+            )
+            await db.commit()
+
+        async with SessionLocal() as db:
+            hyperliquid_job = await db.get(CopyJob, hyperliquid_job_id)
+            assert hyperliquid_job is not None
 
             if terminal_state == ExecutionState.FILLED:
                 hl_outcome = parse_order_response(
@@ -879,7 +901,7 @@ async def test_risex_copyjob_terminal_state_matches_hyperliquid_integration(
                 assert hl_outcome.filled_size < Decimal("0.5")
                 hl_result = await hyperliquid_execution._finish(
                     db,
-                    job,
+                    hyperliquid_job,
                     JobState.DONE,
                     None,
                 )
@@ -890,7 +912,7 @@ async def test_risex_copyjob_terminal_state_matches_hyperliquid_integration(
                 )
                 hl_result = await hyperliquid_execution._finish_action_rejection(
                     db,
-                    job,
+                    hyperliquid_job,
                     user_id=user_id,
                     network="testnet",
                     outcome=hl_outcome,
@@ -901,11 +923,7 @@ async def test_risex_copyjob_terminal_state_matches_hyperliquid_integration(
 
             hyperliquid_job_state = JobState(hl_result)
 
-            job.state = JobState.PROCESSING
-            job.owner = f"risex-parity-{terminal_state.value.lower()}"
-            job.last_error = None
-            await db.commit()
-
+        async with SessionLocal() as db:
             execution = await db.get(Execution, execution_id)
             assert execution is not None
             execution.state = terminal_state
@@ -918,15 +936,15 @@ async def test_risex_copyjob_terminal_state_matches_hyperliquid_integration(
             await db.commit()
 
         async with SessionLocal() as db:
-            job = await db.get(CopyJob, job_id)
+            risex_job = await db.get(CopyJob, risex_job_id)
             execution = await db.get(Execution, execution_id)
-            assert job is not None and execution is not None
+            assert risex_job is not None and execution is not None
             risex_result = await risex_copy_execution._finish_case_a_job(
                 db,
-                job,
+                risex_job,
                 execution,
             )
             assert JobState(risex_result) == hyperliquid_job_state
-            assert job.state == hyperliquid_job_state
+            assert risex_job.state == hyperliquid_job_state
     finally:
         await _cleanup(user_id)
