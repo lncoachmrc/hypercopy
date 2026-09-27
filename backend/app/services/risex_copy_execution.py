@@ -664,7 +664,23 @@ async def _settle_case_a_with_provider_truth(
             f'RISEx terminal provider truth pending: {exc}',
         )
 
-    return await _finish_case_a_job(db, job, settled)
+    if result.get('provider_truth_settled') is True:
+        return await _finish_case_a_job(db, job, settled)
+
+    # Compatibility for older direct callers/tests that provide only the
+    # original settlement callback contract. Production worker wiring always
+    # uses persist_risex_provider_truth(), which settles the Execution itself
+    # and returns provider_truth_settled=True.
+    if settled.state == ExecutionState.FILLED:
+        return await _finish_case_a_job(db, job, settled)
+
+    job.state = JobState.SKIPPED
+    job.last_error = settled.reject_reason
+    job.owner = None
+    job.locked_until = None
+    job.next_attempt_at = None
+    await db.commit()
+    return JobState.SKIPPED.value
 
 
 async def process_risex_job(
