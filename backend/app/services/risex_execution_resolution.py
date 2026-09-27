@@ -136,11 +136,7 @@ def _normalize_exact_order(
             return None
         execution_state = ExecutionState.FILLED
     elif status == "ORDER_STATUS_CANCELLED":
-        execution_state = (
-            ExecutionState.FILLED
-            if filled_size > 0
-            else ExecutionState.CANCELED
-        )
+        execution_state = ExecutionState.CANCELED
     else:
         return None
 
