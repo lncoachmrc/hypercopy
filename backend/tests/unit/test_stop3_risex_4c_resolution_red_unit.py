@@ -471,15 +471,52 @@ async def test_u8_history_pagination_window_duplicates_and_page_cap_are_fail_clo
     )
     assert capped is None
 
-    too_old = _order(created_at=str(SEARCH_START_NS - 1))
-    old_result = await reader(
-        FakeAPI({1: _page([too_old])}),
+    within_lookback = _order(created_at=str(SEARCH_START_NS - 1))
+    within_api = FakeAPI({1: _page([within_lookback])})
+    within_result = await reader(
+        within_api,
         account=ACCOUNT,
         client_order_id=BIG_CLIENT_ORDER_ID,
         execution_created_at=SEARCH_START,
         max_pages=2,
     )
-    assert old_result is None
+    assert within_result is not None
+    assert within_result["client_order_id"] == BIG_CLIENT_ORDER_ID
+
+    lookback_seconds = getattr(
+        _module,
+        "RISEX_4C_HISTORY_LOOKBACK_SECONDS",
+        None,
+    )
+    assert lookback_seconds == 120, (
+        "RED: RISEx 4C history lookback must be exactly 120 seconds"
+    )
+    expected_start_time = SEARCH_START_NS - (120 * 1_000_000_000)
+    assert within_api.calls == [
+        (
+            "/v1/orders",
+            {
+                "account": ACCOUNT,
+                "page": 1,
+                "start_time": expected_start_time,
+            },
+        )
+    ], (
+        "RED: empirically verified RISEx start_time unit is nanoseconds and "
+        "must already include the 120-second lookback"
+    )
+
+    outside_lookback = _order(
+        created_at=str(SEARCH_START_NS - (121 * 1_000_000_000))
+    )
+    outside_result = await reader(
+        FakeAPI({1: _page([outside_lookback])}),
+        account=ACCOUNT,
+        client_order_id=BIG_CLIENT_ORDER_ID,
+        execution_created_at=SEARCH_START,
+        max_pages=2,
+    )
+    assert outside_result is None
 
     duplicate_result = await reader(
         FakeAPI(
