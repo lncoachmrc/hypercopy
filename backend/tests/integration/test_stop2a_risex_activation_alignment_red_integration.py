@@ -325,6 +325,7 @@ def _install_activation_stubs(
     deployment_identity_verified: bool = True,
     verified_account: str | None = None,
     verified_signer: str | None = None,
+    unmanaged_margin: Decimal | None = Decimal("0"),
 ) -> None:
     provider_reads = provider_reads if provider_reads is not None else []
     marks = {asset: Decimal("100") for asset in set(master_positions) | set(follower_positions)}
@@ -369,6 +370,7 @@ def _install_activation_stubs(
             fixture,
             positions=follower_positions,
             marks=marks,
+            unmanaged_margin=unmanaged_margin,
         )
 
     async def verify_binding(*_args, **kwargs):
@@ -420,8 +422,8 @@ def _install_activation_stubs(
     monkeypatch.setattr(activation, "_limiter", lambda: None)
     monkeypatch.setattr(activation, "assert_risex_environment_allowed", env_gate, raising=False)
     monkeypatch.setattr(activation, "read_risex_reconcile_observation", risex_reader, raising=False)
-    monkeypatch.setattr(activation, "_verify_risex_signer_binding", verify_binding, raising=False)
-    monkeypatch.setattr(activation, "verify_risex_activation_session", verify_binding, raising=False)
+    _require_symbol(activation, "_verify_risex_signer_binding")
+    monkeypatch.setattr(activation, "_verify_risex_signer_binding", verify_binding)
 
 
 async def _run_hl(
@@ -575,9 +577,17 @@ async def test_initial_alignment_risex_matches_hyperliquid_target_orders_integra
     rx = await _seed_user(provider="risex", copy_state=CopyState.ACTIVE, positions=positions)
 
     await _run_hl(monkeypatch, hl, positions=positions, master_positions=master)
-    await _run_risex_common(monkeypatch, rx, positions=positions, master_positions=master)
+    hl_state = await _semantic_state(hl.user_id)
+    assert set(hl_state) == {"BTC", "ETH"}
+    assert hl_state["BTC"]["target"] == Decimal("0.25")
+    assert hl_state["BTC"]["intent"] == "OPEN"
+    assert hl_state["BTC"]["delta"] == Decimal("0.15")
+    assert hl_state["ETH"]["target"] == Decimal("0.05")
+    assert hl_state["ETH"]["intent"] == "REDUCE"
+    assert hl_state["ETH"]["delta"] == Decimal("-0.15")
 
-    assert await _semantic_state(rx.user_id) == await _semantic_state(hl.user_id)
+    await _run_risex_common(monkeypatch, rx, positions=positions, master_positions=master)
+    assert await _semantic_state(rx.user_id) == hl_state
 
 
 @pytest.mark.asyncio
@@ -634,8 +644,19 @@ async def test_risex_initial_alignment_uses_same_batch_capacity_reservations_as_
         max_positions=2,
     )
     await _run_hl(monkeypatch, hl, positions={}, master_positions=master)
+    hl_state = await _semantic_state(hl.user_id)
+    assert set(hl_state) == {"BTC", "ETH"}
+    assert Decimal(str(hl_state["BTC"]["submitted_size"])) == Decimal("0.600")
+    assert Decimal(str(hl_state["ETH"]["submitted_size"])) == Decimal("0.400")
+    assert Decimal(str(hl_state["BTC"]["reserved_additional_exposure"])) == Decimal("60")
+    assert Decimal(str(hl_state["ETH"]["reserved_additional_exposure"])) == Decimal("40")
+    assert Decimal(str(hl_state["BTC"]["reserved_total_exposure"])) == Decimal("60")
+    assert Decimal(str(hl_state["ETH"]["reserved_total_exposure"])) == Decimal("100")
+    assert hl_state["BTC"]["reserved_open_positions"] == 1
+    assert hl_state["ETH"]["reserved_open_positions"] == 2
+
     await _run_risex_common(monkeypatch, rx, positions={}, master_positions=master)
-    assert await _semantic_state(rx.user_id) == await _semantic_state(hl.user_id)
+    assert await _semantic_state(rx.user_id) == hl_state
 
 
 @pytest.mark.asyncio
@@ -657,8 +678,15 @@ async def test_risex_initial_alignment_allows_same_over_cap_reductions_as_hyperl
         max_total_exposure=Decimal("100"),
     )
     await _run_hl(monkeypatch, hl, positions=positions, master_positions=master)
+    hl_state = await _semantic_state(hl.user_id)
+    assert set(hl_state) == {"BTC"}
+    assert hl_state["BTC"]["target"] == Decimal("0.50")
+    assert hl_state["BTC"]["intent"] == "REDUCE"
+    assert hl_state["BTC"]["reduce_only"] is True
+    assert Decimal(str(hl_state["BTC"]["submitted_size"])) == Decimal("0.700")
+
     await _run_risex_common(monkeypatch, rx, positions=positions, master_positions=master)
-    assert await _semantic_state(rx.user_id) == await _semantic_state(hl.user_id)
+    assert await _semantic_state(rx.user_id) == hl_state
 
 
 @pytest.mark.asyncio
@@ -728,8 +756,7 @@ async def test_risex_resume_revalidates_credential_and_session_before_alignment_
     assert "gate" in events
     assert "session" in events
     assert "portfolio" in events
-    assert events.index("gate") < events.index("session")
-    assert events.index("gate") < events.index("portfolio")
+    assert events.index("gate") < events.index("session") < events.index("portfolio")
 
 
 @pytest.mark.asyncio
@@ -906,7 +933,13 @@ async def test_risex_activation_planning_failure_rolls_back_to_paused_like_hyper
 async def test_risex_unmanaged_position_without_verified_margin_used_fails_closed_integration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fixture = await _seed_user(
+    indeterminate = getattr(reconcile, "ReconcileObservationIndeterminate", None)
+    assert (
+        isinstance(indeterminate, type)
+        and issubclass(indeterminate, Exception)
+    ), "RED: missing exception app.services.reconcile.ReconcileObservationIndeterminate"
+
+    direct = await _seed_user(
         provider="risex",
         copy_state=CopyState.ACTIVE,
         positions={"BTC": Decimal("0.25")},
@@ -914,14 +947,126 @@ async def test_risex_unmanaged_position_without_verified_margin_used_fails_close
     )
     _install_common_reconcile_stubs(monkeypatch)
     _require_symbol(reconcile, "reconcile_observed_follower")
-    with pytest.raises(Exception, match="margin|indeterminate|marginUsed"):
+
+    async with SessionLocal() as db:
+        ledger = (
+            await db.execute(
+                select(PositionLedger).where(
+                    PositionLedger.user_id == direct.user_id,
+                    PositionLedger.asset == "BTC",
+                )
+            )
+        ).scalar_one()
+        before = (ledger.size, ledger.target_size, ledger.managed)
+
+    with pytest.raises(indeterminate, match="margin|indeterminate|marginUsed"):
         await _run_risex_common(
             monkeypatch,
-            fixture,
+            direct,
             positions={"BTC": Decimal("0.25")},
             master_positions={"ETH": Decimal("0.25")},
             unmanaged_margin=None,
         )
+
+    async with SessionLocal() as db:
+        ledger = (
+            await db.execute(
+                select(PositionLedger).where(
+                    PositionLedger.user_id == direct.user_id,
+                    PositionLedger.asset == "BTC",
+                )
+            )
+        ).scalar_one()
+        jobs = (
+            await db.execute(select(CopyJob).where(CopyJob.user_id == direct.user_id))
+        ).scalars().all()
+        after = (ledger.size, ledger.target_size, ledger.managed)
+    assert jobs == []
+    assert after == before
+
+    resumed = await _seed_user(
+        provider="risex",
+        copy_state=CopyState.SHADOW,
+        positions={"BTC": Decimal("0.25")},
+        managed=False,
+    )
+    _install_signed_write_tripwires(monkeypatch)
+    _install_activation_stubs(
+        monkeypatch,
+        fixture=resumed,
+        master_positions={"ETH": Decimal("0.25")},
+        follower_positions={"BTC": Decimal("0.25")},
+        unmanaged_margin=None,
+    )
+
+    async with SessionLocal() as db:
+        user = await db.get(User, resumed.user_id)
+        assert user is not None
+        with pytest.raises(HTTPException) as exc:
+            await activation.resume_copy_immediate(user=user, db=db)
+    assert exc.value.status_code == 409
+
+    async with SessionLocal() as db:
+        user = await db.get(User, resumed.user_id)
+        jobs = (
+            await db.execute(select(CopyJob).where(CopyJob.user_id == resumed.user_id))
+        ).scalars().all()
+        actions = set(
+            (
+                await db.execute(
+                    select(AuditLog.action).where(AuditLog.subject_id == resumed.user_id)
+                )
+            ).scalars().all()
+        )
+    assert user is not None and user.copy_state != CopyState.ACTIVE
+    assert jobs == []
+    assert "COPY_ACTIVATION_ROLLED_BACK" in actions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("positions", "master_positions"),
+    [
+        ({}, {"BTC": Decimal("0.25")}),
+        ({"BTC": Decimal("0.25")}, {"ETH": Decimal("0.25")}),
+    ],
+)
+async def test_risex_unmanaged_margin_none_is_allowed_when_no_unmanaged_positions_integration(
+    monkeypatch: pytest.MonkeyPatch,
+    positions: dict[str, Decimal],
+    master_positions: dict[str, Decimal],
+) -> None:
+    none_fixture = await _seed_user(
+        provider="risex",
+        copy_state=CopyState.ACTIVE,
+        positions=positions,
+        managed=True,
+    )
+    zero_fixture = await _seed_user(
+        provider="risex",
+        copy_state=CopyState.ACTIVE,
+        positions=positions,
+        managed=True,
+    )
+
+    await _run_risex_common(
+        monkeypatch,
+        none_fixture,
+        positions=positions,
+        master_positions=master_positions,
+        unmanaged_margin=None,
+    )
+    await _run_risex_common(
+        monkeypatch,
+        zero_fixture,
+        positions=positions,
+        master_positions=master_positions,
+        unmanaged_margin=Decimal("0"),
+    )
+
+    zero_state = await _semantic_state(zero_fixture.user_id)
+    assert zero_state, "RED: I14 baseline must create at least one semantic RECONCILE job"
+    assert await _semantic_state(none_fixture.user_id) == zero_state
 
 
 @pytest.mark.asyncio
