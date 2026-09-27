@@ -16,6 +16,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import delete, select
 
+from app.adapters import risex as risex_adapter_module
 from app.adapters import risex_signed_testnet_http
 from app.adapters.hyperliquid import OrderOutcome, parse_order_response
 from app.db.position_ledger_lock import position_ledger_lock_engine
@@ -948,3 +949,56 @@ async def test_risex_copyjob_terminal_state_matches_hyperliquid_integration(
             assert risex_job.state == hyperliquid_job_state
     finally:
         await _cleanup(user_id)
+
+
+def test_risex_worker_closes_db_transaction_before_each_public_read_phase_integration() -> None:
+    source = inspect.getsource(risex_worker_submission.prepare_risex_worker_submission)
+
+    credential_index = source.find("resolved_credential = await resolve_risex_worker_credential")
+    first_commit_index = source.find("await db.commit()", credential_index)
+    first_network_index = source.find("markets_payload = await api.get_json")
+
+    assert credential_index >= 0
+    assert first_network_index >= 0
+    assert credential_index < first_commit_index < first_network_index, (
+        "RED: credential/durable DB reads must be committed before the first "
+        "RISEx HTTP read phase"
+    )
+
+    last_local_db_read_index = source.find(
+        "emergency_stop_flag = await db.get(SystemFlag, 'emergency_stop')"
+    )
+    second_commit_index = source.find("await db.commit()", last_local_db_read_index)
+    second_network_index = source.find("plan = await prepare_risex_ioc_plan")
+
+    assert last_local_db_read_index >= 0
+    assert second_network_index >= 0
+    assert last_local_db_read_index < second_commit_index < second_network_index, (
+        "RED: risk/entitlement DB reads must be committed before the remaining "
+        "RISEx API/RPC read phase"
+    )
+
+    persistence_index = source.find("execution = await persist_risex_pre_post_execution")
+    assert persistence_index > second_network_index
+    network_phase = source[second_commit_index:persistence_index]
+    assert "await db.get(" not in network_phase
+    assert "await db.execute(" not in network_phase
+
+
+def test_risex_adapter_closes_destination_transaction_before_freshness_reads_integration() -> None:
+    source = inspect.getsource(risex_adapter_module.RISExAdapter.place_ioc)
+
+    destination_index = source.find(
+        "destination_matches = await job_matches_active_destination(db, job)"
+    )
+    commit_index = source.find("await db.commit()", destination_index)
+    freshness_index = source.find(
+        "payload = await self.transport.prepare_place_order_post(request)"
+    )
+
+    assert destination_index >= 0
+    assert freshness_index >= 0
+    assert destination_index < commit_index < freshness_index, (
+        "RED: destination verification DB transaction must close before the "
+        "signed transport freshness probe performs RISEx network reads"
+    )
