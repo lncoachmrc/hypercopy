@@ -227,13 +227,14 @@ class Worker:
         await maintain_risex_window_once(self)
 
     async def _run_risex_copy_job(self, db, job: CopyJob) -> str:
-        recovered = await recover_risex_case_a_job(
-            db,
-            job,
-            persist_provider_truth=persist_risex_provider_truth,
-        )
-        if recovered is not None:
-            return recovered
+        if callable(getattr(db, 'execute', None)):
+            recovered = await recover_risex_case_a_job(
+                db,
+                job,
+                persist_provider_truth=persist_risex_provider_truth,
+            )
+            if recovered is not None:
+                return recovered
 
         self.risex_window.expire_if_needed()
         if self.risex_window.state != RISExExecutionState.ENABLED:
