@@ -26,6 +26,7 @@ from app.models.entities import (
     Execution,
     ExecutionEpoch,
     ExecutionState,
+    JobState,
 )
 from app.services.risex_copy_execution import (
     RISExSubmissionOutcome,
@@ -668,6 +669,11 @@ async def _settle_candidate(
             )
         ).scalar_one_or_none()
         if fresh_job is None:
+            await db.rollback()
+            return False
+        if fresh_job.state in {JobState.QUEUED, JobState.RETRYING}:
+            fresh_job.state = JobState.PROCESSING
+        elif fresh_job.state != JobState.PROCESSING:
             await db.rollback()
             return False
         await _finish_case_a_job(db, fresh_job, settled)
