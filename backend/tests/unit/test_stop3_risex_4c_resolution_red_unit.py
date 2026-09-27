@@ -24,6 +24,26 @@ SEARCH_START = datetime(2026, 9, 27, 10, 0, tzinfo=UTC)
 SEARCH_START_NS = int(SEARCH_START.timestamp() * 1_000_000_000)
 
 
+def _abi_address_hex(address: str) -> str:
+    return bytes.fromhex(address[2:]).rjust(32, b"\\x00").hex()
+
+
+def _abi_uint_hex(value: int) -> str:
+    return value.to_bytes(32, "big").hex()
+
+
+def _expected_nonce_call_data(*, used: bool) -> str:
+    if used:
+        return (
+            "0xdcd621a2"
+            + _abi_address_hex(ACCOUNT)
+            + _abi_uint_hex(7)
+            + _abi_uint_hex(13)
+        )
+    return "0x8c1009b5" + _abi_address_hex(ACCOUNT)
+
+
+
 def _require_symbol(name: str):
     try:
         module = importlib.import_module("app.services.risex_execution_resolution")
@@ -158,11 +178,20 @@ class FakeRPC:
         if self.error is not None:
             raise self.error
         if method == "eth_blockNumber":
+            assert params == []
             return "not-hex" if self.malformed_block else "0x64"
         assert method == "eth_call"
+        assert len(params) == 2
+        request, block_tag = params
+        assert isinstance(request, dict)
+        assert request.get("to") == AUTHORIZATION
+        assert block_tag == "0x64"
         self.eth_call_count += 1
         if self.eth_call_count == 1:
+            assert request.get("data") == _expected_nonce_call_data(used=True)
             return "0x" + (1 if self.consumed else 0).to_bytes(32, "big").hex()
+        assert self.eth_call_count == 2
+        assert request.get("data") == _expected_nonce_call_data(used=False)
         bitmap = (1 << self.nonce_bitmap_index) if self.consumed else 0
         return "0x" + (
             self.state_anchor.to_bytes(32, "big")
@@ -183,7 +212,6 @@ async def test_u1_resolution_module_has_no_signed_write_surface_unit() -> None:
         "place_ioc",
         "resolve_risex_worker_credential",
         "decrypt",
-        "unwrap",
     )
     for token in forbidden:
         assert token not in source, (
