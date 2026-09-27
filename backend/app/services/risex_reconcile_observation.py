@@ -180,7 +180,7 @@ def _build_observation(
         epoch_id=epoch_id,
         started_at=started_at,
         account_address=account_address,
-        account_equity=portfolio.total_account_value,
+        account_equity=portfolio.usdc_balance,
         free_margin=portfolio.free_collateral,
         collateral_balance=collateral_balance,
         unrealized_pnl=unrealized_pnl,
