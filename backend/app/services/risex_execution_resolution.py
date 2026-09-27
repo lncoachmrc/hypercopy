@@ -19,6 +19,7 @@ from app.security.risex_deployment_runtime import (
     PublicRPCTransport,
     RISExReadOnlyRPCTransport,
 )
+from app.core.logging import get_logger
 from app.db.position_ledger_lock import position_ledger_lock
 from app.models.entities import (
     CopyJob,
@@ -52,6 +53,8 @@ _RISEX_TESTNET_API_URL = "https://api.testnet.rise.trade"
 _RISEX_TESTNET_RPC_URL = "https://testnet.riselabs.xyz"
 _PINNED_RISEX_TESTNET_AUTHORIZATION = "0x6DA86F486b5E6536358F5b122dBe184522CA0eE3"
 _ACTIVE_STATES = (ExecutionState.SUBMITTING, ExecutionState.UNKNOWN)
+
+log = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -759,8 +762,15 @@ async def resolve_risex_ambiguous_executions(
                     result["resolved"] += 1
                 else:
                     result["unresolved"] += 1
-            except Exception:
+            except Exception as exc:
                 await db.rollback()
+                log.warning(
+                    "RISEx 4C candidate resolution failed",
+                    extra={
+                        "execution_id": str(execution_id),
+                        "error_type": type(exc).__name__,
+                    },
+                )
                 result["unresolved"] += 1
                 continue
     finally:
