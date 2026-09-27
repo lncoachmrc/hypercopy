@@ -287,10 +287,6 @@ class Worker:
                 self.risex_window.lock('RISEx security-relevant runtime context changed during submission')
                 raise ProviderWriteDisabled('RISEx continuous authorization context changed')
             singleton_ok = await risex_singleton_matches_worker(self, db)
-            # The final singleton SELECT autobegins an AsyncSession transaction.
-            # Close that read-only transaction before the provider POST so ADR-0004
-            # B3 never carries a PostgreSQL transaction across RISEx network I/O.
-            await db.commit()
             if not singleton_ok:
                 self.risex_window.lock('RISEx singleton invariant changed during submission')
                 raise ProviderWriteDisabled('RISEx singleton execution-worker invariant changed')
