@@ -239,7 +239,7 @@ async def test_signed_transport_exposes_http_4xx_status_and_body_integration() -
 
 
 def test_risex_4xx_rejection_whitelist_starts_empty_integration() -> None:
-    outcome = risex_copy_execution.classify_risex_submission_response(
+    outcome = risex_copy_execution.classify_risex_runtime_response(
         status_code=409,
         payload={
             "success": False,
@@ -694,9 +694,10 @@ async def test_worker_terminal_evidence_recovery_precedes_disabled_write_window_
             )
 
     worker = SimpleNamespace(risex_window=WindowMustNotRun())
+    fake_db = SimpleNamespace(execute=lambda *_args, **_kwargs: None)
     result = await execution_worker.Worker._run_risex_copy_job(
         worker,
-        object(),
+        fake_db,
         SimpleNamespace(),
     )
 
