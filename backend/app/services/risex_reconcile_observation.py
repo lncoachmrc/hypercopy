@@ -204,14 +204,14 @@ async def read_risex_reconcile_observation(
     started_at: datetime | None = None,
     api: Any | None = None,
 ) -> FollowerReconcileObservation:
-    assert_risex_environment_allowed(
-        network=network,  # type: ignore[arg-type]
-        env=os.environ,
-    )
     observed_at = started_at or datetime.now(UTC)
 
     async def read_with(client: Any) -> FollowerReconcileObservation:
         markets_payload = await client.get_json('/v1/markets')
+        assert_risex_environment_allowed(
+            network=network,  # type: ignore[arg-type]
+            env=os.environ,
+        )
         portfolio_payload = await client.get_json(
             '/v1/portfolio/details',
             params={'account': account_address},
