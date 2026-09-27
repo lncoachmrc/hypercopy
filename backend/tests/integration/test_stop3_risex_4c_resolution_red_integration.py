@@ -16,7 +16,10 @@ import pytest_asyncio
 from sqlalchemy import delete, select
 
 from app.adapters.risex_types import ProviderReadUnavailable
-from app.db.position_ledger_lock import position_ledger_lock_engine
+from app.db.position_ledger_lock import (
+    position_ledger_lock,
+    position_ledger_lock_engine,
+)
 from app.db.session import SessionLocal, engine
 from app.models.entities import (
     CopyJob,
@@ -1625,4 +1628,82 @@ async def test_i26_terminal_resolution_persists_nonsecret_4c_audit_evidence_inte
         assert "private" not in serialized
         assert "secret" not in serialized
     finally:
+        await _cleanup(user_id)
+
+
+@pytest.mark.asyncio
+async def test_i27_4c_settlement_holds_position_ledger_lock_against_concurrent_writer_integration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id, _epoch_id, job_id, execution_id = await _seed_case(
+        suffix="position-lock-behavior"
+    )
+    api = FakeAPI(
+        orders_pages={1: _orders_page([_history_order()])},
+        position_size="0.5",
+    )
+    rpc = FakeRPC(consumed=True)
+    module, resolver = _require_symbol("resolve_risex_ambiguous_executions")
+    original_apply = module._apply_snapshot_under_settlement_lock
+    contender_entered = execution_worker.asyncio.Event()
+    contender_task = None
+
+    async def contender() -> None:
+        async with position_ledger_lock(user_id):
+            contender_entered.set()
+
+    async def observed_apply(db, execution, snapshot):
+        nonlocal contender_task
+        contender_task = execution_worker.asyncio.create_task(contender())
+        try:
+            await execution_worker.asyncio.wait_for(
+                contender_entered.wait(),
+                timeout=0.05,
+            )
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError(
+                "RED: concurrent same-user ledger writer entered before 4C "
+                "settlement released position_ledger_lock"
+            )
+        return await original_apply(db, execution, snapshot)
+
+    monkeypatch.setattr(
+        module,
+        "_apply_snapshot_under_settlement_lock",
+        observed_apply,
+    )
+
+    try:
+        async with SessionLocal() as db:
+            await resolver(
+                db,
+                api=api,
+                rpc=rpc,
+                authorization_address=AUTHORIZATION,
+                user_id=user_id,
+                max_history_pages=3,
+                batch_limit=10,
+            )
+
+        assert contender_task is not None
+        await execution_worker.asyncio.wait_for(contender_task, timeout=0.5)
+        assert contender_entered.is_set()
+
+        execution, job, ledger = await _durable(
+            execution_id=execution_id,
+            job_id=job_id,
+            user_id=user_id,
+        )
+        assert execution.state == ExecutionState.FILLED
+        assert job.state == JobState.DONE
+        assert ledger.last_execution_id == execution_id
+    finally:
+        if contender_task is not None and not contender_task.done():
+            contender_task.cancel()
+            await execution_worker.asyncio.gather(
+                contender_task,
+                return_exceptions=True,
+            )
         await _cleanup(user_id)
