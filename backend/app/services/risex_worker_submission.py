@@ -214,13 +214,7 @@ async def prepare_risex_worker_submission(
     # Durable restart fence: this query happens before b1, plan construction or
     # signing. Recovered ambiguity is reconciliation work, never a retry signal.
     existing = await _existing_execution(db, job)
-    if existing is not None and existing.state in {
-        ExecutionState.SUBMITTING,
-        ExecutionState.UNKNOWN,
-    }:
-        return None
-    if existing is not None:
-        return None
+    # sensitivity mutation: durable existing Execution fence removed.
 
     resolved_credential = await resolve_risex_worker_credential(db, job)
     account_address = resolved_credential.account_address
