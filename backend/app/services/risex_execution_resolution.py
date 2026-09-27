@@ -250,7 +250,7 @@ async def read_risex_order_history(
 
             if not has_next_page:
                 break
-            if page_number == max_pages:
+            if page_number > max_pages:
                 return None
         else:
             return None
