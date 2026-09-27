@@ -29,7 +29,7 @@ from app.models.entities import (
     User,
     UserState,
 )
-from app.services import risex_copy_execution
+from app.services import risex_copy_execution, risex_worker_submission
 from app.workers import execution_worker
 
 
@@ -178,12 +178,15 @@ async def _cleanup(user_id: uuid.UUID) -> None:
 
 def test_worker_wires_real_persist_provider_truth_into_process_risex_job_integration() -> None:
     source = inspect.getsource(execution_worker.Worker._run_risex_copy_job)
-    assert "persist_provider_truth=" in source, (
-        "RED: RISEx worker must pass a real persist_provider_truth callback "
-        "to process_risex_job"
+    assert source.count(
+        "persist_provider_truth=persist_risex_provider_truth"
+    ) >= 3, (
+        "RED: recovery plus both real process_risex_job callsites must receive "
+        "the production persist_risex_provider_truth callback"
     )
-    assert "persist_risex_provider_truth" in source, (
-        "RED: worker must wire the production RISEx provider-truth service"
+    assert "_REAL_PROCESS_RISEX_JOB" in source, (
+        "RED: compatibility with historical test doubles must not remove the "
+        "callback from the real writer path"
     )
 
 
@@ -703,3 +706,40 @@ async def test_worker_terminal_evidence_recovery_precedes_disabled_write_window_
 
     assert result == JobState.DONE.value
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_case_b_unresolved_execution_blocks_worker_repreparation_before_provider_io_integration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_id, job_id, execution_id = await _seed_case(
+        suffix="case-b-reprepare",
+        terminal_evidence=False,
+    )
+
+    monkeypatch.setattr(
+        risex_worker_submission,
+        "assert_risex_worker_write_allowed",
+        lambda **_kwargs: None,
+    )
+
+    try:
+        async with SessionLocal() as db:
+            job = await db.get(CopyJob, job_id)
+            assert job is not None
+            prepared = await risex_worker_submission.prepare_risex_worker_submission(
+                db,
+                job,
+                readiness_assertions={"operatorhub_bypass_disabled": True},
+            )
+
+        assert prepared is None
+        async with SessionLocal() as db:
+            durable = await db.get(Execution, execution_id)
+            assert durable is not None
+            assert durable.state == ExecutionState.SUBMITTING
+            assert durable.nonce_anchor == 7
+            assert durable.nonce_bitmap_index == 13
+            assert durable.reserved_exposure_usdc == Decimal("50")
+    finally:
+        await _cleanup(user_id)
