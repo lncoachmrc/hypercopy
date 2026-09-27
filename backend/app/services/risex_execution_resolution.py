@@ -433,7 +433,6 @@ async def _load_candidate_baseline(
         created_at=execution.created_at,
         baseline=_baseline_from_ledger(ledger),
     )
-    await db.commit()
     return candidate
 
 
