@@ -662,12 +662,9 @@ async def _settle_case_a_with_provider_truth(
             raise RuntimeError('RISEx provider truth callback returned invalid evidence')
 
         if result.get('provider_truth_settled') is False:
-            fresh_job = await db.get(CopyJob, job_id)
-            if fresh_job is None:
-                raise RuntimeError('RISEx CopyJob disappeared during provider-truth retry')
             return await _defer_for_resolution(
                 db,
-                fresh_job,
+                job,
                 'RISEx terminal provider truth pending: '
                 + str(result.get('reason') or 'retry required'),
             )
