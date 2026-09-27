@@ -54,7 +54,7 @@ async def test_activation_uses_fresh_follower_equity_for_entitlement(monkeypatch
     captured = {}
 
     async def network_state(_db, _user_id):
-        return SimpleNamespace(network='mainnet')
+        return SimpleNamespace(network='mainnet', provider='hyperliquid')
 
     async def live_allowed(_db, _network):
         return True
