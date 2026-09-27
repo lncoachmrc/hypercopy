@@ -624,13 +624,17 @@ async def _finish_case_a_job(
         ExecutionState.CANCELED,
     }:
         raise RuntimeError('RISEx case-A finish requires a terminal execution')
-    job.state = JobState.DONE
+    job.state = (
+        JobState.DONE
+        if execution.state == ExecutionState.FILLED
+        else JobState.SKIPPED
+    )
     job.last_error = execution.reject_reason
     job.owner = None
     job.locked_until = None
     job.next_attempt_at = None
     await db.commit()
-    return JobState.DONE.value
+    return job.state.value
 
 
 async def _settle_case_a_with_provider_truth(
