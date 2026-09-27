@@ -106,6 +106,7 @@ async def _seed_case(
                 started_at=datetime.now(UTC),
             )
         )
+        await db.flush()
         db.add(
             CopyJob(
                 id=job_id,
@@ -122,6 +123,7 @@ async def _seed_case(
                 context={"execution_provider": "risex", "follower_network": "testnet"},
             )
         )
+        await db.flush()
         db.add(
             PositionLedger(
                 user_id=user_id,
@@ -496,6 +498,7 @@ async def test_other_unresolved_execution_same_user_asset_blocks_provider_truth_
                 context={"execution_provider": "risex", "follower_network": "testnet"},
             )
         )
+        await db.flush()
         db.add(
             Execution(
                 copy_job_id=peer_job_id,
