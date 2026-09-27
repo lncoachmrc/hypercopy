@@ -48,6 +48,7 @@ from app.services.reconcile import master_snapshot, reconcile_active_users, reco
 from app.services.risex_copy_execution import process_risex_job, recover_risex_case_a_job
 _REAL_PROCESS_RISEX_JOB = process_risex_job
 from app.services.risex_provider_truth import persist_risex_provider_truth
+from app.services.risex_execution_resolution import resolve_risex_ambiguous_executions
 from app.services.risex_worker_credentials import RISExWorkerCredentialResolutionError
 from app.services.risex_worker_submission import prepare_risex_worker_submission
 from app.services.risex_execution_window import RISExExecutionState, RISExOperationalWindowController
@@ -59,6 +60,8 @@ from app.services.risex_execution_worker_extension import (
 )
 
 configure_logging(); log=get_logger(__name__); stop=asyncio.Event()
+
+_RISEX_4C_RESOLUTION_TIMEOUT_SECONDS = 10.0
 
 
 def _stop(*_): stop.set()
@@ -810,6 +813,34 @@ class Worker:
                         if ack: await self.redis.xack(settings.STREAM_NAME,settings.STREAM_GROUP,message_id)
             except Exception: log.exception('Worker consume loop failed'); await asyncio.sleep(2)
 
+    async def _run_risex_4c_resolution_with_deadline(
+        self,
+        timeout: float | None = None,
+    ) -> bool:
+        if timeout is None:
+            timeout = _RISEX_4C_RESOLUTION_TIMEOUT_SECONDS
+
+        async def _run() -> None:
+            async with SessionLocal() as db:
+                await resolve_risex_ambiguous_executions(db)
+
+        try:
+            await asyncio.wait_for(_run(), timeout=float(timeout))
+            return True
+        except TimeoutError:
+            log.warning(
+                'RISEx 4C resolution cycle timed out',
+                extra={'event_code': 'RISEX_4C_RESOLUTION_TIMEOUT'},
+            )
+            return False
+        except Exception:
+            log.warning(
+                'RISEx 4C resolution cycle failed',
+                extra={'event_code': 'RISEX_4C_RESOLUTION_FAILED'},
+                exc_info=True,
+            )
+            return False
+
     async def _run_reconcile_with_deadline(self, timeout: float | None = None) -> bool:
         if timeout is None:
             interval = float(settings.RECONCILE_INTERVAL_SECONDS)
@@ -833,6 +864,7 @@ class Worker:
                     await repair_stream(self.redis,db)
                     await monitor_credential_expiry(db, self.redis)
 
+                await self._run_risex_4c_resolution_with_deadline()
                 await self._poll_risex_control_once()
                 await self._maintain_risex_window_once()
                 await self._run_reconcile_with_deadline()
