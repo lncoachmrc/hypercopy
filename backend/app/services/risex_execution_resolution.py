@@ -739,6 +739,8 @@ async def resolve_risex_ambiguous_executions(
                     result["skipped"] += 1
                     continue
 
+                # Sensitivity mutation: reopen a DB transaction immediately before network I/O.
+                await db.execute(select(Execution.id).limit(1))
                 evidence = await _collect_risex_4c_resolution_evidence(
                     api,
                     rpc,
