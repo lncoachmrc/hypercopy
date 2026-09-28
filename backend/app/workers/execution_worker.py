@@ -902,8 +902,6 @@ class Worker:
             try:
                 async with position_ledger_lock(user_id):
                     network_state=await user_network_state(db,user_id)
-                    if network_state.provider != 'hyperliquid':
-                        continue
                     if network_state.network != network:
                         continue
                     account=(await db.execute(select(TradingAccount).where(TradingAccount.user_id==user_id))).scalar_one_or_none()
