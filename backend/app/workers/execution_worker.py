@@ -1018,20 +1018,6 @@ class Worker:
                           ON e.id = u.active_execution_epoch_id
                         WHERE u.state = 'ACTIVE'
                           AND u.copy_state IN ('ACTIVE','SHADOW','PAUSED')
-                          AND (
-                            (
-                              u.active_execution_epoch_id IS NULL
-                              AND lower(u.execution_provider) = 'hyperliquid'
-                            )
-                            OR
-                            (
-                              u.active_execution_epoch_id IS NOT NULL
-                              AND e.ended_at IS NULL
-                              AND lower(e.provider) = 'hyperliquid'
-                              AND lower(u.execution_provider) = lower(e.provider)
-                              AND lower(u.execution_network) = lower(e.network)
-                            )
-                          )
                     """))).scalars().all()
                     networks=[n for n in raw_networks if n in {'testnet','mainnet'}]
                     for network in networks:
