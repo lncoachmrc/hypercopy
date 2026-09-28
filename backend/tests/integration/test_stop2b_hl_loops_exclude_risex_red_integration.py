@@ -438,7 +438,11 @@ async def test_run_reconcile_if_leader_ignores_networks_owned_only_by_risex_user
 
         def scoped_text(sql):
             raw = str(sql)
-            if "SELECT DISTINCT u.execution_network" in raw:
+            if (
+                "SELECT DISTINCT" in raw
+                and "FROM users AS u" in raw
+                and "JOIN trading_accounts AS ta ON ta.user_id = u.id" in raw
+            ):
                 raw = raw.replace(
                     "WHERE u.state = 'ACTIVE'",
                     (
