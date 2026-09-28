@@ -1055,6 +1055,8 @@ async def reconcile_active_users(
         if is_master_source_user(user):
             continue
         network_state = await user_network_state(db, user.id)
+        if network_state.provider != 'hyperliquid':
+            continue
         if network_state.network != hl.network:
             continue
         await reconcile_user(
