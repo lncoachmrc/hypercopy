@@ -181,7 +181,11 @@ async def resolve_ambiguous_executions(
     """
 
     query = select(Execution.id, Execution.user_id).where(
-        Execution.state.in_([ExecutionState.SUBMITTING, ExecutionState.UNKNOWN])
+        Execution.state.in_([ExecutionState.SUBMITTING, ExecutionState.UNKNOWN]),
+        (
+            Execution.execution_provider.is_(None)
+            | (Execution.execution_provider == 'hyperliquid')
+        ),
     ).order_by(Execution.created_at)
     if user_id is not None:
         query = query.where(Execution.user_id == user_id)

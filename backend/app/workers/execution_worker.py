@@ -902,6 +902,8 @@ class Worker:
             try:
                 async with position_ledger_lock(user_id):
                     network_state=await user_network_state(db,user_id)
+                    if network_state.provider != 'hyperliquid':
+                        continue
                     if network_state.network != network:
                         continue
                     account=(await db.execute(select(TradingAccount).where(TradingAccount.user_id==user_id))).scalar_one_or_none()
@@ -1009,11 +1011,27 @@ class Worker:
             try:
                 async with SessionLocal() as db:
                     raw_networks=(await db.execute(text("""
-                        SELECT DISTINCT u.execution_network
+                        SELECT DISTINCT COALESCE(e.network, u.execution_network)
                         FROM users AS u
                         JOIN trading_accounts AS ta ON ta.user_id = u.id
+                        LEFT JOIN execution_epochs AS e
+                          ON e.id = u.active_execution_epoch_id
                         WHERE u.state = 'ACTIVE'
                           AND u.copy_state IN ('ACTIVE','SHADOW','PAUSED')
+                          AND (
+                            (
+                              u.active_execution_epoch_id IS NULL
+                              AND lower(u.execution_provider) = 'hyperliquid'
+                            )
+                            OR
+                            (
+                              u.active_execution_epoch_id IS NOT NULL
+                              AND e.ended_at IS NULL
+                              AND lower(e.provider) = 'hyperliquid'
+                              AND lower(u.execution_provider) = lower(e.provider)
+                              AND lower(u.execution_network) = lower(e.network)
+                            )
+                          )
                     """))).scalars().all()
                     networks=[n for n in raw_networks if n in {'testnet','mainnet'}]
                     for network in networks:
