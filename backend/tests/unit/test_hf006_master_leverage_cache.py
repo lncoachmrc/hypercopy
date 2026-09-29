@@ -571,7 +571,7 @@ async def test_watcher_replay_persists_history_without_creating_copy_jobs(monkey
     ]
 
     class FakeMasterAdapter:
-        async def user_fills_by_time(self, _address, cursor):
+        async def user_fills_by_time(self, _address, cursor, *, priority=None):
             assert cursor == 100
             return fills
 

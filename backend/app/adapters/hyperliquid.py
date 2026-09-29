@@ -20,7 +20,7 @@ from app.core.config import Network, settings
 from app.core.logging import get_logger
 from app.db.signer_action_lock import signer_action_lock
 from app.engine.sizing import AssetSpec, round_price
-from app.adapters.ratelimit import Priority, WEIGHT_CHEAP_INFO, WEIGHT_EXCHANGE_ACTION, WEIGHT_STANDARD_INFO, WEIGHT_USER_FILLS_MAX, WeightedRateLimiter
+from app.adapters.ratelimit import Priority, RateLimitExhausted, WEIGHT_CHEAP_INFO, WEIGHT_EXCHANGE_ACTION, WEIGHT_STANDARD_INFO, WEIGHT_USER_FILLS_MAX, WeightedRateLimiter
 
 log = get_logger(__name__)
 
@@ -139,6 +139,21 @@ def _unrealized_pnl(state: dict) -> Decimal:
         position = row.get('position', row)
         total += _decimal(position.get('unrealizedPnl'))
     return total
+
+
+_MAX_ABSTRACTION_LENGTH = 64
+
+
+def _valid_abstraction(raw: object) -> str | None:
+    """Accept only a non-empty, bounded account-mode string."""
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode('utf-8')
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(raw, str) or not raw or len(raw) > _MAX_ABSTRACTION_LENGTH:
+        return None
+    return raw
 
 
 WEIGHT_USER_FUNDING_MAX = WEIGHT_STANDARD_INFO + 25  # 500 rows => +25 weight
@@ -425,14 +440,31 @@ class HyperliquidAdapter:
             reservation = None
             limiter = self.limiter
             weight_fn = response_weight
-            if limiter is not None and weight_fn is not None:
-                reservation = await limiter.reserve(
-                    weight,
-                    priority,
-                    timeout=timeout,
+            try:
+                if limiter is not None and weight_fn is not None:
+                    reservation = await limiter.reserve(
+                        weight,
+                        priority,
+                        timeout=timeout,
+                    )
+                else:
+                    await self._acquire(weight, priority, timeout=timeout)
+            except RateLimitExhausted:
+                # Local lane exhaustion is not an exchange 429: no retry and no
+                # cooldown, but it must be visible per lane before propagating.
+                await self._metric_incr('hl_limiter_exhausted_count')
+                await self._metric_incr(f'hl_limiter_exhausted_count:{priority.name}')
+                log.warning(
+                    'Hyperliquid limiter lane exhausted before read',
+                    extra={
+                        'event_code': 'HL_LIMITER_EXHAUSTED',
+                        'network': self.network,
+                        'lane': priority.name,
+                        'weight': weight,
+                        'timeout': float(timeout),
+                    },
                 )
-            else:
-                await self._acquire(weight, priority, timeout=timeout)
+                raise
             try:
                 response = await asyncio.wait_for(
                     self._call(func, *args),
@@ -540,13 +572,50 @@ class HyperliquidAdapter:
         cached = self._abstraction_cache.get(key)
         if cached and cached[0] > time.monotonic():
             return cached[1]
+        local_ttl = min(300.0, float(settings.HL_ABSTRACTION_CACHE_TTL_SECONDS))
+        shared_key = f'hl:abstraction:{self.network}:{key}'
+        shared = await self._shared_abstraction_get(shared_key)
+        if shared is not None:
+            self._abstraction_cache[key] = (time.monotonic() + local_ttl, shared)
+            return shared
         value = await self._read(
             self.info.post, '/info', {'type': 'userAbstraction', 'user': address},
             weight=WEIGHT_STANDARD_INFO, priority=priority, timeout=15,
         )
         abstraction = str(value or 'default')
-        self._abstraction_cache[key] = (time.monotonic() + 300, abstraction)
+        self._abstraction_cache[key] = (time.monotonic() + local_ttl, abstraction)
+        await self._shared_abstraction_set(shared_key, abstraction)
         return abstraction
+
+    async def _shared_abstraction_get(self, shared_key: str) -> str | None:
+        """Cross-process userAbstraction cache; any Redis problem means a miss.
+
+        A miss always falls through to the authoritative HTTP read: this cache
+        can save weight but can never invent an account mode.
+        """
+        if self.limiter is None:
+            return None
+        try:
+            raw = await self.limiter._redis.get(shared_key)
+        except Exception:
+            await self._metric_incr('hl_abstraction_shared_cache_error_count')
+            return None
+        value = _valid_abstraction(raw)
+        if value is not None:
+            await self._metric_incr('hl_abstraction_shared_cache_hit_count')
+        return value
+
+    async def _shared_abstraction_set(self, shared_key: str, abstraction: str) -> None:
+        if self.limiter is None or _valid_abstraction(abstraction) is None:
+            return
+        try:
+            await self.limiter._redis.set(
+                shared_key,
+                abstraction,
+                ex=int(settings.HL_ABSTRACTION_CACHE_TTL_SECONDS),
+            )
+        except Exception:
+            await self._metric_incr('hl_abstraction_shared_cache_error_count')
 
     async def user_rate_limit(self, address: str, *, priority: Priority = Priority.DIAGNOSTIC) -> dict:
         """Read Hyperliquid's authoritative per-user action quota status."""
@@ -758,14 +827,21 @@ class HyperliquidAdapter:
             raise ValueError("Malformed Hyperliquid order status response")
         return value
 
-    async def user_fills_by_time(self, account: str, start_ms: int, end_ms: int | None = None) -> list[dict]:
+    async def user_fills_by_time(
+        self,
+        account: str,
+        start_ms: int,
+        end_ms: int | None = None,
+        *,
+        priority: Priority = Priority.RECONCILE,
+    ) -> list[dict]:
         return await self._read(
             self.info.user_fills_by_time,
             account,
             start_ms,
             end_ms,
             weight=WEIGHT_USER_FILLS_MAX,
-            priority=Priority.RECONCILE,
+            priority=priority,
             timeout=30,
             response_weight=_variable_info_response_weight,
         )

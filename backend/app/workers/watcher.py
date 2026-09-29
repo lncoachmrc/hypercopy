@@ -274,7 +274,9 @@ class Watcher:
         if start<=0: start=max(int(datetime.now(UTC).timestamp()*1000)-5*60*1000,0)
         seen=0; cursor=start
         for _ in range(5):
-            fills=await self.hl.user_fills_by_time(settings.HYPERLIQUID_MASTER_ADDRESS,cursor)
+            # Master continuity data: reserve on MASTER_STATE, never on the
+            # follower RECONCILE lane that reconciliation and AI saturate.
+            fills=await self.hl.user_fills_by_time(settings.HYPERLIQUID_MASTER_ADDRESS,cursor,priority=Priority.MASTER_STATE)
             fills=sorted(fills,key=lambda x:int(x.get('time',0)))
             new=[f for f in fills if int(f.get('time',0))>=cursor]
             if not new: return

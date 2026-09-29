@@ -11,7 +11,7 @@ from sqlalchemy import select, text
 
 from app.adapters.address_ratelimit import is_exchange_rate_limit_error
 from app.adapters.hyperliquid import HyperliquidAdapter, position_configs
-from app.adapters.ratelimit import Budget, Priority, WeightedRateLimiter
+from app.adapters.ratelimit import Budget, Priority, RateLimitExhausted, WeightedRateLimiter
 from app.adapters.risex import RISExAdapter
 from app.adapters.risex_types import ProviderWriteDisabled
 from app.core.config import Network, settings
@@ -977,6 +977,19 @@ class Worker:
         exc: Exception,
     ) -> int:
         error_info = (type(exc), exc, exc.__traceback__)
+        if isinstance(exc, RateLimitExhausted):
+            # The shared lane is already exhausted: re-reading every follower
+            # snapshot on it would only deepen the saturation.
+            log.warning(
+                'Follower observability refresh deferred after Hyperliquid limiter exhaustion',
+                extra={
+                    'event_code': 'FOLLOWER_OBSERVABILITY_LIMITER_DEFERRED',
+                    'master_network': settings.master_network,
+                    'follower_network': network,
+                    'error': str(exc),
+                },
+            )
+            return 0
         if is_exchange_rate_limit_error(exc):
             log.warning(
                 'Follower observability refresh deferred after Hyperliquid rate limit',

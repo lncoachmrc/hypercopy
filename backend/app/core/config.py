@@ -51,6 +51,10 @@ class Settings(BaseSettings):
     # last-known-good window bridges transient 429/5xx responses without
     # allowing old leverage data to live indefinitely.
     HL_MASTER_SNAPSHOT_TTL_SECONDS: float = 2.0
+    # userAbstraction (weight 20) shared across every process through Redis.
+    # A change of account mode is observed with at most this delay; a Redis
+    # miss or failure always falls back to the authoritative HTTP read.
+    HL_ABSTRACTION_CACHE_TTL_SECONDS: int = 3600
     HL_MASTER_SNAPSHOT_STALE_SECONDS: float = 15.0
     # Operational SLO for recovering authoritative master leverage after a
     # realtime fill could not carry it. The safety behavior remains fail-closed;
@@ -200,6 +204,8 @@ class Settings(BaseSettings):
             raise ValueError('SESSION_REFRESH_GRACE_SECONDS must be between 1 and SESSION_TTL_SECONDS')
         if self.WATCHER_LEASE_RENEW_SECONDS >= self.WATCHER_LEASE_TTL_SECONDS:
             raise ValueError('watcher lease renew interval must be lower than TTL')
+        if not 0 < self.HL_ABSTRACTION_CACHE_TTL_SECONDS <= 86_400:
+            raise ValueError('HL_ABSTRACTION_CACHE_TTL_SECONDS must be between 1 and 86400')
         if self.HL_MASTER_SNAPSHOT_TTL_SECONDS <= 0:
             raise ValueError('HL_MASTER_SNAPSHOT_TTL_SECONDS must be positive')
         if self.HL_MASTER_SNAPSHOT_STALE_SECONDS < self.HL_MASTER_SNAPSHOT_TTL_SECONDS:
