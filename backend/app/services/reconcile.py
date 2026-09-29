@@ -1081,43 +1081,11 @@ async def reconcile_active_users(
             continue
         if network_state.network != hl.network:
             continue
-        try:
-            await reconcile_user(
-                db, hl, user,
-                master_positions=mp, master_equity=me, mids=follower_mids, master_mids=source_mids,
-                master_configs=source_configs,
-            )
-        except RateLimitExhausted as exc:
-            # The shared lane is exhausted: every later follower would wait and
-            # fail the same way. Defer the rest of the cycle; rotation serves
-            # them first next time.
-            await db.rollback()
-            deferred = len(user_ids) - index
-            log.warning(
-                'Follower reconciliation deferred: Hyperliquid limiter lane exhausted',
-                extra={
-                    'event_code': 'RECONCILE_USER_DEFERRED_LIMITER',
-                    'user_id': str(user_id),
-                    'follower_network': hl.network,
-                    'deferred': deferred,
-                    'error': str(exc),
-                },
-            )
-            break
-        except Exception as exc:
-            await db.rollback()
-            failed += 1
-            log.warning(
-                'Follower reconciliation failed; continuing with the next follower',
-                extra={
-                    'event_code': 'RECONCILE_USER_FAILED',
-                    'user_id': str(user_id),
-                    'follower_network': hl.network,
-                    'error_type': type(exc).__name__,
-                },
-                exc_info=True,
-            )
-            continue
+        await reconcile_user(
+            db, hl, user,
+            master_positions=mp, master_equity=me, mids=follower_mids, master_mids=source_mids,
+            master_configs=source_configs,
+        )
         reconciled += 1
         if limit is not None and reconciled >= limit:
             break
