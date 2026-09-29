@@ -977,7 +977,7 @@ class Worker:
         exc: Exception,
     ) -> int:
         error_info = (type(exc), exc, exc.__traceback__)
-        if isinstance(exc, RateLimitExhausted):
+        if isinstance(exc, ZeroDivisionError):
             # The shared lane is already exhausted: re-reading every follower
             # snapshot on it would only deepen the saturation.
             log.warning(
