@@ -6,13 +6,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Awaitable, Callable
 from decimal import ROUND_HALF_UP, Decimal
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.action_errors import ActionErrorClass, classify_action_error
 from app.adapters.hyperliquid import HyperliquidAdapter, PositionConfig, fill_event_id, position_configs
-from app.adapters.ratelimit import Priority
+from app.adapters.ratelimit import Priority, RateLimitExhausted
 from app.core.config import settings
 from app.db.position_ledger_lock import position_ledger_lock
 from app.db.redis import redis_client
@@ -1045,13 +1045,35 @@ async def reconcile_active_users(
         if source_hl.network == hl.network
         else await hl.mids(priority=Priority.RECONCILE)
     )
-    query = select(User).join(TradingAccount, TradingAccount.user_id == User.id).where(
-        User.state == UserState.ACTIVE,
-        User.copy_state.in_([CopyState.ACTIVE, CopyState.SHADOW, CopyState.PAUSED]),
-    ).order_by(User.created_at)
-    users = (await db.execute(query)).scalars().all()
+    # Rotation: followers that waited the longest since their last
+    # reconciliation go first, so a deferred or failed follower is served at
+    # the start of the next cycle instead of always after the same users.
+    last_run = (
+        select(
+            ReconciliationRun.user_id.label('user_id'),
+            func.max(ReconciliationRun.started_at).label('last_started_at'),
+        )
+        .group_by(ReconciliationRun.user_id)
+        .subquery()
+    )
+    query = (
+        select(User.id)
+        .join(TradingAccount, TradingAccount.user_id == User.id)
+        .outerjoin(last_run, last_run.c.user_id == User.id)
+        .where(
+            User.state == UserState.ACTIVE,
+            User.copy_state.in_([CopyState.ACTIVE, CopyState.SHADOW, CopyState.PAUSED]),
+        )
+        .order_by(last_run.c.last_started_at.asc().nulls_first(), User.created_at)
+    )
+    user_ids = list((await db.execute(query)).scalars().all())
     reconciled = 0
-    for user in users:
+    failed = 0
+    deferred = 0
+    for index, user_id in enumerate(user_ids):
+        user = await db.get(User, user_id)
+        if user is None:
+            continue
         if is_master_source_user(user):
             continue
         network_state = await user_network_state(db, user.id)
@@ -1059,12 +1081,54 @@ async def reconcile_active_users(
             continue
         if network_state.network != hl.network:
             continue
-        await reconcile_user(
-            db, hl, user,
-            master_positions=mp, master_equity=me, mids=follower_mids, master_mids=source_mids,
-            master_configs=source_configs,
-        )
+        try:
+            await reconcile_user(
+                db, hl, user,
+                master_positions=mp, master_equity=me, mids=follower_mids, master_mids=source_mids,
+                master_configs=source_configs,
+            )
+        except RateLimitExhausted as exc:
+            # The shared lane is exhausted: every later follower would wait and
+            # fail the same way. Defer the rest of the cycle; rotation serves
+            # them first next time.
+            await db.rollback()
+            deferred = len(user_ids) - index
+            log.warning(
+                'Follower reconciliation deferred: Hyperliquid limiter lane exhausted',
+                extra={
+                    'event_code': 'RECONCILE_USER_DEFERRED_LIMITER',
+                    'user_id': str(user_id),
+                    'follower_network': hl.network,
+                    'deferred': deferred,
+                    'error': str(exc),
+                },
+            )
+            break
+        except Exception as exc:
+            await db.rollback()
+            failed += 1
+            log.warning(
+                'Follower reconciliation failed; continuing with the next follower',
+                extra={
+                    'event_code': 'RECONCILE_USER_FAILED',
+                    'user_id': str(user_id),
+                    'follower_network': hl.network,
+                    'error_type': type(exc).__name__,
+                },
+                exc_info=True,
+            )
+            continue
         reconciled += 1
         if limit is not None and reconciled >= limit:
             break
+    log.info(
+        'Reconciliation cycle completed',
+        extra={
+            'event_code': 'RECONCILE_CYCLE_COMPLETED',
+            'follower_network': hl.network,
+            'reconciled': reconciled,
+            'failed': failed,
+            'deferred': deferred,
+        },
+    )
     return reconciled
