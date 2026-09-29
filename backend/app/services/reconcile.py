@@ -1103,7 +1103,7 @@ async def reconcile_active_users(
                     'error': str(exc),
                 },
             )
-            break
+            continue
         except Exception as exc:
             await db.rollback()
             failed += 1
