@@ -1064,7 +1064,7 @@ async def reconcile_active_users(
             User.state == UserState.ACTIVE,
             User.copy_state.in_([CopyState.ACTIVE, CopyState.SHADOW, CopyState.PAUSED]),
         )
-        .order_by(last_run.c.last_started_at.asc().nulls_first(), User.created_at)
+        .order_by(User.created_at)
     )
     user_ids = list((await db.execute(query)).scalars().all())
     reconciled = 0
