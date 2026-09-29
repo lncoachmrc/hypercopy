@@ -599,7 +599,7 @@ class HyperliquidAdapter:
             raw = await self.limiter._redis.get(shared_key)
         except Exception:
             await self._metric_incr('hl_abstraction_shared_cache_error_count')
-            return None
+            return 'default'
         value = _valid_abstraction(raw)
         if value is not None:
             await self._metric_incr('hl_abstraction_shared_cache_hit_count')
