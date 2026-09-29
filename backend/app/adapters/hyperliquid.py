@@ -574,7 +574,7 @@ class HyperliquidAdapter:
             return cached[1]
         local_ttl = min(300.0, float(settings.HL_ABSTRACTION_CACHE_TTL_SECONDS))
         shared_key = f'hl:abstraction:{self.network}:{key}'
-        shared = await self._shared_abstraction_get(shared_key)
+        shared = None
         if shared is not None:
             self._abstraction_cache[key] = (time.monotonic() + local_ttl, shared)
             return shared
