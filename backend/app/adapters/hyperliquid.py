@@ -450,20 +450,6 @@ class HyperliquidAdapter:
                 else:
                     await self._acquire(weight, priority, timeout=timeout)
             except RateLimitExhausted:
-                # Local lane exhaustion is not an exchange 429: no retry and no
-                # cooldown, but it must be visible per lane before propagating.
-                await self._metric_incr('hl_limiter_exhausted_count')
-                await self._metric_incr(f'hl_limiter_exhausted_count:{priority.name}')
-                log.warning(
-                    'Hyperliquid limiter lane exhausted before read',
-                    extra={
-                        'event_code': 'HL_LIMITER_EXHAUSTED',
-                        'network': self.network,
-                        'lane': priority.name,
-                        'weight': weight,
-                        'timeout': float(timeout),
-                    },
-                )
                 raise
             try:
                 response = await asyncio.wait_for(
