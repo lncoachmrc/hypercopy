@@ -52,6 +52,11 @@ def _llm_enabled() -> bool:
     return os.getenv("LLM_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _shadow_retention_allowed(*, mode: ProfitExitFeatureMode, follower_position: Decimal) -> bool:
+    """Research signal: SHORT-only. Never influence ON execution."""
+    return mode is ProfitExitFeatureMode.SHADOW and follower_position < 0
+
+
 def _validated_profit_exit_action(raw: object) -> tuple[ProfitExitAction, str]:
     if not isinstance(raw, dict):
         return ProfitExitAction.ABSTAIN, "LLM response is not a JSON object"
@@ -324,7 +329,7 @@ async def evaluate_profit_exit_portfolio(
         if await db.get(AIProfitExitDecision, decision_id) is not None:
             continue
 
-        if mode is ProfitExitFeatureMode.SHADOW:
+        if _shadow_retention_allowed(mode=mode, follower_position=observation.current_position):
             # Research-only: historical samples never influence ON execution.
             # Match the exact source cycle/version and follower size to avoid
             # comparing PnL across scale-ins, reversals, or changed destinations.
