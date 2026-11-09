@@ -40,6 +40,7 @@ from app.services.ai_profit_exit_collector import (
     collect_shadow_profit_exit_economics,
 )
 from app.services.ai_profit_exit_mode import read_profit_exit_mode
+from app.services.ai_profit_exit_telemetry import record_shadow_observation
 from app.services.ai_profit_exit_retention import RETENTION_VARIANT, read_retention_context
 from app.services.master_source_identity import is_master_source_user
 from app.services.networking import user_network_state
@@ -293,6 +294,23 @@ async def evaluate_profit_exit_portfolio(
             if user.copy_state == CopyState.SHADOW
             else Decimal(str(ledger.size)) == observation.current_position
         )
+        if mode is ProfitExitFeatureMode.SHADOW and user.copy_state == CopyState.SHADOW:
+            # Record negative/zero PnL and incomplete prices even when the AI
+            # must abstain. Only read-only market data was collected above.
+            await record_shadow_observation(
+                db,
+                user_id=user.id,
+                execution_epoch_id=destination.epoch_id,
+                execution_provider=destination.provider,
+                execution_network=destination.network,
+                asset=ledger.asset,
+                source_cycle_id=cycle.source_cycle_id,
+                state_version=cycle.state_version,
+                evaluation_slot=evaluation_slot,
+                observation=observation,
+                position_matches=position_matches,
+            )
+
         if (
             not observation.complete
             or not observation.eligible
