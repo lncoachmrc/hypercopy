@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import statistics
@@ -9,13 +10,51 @@ import urllib.request
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import NamedTuple
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.entities import MasterEvent, SystemFlag
 
 AI_FLAG_SLUG = 'ai:master_strategy_intelligence'
+MASTER_STRATEGY_FEATURE_VERSION = 1
+CAPITAL_INTELLIGENCE_SYSTEM_PROMPT = (
+    'You are Traxion Capital Intelligence. Analyze an observed master copy-trading strategy. '
+    'You are advisory only: never invent orders, leverage, prices, or risk overrides. '
+    'Return JSON only with keys summary, observed_patterns, capital_policy, confidence. '
+    'capital_policy must include buffer_pct, minimum_coverage_pct, preferred_coverage_pct, '
+    'micro_position_policy, rebalance_urgency.'
+)
+
+
+class MasterSourceCursor(NamedTuple):
+    event_ts: datetime
+    exchange_event_id: str
+    boundary_count: int
+
+
+async def read_master_source_cursor(db: AsyncSession) -> MasterSourceCursor | None:
+    """Read the latest timestamp and its full boundary count in one DB snapshot.
+
+    IDs are not chronological. Counting every row at the timestamp detects a
+    newly committed equal-time fill even when its ID sorts before the last ID.
+    The timestamp index bounds the count; this does not scan all historical rows.
+    """
+    latest_ts = select(func.max(MasterEvent.event_ts)).correlate(None).scalar_subquery()
+    row = (await db.execute(
+        select(
+            MasterEvent.event_ts.label('source_event_ts'),
+            MasterEvent.exchange_event_id,
+            func.count().over().label('boundary_count'),
+        )
+        .where(MasterEvent.event_ts == latest_ts)
+        .order_by(MasterEvent.exchange_event_id.desc())
+        .limit(1)
+    )).first()
+    if row is None:
+        return None
+    return MasterSourceCursor(row[0], row[1], int(row[2]))
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -282,64 +321,170 @@ def _validated_analysis(raw: dict) -> dict:
     }
 
 
+def _analysis_input_fingerprint(events: list[MasterEvent], *, mode: str, days: int) -> str:
+    """Hash data, provider configuration, actual prompt and feature version."""
+    payload = {
+        'version': 2,
+        'system_prompt_sha256': hashlib.sha256(CAPITAL_INTELLIGENCE_SYSTEM_PROMPT.encode('utf-8')).hexdigest(),
+        'feature_version': MASTER_STRATEGY_FEATURE_VERSION,
+        'mode': mode,
+        'lookback_days': days,
+        'providers': provider_chain(),
+        'events': [
+            (
+                event.exchange_event_id,
+                event.event_ts.isoformat(),
+                event.asset,
+                str(event.size),
+                str(event.price),
+                str(event.start_position),
+                str(event.position_after),
+                str(event.master_equity),
+            )
+            for event in events
+        ],
+    }
+    encoded = json.dumps(payload, separators=(',', ':'), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+
+
+def _last_valid_analysis(previous: dict) -> dict | None:
+    """Keep old evidence for audit, never as an active analysis on empty input."""
+    snapshot = previous.get('last_valid_analysis')
+    if isinstance(snapshot, dict):
+        return snapshot
+    profile = previous.get('strategy_profile')
+    if (
+        previous.get('status') == 'ok'
+        and isinstance(profile, dict)
+        and profile.get('lookback_events', 0) > 0
+        and previous.get('source_event_ts')
+        and isinstance(previous.get('analysis'), dict)
+    ):
+        return {
+            'analysis': previous['analysis'],
+            'strategy_profile': profile,
+            'source_event_ts': previous['source_event_ts'],
+            'source_event_id': previous.get('source_event_id'),
+            'analyzed_at': previous.get('updated_at'),
+        }
+    return None
+
+
 async def refresh_ai_intelligence(db: AsyncSession, *, force: bool = False) -> dict:
     enabled = _env_bool('LLM_ENABLED', False)
     mode = os.getenv('LLM_MODE', 'shadow').strip().lower() or 'shadow'
     row = await db.get(SystemFlag, AI_FLAG_SLUG)
+    previous = (row.value or {}) if row else {}
     now = datetime.now(UTC)
     interval = max(int(os.getenv('LLM_ANALYSIS_INTERVAL_SECONDS', '900')), 60)
     if not force and row and row.updated_at and (now - row.updated_at).total_seconds() < interval:
-        return row.value or {}
+        return previous
+
+    # Capture before reading model inputs. An arrival during the provider call
+    # must remain detectable, rather than being acknowledged without analysis.
+    latest_persisted = await read_master_source_cursor(db)
+    observed = {
+        'observed_source_event_ts': latest_persisted.event_ts.isoformat() if latest_persisted else None,
+        'observed_source_event_id': latest_persisted.exchange_event_id if latest_persisted else None,
+        'observed_source_boundary_count': latest_persisted.boundary_count if latest_persisted else 0,
+    }
+    same_cursor = all(previous.get(key) == value for key, value in observed.items())
+    preferred = os.getenv('LLM_PREFERRED_MODEL', '').strip()
+    last_valid = _last_valid_analysis(previous)
 
     if not enabled:
-        value = {'status': 'disabled', 'mode': mode, 'updated_at': now.isoformat()}
+        if previous.get('status') == 'disabled' and previous.get('mode') == mode and same_cursor:
+            return previous
+        value = {
+            'status': 'disabled',
+            'mode': mode,
+            'analysis': None,
+            'last_valid_analysis': last_valid,
+            'source_event_ts': None,
+            'source_event_id': None,
+            **observed,
+            'updated_at': now.isoformat(),
+        }
     else:
         days = max(min(int(os.getenv('LLM_LOOKBACK_DAYS', '30')), 180), 1)
         cutoff = now - timedelta(days=days)
         events = (await db.execute(
-            select(MasterEvent).where(MasterEvent.event_ts >= cutoff).order_by(MasterEvent.event_ts.desc()).limit(5000)
+            select(MasterEvent)
+            .where(MasterEvent.event_ts >= cutoff)
+            .order_by(MasterEvent.event_ts.desc(), MasterEvent.exchange_event_id.desc())
+            .limit(5000)
         )).scalars().all()
         events = list(reversed(events))
         latest_event = events[-1] if events else None
-        profile = learn_master_strategy(events)
-        preferred = os.getenv('LLM_PREFERRED_MODEL', '').strip()
-        system = (
-            'You are Traxion Capital Intelligence. Analyze an observed master copy-trading strategy. '
-            'You are advisory only: never invent orders, leverage, prices, or risk overrides. '
-            'Return JSON only with keys summary, observed_patterns, capital_policy, confidence. '
-            'capital_policy must include buffer_pct, minimum_coverage_pct, preferred_coverage_pct, '
-            'micro_position_policy, rebalance_urgency.'
-        )
-        prompt = json.dumps({'master_strategy_profile': profile, 'execution_mode': mode}, separators=(',', ':'))
-        try:
-            raw, runtime = await call_llm_with_failover(system, prompt)
+        fingerprint = _analysis_input_fingerprint(events, mode=mode, days=days)
+
+        if not events:
+            if (
+                previous.get('status') == 'insufficient_data'
+                and previous.get('input_fingerprint') == fingerprint
+                and same_cursor
+            ):
+                return previous
             value = {
-                'status': 'ok',
+                'status': 'insufficient_data',
+                'data_quality': 'stale_source' if latest_persisted else 'no_master_history',
+                'reason': 'No master events in the configured lookback',
                 'mode': mode,
                 'preferred_model': preferred,
-                'provider': runtime['provider'],
-                'model': runtime['model'],
-                'fallback_index': runtime['fallback_index'],
-                'provider_failures': runtime['failures'],
-                'strategy_profile': profile,
-                'analysis': _validated_analysis(raw),
-                'source_event_ts': latest_event.event_ts.isoformat() if latest_event else None,
-                'source_event_id': latest_event.exchange_event_id if latest_event else None,
+                'strategy_profile': learn_master_strategy([]),
+                'analysis': None,
+                'last_valid_analysis': last_valid,
+                'source_event_ts': None,
+                'source_event_id': None,
+                'input_fingerprint': fingerprint,
+                **observed,
                 'updated_at': now.isoformat(),
             }
-        except Exception as exc:
-            previous = (row.value or {}) if row else {}
-            value = {
-                **previous,
-                'status': 'degraded',
-                'mode': mode,
-                'preferred_model': preferred,
-                'last_error': f'{type(exc).__name__}: {exc}'[:1200],
-                'strategy_profile': profile,
-                'attempted_source_event_ts': latest_event.event_ts.isoformat() if latest_event else None,
-                'attempted_source_event_id': latest_event.exchange_event_id if latest_event else None,
-                'updated_at': now.isoformat(),
-            }
+        elif previous.get('status') == 'ok' and previous.get('input_fingerprint') == fingerprint:
+            # A cursor/input read race may leave metadata one arrival behind.
+            # Repair it without another LLM call or a fake analysis timestamp.
+            if same_cursor:
+                return previous
+            value = {**previous, **observed}
+        else:
+            profile = learn_master_strategy(events)
+            system = CAPITAL_INTELLIGENCE_SYSTEM_PROMPT
+            prompt = json.dumps({'master_strategy_profile': profile, 'execution_mode': mode}, separators=(',', ':'))
+            try:
+                raw, runtime = await call_llm_with_failover(system, prompt)
+                value = {
+                    'status': 'ok',
+                    'data_quality': 'ready',
+                    'mode': mode,
+                    'preferred_model': preferred,
+                    'provider': runtime['provider'],
+                    'model': runtime['model'],
+                    'fallback_index': runtime['fallback_index'],
+                    'provider_failures': runtime['failures'],
+                    'strategy_profile': profile,
+                    'analysis': _validated_analysis(raw),
+                    'source_event_ts': latest_event.event_ts.isoformat(),
+                    'source_event_id': latest_event.exchange_event_id,
+                    'input_fingerprint': fingerprint,
+                    **observed,
+                    'updated_at': now.isoformat(),
+                }
+            except Exception as exc:
+                value = {
+                    **previous,
+                    'status': 'degraded',
+                    'data_quality': 'provider_error',
+                    'mode': mode,
+                    'preferred_model': preferred,
+                    'last_error': f'{type(exc).__name__}: {exc}'[:1200],
+                    'last_valid_analysis': last_valid,
+                    'attempted_input_fingerprint': fingerprint,
+                    'attempted_source_event_ts': latest_event.event_ts.isoformat(),
+                    'attempted_source_event_id': latest_event.exchange_event_id,
+                    **observed,
+                    'updated_at': now.isoformat(),
+                }
 
     if not row:
         row = SystemFlag(slug=AI_FLAG_SLUG, enabled=enabled, value=value, reason='Traxion LLM capital intelligence')
