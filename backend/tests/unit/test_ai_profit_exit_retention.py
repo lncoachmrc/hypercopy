@@ -8,7 +8,7 @@ from decimal import Decimal as D
 import pytest
 
 from app.services import ai_profit_exit_decision as decision
-from app.services.ai_profit_exit import ProfitExitAction
+from app.services.ai_profit_exit import ProfitExitAction, ProfitExitFeatureMode
 from app.services.ai_profit_exit_retention import (
     RETENTION_VARIANT,
     build_retention_context,
@@ -159,7 +159,7 @@ async def test_shadow_prompt_uses_observed_profit_erosion_without_hard_threshold
 def test_retention_context_is_only_loaded_for_shadow_mode_after_dedupe():
     source = inspect.getsource(decision.evaluate_profit_exit_portfolio)
     duplicate_index = source.index("if await db.get(AIProfitExitDecision, decision_id) is not None:")
-    pilot_index = source.index("if mode is ProfitExitFeatureMode.SHADOW:")
+    pilot_index = source.index("if _shadow_retention_allowed(mode=mode, follower_position=observation.current_position):")
     call_index = source.index("action, reason, runtime = await _decide_with_ai(inputs)")
     assert duplicate_index < pilot_index < call_index
     pilot_scope = source[pilot_index:call_index]
@@ -171,3 +171,20 @@ def test_retention_context_is_only_loaded_for_shadow_mode_after_dedupe():
     # The operational branch must remain gated by ON and ACTIVE.
     assert "mode is ProfitExitFeatureMode.ON" in source
     assert "and user.copy_state == CopyState.ACTIVE" in source
+
+
+@pytest.mark.parametrize(
+    ("mode", "position", "expected"),
+    [
+        (ProfitExitFeatureMode.SHADOW, "-1", True),
+        (ProfitExitFeatureMode.SHADOW, "1", False),
+        (ProfitExitFeatureMode.SHADOW, "0", False),
+        (ProfitExitFeatureMode.ON, "-1", False),
+        (ProfitExitFeatureMode.ON, "1", False),
+        (ProfitExitFeatureMode.OFF, "-1", False),
+    ],
+)
+def test_retention_v1_only_in_shadow_short(mode, position, expected):
+    assert decision._shadow_retention_allowed(
+        mode=mode, follower_position=D(position)
+    ) is expected
