@@ -40,6 +40,8 @@ from app.services.ai_profit_exit_collector import (
     collect_shadow_profit_exit_economics,
 )
 from app.services.ai_profit_exit_mode import read_profit_exit_mode
+from app.services.ai_profit_exit_telemetry import record_shadow_observation
+from app.services.ai_profit_exit_retention import RETENTION_VARIANT, read_retention_context
 from app.services.master_source_identity import is_master_source_user
 from app.services.networking import user_network_state
 from app.services.queue import publish_job
@@ -49,6 +51,11 @@ from app.services.strategy_intents import master_position_from_state
 
 def _llm_enabled() -> bool:
     return os.getenv("LLM_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _shadow_retention_allowed(*, mode: ProfitExitFeatureMode, follower_position: Decimal) -> bool:
+    """Research signal: SHORT-only. Never influence ON execution."""
+    return mode is ProfitExitFeatureMode.SHADOW and follower_position < 0
 
 
 def _validated_profit_exit_action(raw: object) -> tuple[ProfitExitAction, str]:
@@ -86,6 +93,22 @@ async def _decide_with_ai(payload: dict) -> tuple[ProfitExitAction, str, dict]:
         "funding is not modeled and the result is record-only. Treat material uncertainty "
         "conservatively and use ABSTAIN when that uncertainty prevents a reliable choice."
     )
+    retention = payload.get("profit_retention")
+    if (
+        isinstance(retention, dict)
+        and retention.get("variant") == RETENTION_VARIANT
+        and retention.get("status") == "observed"
+    ):
+        system += (
+            " SHADOW-ONLY PROFIT RETENTION RESEARCH: the supplied observed_peak_net_pnl "
+            "comes from prior durable evaluation samples, not intraperiod market highs. "
+            "Consider recent net-profit change and observed giveback when judging whether "
+            "an already-profitable position should be closed now rather than held. "
+            "A single sample provides no trend; do not infer unobserved prices or future "
+            "returns, and do not introduce a fixed exit threshold or trailing-stop rule. "
+            "If funding is incomplete or the evidence is weak, prefer ABSTAIN. "
+            "Any CLOSE_PROFIT in SHADOW is only a recorded hypothesis, never an order."
+        )
     try:
         raw, runtime = await call_llm_with_failover(
             system,
@@ -271,6 +294,23 @@ async def evaluate_profit_exit_portfolio(
             if user.copy_state == CopyState.SHADOW
             else Decimal(str(ledger.size)) == observation.current_position
         )
+        if mode is ProfitExitFeatureMode.SHADOW and user.copy_state == CopyState.SHADOW:
+            # Record negative/zero PnL and incomplete prices even when the AI
+            # must abstain. Only read-only market data was collected above.
+            await record_shadow_observation(
+                db,
+                user_id=user.id,
+                execution_epoch_id=destination.epoch_id,
+                execution_provider=destination.provider,
+                execution_network=destination.network,
+                asset=ledger.asset,
+                source_cycle_id=cycle.source_cycle_id,
+                state_version=cycle.state_version,
+                evaluation_slot=evaluation_slot,
+                observation=observation,
+                position_matches=position_matches,
+            )
+
         if (
             not observation.complete
             or not observation.eligible
@@ -306,6 +346,24 @@ async def evaluate_profit_exit_portfolio(
         )
         if await db.get(AIProfitExitDecision, decision_id) is not None:
             continue
+
+        if _shadow_retention_allowed(mode=mode, follower_position=observation.current_position):
+            # Research-only: historical samples never influence ON execution.
+            # Match the exact source cycle/version and follower size to avoid
+            # comparing PnL across scale-ins, reversals, or changed destinations.
+            inputs["profit_retention"] = await read_retention_context(
+                db,
+                user_id=user.id,
+                execution_epoch_id=destination.epoch_id,
+                execution_provider=destination.provider,
+                execution_network=destination.network,
+                asset=ledger.asset,
+                source_cycle_id=cycle.source_cycle_id,
+                state_version=cycle.state_version,
+                follower_position_size=observation.current_position,
+                pnl_complete=observation.pnl_complete,
+                current_net_pnl=observation.economics.net_pnl,
+            )
 
         action, reason, runtime = await _decide_with_ai(inputs)
         decision_now = datetime.now(UTC)
