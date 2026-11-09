@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import os
 from decimal import Decimal
 
 import pytest
@@ -44,7 +45,7 @@ class _Session:
             reverse=True,
         )
         if stmt.whereclause is not None:
-            days = intelligence.max(min(int(__import__('os').getenv('LLM_LOOKBACK_DAYS', '30')), 180), 1)
+            days = max(min(int(os.getenv('LLM_LOOKBACK_DAYS', '30')), 180), 1)
             cutoff = datetime.now(UTC) - timedelta(days=days)
             return _Result([e for e in ordered if e.event_ts >= cutoff][:5000])
         return _Result(ordered[:1])
