@@ -53,6 +53,31 @@ async def test_duplicate_redis_signal_does_not_mark_pending():
 
 
 @pytest.mark.asyncio
+async def test_equal_timestamp_redis_fill_reaches_fingerprint_check():
+    worker = module.AIIntelligenceWorker.__new__(module.AIIntelligenceWorker)
+    ts = datetime(2026, 10, 3, tzinfo=UTC)
+
+    class Redis:
+        async def brpop(self, *_args, **_kwargs):
+            return ('events', json.dumps({
+                'event_ts': ts.isoformat(), 'exchange_event_id': 'another-fill',
+            }))
+
+        async def rpop(self, *_args, **_kwargs):
+            return None
+
+    worker.redis = Redis()
+    worker.queue = 'events'
+    worker.poll = 1
+    worker._source_ts = ts
+    worker._pending = False
+    worker._last_signal_mono = None
+
+    assert await worker._consume_signal() is True
+    assert worker._pending is True
+
+
+@pytest.mark.asyncio
 async def test_db_fallback_detects_new_event_after_stale_cursor():
     worker = module.AIIntelligenceWorker.__new__(module.AIIntelligenceWorker)
     worker._source_ts = datetime(2026, 10, 3, tzinfo=UTC)
