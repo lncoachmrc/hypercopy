@@ -20,6 +20,9 @@ class _Result:
     def scalar_one_or_none(self):
         return self.values[0] if self.values else None
 
+    def first(self):
+        return self.values[0] if self.values else None
+
     def scalars(self):
         return self
 
@@ -44,6 +47,12 @@ class _Session:
             key=lambda item: (item.event_ts, item.exchange_event_id),
             reverse=True,
         )
+        if stmt.column_descriptions[0]['name'] == 'source_event_ts':
+            if not ordered:
+                return _Result([])
+            latest = ordered[0]
+            boundary_count = sum(e.event_ts == latest.event_ts for e in ordered)
+            return _Result([(latest.event_ts, latest.exchange_event_id, boundary_count)])
         if stmt.whereclause is not None:
             days = max(min(int(os.getenv('LLM_LOOKBACK_DAYS', '30')), 180), 1)
             cutoff = datetime.now(UTC) - timedelta(days=days)
