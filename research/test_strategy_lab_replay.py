@@ -96,7 +96,7 @@ class StrategyLabTests(unittest.TestCase):
         cycle = self.cycle(partial=True)
         bars = self.bars([100, 110, 108, 98, 98, 98])
         observed = candidate_observations(cycle, bars, D(0), D(0), D(0))
-        after_partial = [x for x in observed if x["state"] == 2][0]
+        after_partial = [x for x in observed if x["state"] == 2][-1]
         # The partial close realized +1.5; the remaining position at 98
         # is *not* profitable, even if cumulative cycle PnL can be positive.
         self.assertLess(after_partial["net_est"], D(0))
