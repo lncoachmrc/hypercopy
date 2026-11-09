@@ -33,7 +33,7 @@ async def test_expired_lookback_cursor_does_not_trigger_old_event_again():
 
 
 @pytest.mark.asyncio
-async def test_duplicate_redis_signal_does_not_mark_pending():
+async def test_older_redis_signal_does_not_mark_pending():
     worker = module.AIIntelligenceWorker.__new__(module.AIIntelligenceWorker)
     ts = datetime(2026, 10, 3, tzinfo=UTC)
 
@@ -44,7 +44,7 @@ async def test_duplicate_redis_signal_does_not_mark_pending():
     worker.redis = Redis()
     worker.queue = 'events'
     worker.poll = 1
-    worker._source_ts = ts
+    worker._source_ts = ts + timedelta(seconds=1)
     worker._pending = False
     worker._last_signal_mono = None
 
