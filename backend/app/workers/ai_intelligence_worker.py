@@ -184,7 +184,9 @@ class AIIntelligenceWorker:
 
         _,payload=result
         ts=_signal_ts(payload)
-        if ts is not None and self._source_ts is not None and ts <= self._source_ts:
+        # Distinct fills can share one millisecond. Do not drop equal-time
+        # notifications: the persisted input fingerprint deduplicates repeats.
+        if ts is not None and self._source_ts is not None and ts < self._source_ts:
             return False
 
         self._pending=True
