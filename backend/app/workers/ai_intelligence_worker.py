@@ -6,7 +6,7 @@ import os
 import signal
 from datetime import UTC, datetime
 
-from sqlalchemy import select, text
+from sqlalchemy import text
 
 from app.adapters.hyperliquid import HyperliquidAdapter
 from app.adapters.ratelimit import Budget, WeightedRateLimiter
@@ -15,8 +15,12 @@ from app.core.logging import configure_logging, get_logger
 from app.db.redis import redis_client
 from app.db.schema import assert_schema
 from app.db.session import SessionLocal, engine
-from app.models.entities import MasterEvent
-from app.services.ai_intelligence import read_ai_intelligence, refresh_ai_intelligence
+from app.services.ai_intelligence import (
+    MasterSourceCursor,
+    read_ai_intelligence,
+    read_master_source_cursor,
+    refresh_ai_intelligence,
+)
 from app.services.ai_profit_exit import ProfitExitFeatureMode
 from app.services.ai_profit_exit_mode import read_profit_exit_mode
 from app.services.ai_profit_exit_decision import evaluate_profit_exit_portfolio
@@ -85,6 +89,7 @@ class AIIntelligenceWorker:
         self._pending=False
         self._last_signal_mono: float | None=None
         self._source_ts: datetime | None=None
+        self._source_boundary_count: int | None=None
         self.profit_exit_interval=max(int(settings.AI_PROFIT_EXIT_EVAL_SECONDS),1)
         self._last_profit_exit_eval=0.0
 
@@ -98,11 +103,9 @@ class AIIntelligenceWorker:
             self.followers[network]=adapter
         return adapter
 
-    async def _latest_master_event(self) -> MasterEvent | None:
+    async def _latest_master_event(self) -> MasterSourceCursor | None:
         async with SessionLocal() as db:
-            return (await db.execute(
-                select(MasterEvent).order_by(MasterEvent.event_ts.desc(), MasterEvent.exchange_event_id.desc()).limit(1)
-            )).scalar_one_or_none()
+            return await read_master_source_cursor(db)
 
     async def _state(self) -> dict:
         async with SessionLocal() as db:
@@ -112,15 +115,31 @@ class AIIntelligenceWorker:
         async with SessionLocal() as db:
             return await read_profit_exit_mode(db)
 
+    def _set_source_cursor(self, state: dict) -> None:
+        self._source_ts=_parse_ts(state.get('observed_source_event_ts') or state.get('source_event_ts'))
+        count=state.get('observed_source_boundary_count')
+        self._source_boundary_count=(
+            count if isinstance(count,int) and not isinstance(count,bool) and count >= 0 else None
+        )
+
     async def _sync_source_from_state(self) -> dict:
         state=await self._state()
-        self._source_ts=_parse_ts(state.get('observed_source_event_ts') or state.get('source_event_ts'))
+        self._set_source_cursor(state)
         return state
 
-    def _is_new_event(self, event: MasterEvent | None) -> bool:
+    def _is_new_event(self, event: MasterSourceCursor | None) -> bool:
         if event is None:
             return False
-        return self._source_ts is None or event.event_ts > self._source_ts
+        if self._source_ts is None or event.event_ts > self._source_ts:
+            return True
+        # Legacy saved states have no count: recheck their boundary once.
+        # Compare cardinality, not lexicographic IDs; either ID order is valid.
+        count=getattr(event,'boundary_count',None)
+        return (
+            event.event_ts == self._source_ts
+            and count is not None
+            and count != getattr(self,'_source_boundary_count',None)
+        )
 
     async def _has_unanalysed_events(self) -> bool:
         return self._is_new_event(await self._latest_master_event())
@@ -161,7 +180,7 @@ class AIIntelligenceWorker:
                 await conn.execute(text("SELECT pg_advisory_unlock(hashtext('hypercopy:ai-intelligence'))"))
                 await conn.commit()
 
-        self._source_ts=_parse_ts(state.get('observed_source_event_ts') or state.get('source_event_ts'))
+        self._set_source_cursor(state)
         log.info('AI intelligence refresh completed',extra={
             'reason':reason,
             'status':state.get('status'),
