@@ -177,6 +177,28 @@ async def test_new_fill_triggers_once_and_mode_change_recalculates(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_distinct_fills_at_identical_timestamp_invalidate_fingerprint(monkeypatch):
+    _enable(monkeypatch)
+    calls, provider = _fake_provider()
+    monkeypatch.setattr(intelligence, 'call_llm_with_failover', provider)
+    first_event = _event('one')
+    db = _Session([first_event])
+
+    original = await intelligence.refresh_ai_intelligence(db, force=True)
+    second_event = _event('two')
+    second_event.event_ts = first_event.event_ts
+    db.events.append(second_event)
+
+    newer = await intelligence.refresh_ai_intelligence(db, force=True)
+    assert newer['strategy_profile']['lookback_events'] == 2
+    assert newer['input_fingerprint'] != original['input_fingerprint']
+    assert len(calls) == 2
+
+    await intelligence.refresh_ai_intelligence(db, force=True)
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_old_valid_analysis_is_audit_only_after_lookback_expires(monkeypatch):
     _enable(monkeypatch)
     calls, provider = _fake_provider()
