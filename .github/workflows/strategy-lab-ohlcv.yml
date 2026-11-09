@@ -1,0 +1,45 @@
+name: Strategy Lab public OHLCV (read-only)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "scripts/strategy_lab/**"
+      - ".github/workflows/strategy-lab-ohlcv.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  public-candles:
+    if: github.event.pull_request.head.ref == 'codex/strategy-lab-hourly-ohlcv-research-20261109'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate importer with no network
+        run: python -m unittest discover -s scripts/strategy_lab -p 'test_ohlcv_snapshot.py' -v
+      - name: Fetch PUBLIC Hyperliquid candleSnapshot only
+        run: python scripts/strategy_lab/ohlcv_snapshot.py --out "$RUNNER_TEMP/traxion-ohlcv"
+      - name: Print per-asset completeness (no user trade history)
+        run: |
+          python - <<'PY'
+          import json,os,pathlib
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'traxion-ohlcv'/'manifest.json'
+          d=json.loads(p.read_text())
+          for asset,record in sorted(d['assets'].items()):
+            print(asset, record['status'], record.get('count',0), record.get('gaps','n/a'))
+          assert all(record['status'] in ('full','partial','empty','error') for record in d['assets'].values())
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: strategy-lab-public-ohlcv-${{ github.sha }}
+          path: ${{ runner.temp }}/traxion-ohlcv/
+          retention-days: 14
+          if-no-files-found: warn
