@@ -1,0 +1,40 @@
+# Temporary read-only lockfile resolver for PR #300; delete before review.
+name: Frontend dependency lock candidate (temporary)
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'frontend/package.json'
+      - '.github/workflows/frontend-lock-candidate.yml'
+permissions:
+  contents: read
+jobs:
+  resolve-lockfile:
+    if: github.event.pull_request.head.ref == 'codex/frontend-reown-security-20261109'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --global npm@11.0.0
+      - name: Resolve lockfile respecting semver and no lifecycle scripts
+        working-directory: frontend
+        run: |
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm audit fix --package-lock-only --ignore-scripts --no-fund || true
+      - name: Print audit diagnostic (no suppression in authoritative CI)
+        working-directory: frontend
+        run: npm audit --audit-level=moderate || true
+      - name: Emit lockfile chunks
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const src=fs.readFileSync('frontend/package-lock.json','utf8');
+          const chunk=2800;
+          console.log('__TRAXION_FRONT_LOCK_LEN__:'+src.length);
+          for(let i=0;i<src.length;i+=chunk){
+            console.log('__TRAXION_FRONT_LOCK_CHUNK__:'+(i/chunk)+':'+JSON.stringify(src.slice(i,i+chunk)));
+          }
+          console.log('__TRAXION_FRONT_LOCK_END__:'+Math.ceil(src.length/chunk));
+          NODE
