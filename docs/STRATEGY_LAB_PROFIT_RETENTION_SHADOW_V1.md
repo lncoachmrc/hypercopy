@@ -14,8 +14,9 @@ out-of-sample. This is an **untested strategy hypothesis**, not a measured edge.
 
 ## Behavior
 
-- Only when the **global Profit Exit mode is SHADOW** and the existing economic
-  gate has certified a *strictly positive* current estimated net PnL, load prior
+- Only when the **global Profit Exit mode is SHADOW**, the follower is **SHORT**
+  and the existing economic gate has certified a *strictly positive* current
+  estimated net PnL, load prior
   durable decisions in the same user/epoch/provider/network/asset/source cycle,
   causal state version, follower position size and accounting-completeness class.
 - A single indexed SQL window query yields the latest sample, prior peak and
@@ -25,7 +26,10 @@ out-of-sample. This is an **untested strategy hypothesis**, not a measured edge.
 - Add the experiment identifier `profit_retention_shadow_v1` to the persisted
   decision inputs. The existing idempotent decision record captures the entire
   contemporaneous input and action.
-- **No change in ON or OFF**. The ON path receives the original prompt and
+- **No change in LONG or ON or OFF**. LONG SHADOW keeps the original prompt and
+  inputs; historical replay of hypothetical giveback exits produced conflicting
+  results for LONG and stronger improvement for SHORT. This is a research choice,
+  not proof of a profitable SHORT strategy.\n- **No change in ON or OFF**. The ON path receives the original prompt and
   decision inputs, and all existing order/risk/safety checks remain unchanged.
   SHADOW never emits a CopyJob as an operational Profit Exit.
 - No new environment variables, migrations, wallet permissions, model calls,
