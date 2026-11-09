@@ -1,0 +1,31 @@
+name: Strategy Lab replay safety tests
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'research/strategy_lab_replay.py'
+      - 'research/test_strategy_lab_replay.py'
+      - '.github/workflows/strategy-lab-tests.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'research/strategy_lab_replay.py'
+      - 'research/test_strategy_lab_replay.py'
+      - '.github/workflows/strategy-lab-tests.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  strategy-lab-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile offline research code
+        run: python -m py_compile research/strategy_lab_replay.py
+      - name: Run causal no-lookahead and residual-PnL tests
+        run: python -m unittest discover -s research -p test_strategy_lab_replay.py -v
