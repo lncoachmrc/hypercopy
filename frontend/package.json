@@ -12,8 +12,8 @@
     "test:wallet-login": "node scripts/check-wallet-login-chain-independence.mjs"
   },
   "dependencies": {
-    "@reown/appkit": "1.8.23",
-    "@reown/appkit-adapter-ethers": "1.8.23",
+    "@reown/appkit": "1.8.24",
+    "@reown/appkit-adapter-ethers": "1.8.24",
     "ethers": "6.17.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
@@ -25,11 +25,11 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
     "typescript": "^5.7.2",
-    "vite": "^6.0.3"
+    "vite": "^6.4.5"
   },
   "overrides": {
     "@coinbase/cdp-sdk": {
-      "axios": "1.18.1"
+      "axios": "1.21.0"
     }
   }
 }
