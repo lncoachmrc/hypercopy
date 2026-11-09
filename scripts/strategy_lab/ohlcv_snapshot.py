@@ -15,7 +15,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 API = "https://api.hyperliquid.xyz/info"
-ASSETS = ("BTC", "ETH", "SOL", "LTC", "LINK", "GMX", "FOGO", "HBAR", "FET", "ADA", "AVAX", "XLM")
+ASSETS = ("BTC", "ETH", "SOL", "LTC", "LINK", "GMX", "FOGO", "HBAR", "FET", "ADA", "AVAX", "XLM", "AAVE", "BCH", "FIL", "XRP", "UNI", "TRX", "DOT", "BNB", "NEAR", "POL", "ENA", "ATOM")
 HOUR_MS = 3_600_000
 START = int(datetime(2026, 8, 28, tzinfo=UTC).timestamp() * 1000)
 END = int(datetime(2026, 10, 4, tzinfo=UTC).timestamp() * 1000) - 1
