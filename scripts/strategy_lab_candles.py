@@ -85,7 +85,7 @@ def request_public_candles(
     """Public, read-only HTTP POST to /info. Never POST /exchange."""
     payload = json.dumps({
         "type": "candleSnapshot",
-        "req": {"coin": coin, "interval": interval, "startTime": start_ms, "endTime": end_ms},
+        "req": {"coin": coin, "interval": interval, "startTime": start_ms, "endTime": end_ms - 1},
     }).encode("utf-8")
     for attempt in range(retries):
         try:
