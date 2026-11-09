@@ -1,0 +1,74 @@
+name: Strategy Lab public candle archive (read-only)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/strategy_lab_candles.py'
+      - 'scripts/strategy_lab_candle_replay.py'
+      - 'scripts/tests/test_strategy_lab_candle_replay.py'
+      - '.github/workflows/strategy-lab-candles.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: strategy-lab-candles-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  offline-tests:
+    if: github.event.pull_request.head.ref == 'codex/strategy-lab-candle-replay-20261109'
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test OHLC validation, causal chronology and cost scenarios
+        run: python -m unittest discover -s scripts/tests -p 'test_strategy_lab_candle_replay.py' -v
+
+  public-archive:
+    needs: offline-tests
+    if: github.event.pull_request.head.ref == 'codex/strategy-lab-candle-replay-20261109'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download ONLY historic public candles, no account data
+        env:
+          RESEARCH_ASSETS: "2Z,AAVE,ADA,AERO,AIXBT,ANIME,APT,AR,ARB,ASTER,ATOM,AVAX,BABY,BCH,BNB,BTC,CAKE,CRV,DOT,DYDX,DYM,EIGEN,ENA,ETC,ETH,ETHFI,FET,FIL,FOGO,GMX,HBAR,HYPER,ICP,INIT,INJ,IO,JTO,LDO,LINK,LTC,MANTA,MET,MINA,MORPHO,NEAR,NIL,NXPC,ONDO,OP,PENDLE,PENGU,POL,PUMP,RESOLV,REZ,RSR,RUNE,SKY,SOL,SOPH,STRK,STX,SUI,SUPER,TAO,TIA,TNSR,TRUMP,TRX,UMA,UNI,USUAL,VIRTUAL,WCT,WLD,WLFI,XLM,XPL,XRP,ZEN,ZRO"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/strategy_lab_candles.py \
+            --assets "$RESEARCH_ASSETS" \
+            --start 2026-08-28T19:00:00Z \
+            --end 2026-10-04T00:00:00Z \
+            --interval 1h --sleep 2.5 \
+            --output-dir strategy-lab-public-candles
+      - name: Summarize archive coverage without account data
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          summary=json.loads(Path('strategy-lab-public-candles/manifest.json').read_text())
+          counts={}
+          for entry in summary['assets']:
+              counts[entry['status']]=counts.get(entry['status'],0)+1
+          print('PUBLIC_CANDLES_BARS:', summary['bars'])
+          print('PUBLIC_CANDLES_ASSETS:', summary['asset_count'])
+          print('PUBLIC_CANDLES_STATUS:', counts)
+          print('PUBLIC_CANDLES_SHA256:', summary['data_sha256'])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: traxion-public-hourly-candles-${{ github.event.pull_request.head.sha }}
+          path: strategy-lab-public-candles/
+          retention-days: 30
+          if-no-files-found: warn
