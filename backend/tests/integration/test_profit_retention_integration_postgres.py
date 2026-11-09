@@ -158,7 +158,7 @@ async def test_prior_profit_peak_does_not_mix_other_cycle_or_state(isolated_tabl
             current_net_pnl=Decimal("6"),
         )
         assert result["sample_count"] == 3
-        assert result["observed_peak_net_pnl_usdc"] == "10"
-        assert result["observed_giveback_usdc"] == "4"
-        assert result["change_since_previous_usdc"] == "-1"
+        assert Decimal(result["observed_peak_net_pnl_usdc"]) == Decimal("10")
+        assert Decimal(result["observed_giveback_usdc"]) == Decimal("4")
+        assert Decimal(result["change_since_previous_usdc"]) == Decimal("-1")
         assert result["peak_is_intraperiod_mfe"] is False
