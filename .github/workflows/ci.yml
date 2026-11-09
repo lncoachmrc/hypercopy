@@ -115,10 +115,21 @@ jobs:
           npm install --global npm@11.0.0
           npm --version
       - run: npm ci
+      - name: Test expiring audit exception and mitigation guards
+        run: node --test scripts/audit-zod-exception.test.mjs
       - run: npm run test:wallet-login
       - run: npm run typecheck
       - run: npm run build
-      - run: npm audit --audit-level=moderate
+      - name: Audit frontend with the single approved expiring Zod exception
+        run: node scripts/audit-zod-exception.mjs
+      - name: Preserve complete npm audit and gate decision
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-npm-audit-${{ github.sha }}
+          path: frontend/audit-evidence/
+          if-no-files-found: error
+          retention-days: 30
 
   landing:
     runs-on: ubuntu-latest
