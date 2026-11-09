@@ -109,8 +109,11 @@ def test_non_alphabet_signature_junk_is_not_accepted(signing_key):
 
 
 def test_deep_payload_raises_token_error_not_raw_recursion_error(signing_key):
-    # Bounded input exercises upstream recursion handling, not a load test.
-    payload = b'{"nested":' + b'[' * 1500 + b'0' + b']' * 1500 + b'}'
+    # About 20 KB, local only. Check the decoder precondition explicitly:
+    # 1,500 levels did not exceed the JSON decoder limit on the CI runner.
+    payload = b'{"nested":' + b'[' * 10000 + b'0' + b']' * 10000 + b'}'
+    with pytest.raises(RecursionError):
+        json.loads(payload)
     token = _signed_payload(payload, signing_key)
     with pytest.raises(jwt.DecodeError):
         security.decode_session_token(token)
