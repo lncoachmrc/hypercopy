@@ -99,6 +99,16 @@ def derive_ai_execution_policy(
         # latest validated conservative factor.
         if latest_valid_factor is not None:
             factor = min(factor, latest_valid_factor)
+        # Empty/disabled input moves the old analysis into its audit snapshot.
+        # It may only tighten the frozen bound, never authorize AI influence or
+        # override a fresh healthy policy / an explicit switch to SHADOW.
+        snapshot = state.get('last_valid_analysis')
+        archived_analysis = snapshot.get('analysis') if isinstance(snapshot, dict) else None
+        archived_policy = archived_analysis.get('capital_policy') if isinstance(archived_analysis, dict) else None
+        if isinstance(archived_policy, dict):
+            archived_factor = _factor_from_capital_policy(archived_policy)
+            if archived_factor is not None:
+                factor = min(factor, archived_factor)
     applied_buffer = Decimal(1) - factor
 
     return AiExecutionPolicy(
@@ -156,12 +166,16 @@ async def read_ai_execution_policy(db: AsyncSession) -> AiExecutionPolicy:
         fallback_factor=fallback_factor,
     )
 
-    # Keep the persisted fallback aligned with every newly accepted healthy
-    # policy. Callers already own the surrounding transaction; flush only.
-    if mode_row and mode_row.enabled and policy.effective:
+    # Persist healthy policy updates and stricter recovered safety bounds.
+    # An unavailable analysis must never relax this persisted fallback.
+    # Callers own the surrounding transaction; flush only, never toggle enabled.
+    if mode_row and mode_row.enabled:
         previous_factor = _bounded_factor(mode_value.get('last_valid_factor', 1))
         previous_buffer = _bounded_buffer(mode_value.get('last_valid_buffer_pct', 0))
-        if previous_factor != policy.factor or previous_buffer != policy.buffer_pct:
+        if (
+            (policy.effective or policy.factor < previous_factor)
+            and (previous_factor != policy.factor or previous_buffer != policy.buffer_pct)
+        ):
             mode_row.value = {
                 **mode_value,
                 'last_valid_factor': str(policy.factor),
