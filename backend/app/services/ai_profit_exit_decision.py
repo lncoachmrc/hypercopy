@@ -40,6 +40,8 @@ from app.services.ai_profit_exit_collector import (
     collect_shadow_profit_exit_economics,
 )
 from app.services.ai_profit_exit_mode import read_profit_exit_mode
+from app.services.ai_exit_feedback import FEEDBACK_VERSION, read_exit_feedback
+from app.services.risex_profit_exit_shadow import evaluate_risex_shadow_portfolio
 from app.services.ai_profit_exit_telemetry import record_shadow_observation
 from app.services.ai_profit_exit_retention import RETENTION_VARIANT, read_retention_context
 from app.services.master_source_identity import is_master_source_user
@@ -109,6 +111,25 @@ async def _decide_with_ai(payload: dict) -> tuple[ProfitExitAction, str, dict]:
             "If funding is incomplete or the evidence is weak, prefer ABSTAIN. "
             "Any CLOSE_PROFIT in SHADOW is only a recorded hypothesis, never an order."
         )
+    if payload.get("decision_mode") == "SHADOW":
+        if payload.get("execution_provider") == "risex":
+            system += (
+                " RISEx inputs are record-only TESTNET estimates: the entry is a master "
+                "cross-venue proxy, fees are configured assumptions and funding is unknown. "
+                "Never represent this as realized or fully net profit. Abstain when costs "
+                "or cross-venue differences make the proposed exit unreliable."
+            )
+        feedback = payload.get("exit_feedback")
+        if (isinstance(feedback, dict) and feedback.get("version") == FEEDBACK_VERSION
+                and feedback.get("status") == "observed"):
+            system += (
+                " EXIT FEEDBACK: these are sampled 30-35 minute counterfactual outcomes "
+                "from distinct prior cycles, NOT realized returns or a causal profitability "
+                "proof. Positive close-advantage means an earlier exit estimate exceeded a "
+                "later hold estimate. Use both successes and sacrificed upside as uncertain "
+                "context; do not turn the posterior mean into a trading threshold or a "
+                "time-based exit. This feedback cannot alter entries, risk limits or ON mode."
+            )
     try:
         raw, runtime = await call_llm_with_failover(
             system,
@@ -365,6 +386,17 @@ async def evaluate_profit_exit_portfolio(
                 current_net_pnl=observation.economics.net_pnl,
             )
 
+        if mode is ProfitExitFeatureMode.SHADOW and user.copy_state == CopyState.SHADOW:
+            inputs.update(decision_mode="SHADOW", learning_policy_version=FEEDBACK_VERSION)
+            if observation.current_position < 0:
+                inputs["exit_feedback"] = await read_exit_feedback(
+                    db, user_id=user.id, epoch_id=destination.epoch_id,
+                    provider=destination.provider, network=destination.network,
+                    asset=ledger.asset, side="SHORT", basis=observation.basis,
+                    pnl_complete=observation.pnl_complete, funding_model=observation.funding_model,
+                    current_cycle=cycle.source_cycle_id, as_of=datetime.now(UTC),
+                )
+
         action, reason, runtime = await _decide_with_ai(inputs)
         decision_now = datetime.now(UTC)
         operational = (
@@ -449,7 +481,13 @@ async def evaluate_profit_exit_portfolio(
         if action is ProfitExitAction.ABSTAIN:
             abstained += 1
 
+    risex_shadow = await evaluate_risex_shadow_portfolio(
+        db, mode=mode, master_snapshot=master_snapshot,
+        snapshot_started_order=snapshot_started_order, intelligence=intelligence,
+        evaluation_slot=evaluation_slot, decide=_decide_with_ai, inputs_builder=_decision_inputs,
+    )
     return {
+        "risex_shadow": risex_shadow,
         "mode": mode.value,
         "evaluated": evaluated,
         "decisions": decisions,
