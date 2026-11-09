@@ -1,0 +1,68 @@
+# Temporary public OHLC research collector; removed before PR final review.
+name: Strategy Lab historical candles (temporary)
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/strategy-lab-marketdata-temporary.yml'
+permissions:
+  contents: read
+jobs:
+  collect-public-candles:
+    if: github.event.pull_request.head.ref == 'codex/strategy-lab-ohlc-replay-20261109'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Fetch historical public one-hour Hyperliquid candles (no private CSV)
+        run: |
+          node --input-type=module <<'NODE'
+          import {writeFileSync} from 'node:fs';
+          import {gzipSync} from 'node:zlib';
+          import {setTimeout as wait} from 'node:timers/promises';
+
+          // Public market symbols only: no fills, wallet address, portfolio or user secrets.
+          const assets = 'BTC GMX ETH FOGO LTC HBAR FET ADA XLM LINK RESOLV DOT AVAX NEAR SOL AAVE UNI BNB TRX BCH XRP FIL WLFI DYM TRUMP NXPC CRV USUAL PUMP XPL VIRTUAL RSR MORPHO WLD 2Z ZRO ATOM POL ZEN OP DYDX PENDLE HYPER SUI ENA STX ASTER NIL PENGU IO WCT CAKE UMA ETHFI TIA INJ BABY MINA SUPER APT REZ SKY JTO ARB AIXBT RUNE ANIME MANTA ICP STRK AR TAO EIGEN LDO MET ONDO AERO SOPH INIT ETC TNSR'.split(' ');
+          const start = Date.parse('2026-08-27T00:00:00.000Z');
+          const end = Date.parse('2026-10-05T00:00:00.000Z');
+          const markets={}, errors=[];
+          for (const [index,coin] of assets.entries()) {
+            let candles, error;
+            for (let attempt=0;attempt<3;attempt++){
+              try {
+                const response = await fetch('https://api.hyperliquid.xyz/info',{
+                  method:'POST',
+                  headers:{'Content-Type':'application/json'},
+                  body:JSON.stringify({type:'candleSnapshot',req:{coin,interval:'1h',startTime:start,endTime:end}}),
+                  signal:AbortSignal.timeout(20000),
+                });
+                const text=await response.text();
+                if(!response.ok)throw new Error('HTTP '+response.status+': '+text.slice(0,120));
+                const result=JSON.parse(text);
+                if(!Array.isArray(result))throw new Error('Response is not an array');
+                candles=result.filter(x=>x&&Number.isSafeInteger(x.t)&&x.i==='1h'&&x.s===coin&&x.t>=start&&x.t<=end&&typeof x.c==='string')
+                  .map(x=>({t:x.t,T:x.T,o:x.o,h:x.h,l:x.l,c:x.c,v:x.v,n:x.n}));
+                error=null;break;
+              }catch(e){error=String(e);await wait(1500*(attempt+1));}
+            }
+            if(candles){markets[coin]=candles;console.log('MARKET',index+1,assets.length,coin,candles.length)}
+            else{errors.push({coin,error});console.log('ERROR',index+1,assets.length,coin,error)}
+            await wait(3000);
+          }
+          const payload={source:'Hyperliquid public candleSnapshot',interval:'1h',start_ms:start,end_ms:end,as_of_utc:new Date().toISOString(),markets,errors};
+          writeFileSync('public_market_candles_1h.json.gz',gzipSync(JSON.stringify(payload),{level:9}));
+          writeFileSync('public_market_collection_summary.json',JSON.stringify({symbols_requested:assets.length,symbols_nonempty:Object.values(markets).filter(a=>a.length>0).length,candles_total:Object.values(markets).reduce((s,a)=>s+a.length,0),errors,as_of_utc:payload.as_of_utc},null,2));
+          console.log('SUMMARY',JSON.stringify({requested:assets.length,nonempty:Object.values(markets).filter(a=>a.length>0).length,errors:errors.length,candles:Object.values(markets).reduce((s,a)=>s+a.length,0)}));
+          if(!markets.BTC?.length || !markets.ETH?.length)throw new Error('Missing core BTC or ETH candles');
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: public-hyperliquid-candles-1h-2026-08-27_10-05
+          path: |
+            public_market_candles_1h.json.gz
+            public_market_collection_summary.json
+          retention-days: 7
+          if-no-files-found: error
