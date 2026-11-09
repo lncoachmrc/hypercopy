@@ -70,7 +70,8 @@ async def test_mature_losses_reach_feedback_and_duplicate_decisions_do_not_infla
         await db.commit()
         summary=await read(db,now)
         assert summary['sample_count']==1
-        assert D(summary['mean_close_advantage_bps'])==D('700')
+        assert summary['status']=='warming_up'
+        assert summary['mean_close_advantage_bps'] is None
         assert summary['realized_performance'] is False
         assert summary['promotion_allowed'] is False
 
@@ -111,3 +112,38 @@ async def test_risex_candidate_statement_executes_without_legacy_hl_account_join
         assert 'JOIN trading_accounts ' not in sql
         # Real ORM SQL is parsed/executed against migrated PostgreSQL.
         await db.execute(stmt)
+
+
+@pytest.mark.asyncio
+async def test_twenty_distinct_mature_cycles_enable_observed_statistics(database):
+    now=datetime.now(UTC)
+    async with database() as db:
+        for index in range(20):
+            d,o=records(now)
+            d.source_cycle_id=o.source_cycle_id=f'testnet:BTC:old-{index}'
+            db.add_all([d,o])
+        await db.commit()
+        summary=await read(db,now)
+        assert summary['status']=='observed'
+        assert summary['sample_count']==20
+        assert D(summary['mean_close_advantage_bps'])==D('700')
+        assert summary['promotion_allowed'] is False
+
+
+@pytest.mark.asyncio
+async def test_risex_peak_cannot_mix_different_fee_assumptions(database):
+    from app.services.ai_profit_exit_retention import read_retention_context
+    now=datetime.now(UTC)
+    async with database() as db:
+        d,_=records(now)
+        other,_=records(now)
+        other.net_pnl=D('100')
+        other.decision_inputs={**other.decision_inputs,'funding_model':'not_modeled_fee_5bps'}
+        db.add_all([d,other]);await db.commit()
+        result=await read_retention_context(db, user_id=d.user_id, execution_epoch_id=d.execution_epoch_id,
+            execution_provider='risex',execution_network='testnet',asset='BTC',
+            source_cycle_id=d.source_cycle_id,state_version=d.state_version,
+            follower_position_size=D('-1'),pnl_complete=False,current_net_pnl=D('3'),
+            evaluation_basis='risex_copy_shadow_estimate',funding_model='not_modeled_fee_1E+1bps')
+        assert result['sample_count']==2
+        assert D(result['observed_peak_net_pnl_usdc'])==D('5')

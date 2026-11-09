@@ -78,6 +78,8 @@ async def read_retention_context(
     follower_position_size: Decimal,
     pnl_complete: bool,
     current_net_pnl: Decimal,
+    evaluation_basis: str | None = None,
+    funding_model: str | None = None,
 ) -> dict:
     """Compute a durable high-water mark in one indexed SQL query.
 
@@ -109,6 +111,12 @@ async def read_retention_context(
         )
         .limit(1)
     )
+    # Optional stricter scope for a cross-venue estimated cost model. Existing
+    # callers keep their original behavior; RISEx cannot mix changed fee assumptions.
+    if evaluation_basis is not None:
+        stmt = stmt.where(AIProfitExitDecision.decision_inputs['evaluation_basis'].as_string() == evaluation_basis)
+    if funding_model is not None:
+        stmt = stmt.where(AIProfitExitDecision.decision_inputs['funding_model'].as_string() == funding_model)
     row = (await db.execute(stmt)).one_or_none()
     return build_retention_context(
         current_net_pnl=current_net_pnl,

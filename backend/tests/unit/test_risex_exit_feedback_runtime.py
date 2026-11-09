@@ -69,7 +69,7 @@ def fixture(monkeypatch,net='5'):
     user_id,epoch_id=uuid.uuid4(),uuid.uuid4()
     account_address='0x'+'1'*40
     user=NS(id=user_id,state=UserState.ACTIVE,copy_state=CopyState.SHADOW,
-            execution_provider='risex',execution_network='testnet',active_execution_epoch_id=epoch_id)
+            execution_provider='risex',active_execution_epoch_id=epoch_id)
     ledger=NS(user_id=user_id,managed=True,target_size=D('-1'),asset='BTC')
     account=NS(user_id=user_id,account_address=account_address)
     epoch=NS(id=epoch_id,user_id=user_id,provider='risex',network='testnet',ended_at=None,account_address=account_address)
@@ -135,9 +135,13 @@ async def test_on_off_never_enable_risex_pilot(monkeypatch,mode):
 
 @pytest.mark.asyncio
 async def test_changed_destination_during_model_call_discards_decision(monkeypatch):
-    db,_,_,args,decide=fixture(monkeypatch)
-    monkeypatch.setattr(pilot,'user_destination_state',AsyncMock(return_value=NS(epoch_id=uuid.uuid4(),provider='risex',network='testnet')))
+    db,_,epoch,args,decide=fixture(monkeypatch)
+    monkeypatch.setattr(pilot,'user_destination_state',AsyncMock(side_effect=[
+        NS(epoch_id=epoch.id,provider='risex',network='testnet'),
+        NS(epoch_id=uuid.uuid4(),provider='risex',network='testnet'),
+    ]))
     stats=await pilot.evaluate_risex_shadow_portfolio(db,**args)
+    decide.assert_awaited_once()
     assert stats['decisions']==0 and not db.added and stats['queued']==0
 
 

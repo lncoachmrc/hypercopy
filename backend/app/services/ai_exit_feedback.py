@@ -145,5 +145,11 @@ async def read_exit_feedback(db, *, user_id, epoch_id, provider: str, network: s
         'version': FEEDBACK_VERSION,
     })
     summary = summarize_feedback(result.mappings().all(), as_of=as_of, current_cycle=current_cycle)
+    if summary['status'] != 'observed':
+        # A cold-start label alone cannot stop a model from using small-sample
+        # numbers. Do not put those actionable statistics into its payload.
+        for field in ('mean_close_advantage_bps', 'close_advantage_posterior_mean',
+                      'close_better_count', 'hold_better_count', 'tie_count'):
+            summary[field] = None
     return {**summary, 'provider': provider, 'network': network, 'basis': basis,
             'pnl_complete': pnl_complete}

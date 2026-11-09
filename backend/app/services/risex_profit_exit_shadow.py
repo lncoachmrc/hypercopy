@@ -28,13 +28,14 @@ from app.services.strategy_intents import master_position_from_state
 
 def risex_shadow_candidates():
     return (select(User, PositionLedger, RISExTradingAccount, RiskProfile, ExecutionEpoch)
+        .select_from(User)
         .join(PositionLedger, PositionLedger.user_id == User.id)
         .join(RISExTradingAccount, RISExTradingAccount.user_id == User.id)
         .join(RiskProfile, RiskProfile.user_id == User.id)
         .join(ExecutionEpoch, and_(ExecutionEpoch.id == User.active_execution_epoch_id,
                                   ExecutionEpoch.user_id == User.id))
         .where(User.state == UserState.ACTIVE, User.copy_state == CopyState.SHADOW,
-               User.execution_provider == 'risex', User.execution_network == 'testnet',
+               User.execution_provider == 'risex',
                ExecutionEpoch.provider == 'risex', ExecutionEpoch.network == 'testnet',
                ExecutionEpoch.ended_at.is_(None), PositionLedger.managed.is_(True),
                PositionLedger.target_size != 0)
@@ -43,7 +44,7 @@ def risex_shadow_candidates():
 
 def _bound(user, ledger, account, epoch) -> bool:
     return (user.state == UserState.ACTIVE and user.copy_state == CopyState.SHADOW
-        and user.execution_provider == 'risex' and user.execution_network == 'testnet'
+        and user.execution_provider == 'risex'
         and user.active_execution_epoch_id == epoch.id and epoch.user_id == user.id
         and epoch.provider == 'risex' and epoch.network == 'testnet' and epoch.ended_at is None
         and account.user_id == user.id and ledger.user_id == user.id and ledger.managed
@@ -66,6 +67,14 @@ async def evaluate_risex_shadow_portfolio(db, *, mode, master_snapshot,
             stats['evaluated'] += 1
             try:
                 if not _bound(user, ledger, account, epoch) or is_master_source_user(user):
+                    stats['abstained'] += 1
+                    continue
+                # User.execution_network is a legacy SQL column, deliberately
+                # absent from the ORM model. Reuse the canonical state reader
+                # to check user/epoch agreement rather than inventing an ORM field.
+                destination = await user_destination_state(db, user.id)
+                if (destination.epoch_id != epoch.id or destination.provider != 'risex'
+                        or destination.network != 'testnet'):
                     stats['abstained'] += 1
                     continue
                 cycle = await read_current_source_cycle(
@@ -108,6 +117,7 @@ async def evaluate_risex_shadow_portfolio(db, *, mode, master_snapshot,
                     inputs['profit_retention'] = await read_retention_context(
                         db, **scope, follower_position_size=obs.current_position,
                         pnl_complete=False, current_net_pnl=obs.economics.net_pnl,
+                        evaluation_basis=obs.basis, funding_model=obs.funding_model,
                     )
                     inputs['exit_feedback'] = await read_exit_feedback(
                         db, user_id=user.id, epoch_id=epoch.id, provider='risex', network='testnet',
