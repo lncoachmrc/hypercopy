@@ -1,0 +1,57 @@
+# TEMPORARY CI-only lockfile generator. Removed before final PR review.
+name: Landing dependency lock candidate (temporary)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'landing/package.json'
+      - '.github/workflows/landing-lock-candidate.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  lock-candidate:
+    if: github.event.pull_request.head.ref == 'codex/landing-security-deps-20261109'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --global npm@11.0.0
+      - name: Resolve compatible lockfile without force
+        working-directory: landing
+        run: |
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm audit fix --package-lock-only --ignore-scripts --no-fund || true
+      - name: Audit candidate (diagnostic, authoritative CI is unchanged)
+        working-directory: landing
+        run: npm audit --audit-level=high || true
+      - name: Emit candidate manifest and lock in reconstructable chunks
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs');
+          for (const [name, path] of [
+            ['MANIFEST', 'landing/package.json'],
+            ['LOCK', 'landing/package-lock.json'],
+          ]) {
+            const data = fs.readFileSync(path, 'utf8');
+            const size = 2800;
+            console.log('__TRAXION_' + name + '_LEN__:' + data.length);
+            for (let i=0;i<data.length;i+=size) {
+              const chunk=JSON.stringify(data.slice(i,i+size));
+              console.log('__TRAXION_' + name + '_CHUNK__:' + (i/size) + ':' + chunk);
+            }
+            console.log('__TRAXION_' + name + '_END__:' + Math.ceil(data.length/size));
+          }
+          NODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: traxion-landing-lock-candidate
+          path: |
+            landing/package.json
+            landing/package-lock.json
+          retention-days: 2
+          if-no-files-found: error
