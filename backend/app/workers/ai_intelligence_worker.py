@@ -81,6 +81,7 @@ class AIIntelligenceWorker:
         self.poll=max(min(int(os.getenv('LLM_EVENT_POLL_SECONDS','10')),15),1)
         self.db_poll=max(int(os.getenv('LLM_DB_FALLBACK_POLL_SECONDS','60')),self.poll)
         self._last_db_poll=0.0
+        self._last_safety_check_mono: float | None=None
         self._pending=False
         self._last_signal_mono: float | None=None
         self._source_ts: datetime | None=None
@@ -100,7 +101,7 @@ class AIIntelligenceWorker:
     async def _latest_master_event(self) -> MasterEvent | None:
         async with SessionLocal() as db:
             return (await db.execute(
-                select(MasterEvent).order_by(MasterEvent.event_ts.desc()).limit(1)
+                select(MasterEvent).order_by(MasterEvent.event_ts.desc(), MasterEvent.exchange_event_id.desc()).limit(1)
             )).scalar_one_or_none()
 
     async def _state(self) -> dict:
@@ -113,7 +114,7 @@ class AIIntelligenceWorker:
 
     async def _sync_source_from_state(self) -> dict:
         state=await self._state()
-        self._source_ts=_parse_ts(state.get('source_event_ts'))
+        self._source_ts=_parse_ts(state.get('observed_source_event_ts') or state.get('source_event_ts'))
         return state
 
     def _is_new_event(self, event: MasterEvent | None) -> bool:
@@ -160,8 +161,8 @@ class AIIntelligenceWorker:
                 await conn.execute(text("SELECT pg_advisory_unlock(hashtext('hypercopy:ai-intelligence'))"))
                 await conn.commit()
 
-        self._source_ts=_parse_ts(state.get('source_event_ts'))
-        log.info('AI intelligence analysis completed',extra={
+        self._source_ts=_parse_ts(state.get('observed_source_event_ts') or state.get('source_event_ts'))
+        log.info('AI intelligence refresh completed',extra={
             'reason':reason,
             'status':state.get('status'),
             'provider':state.get('provider'),
@@ -289,6 +290,7 @@ class AIIntelligenceWorker:
                 if quiet_for >= self.debounce and age >= retry_after:
                     ran=await self._run_analysis('master_event_batch')
                     if ran:
+                        self._last_safety_check_mono=asyncio.get_running_loop().time()
                         # An event may have landed while provider calls were in
                         # flight. Compare against PostgreSQL before clearing.
                         latest=await self._latest_master_event()
@@ -299,8 +301,19 @@ class AIIntelligenceWorker:
                             self._last_signal_mono=None
                     continue
 
-            if not self._pending and age >= self.max_refresh:
-                await self._run_analysis('safety_refresh')
+            # Fingerprint no-ops retain the last analysis timestamp. Throttle
+            # periodic checks independently; retry provider failures sooner.
+            refresh_interval = self.failure_retry if state.get('status') == 'degraded' else self.max_refresh
+            if (
+                not self._pending
+                and age >= refresh_interval
+                and (
+                    self._last_safety_check_mono is None
+                    or now - self._last_safety_check_mono >= refresh_interval
+                )
+            ):
+                self._last_safety_check_mono=now
+                await self._run_analysis('provider_retry' if state.get('status') == 'degraded' else 'safety_refresh')
 
 
 async def main():
