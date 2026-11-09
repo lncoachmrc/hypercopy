@@ -120,10 +120,10 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(self.replay(bars=bars)["status"], "no_signal_before_master_exit")
 
     def test_master_change_between_decision_and_exit_cancels_signal(self):
-        c = Cycle("BTC", "LONG", 0, 4 * H + H // 2, (
+        c = Cycle("BTC", "LONG", 0, 3 * H + H // 2, (
             Leg(0, D(1), D(100)),
             Leg(2 * H + 100, D(1), D(106)),
-            Leg(4 * H + H // 2, D(-2), D(104)),
+            Leg(3 * H + H // 2, D(-2), D(104)),
         ))
         self.assertNotEqual(self.replay(cycle=c)["status"], "hypothetical_exit")
 
