@@ -48,6 +48,7 @@ from app.services.ai_profit_exit_retention import RETENTION_VARIANT, read_retent
 from app.services.ai_profit_exit_learning import (
     LEARNING_VERSION, read_shadow_learning_feedback,
 )
+from app.services.ai_profit_exit_risex_targets import refresh_risex_shadow_targets
 from app.services.ai_profit_exit_risex_shadow import (
     RISEX_SHADOW_BASIS, collect_risex_shadow_profit_exit_economics,
 )
@@ -215,6 +216,21 @@ async def evaluate_profit_exit_portfolio(
         priority=Priority.MASTER_STATE,
     )
     intelligence = await read_ai_intelligence(db)
+
+    if mode is ProfitExitFeatureMode.SHADOW:
+        # Reuse the same deterministic source-to-target sizing as RISEx
+        # activation, with create_jobs=False. No provider order is emitted.
+        try:
+            await refresh_risex_shadow_targets(
+                db, master_hl=master_hl, master_snapshot=master_snapshot,
+                snapshot_started_order=snapshot_started_order,
+            )
+        except Exception:
+            await db.rollback()
+            log.warning(
+                "RISEx shadow target refresh unavailable; proceeding with existing evidence",
+                exc_info=True,
+            )
 
     rows = (await db.execute(
         select(User, PositionLedger, TradingAccount, RiskProfile)
