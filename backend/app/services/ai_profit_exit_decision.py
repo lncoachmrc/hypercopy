@@ -18,6 +18,8 @@ from app.models.entities import (
     CopyState,
     JobState,
     MasterEvent,
+    ExecutionEpoch,
+    RISExTradingAccount,
     PositionLedger,
     RiskProfile,
     TradingAccount,
@@ -42,6 +44,10 @@ from app.services.ai_profit_exit_collector import (
 from app.services.ai_profit_exit_mode import read_profit_exit_mode
 from app.services.ai_profit_exit_telemetry import record_shadow_observation
 from app.services.ai_profit_exit_retention import RETENTION_VARIANT, read_retention_context
+from app.services.ai_profit_exit_risex_shadow import (
+    RISEX_SHADOW_BASIS, collect_risex_shadow_profit_exit_economics,
+)
+from app.adapters.risex_http import RISExReadOnlyHTTPTransport
 from app.services.master_source_identity import is_master_source_user
 from app.services.networking import user_network_state
 from app.services.queue import publish_job
@@ -89,10 +95,18 @@ async def _decide_with_ai(payload: dict) -> tuple[ProfitExitAction, str, dict]:
         "fixed take-profit thresholds, fixed retracement rules, or time-based exits. "
         "CLOSE_PROFIT means close the full residual follower position now. Deterministic "
         "TRAXION safety controls independently decide whether that action is admissible. "
-        "When evaluation_basis is copy_shadow_estimate the position is hypothetical, "
+        "When evaluation_basis identifies a shadow estimate the position is hypothetical, "
         "funding is not modeled and the result is record-only. Treat material uncertainty "
         "conservatively and use ABSTAIN when that uncertainty prevents a reliable choice."
     )
+    if payload.get("evaluation_basis") == RISEX_SHADOW_BASIS:
+        system += (
+            " RISEx TESTNET shadow valuation uses the Hyperliquid master entry "
+            "as a proxy and the published tier-1 taker fee as a hypothetical "
+            "cost. Funding, actual account-specific fees, actual entry fills, "
+            "and executable slippage are not verified. Never describe this as "
+            "realized or complete net profit. This is record-only evidence."
+        )
     retention = payload.get("profit_retention")
     if (
         isinstance(retention, dict)
@@ -189,7 +203,7 @@ async def evaluate_profit_exit_portfolio(
     rows = (await db.execute(
         select(User, PositionLedger, TradingAccount, RiskProfile)
         .join(PositionLedger, PositionLedger.user_id == User.id)
-        .join(TradingAccount, TradingAccount.user_id == User.id)
+        .outerjoin(TradingAccount, TradingAccount.user_id == User.id)
         .join(RiskProfile, RiskProfile.user_id == User.id)
         .where(
             User.state == UserState.ACTIVE,
@@ -223,7 +237,36 @@ async def evaluate_profit_exit_portfolio(
         except Exception:
             abstained += 1
             continue
-        if destination.provider != "hyperliquid":
+        risex_account = None
+        if destination.provider == "hyperliquid":
+            if account is None:
+                abstained += 1
+                continue
+        elif (
+            destination.provider == "risex"
+            and destination.network == "testnet"
+            and mode is ProfitExitFeatureMode.SHADOW
+            and user.copy_state == CopyState.SHADOW
+        ):
+            risex_account = (await db.execute(
+                select(RISExTradingAccount).where(
+                    RISExTradingAccount.user_id == user.id,
+                )
+            )).scalar_one_or_none()
+            epoch = await db.get(ExecutionEpoch, destination.epoch_id)
+            if (
+                risex_account is None
+                or epoch is None
+                or epoch.user_id != user.id
+                or epoch.ended_at is not None
+                or epoch.provider != "risex"
+                or epoch.network != "testnet"
+                or not epoch.account_address
+                or epoch.account_address.lower() != risex_account.account_address.lower()
+            ):
+                abstained += 1
+                continue
+        else:
             abstained += 1
             continue
 
@@ -264,30 +307,45 @@ async def evaluate_profit_exit_portfolio(
             abstained += 1
             continue
 
-        follower_hl = follower_hl_for_network(destination.network)
-        if follower_hl.limiter is None:
-            abstained += 1
-            continue
-
-        if user.copy_state == CopyState.SHADOW:
+        if destination.provider == "risex":
+            # RISEx research always uses a fresh unauthenticated READ-ONLY
+            # transport to the testnet. Never pass credentials or order clients.
             shadow_candidates += 1
-            observation = await collect_shadow_profit_exit_economics(
-                follower_hl,
-                account_address=account.account_address,
-                asset=ledger.asset,
-                shadow_position=Decimal(str(ledger.target_size)),
-                master_perp_state=master_snapshot.perp_state,
-                slippage_bps=risk.max_slippage_bps,
-            )
+            async with RISExReadOnlyHTTPTransport(
+                base_url="https://api.testnet.rise.trade",
+            ) as public_risex:
+                observation = await collect_risex_shadow_profit_exit_economics(
+                    public_risex,
+                    asset=ledger.asset,
+                    shadow_position=Decimal(str(ledger.target_size)),
+                    master_perp_state=master_snapshot.perp_state,
+                    slippage_bps=risk.max_slippage_bps,
+                    network=destination.network,
+                )
         else:
-            observation = await collect_profit_exit_economics(
-                follower_hl,
-                account_address=account.account_address,
-                asset=ledger.asset,
-                history_start_ms=max(0, int(open_event.event_ts.timestamp() * 1000)),
-                history_end_ms=None,
-                slippage_bps=risk.max_slippage_bps,
-            )
+            follower_hl = follower_hl_for_network(destination.network)
+            if follower_hl.limiter is None:
+                abstained += 1
+                continue
+            if user.copy_state == CopyState.SHADOW:
+                shadow_candidates += 1
+                observation = await collect_shadow_profit_exit_economics(
+                    follower_hl,
+                    account_address=account.account_address,
+                    asset=ledger.asset,
+                    shadow_position=Decimal(str(ledger.target_size)),
+                    master_perp_state=master_snapshot.perp_state,
+                    slippage_bps=risk.max_slippage_bps,
+                )
+            else:
+                observation = await collect_profit_exit_economics(
+                    follower_hl,
+                    account_address=account.account_address,
+                    asset=ledger.asset,
+                    history_start_ms=max(0, int(open_event.event_ts.timestamp() * 1000)),
+                    history_end_ms=None,
+                    slippage_bps=risk.max_slippage_bps,
+                )
 
         position_matches = (
             Decimal(str(ledger.target_size)) == observation.current_position
@@ -332,6 +390,9 @@ async def evaluate_profit_exit_portfolio(
             evaluation_slot,
             copy_state=user.copy_state,
         )
+        if destination.provider == "risex":
+            inputs["estimated_fee_source"] = "risex_tier1_assumption_not_account_verified"
+            inputs["actual_account_entry_verified"] = False
         decision_id = profit_exit_decision_id(
             user_id=user.id,
             execution_epoch_id=destination.epoch_id,
@@ -369,6 +430,7 @@ async def evaluate_profit_exit_portfolio(
         decision_now = datetime.now(UTC)
         operational = (
             mode is ProfitExitFeatureMode.ON
+            and destination.provider == "hyperliquid"
             and user.copy_state == CopyState.ACTIVE
             and action is ProfitExitAction.CLOSE_PROFIT
         )
