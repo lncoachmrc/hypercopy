@@ -242,7 +242,7 @@ class Worker:
             if recovered is not None:
                 return recovered
 
-        if job.origin in {'EVENT', 'RECONCILE'}:
+        if getattr(job, 'origin', None) in {'EVENT', 'RECONCILE'}:
             # Recovery of an already-submitted ambiguous order must run first.
             # For any *new* source order, SHADOW/PAUSED/suspended or missing
             # users can never enter RISEx's signed order preparation.
