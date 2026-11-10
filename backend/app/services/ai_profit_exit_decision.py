@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -44,6 +45,9 @@ from app.services.ai_profit_exit_collector import (
 from app.services.ai_profit_exit_mode import read_profit_exit_mode
 from app.services.ai_profit_exit_telemetry import record_shadow_observation
 from app.services.ai_profit_exit_retention import RETENTION_VARIANT, read_retention_context
+from app.services.ai_profit_exit_learning import (
+    LEARNING_VERSION, read_shadow_learning_feedback,
+)
 from app.services.ai_profit_exit_risex_shadow import (
     RISEX_SHADOW_BASIS, collect_risex_shadow_profit_exit_economics,
 )
@@ -53,6 +57,9 @@ from app.services.networking import user_network_state
 from app.services.queue import publish_job
 from app.services.reconcile import master_snapshot_started_order
 from app.services.strategy_intents import master_position_from_state
+
+
+log = logging.getLogger(__name__)
 
 
 def _llm_enabled() -> bool:
@@ -106,6 +113,15 @@ async def _decide_with_ai(payload: dict) -> tuple[ProfitExitAction, str, dict]:
             "cost. Funding, actual account-specific fees, actual entry fills, "
             "and executable slippage are not verified. Never describe this as "
             "realized or complete net profit. This is record-only evidence."
+        )
+    feedback = payload.get("learning_feedback")
+    if isinstance(feedback, dict) and feedback.get("status") == "exploratory":
+        system += (
+            " SHADOW RESEARCH FEEDBACK: use aggregate prior source-cycle, "
+            "same-provider next-observation statistics as weak contextual "
+            "evidence only, never as realized PnL or proof of causation. "
+            "Do not infer an exit threshold, retrain a model, or override "
+            "the master/risk controller using this exploratory feedback."
         )
     retention = payload.get("profit_retention")
     if (
@@ -224,6 +240,7 @@ async def evaluate_profit_exit_portfolio(
 
     evaluated = decisions = queued = abstained = 0
     shadow_candidates = shadow_profitable = shadow_decisions = 0
+    learning_cache: dict[tuple[str, str, str, str], dict] = {}
     now = datetime.now(UTC)
     evaluation_slot = int(now.timestamp()) // settings.AI_PROFIT_EXIT_EVAL_SECONDS
 
@@ -425,6 +442,31 @@ async def evaluate_profit_exit_portfolio(
                 pnl_complete=observation.pnl_complete,
                 current_net_pnl=observation.economics.net_pnl,
             )
+            cache_key = (
+                destination.provider, str(destination.network),
+                ledger.asset, cycle.source_cycle_id,
+            )
+            if cache_key not in learning_cache:
+                try:
+                    learning_cache[cache_key] = await read_shadow_learning_feedback(
+                        db,
+                        provider=destination.provider,
+                        network=str(destination.network),
+                        asset=ledger.asset,
+                        current_source_cycle_id=cycle.source_cycle_id,
+                        now=now,
+                    )
+                except Exception:
+                    log.warning(
+                        "Shadow learning evidence unavailable; no adaptive hints applied",
+                        extra={"provider": destination.provider, "asset": ledger.asset},
+                        exc_info=True,
+                    )
+                    learning_cache[cache_key] = {
+                        "version": LEARNING_VERSION, "status": "unavailable",
+                        "policy_promotion": "disabled",
+                    }
+            inputs["learning_feedback"] = learning_cache[cache_key]
 
         action, reason, runtime = await _decide_with_ai(inputs)
         decision_now = datetime.now(UTC)
