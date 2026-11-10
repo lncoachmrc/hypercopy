@@ -22,9 +22,32 @@
 - Future evaluations in **SHADOW SHORT only** receive versioned aggregate feedback. This is a continuously updating *advisory learning context* for the LLM; it cannot alter deterministic safety checks, execution policy, model weights, or rewrite prompts.
 - There is **NO automatic promotion** into ON or mainnet. For real improvement evidence, subsequent validation must use verified exchange fills, funding, slippage, independent source cycles, repeated regimes, and a prospective untouched holdout. A positive statistical association does not guarantee higher profits.
 
-## Scope boundary discovered during source fanout review
+## Verified master-fill fanout bridge for RISEx ACTIVE testnet
 
-The current master fill fanout in `backend/app/services/copy.py` still selects eligible users via a `JOIN trading_accounts` (legacy Hyperliquid) and the periodic `reconcile_active_users` intentionally excludes RISEx. **This PR does not change that order-creation path.** The read-only RISEx shadow refresh above obtains targets safely via the common reconciliation core, but **ACTIVE RISEx source-fill fanout still requires a separate carefully scoped correction** after verifying writer admission, idempotency and same-cycle protection. Do not claim RISEx ACTIVE end-to-end execution is proven by the new AI SHADOW tests.
+The master watcher still observes **Hyperliquid confirmed fills**. The source fanout
+now selects exactly one eligible destination per user using the active epoch:
+- Existing Hyperliquid users with legacy `TradingAccount` continue in the
+  original ACTIVE/SHADOW selection, under a Hyperliquid execution destination.
+- RISEx-only users enter the new source EVENT fanout **only** with
+  `CopyState.ACTIVE`, `execution_provider=risex`, valid matched
+  `RISExTradingAccount` / active `ExecutionEpoch`, network **testnet**,
+  and both watcher variables `ENABLE_LIVE_TRADING=false` and
+  `RISEX_SIGNED_WRITES_ENABLED=true`.
+- RISEx in SHADOW/PAUSED, unbound/expired destination, wrong provider/network,
+  disabled environment or suspended user **never** enters the RISEx EVENT
+  fanout. SHADOW instead uses the read-only reconciler described above.
+- The execution-worker, **after resolving any already-ambiguous submission**,
+  refuses new RISEx source EVENT/RECONCILE jobs for any user no longer ACTIVE.
+  Mandatory provider readiness, signed testnet credentials, Risk Engine,
+  window arming, singleton and point-of-use fences remain unchanged.
+
+**No change to mainnet, order sizing or Risk Engine.** This source-routing
+bridge is tested against isolated CI PostgreSQL and fake worker. It has
+**not** executed a RISEx testnet provider order and cannot establish a
+real-money release gate. Before runtime activation, verify the exact
+`risex-e2e` Railway project/environment/services, commit, testnet-only
+variables on the correct services, isolated DB/cache, signer freshness,
+master source access and kill switch. No automatic ARM and no mainnet use.
 
 ## Known gaps and acceptance
 
