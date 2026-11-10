@@ -51,8 +51,8 @@ async def test_risex_worker_skips_new_source_jobs_without_potential_to_submit(mo
 def test_recovery_precedes_new_submission_state_guard():
     source=inspect.getsource(execution_worker.Worker._run_risex_copy_job)
     assert source.index("await recover_risex_case_a_job(") < source.index(
-        "if job.origin in {'EVENT', 'RECONCILE'}:"
+        "if getattr(job, 'origin', None) in {'EVENT', 'RECONCILE'}:"
     )
-    assert source.index("if job.origin in {'EVENT', 'RECONCILE'}:") < source.index(
+    assert source.index("if getattr(job, 'origin', None) in {'EVENT', 'RECONCILE'}:") < source.index(
         "self.risex_window.expire_if_needed()"
     )
