@@ -52,6 +52,7 @@ EXPECTED_MIGRATIONS = {
     '0016_ai_profit_exit_decisions.py',
     '0017_master_event_causal_order.py',
     '0018_risex_user_credentials.py',
+    '0019_profit_exit_observations.py',
 }
 
 missing = [path for path in REQUIRED_FILES if not (root / path).exists()]

@@ -24,12 +24,14 @@ from app.db.session import SessionLocal, engine
 from app.db.schema import assert_schema
 from app.models.entities import (
     CopyJob,
+    CopyState,
     EquitySnapshot,
     JobState,
     PositionLedger,
     SigningCredential,
     TradingAccount,
     User,
+    UserState,
     WorkerHeartbeat,
 )
 from app.services.admin_leverage_sync import (
@@ -239,6 +241,25 @@ class Worker:
             )
             if recovered is not None:
                 return recovered
+
+        if getattr(job, 'origin', None) in {'EVENT', 'RECONCILE'}:
+            # Recovery of an already-submitted ambiguous order must run first.
+            # For any *new* source order, SHADOW/PAUSED/suspended or missing
+            # users can never enter RISEx's signed order preparation.
+            user = await db.get(User, job.user_id)
+            if (
+                user is None
+                or user.state != UserState.ACTIVE
+                or user.copy_state != CopyState.ACTIVE
+            ):
+                job.state = JobState.SKIPPED
+                job.last_error = 'RISEx source order blocked: follower is not ACTIVE'
+                job.owner = None
+                job.locked_until = None
+                job.enqueued_at = None
+                job.next_attempt_at = None
+                await db.commit()
+                return JobState.SKIPPED.value
 
         self.risex_window.expire_if_needed()
         if self.risex_window.state != RISExExecutionState.ENABLED:

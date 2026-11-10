@@ -323,6 +323,42 @@ class CopyJob(BaseUuid, Base):
     )
 
 
+class AIProfitExitObservation(BaseUuid, Timestamped, Base):
+    """Immutable evaluation-slot snapshot; SHADOW-only research input."""
+
+    __tablename__ = 'ai_profit_exit_observations'
+
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    execution_epoch_id: Mapped[uuid.UUID] = mapped_column(ForeignKey('execution_epochs.id', ondelete='RESTRICT'), nullable=False)
+    execution_provider: Mapped[str] = mapped_column(String(24), nullable=False)
+    execution_network: Mapped[str] = mapped_column(String(16), nullable=False)
+    asset: Mapped[str] = mapped_column(String(24), nullable=False)
+    source_cycle_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    state_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    evaluation_slot: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    follower_position_size: Mapped[Decimal | None] = mapped_column(D, nullable=True)
+    evaluation_basis: Mapped[str] = mapped_column(String(32), nullable=False)
+    pnl_complete: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    funding_model: Mapped[str] = mapped_column(String(40), nullable=False)
+    mark_price: Mapped[Decimal | None] = mapped_column(D)
+    executable_exit_price: Mapped[Decimal | None] = mapped_column(D)
+    entry_price: Mapped[Decimal | None] = mapped_column(D)
+    net_pnl: Mapped[Decimal | None] = mapped_column(D)
+    complete: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    eligible: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    position_matches: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[str] = mapped_column(String(240), nullable=False, default='')
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index(
+            'ix_profit_exit_observations_scope',
+            'user_id', 'execution_epoch_id', 'asset',
+            'source_cycle_id', 'observed_at',
+        ),
+    )
+
+
 class AIProfitExitDecision(BaseUuid, Timestamped, Base):
     __tablename__ = 'ai_profit_exit_decisions'
 

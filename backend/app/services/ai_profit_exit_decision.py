@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -18,6 +19,8 @@ from app.models.entities import (
     CopyState,
     JobState,
     MasterEvent,
+    ExecutionEpoch,
+    RISExTradingAccount,
     PositionLedger,
     RiskProfile,
     TradingAccount,
@@ -40,6 +43,16 @@ from app.services.ai_profit_exit_collector import (
     collect_shadow_profit_exit_economics,
 )
 from app.services.ai_profit_exit_mode import read_profit_exit_mode
+from app.services.ai_profit_exit_telemetry import record_shadow_observation
+from app.services.ai_profit_exit_retention import RETENTION_VARIANT, read_retention_context
+from app.services.ai_profit_exit_learning import (
+    LEARNING_VERSION, read_shadow_learning_feedback,
+)
+from app.services.ai_profit_exit_risex_targets import refresh_risex_shadow_targets
+from app.services.ai_profit_exit_risex_shadow import (
+    RISEX_SHADOW_BASIS, collect_risex_shadow_profit_exit_economics,
+)
+from app.adapters.risex_http import RISExReadOnlyHTTPTransport
 from app.services.master_source_identity import is_master_source_user
 from app.services.networking import user_network_state
 from app.services.queue import publish_job
@@ -47,8 +60,16 @@ from app.services.reconcile import master_snapshot_started_order
 from app.services.strategy_intents import master_position_from_state
 
 
+log = logging.getLogger(__name__)
+
+
 def _llm_enabled() -> bool:
     return os.getenv("LLM_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _shadow_retention_allowed(*, mode: ProfitExitFeatureMode, follower_position: Decimal) -> bool:
+    """Research signal: SHORT-only. Never influence ON execution."""
+    return mode is ProfitExitFeatureMode.SHADOW and follower_position < 0
 
 
 def _validated_profit_exit_action(raw: object) -> tuple[ProfitExitAction, str]:
@@ -82,10 +103,43 @@ async def _decide_with_ai(payload: dict) -> tuple[ProfitExitAction, str, dict]:
         "fixed take-profit thresholds, fixed retracement rules, or time-based exits. "
         "CLOSE_PROFIT means close the full residual follower position now. Deterministic "
         "TRAXION safety controls independently decide whether that action is admissible. "
-        "When evaluation_basis is copy_shadow_estimate the position is hypothetical, "
+        "When evaluation_basis identifies a shadow estimate the position is hypothetical, "
         "funding is not modeled and the result is record-only. Treat material uncertainty "
         "conservatively and use ABSTAIN when that uncertainty prevents a reliable choice."
     )
+    if payload.get("evaluation_basis") == RISEX_SHADOW_BASIS:
+        system += (
+            " RISEx TESTNET shadow valuation uses the Hyperliquid master entry "
+            "as a proxy and the published tier-1 taker fee as a hypothetical "
+            "cost. Funding, actual account-specific fees, actual entry fills, "
+            "and executable slippage are not verified. Never describe this as "
+            "realized or complete net profit. This is record-only evidence."
+        )
+    feedback = payload.get("learning_feedback")
+    if isinstance(feedback, dict) and feedback.get("status") == "exploratory":
+        system += (
+            " SHADOW RESEARCH FEEDBACK: use aggregate prior source-cycle, "
+            "same-provider next-observation statistics as weak contextual "
+            "evidence only, never as realized PnL or proof of causation. "
+            "Do not infer an exit threshold, retrain a model, or override "
+            "the master/risk controller using this exploratory feedback."
+        )
+    retention = payload.get("profit_retention")
+    if (
+        isinstance(retention, dict)
+        and retention.get("variant") == RETENTION_VARIANT
+        and retention.get("status") == "observed"
+    ):
+        system += (
+            " SHADOW-ONLY PROFIT RETENTION RESEARCH: the supplied observed_peak_net_pnl "
+            "comes from prior durable evaluation samples, not intraperiod market highs. "
+            "Consider recent net-profit change and observed giveback when judging whether "
+            "an already-profitable position should be closed now rather than held. "
+            "A single sample provides no trend; do not infer unobserved prices or future "
+            "returns, and do not introduce a fixed exit threshold or trailing-stop rule. "
+            "If funding is incomplete or the evidence is weak, prefer ABSTAIN. "
+            "Any CLOSE_PROFIT in SHADOW is only a recorded hypothesis, never an order."
+        )
     try:
         raw, runtime = await call_llm_with_failover(
             system,
@@ -163,10 +217,25 @@ async def evaluate_profit_exit_portfolio(
     )
     intelligence = await read_ai_intelligence(db)
 
+    if mode is ProfitExitFeatureMode.SHADOW:
+        # Reuse the same deterministic source-to-target sizing as RISEx
+        # activation, with create_jobs=False. No provider order is emitted.
+        try:
+            await refresh_risex_shadow_targets(
+                db, master_hl=master_hl, master_snapshot=master_snapshot,
+                snapshot_started_order=snapshot_started_order,
+            )
+        except Exception:
+            await db.rollback()
+            log.warning(
+                "RISEx shadow target refresh unavailable; proceeding with existing evidence",
+                exc_info=True,
+            )
+
     rows = (await db.execute(
         select(User, PositionLedger, TradingAccount, RiskProfile)
         .join(PositionLedger, PositionLedger.user_id == User.id)
-        .join(TradingAccount, TradingAccount.user_id == User.id)
+        .outerjoin(TradingAccount, TradingAccount.user_id == User.id)
         .join(RiskProfile, RiskProfile.user_id == User.id)
         .where(
             User.state == UserState.ACTIVE,
@@ -187,6 +256,7 @@ async def evaluate_profit_exit_portfolio(
 
     evaluated = decisions = queued = abstained = 0
     shadow_candidates = shadow_profitable = shadow_decisions = 0
+    learning_cache: dict[tuple[str, str, str, str], dict] = {}
     now = datetime.now(UTC)
     evaluation_slot = int(now.timestamp()) // settings.AI_PROFIT_EXIT_EVAL_SECONDS
 
@@ -200,7 +270,36 @@ async def evaluate_profit_exit_portfolio(
         except Exception:
             abstained += 1
             continue
-        if destination.provider != "hyperliquid":
+        risex_account = None
+        if destination.provider == "hyperliquid":
+            if account is None:
+                abstained += 1
+                continue
+        elif (
+            destination.provider == "risex"
+            and destination.network == "testnet"
+            and mode is ProfitExitFeatureMode.SHADOW
+            and user.copy_state == CopyState.SHADOW
+        ):
+            risex_account = (await db.execute(
+                select(RISExTradingAccount).where(
+                    RISExTradingAccount.user_id == user.id,
+                )
+            )).scalar_one_or_none()
+            epoch = await db.get(ExecutionEpoch, destination.epoch_id)
+            if (
+                risex_account is None
+                or epoch is None
+                or epoch.user_id != user.id
+                or epoch.ended_at is not None
+                or epoch.provider != "risex"
+                or epoch.network != "testnet"
+                or not epoch.account_address
+                or epoch.account_address.lower() != risex_account.account_address.lower()
+            ):
+                abstained += 1
+                continue
+        else:
             abstained += 1
             continue
 
@@ -241,36 +340,68 @@ async def evaluate_profit_exit_portfolio(
             abstained += 1
             continue
 
-        follower_hl = follower_hl_for_network(destination.network)
-        if follower_hl.limiter is None:
-            abstained += 1
-            continue
-
-        if user.copy_state == CopyState.SHADOW:
+        if destination.provider == "risex":
+            # RISEx research always uses a fresh unauthenticated READ-ONLY
+            # transport to the testnet. Never pass credentials or order clients.
             shadow_candidates += 1
-            observation = await collect_shadow_profit_exit_economics(
-                follower_hl,
-                account_address=account.account_address,
-                asset=ledger.asset,
-                shadow_position=Decimal(str(ledger.target_size)),
-                master_perp_state=master_snapshot.perp_state,
-                slippage_bps=risk.max_slippage_bps,
-            )
+            async with RISExReadOnlyHTTPTransport(
+                base_url="https://api.testnet.rise.trade",
+            ) as public_risex:
+                observation = await collect_risex_shadow_profit_exit_economics(
+                    public_risex,
+                    asset=ledger.asset,
+                    shadow_position=Decimal(str(ledger.target_size)),
+                    master_perp_state=master_snapshot.perp_state,
+                    slippage_bps=risk.max_slippage_bps,
+                    network=destination.network,
+                )
         else:
-            observation = await collect_profit_exit_economics(
-                follower_hl,
-                account_address=account.account_address,
-                asset=ledger.asset,
-                history_start_ms=max(0, int(open_event.event_ts.timestamp() * 1000)),
-                history_end_ms=None,
-                slippage_bps=risk.max_slippage_bps,
-            )
+            follower_hl = follower_hl_for_network(destination.network)
+            if follower_hl.limiter is None:
+                abstained += 1
+                continue
+            if user.copy_state == CopyState.SHADOW:
+                shadow_candidates += 1
+                observation = await collect_shadow_profit_exit_economics(
+                    follower_hl,
+                    account_address=account.account_address,
+                    asset=ledger.asset,
+                    shadow_position=Decimal(str(ledger.target_size)),
+                    master_perp_state=master_snapshot.perp_state,
+                    slippage_bps=risk.max_slippage_bps,
+                )
+            else:
+                observation = await collect_profit_exit_economics(
+                    follower_hl,
+                    account_address=account.account_address,
+                    asset=ledger.asset,
+                    history_start_ms=max(0, int(open_event.event_ts.timestamp() * 1000)),
+                    history_end_ms=None,
+                    slippage_bps=risk.max_slippage_bps,
+                )
 
         position_matches = (
             Decimal(str(ledger.target_size)) == observation.current_position
             if user.copy_state == CopyState.SHADOW
             else Decimal(str(ledger.size)) == observation.current_position
         )
+        if mode is ProfitExitFeatureMode.SHADOW and user.copy_state == CopyState.SHADOW:
+            # Record negative/zero PnL and incomplete prices even when the AI
+            # must abstain. Only read-only market data was collected above.
+            await record_shadow_observation(
+                db,
+                user_id=user.id,
+                execution_epoch_id=destination.epoch_id,
+                execution_provider=destination.provider,
+                execution_network=destination.network,
+                asset=ledger.asset,
+                source_cycle_id=cycle.source_cycle_id,
+                state_version=cycle.state_version,
+                evaluation_slot=evaluation_slot,
+                observation=observation,
+                position_matches=position_matches,
+            )
+
         if (
             not observation.complete
             or not observation.eligible
@@ -292,6 +423,9 @@ async def evaluate_profit_exit_portfolio(
             evaluation_slot,
             copy_state=user.copy_state,
         )
+        if destination.provider == "risex":
+            inputs["estimated_fee_source"] = "risex_tier1_assumption_not_account_verified"
+            inputs["actual_account_entry_verified"] = False
         decision_id = profit_exit_decision_id(
             user_id=user.id,
             execution_epoch_id=destination.epoch_id,
@@ -307,10 +441,54 @@ async def evaluate_profit_exit_portfolio(
         if await db.get(AIProfitExitDecision, decision_id) is not None:
             continue
 
+        if _shadow_retention_allowed(mode=mode, follower_position=observation.current_position):
+            # Research-only: historical samples never influence ON execution.
+            # Match the exact source cycle/version and follower size to avoid
+            # comparing PnL across scale-ins, reversals, or changed destinations.
+            inputs["profit_retention"] = await read_retention_context(
+                db,
+                user_id=user.id,
+                execution_epoch_id=destination.epoch_id,
+                execution_provider=destination.provider,
+                execution_network=destination.network,
+                asset=ledger.asset,
+                source_cycle_id=cycle.source_cycle_id,
+                state_version=cycle.state_version,
+                follower_position_size=observation.current_position,
+                pnl_complete=observation.pnl_complete,
+                current_net_pnl=observation.economics.net_pnl,
+            )
+            cache_key = (
+                destination.provider, str(destination.network),
+                ledger.asset, cycle.source_cycle_id,
+            )
+            if cache_key not in learning_cache:
+                try:
+                    learning_cache[cache_key] = await read_shadow_learning_feedback(
+                        db,
+                        provider=destination.provider,
+                        network=str(destination.network),
+                        asset=ledger.asset,
+                        current_source_cycle_id=cycle.source_cycle_id,
+                        now=now,
+                    )
+                except Exception:
+                    log.warning(
+                        "Shadow learning evidence unavailable; no adaptive hints applied",
+                        extra={"provider": destination.provider, "asset": ledger.asset},
+                        exc_info=True,
+                    )
+                    learning_cache[cache_key] = {
+                        "version": LEARNING_VERSION, "status": "unavailable",
+                        "policy_promotion": "disabled",
+                    }
+            inputs["learning_feedback"] = learning_cache[cache_key]
+
         action, reason, runtime = await _decide_with_ai(inputs)
         decision_now = datetime.now(UTC)
         operational = (
             mode is ProfitExitFeatureMode.ON
+            and destination.provider == "hyperliquid"
             and user.copy_state == CopyState.ACTIVE
             and action is ProfitExitAction.CLOSE_PROFIT
         )

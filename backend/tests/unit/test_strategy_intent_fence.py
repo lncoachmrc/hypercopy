@@ -220,9 +220,16 @@ def test_mainnet_writer_fence_cancel_requires_fresh_reconciliation() -> None:
 
 
 def test_paused_followers_do_not_receive_realtime_event_fanout() -> None:
-    source = inspect.getsource(copy_service.persist_master_fill_and_jobs)
+    # The source selector was extracted to support provider-aware epochs while
+    # retaining the original ACTIVE/SHADOW Hyperliquid behavior.
+    source = inspect.getsource(copy_service.eligible_copy_followers)
+    watcher = inspect.getsource(copy_service.persist_master_fill_and_jobs)
     assert "u.copy_state IN ('ACTIVE', 'SHADOW')" in source
     assert "u.state = 'ACTIVE'" in source
+    assert "eligible_copy_followers(" in watcher
+    # RISEx uses an independent ACTIVE-only testnet branch.
+    assert "u.copy_state = 'ACTIVE'" in source
+    assert "epoch.network = 'testnet'" in source
 
 
 def test_historical_fill_age_is_measured_from_exchange_event_time() -> None:
