@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -22,6 +23,55 @@ log = get_logger(__name__)
 def _event_time(fill: dict[str, Any]) -> datetime:
     ts = int(fill.get('time') or int(datetime.now(UTC).timestamp() * 1000))
     return datetime.fromtimestamp(ts / 1000, UTC)
+
+
+async def eligible_copy_followers(
+    db: AsyncSession, *, master_address: str, allow_risex_testnet: bool,
+) -> list[tuple[uuid.UUID, str]]:
+    """Select one follower per master fill using the CURRENT destination.
+
+    Hyperliquid legacy accounts retain their original eligibility. RISEx-only
+    followers are added only when their destination is a bound, unexpired
+    testnet epoch and copy state is ACTIVE. RISEx SHADOW is simulated by
+    reconciliation, never queued to the signed execution worker.
+    """
+    rows = (await db.execute(text("""
+        SELECT u.id,
+               COALESCE(epoch.network, u.execution_network) AS follower_network
+          FROM users AS u
+          LEFT JOIN trading_accounts AS ta ON ta.user_id = u.id
+          LEFT JOIN risex_trading_accounts AS ra ON ra.user_id = u.id
+          LEFT JOIN execution_epochs AS epoch
+            ON epoch.id = u.active_execution_epoch_id AND epoch.user_id = u.id
+         WHERE u.state = 'ACTIVE'
+           AND u.copy_state IN ('ACTIVE', 'SHADOW')
+           AND (:master_address = '' OR lower(u.auth_wallet) <> lower(:master_address))
+           AND (
+             (
+               u.execution_provider = 'hyperliquid'
+               AND ta.user_id IS NOT NULL
+               AND (epoch.id IS NULL OR
+                    (epoch.provider = 'hyperliquid' AND epoch.ended_at IS NULL))
+             )
+             OR
+             (
+               :allow_risex_testnet = TRUE
+               AND u.copy_state = 'ACTIVE'
+               AND u.execution_provider = 'risex'
+               AND epoch.provider = 'risex'
+               AND epoch.network = 'testnet'
+               AND epoch.ended_at IS NULL
+               AND epoch.account_address IS NOT NULL
+               AND ra.user_id IS NOT NULL
+               AND lower(epoch.account_address) = lower(ra.account_address)
+             )
+           )
+         ORDER BY u.id
+    """), {
+        "master_address": master_address,
+        "allow_risex_testnet": bool(allow_risex_testnet),
+    })).all()
+    return [(uid, str(network)) for uid, network in rows]
 
 
 async def persist_master_fill_and_jobs(
@@ -90,14 +140,17 @@ async def persist_master_fill_and_jobs(
     # performs a fresh authoritative reconciliation. SHADOW followers still need
     # realtime intents so simulation remains representative.
     master_address = settings.HYPERLIQUID_MASTER_ADDRESS or ''
-    eligible = (await db.execute(text("""
-        SELECT u.id, u.execution_network
-        FROM users AS u
-        JOIN trading_accounts AS ta ON ta.user_id = u.id
-        WHERE u.state = 'ACTIVE'
-          AND u.copy_state IN ('ACTIVE', 'SHADOW')
-          AND (:master_address = '' OR lower(u.auth_wallet) <> lower(:master_address))
-    """), {'master_address': master_address})).all()
+    eligible = await eligible_copy_followers(
+        db,
+        master_address=master_address,
+        # Only a dedicated testnet stack with the explicit RISEx write opt-in
+        # may receive new RISEx source jobs. The point-of-use worker must still
+        # independently pass readiness, risk, signer and window gates.
+        allow_risex_testnet=(
+            os.environ.get("ENABLE_LIVE_TRADING") == "false"
+            and os.environ.get("RISEX_SIGNED_WRITES_ENABLED") == "true"
+        ),
+    )
 
     jobs: list[CopyJob] = []
     for user_id, raw_network in eligible:
