@@ -5,8 +5,16 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  workflow_dispatch:
   schedule:
     - cron: "17 3 * * 1"
+
+# Only obsolete revisions of the same PR are canceled. Main/scheduled/manual
+# runs keep independent groups, so no required main check is replaced.
+concurrency:
+  group: codeql-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   packages: read
@@ -20,6 +28,13 @@ jobs:
       matrix:
         language: [python, javascript-typescript]
     steps:
+      # Deferred is deliberately red, never a successful/skipped required check.
+      - name: Draft — full validation deferred
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
+        run: |
+          echo '::notice::DRAFT: mark ready or dispatch full CI on this exact revision.'
+          echo 'DRAFT — required full check NOT run; not release evidence.' >> "$GITHUB_STEP_SUMMARY"
+          exit 1
       - uses: actions/checkout@v4
       - uses: github/codeql-action/init@v3
         with:

@@ -2,6 +2,8 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  workflow_dispatch:
   push:
     branches: [main]
 
@@ -18,6 +20,13 @@ jobs:
     env:
       REPOSITORY_TREE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
     steps:
+      # Deferred is deliberately red, never a successful/skipped required check.
+      - name: Draft — full validation deferred
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
+        run: |
+          echo '::notice::DRAFT: mark ready or dispatch full CI on this exact revision.'
+          echo 'DRAFT — required full check NOT run; not release evidence.' >> "$GITHUB_STEP_SUMMARY"
+          exit 1
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.REPOSITORY_TREE_SHA }}
@@ -76,6 +85,13 @@ jobs:
       HYPERLIQUID_MASTER_ADDRESS: 0x0000000000000000000000000000000000000000
       RUN_INTEGRATION: "1"
     steps:
+      # Deferred is deliberately red, never a successful/skipped required check.
+      - name: Draft — full validation deferred
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
+        run: |
+          echo '::notice::DRAFT: mark ready or dispatch full CI on this exact revision.'
+          echo 'DRAFT — required full check NOT run; not release evidence.' >> "$GITHUB_STEP_SUMMARY"
+          exit 1
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -104,6 +120,13 @@ jobs:
       run:
         working-directory: frontend
     steps:
+      # Deferred is deliberately red, never a successful/skipped required check.
+      - name: Draft — full validation deferred
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
+        run: |
+          echo '::notice::DRAFT: mark ready or dispatch full CI on this exact revision.'
+          echo 'DRAFT — required full check NOT run; not release evidence.' >> "$GITHUB_STEP_SUMMARY"
+          exit 1
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -126,6 +149,13 @@ jobs:
       run:
         working-directory: landing
     steps:
+      # Deferred is deliberately red, never a successful/skipped required check.
+      - name: Draft — full validation deferred
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft }}
+        run: |
+          echo '::notice::DRAFT: mark ready or dispatch full CI on this exact revision.'
+          echo 'DRAFT — required full check NOT run; not release evidence.' >> "$GITHUB_STEP_SUMMARY"
+          exit 1
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
